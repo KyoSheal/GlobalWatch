@@ -1,0 +1,15 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 你的本地记忆数据库 (不要上传这个！)
+memory_db/
+chroma_db/
+
+# 如果你有虚拟环境
+venv/
+.env
+
+# IDE配置
+.vscode/
+.idea/
