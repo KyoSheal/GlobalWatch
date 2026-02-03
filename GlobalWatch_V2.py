@@ -39,6 +39,30 @@ GLOBAL MACRO RULES:
 4. TECH STOCKS (e.g. NVDA) are sensitive to Interest Rates & AI hype.
 """
 
+# Early-Warning 监控列表配置
+WATCHLIST = {
+    "Gold": {
+        "ticker": "GC=F",
+        "type": "commodity",
+        "correlations": {"DXY": -0.7, "^TNX": -0.5}
+    },
+    "Oil": {
+        "ticker": "CL=F",
+        "type": "commodity",
+        "correlations": {"DXY": -0.4, "CAD=X": 0.6}
+    },
+    "CNY": {
+        "ticker": "CNY=X",
+        "type": "fx",
+        "correlations": {"DXY": -0.6, "CL=F": 0.3}
+    },
+    "CAD": {
+        "ticker": "CAD=X",
+        "type": "fx",
+        "correlations": {"CL=F": 0.6, "DXY": -0.4}
+    }
+}
+
 ASSETS_DB = {
     "USD (美元)": {"ticker": "USD", "type": "fiat_base"},
     "CNY (人民币)": {"ticker": "CNY=X", "type": "fiat_quote"}, 
@@ -474,6 +498,528 @@ def check_direction(predicted_direction, actual_return):
         return "CORRECT" if actual_return < 0 else "WRONG"
     
     return "UNKNOWN"
+
+# ================= 2.6. Early-Warning 风险评分系统 =================
+
+def calculate_rsi(ticker, period=14):
+    """计算 RSI 指标"""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="3mo")
+        if hist.empty or len(hist) < period + 1:
+            return None
+        
+        delta = hist['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1])
+    except:
+        return None
+
+def calculate_ma(ticker, period=20):
+    """计算移动平均线"""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="3mo")
+        if hist.empty or len(hist) < period:
+            return None
+        return float(hist['Close'].rolling(window=period).mean().iloc[-1])
+    except:
+        return None
+
+def calculate_atr(ticker, period=14):
+    """计算 ATR (Average True Range)"""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="3mo")
+        if hist.empty or len(hist) < period + 1:
+            return None
+        
+        high_low = hist['High'] - hist['Low']
+        high_close = abs(hist['High'] - hist['Close'].shift())
+        low_close = abs(hist['Low'] - hist['Close'].shift())
+        
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return float(atr.iloc[-1])
+    except:
+        return None
+
+def get_price_change(ticker, period="1w"):
+    """获取价格变化百分比"""
+    try:
+        t = yf.Ticker(ticker)
+        if period == "1w":
+            hist = t.history(period="1mo")
+            if len(hist) < 5:
+                return 0.0
+            old_price = hist['Close'].iloc[-5]
+        elif period == "1d":
+            hist = t.history(period="5d")
+            if len(hist) < 2:
+                return 0.0
+            old_price = hist['Close'].iloc[-2]
+        else:
+            return 0.0
+        
+        current_price = hist['Close'].iloc[-1]
+        return float((current_price - old_price) / old_price * 100)
+    except:
+        return 0.0
+
+def calculate_gap(ticker):
+    """计算跳空缺口"""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="5d")
+        if len(hist) < 2:
+            return 0.0
+        
+        prev_close = hist['Close'].iloc[-2]
+        current_open = hist['Open'].iloc[-1]
+        gap = (current_open - prev_close) / prev_close * 100
+        return float(gap)
+    except:
+        return 0.0
+
+def get_current_volume(ticker):
+    """获取当前成交量"""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="1d")
+        if hist.empty:
+            return 0
+        return int(hist['Volume'].iloc[-1])
+    except:
+        return 0
+
+def get_avg_volume(ticker, period=20):
+    """获取平均成交量"""
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="1mo")
+        if hist.empty or len(hist) < period:
+            return 1  # 避免除零
+        return int(hist['Volume'].rolling(window=period).mean().iloc[-1])
+    except:
+        return 1
+
+def count_keyword_mentions(keywords, news_list):
+    """统计关键词在新闻中的出现次数"""
+    count = 0
+    for news_item in news_list:
+        title = news_item.get('title', '').lower()
+        for keyword in keywords:
+            if keyword.lower() in title:
+                count += 1
+                break  # 每条新闻只计数一次
+    return count
+
+def calculate_macro_chain_score(asset_name, asset_config, recent_news):
+    """
+    计算宏观链条分 (0-25)
+    基于美元指数、利率、相关性
+    """
+    score = 0
+    evidence = []
+    
+    try:
+        # 1. 美元指数影响 (0-10分)
+        dxy_change = get_price_change("DX-Y.NYB", period="1w")  # 美元指数
+        dxy_correlation = asset_config['correlations'].get('DXY', 0)
+        
+        if abs(dxy_correlation) > 0.5:  # 强相关
+            if (dxy_correlation < 0 and dxy_change > 2) or (dxy_correlation > 0 and dxy_change < -2):
+                score += 8
+                evidence.append({
+                    "type": "price",
+                    "indicator": "DXY",
+                    "value": f"{dxy_change:+.1f}%",
+                    "interpretation": f"USD {'strength' if dxy_change > 0 else 'weakness'} {'negative' if dxy_correlation < 0 else 'positive'} for {asset_name}"
+                })
+            elif abs(dxy_change) > 1:
+                score += 4
+                evidence.append({
+                    "type": "price",
+                    "indicator": "DXY",
+                    "value": f"{dxy_change:+.1f}%",
+                    "interpretation": f"Moderate USD movement, correlation: {dxy_correlation:.2f}"
+                })
+        
+        # 2. 利率影响 (0-10分)
+        tnx_change = get_price_change("^TNX", period="1w")  # 10年期国债
+        tnx_correlation = asset_config['correlations'].get('^TNX', 0)
+        
+        if abs(tnx_correlation) > 0.3:
+            if (tnx_correlation < 0 and tnx_change > 0.2) or (tnx_correlation > 0 and tnx_change < -0.2):
+                score += 7
+                evidence.append({
+                    "type": "price",
+                    "indicator": "10Y Yield",
+                    "value": f"{tnx_change:+.2f}%",
+                    "interpretation": f"Rate {'rise' if tnx_change > 0 else 'fall'} {'negative' if tnx_correlation < 0 else 'positive'} for {asset_name}"
+                })
+        
+        # 3. 新闻中的宏观提及 (0-5分)
+        macro_keywords = ["Fed", "interest rate", "dollar", "USD", "inflation", "央行", "利率"]
+        news_mentions = count_keyword_mentions(macro_keywords, recent_news)
+        
+        if news_mentions >= 3:
+            score += 5
+            evidence.append({
+                "type": "news",
+                "count": news_mentions,
+                "keywords": "Fed/rates/USD",
+                "interpretation": "High macro news flow increases uncertainty"
+            })
+        elif news_mentions > 0:
+            score += 2
+            evidence.append({
+                "type": "news",
+                "count": news_mentions,
+                "keywords": "Fed/rates/USD",
+                "interpretation": "Moderate macro news mentions"
+            })
+        
+    except Exception as e:
+        evidence.append({
+            "type": "error",
+            "message": f"Error calculating macro score: {str(e)}"
+        })
+    
+    return min(score, 25), evidence
+
+def calculate_crowding_score(ticker):
+    """
+    计算拥挤度分 (0-25)
+    基于 RSI、价格偏离均线、情绪
+    """
+    score = 0
+    evidence = []
+    
+    try:
+        # 1. RSI 超买/超卖 (0-12分)
+        rsi = calculate_rsi(ticker, period=14)
+        
+        if rsi is not None:
+            if rsi > 70:  # 超买
+                score += min((rsi - 70) / 3, 12)
+                evidence.append({
+                    "type": "price",
+                    "indicator": "RSI(14)",
+                    "value": f"{rsi:.1f}",
+                    "interpretation": "Overbought - potential reversal risk"
+                })
+            elif rsi < 30:  # 超卖
+                score += min((30 - rsi) / 3, 12)
+                evidence.append({
+                    "type": "price",
+                    "indicator": "RSI(14)",
+                    "value": f"{rsi:.1f}",
+                    "interpretation": "Oversold - potential bounce risk"
+                })
+            elif rsi > 60 or rsi < 40:
+                score += 3
+                evidence.append({
+                    "type": "price",
+                    "indicator": "RSI(14)",
+                    "value": f"{rsi:.1f}",
+                    "interpretation": "Moderate momentum"
+                })
+        
+        # 2. 价格偏离均线 (0-10分)
+        price = get_current_price(ticker)
+        ma20 = calculate_ma(ticker, period=20)
+        
+        if price and ma20:
+            deviation = (price - ma20) / ma20 * 100
+            
+            if abs(deviation) > 5:
+                score += min(abs(deviation) - 5, 10)
+                evidence.append({
+                    "type": "price",
+                    "indicator": "Price vs MA20",
+                    "value": f"{deviation:+.1f}%",
+                    "interpretation": f"{'Above' if deviation > 0 else 'Below'} MA20 - stretched"
+                })
+            elif abs(deviation) > 2:
+                score += 2
+                evidence.append({
+                    "type": "price",
+                    "indicator": "Price vs MA20",
+                    "value": f"{deviation:+.1f}%",
+                    "interpretation": "Moderate deviation from MA20"
+                })
+        
+        # 3. 成交量异常 (0-3分)
+        current_volume = get_current_volume(ticker)
+        avg_volume = get_avg_volume(ticker, period=20)
+        
+        if current_volume > 0 and avg_volume > 0:
+            volume_ratio = current_volume / avg_volume
+            
+            if volume_ratio > 2:
+                score += 3
+                evidence.append({
+                    "type": "price",
+                    "indicator": "Volume",
+                    "value": f"{volume_ratio:.1f}x avg",
+                    "interpretation": "Volume spike - increased crowding"
+                })
+    
+    except Exception as e:
+        evidence.append({
+            "type": "error",
+            "message": f"Error calculating crowding score: {str(e)}"
+        })
+    
+    return min(score, 25), evidence
+
+def calculate_microstructure_score(ticker):
+    """
+    计算微结构分 (0-25)
+    基于波动率、跳空、成交量
+    """
+    score = 0
+    evidence = []
+    
+    try:
+        # 1. 波动率骤增 (0-12分)
+        current_atr = calculate_atr(ticker, period=14)
+        avg_atr = calculate_atr(ticker, period=50)
+        
+        if current_atr and avg_atr and avg_atr > 0:
+            atr_ratio = current_atr / avg_atr
+            
+            if atr_ratio > 1.5:  # 波动率上升50%+
+                score += min((atr_ratio - 1) * 6, 12)
+                evidence.append({
+                    "type": "price",
+                    "indicator": "ATR Ratio",
+                    "value": f"{atr_ratio:.2f}x",
+                    "interpretation": "Volatility surge - increased risk"
+                })
+            elif atr_ratio > 1.2:
+                score += 3
+                evidence.append({
+                    "type": "price",
+                    "indicator": "ATR Ratio",
+                    "value": f"{atr_ratio:.2f}x",
+                    "interpretation": "Elevated volatility"
+                })
+        
+        # 2. 跳空缺口 (0-8分)
+        gap = calculate_gap(ticker)
+        
+        if abs(gap) > 2:  # 跳空超过2%
+            score += min(abs(gap), 8)
+            evidence.append({
+                "type": "price",
+                "indicator": "Gap",
+                "value": f"{gap:+.1f}%",
+                "interpretation": f"{'Upward' if gap > 0 else 'Downward'} gap - momentum shift"
+            })
+        elif abs(gap) > 1:
+            score += 2
+            evidence.append({
+                "type": "price",
+                "indicator": "Gap",
+                "value": f"{gap:+.1f}%",
+                "interpretation": "Small gap detected"
+            })
+        
+        # 3. 成交量异常 (0-5分)
+        current_volume = get_current_volume(ticker)
+        avg_volume = get_avg_volume(ticker, period=20)
+        
+        if current_volume > 0 and avg_volume > 0:
+            volume_ratio = current_volume / avg_volume
+            
+            if volume_ratio > 2:  # 成交量翻倍
+                score += min((volume_ratio - 1) * 2.5, 5)
+                evidence.append({
+                    "type": "price",
+                    "indicator": "Volume Ratio",
+                    "value": f"{volume_ratio:.1f}x",
+                    "interpretation": "Volume spike - increased activity"
+                })
+    
+    except Exception as e:
+        evidence.append({
+            "type": "error",
+            "message": f"Error calculating microstructure score: {str(e)}"
+        })
+    
+    return min(score, 25), evidence
+
+def calculate_event_risk_score(recent_news):
+    """
+    计算事件风险分 (0-25)
+    基于新闻关键词匹配
+    """
+    score = 0
+    evidence = []
+    
+    try:
+        # 定义事件风险关键词
+        event_keywords = {
+            "central_bank": ["Fed", "ECB", "央行", "interest rate", "monetary policy", "Powell", "Yellen"],
+            "policy": ["tariff", "sanction", "regulation", "policy", "law", "trade war", "关税"],
+            "geopolitical": ["war", "conflict", "election", "crisis", "tension", "战争", "冲突"]
+        }
+        
+        # 1. 央行事件 (0-10分)
+        cb_mentions = count_keyword_mentions(event_keywords["central_bank"], recent_news)
+        if cb_mentions >= 3:
+            score += 10
+            evidence.append({
+                "type": "news",
+                "category": "Central Bank",
+                "count": cb_mentions,
+                "interpretation": "High central bank event risk"
+            })
+        elif cb_mentions > 0:
+            score += cb_mentions * 2
+            evidence.append({
+                "type": "news",
+                "category": "Central Bank",
+                "count": cb_mentions,
+                "interpretation": "Central bank mentions detected"
+            })
+        
+        # 2. 政策风险 (0-8分)
+        policy_mentions = count_keyword_mentions(event_keywords["policy"], recent_news)
+        if policy_mentions >= 3:
+            score += 8
+            evidence.append({
+                "type": "news",
+                "category": "Policy",
+                "count": policy_mentions,
+                "interpretation": "High policy uncertainty"
+            })
+        elif policy_mentions > 0:
+            score += policy_mentions * 2
+            evidence.append({
+                "type": "news",
+                "category": "Policy",
+                "count": policy_mentions,
+                "interpretation": "Policy risk mentions"
+            })
+        
+        # 3. 地缘政治 (0-7分)
+        geo_mentions = count_keyword_mentions(event_keywords["geopolitical"], recent_news)
+        if geo_mentions >= 3:
+            score += 7
+            evidence.append({
+                "type": "news",
+                "category": "Geopolitical",
+                "count": geo_mentions,
+                "interpretation": "High geopolitical risk"
+            })
+        elif geo_mentions > 0:
+            score += geo_mentions * 2
+            evidence.append({
+                "type": "news",
+                "category": "Geopolitical",
+                "count": geo_mentions,
+                "interpretation": "Geopolitical mentions detected"
+            })
+    
+    except Exception as e:
+        evidence.append({
+            "type": "error",
+            "message": f"Error calculating event risk score: {str(e)}"
+        })
+    
+    return min(score, 25), evidence
+
+def calculate_early_warning_score(asset_name, recent_news):
+    """
+    计算综合 Early-Warning 风险分数
+    Returns:
+        dict: {
+            "asset": str,
+            "timestamp": str,
+            "total_risk_score": int (0-100),
+            "risk_level": str (LOW/MEDIUM/HIGH/CRITICAL),
+            "sub_scores": {
+                "macro_chain": {"score": int, "evidence": list},
+                "crowding": {"score": int, "evidence": list},
+                "microstructure": {"score": int, "evidence": list},
+                "event_risk": {"score": int, "evidence": list}
+            },
+            "alert_triggers": list,
+            "recommendation": str
+        }
+    """
+    if asset_name not in WATCHLIST:
+        return {
+            "asset": asset_name,
+            "error": "Asset not in watchlist"
+        }
+    
+    asset_config = WATCHLIST[asset_name]
+    ticker = asset_config['ticker']
+    
+    # 计算四个子分数
+    macro_score, macro_evidence = calculate_macro_chain_score(asset_name, asset_config, recent_news)
+    crowding_score, crowding_evidence = calculate_crowding_score(ticker)
+    micro_score, micro_evidence = calculate_microstructure_score(ticker)
+    event_score, event_evidence = calculate_event_risk_score(recent_news)
+    
+    # 综合分数
+    total_score = macro_score + crowding_score + micro_score + event_score
+    
+    # 风险等级
+    if total_score >= 76:
+        risk_level = "CRITICAL"
+    elif total_score >= 51:
+        risk_level = "HIGH"
+    elif total_score >= 26:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+    
+    # 告警触发器
+    alert_triggers = []
+    if total_score > 60:
+        alert_triggers.append(f"Total risk score > 60 ({risk_level})")
+    if macro_score > 15:
+        alert_triggers.append(f"Macro chain score > 15 ({macro_score})")
+    if crowding_score > 18:
+        alert_triggers.append(f"Crowding score > 18 ({crowding_score})")
+    if micro_score > 15:
+        alert_triggers.append(f"Microstructure score > 15 ({micro_score})")
+    if event_score > 15:
+        alert_triggers.append(f"Event risk score > 15 ({event_score})")
+    
+    # 建议
+    if risk_level == "CRITICAL":
+        recommendation = "🔴 CRITICAL: Multiple risk factors at extreme levels. Consider reducing exposure significantly or hedging."
+    elif risk_level == "HIGH":
+        recommendation = "🟠 CAUTION: Elevated risk across multiple dimensions. Monitor closely and consider risk management."
+    elif risk_level == "MEDIUM":
+        recommendation = "🟡 WATCH: Some risk factors elevated. Stay alert to developments."
+    else:
+        recommendation = "🟢 NORMAL: Risk levels within normal range. Continue monitoring."
+    
+    return {
+        "asset": asset_name,
+        "timestamp": datetime.now().isoformat(),
+        "total_risk_score": total_score,
+        "risk_level": risk_level,
+        "sub_scores": {
+            "macro_chain": {"score": macro_score, "evidence": macro_evidence},
+            "crowding": {"score": crowding_score, "evidence": crowding_evidence},
+            "microstructure": {"score": micro_score, "evidence": micro_evidence},
+            "event_risk": {"score": event_score, "evidence": event_evidence}
+        },
+        "alert_triggers": alert_triggers,
+        "recommendation": recommendation
+    }
 
 def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
     """
@@ -920,7 +1466,7 @@ st.title("🦁 GlobalWatch: DeepSeek-R1 推理版")
 st.caption("🚀 Powered by Chain-of-Thought Reasoning")
 st.divider()
 
-tab_macro, tab_stock, tab_scoreboard = st.tabs(["🌍 宏观/外汇 (Macro/FX)", "🇺🇸 美股透视 (US Stocks)", "📊 Signal Scoreboard"])
+tab_macro, tab_stock, tab_scoreboard, tab_warning = st.tabs(["🌍 宏观/外汇 (Macro/FX)", "🇺🇸 美股透视 (US Stocks)", "📊 Signal Scoreboard", "🚨 Early-Warning"])
 
 # === TAB 1: 宏观外汇 ===
 with tab_macro:
@@ -1302,3 +1848,299 @@ with tab_scoreboard:
         - Past performance doesn't guarantee future results
         - Use this data to validate your strategy before risking real money
         """)
+
+
+# === TAB 4: Early-Warning ===
+with tab_warning:
+    st.header("🚨 Early-Warning Risk Monitor")
+    st.caption("Universal risk scoring system for monitored assets")
+    
+    st.divider()
+    
+    # 监控列表选择
+    st.subheader("📋 Watchlist")
+    
+    col_select, col_analyze = st.columns([3, 1])
+    
+    selected_asset = col_select.selectbox(
+        "Select Asset to Analyze",
+        list(WATCHLIST.keys()),
+        index=0
+    )
+    
+    if col_analyze.button("🔍 Calculate Risk Score"):
+        with st.spinner(f"Analyzing risk for {selected_asset}..."):
+            # 获取最新新闻
+            recent_news = st.session_state.get('news', [])
+            if not recent_news:
+                recent_news = get_rss_news()
+            
+            # 计算风险分数
+            risk_result = calculate_early_warning_score(selected_asset, recent_news)
+            
+            # 存储到 session state
+            st.session_state['risk_result'] = risk_result
+            st.rerun()
+    
+    st.divider()
+    
+    # 显示风险评分结果
+    if 'risk_result' in st.session_state:
+        risk = st.session_state['risk_result']
+        
+        if 'error' in risk:
+            st.error(f"Error: {risk['error']}")
+        else:
+            # 风险总览
+            st.subheader(f"📊 Risk Assessment: {risk['asset']}")
+            
+            # 综合风险分数
+            total_score = risk['total_risk_score']
+            risk_level = risk['risk_level']
+            
+            # 风险等级颜色
+            level_colors = {
+                "LOW": "green",
+                "MEDIUM": "yellow",
+                "HIGH": "orange",
+                "CRITICAL": "red"
+            }
+            level_color = level_colors.get(risk_level, "gray")
+            
+            # 显示综合分数
+            col_score, col_level = st.columns(2)
+            
+            col_score.metric(
+                "Total Risk Score",
+                f"{total_score}/100",
+                help="Combined score from all risk dimensions"
+            )
+            
+            col_level.markdown(f"""
+            <div style="padding:20px; background-color:{level_color}; border-radius:10px; text-align:center;">
+                <h2 style="color:white; margin:0;">{risk_level}</h2>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.divider()
+            
+            # 四维子分数
+            st.subheader("📈 Risk Breakdown")
+            
+            sub_scores = risk['sub_scores']
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            col1.metric(
+                "🌐 Macro Chain",
+                f"{sub_scores['macro_chain']['score']}/25",
+                help="USD/rates/macro environment impact"
+            )
+            
+            col2.metric(
+                "👥 Crowding",
+                f"{sub_scores['crowding']['score']}/25",
+                help="Technical overbought/oversold levels"
+            )
+            
+            col3.metric(
+                "📊 Microstructure",
+                f"{sub_scores['microstructure']['score']}/25",
+                help="Volatility/gaps/volume anomalies"
+            )
+            
+            col4.metric(
+                "⚡ Event Risk",
+                f"{sub_scores['event_risk']['score']}/25",
+                help="Central bank/policy/geopolitical events"
+            )
+            
+            st.divider()
+            
+            # 雷达图
+            st.subheader("🎯 Risk Radar")
+            
+            categories = ['Macro Chain', 'Crowding', 'Microstructure', 'Event Risk']
+            values = [
+                sub_scores['macro_chain']['score'],
+                sub_scores['crowding']['score'],
+                sub_scores['microstructure']['score'],
+                sub_scores['event_risk']['score']
+            ]
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Scatterpolar(
+                r=values + [values[0]],  # 闭合图形
+                theta=categories + [categories[0]],
+                fill='toself',
+                name='Risk Score',
+                line_color='red'
+            ))
+            
+            fig.update_layout(
+                polar=dict(
+                    radialaxis=dict(
+                        visible=True,
+                        range=[0, 25]
+                    )
+                ),
+                showlegend=False,
+                height=400
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider()
+            
+            # 证据链展示
+            st.subheader("📋 Evidence Chain")
+            
+            # Macro Chain Evidence
+            with st.expander("🌐 Macro Chain Evidence", expanded=True):
+                macro_evidence = sub_scores['macro_chain']['evidence']
+                if macro_evidence:
+                    for idx, ev in enumerate(macro_evidence, 1):
+                        if ev.get('type') == 'error':
+                            st.error(f"⚠️ {ev.get('message')}")
+                        else:
+                            st.markdown(f"**Evidence {idx}**")
+                            st.markdown(f"- **Type**: {ev.get('type', 'N/A')}")
+                            if 'indicator' in ev:
+                                st.markdown(f"- **Indicator**: {ev.get('indicator')}")
+                            if 'value' in ev:
+                                st.markdown(f"- **Value**: {ev.get('value')}")
+                            if 'count' in ev:
+                                st.markdown(f"- **Count**: {ev.get('count')}")
+                            st.markdown(f"- **Interpretation**: {ev.get('interpretation', 'N/A')}")
+                            st.divider()
+                else:
+                    st.info("No macro chain risks detected")
+            
+            # Crowding Evidence
+            with st.expander("👥 Crowding Evidence"):
+                crowding_evidence = sub_scores['crowding']['evidence']
+                if crowding_evidence:
+                    for idx, ev in enumerate(crowding_evidence, 1):
+                        if ev.get('type') == 'error':
+                            st.error(f"⚠️ {ev.get('message')}")
+                        else:
+                            st.markdown(f"**Evidence {idx}**")
+                            st.markdown(f"- **Indicator**: {ev.get('indicator', 'N/A')}")
+                            st.markdown(f"- **Value**: {ev.get('value', 'N/A')}")
+                            st.markdown(f"- **Interpretation**: {ev.get('interpretation', 'N/A')}")
+                            st.divider()
+                else:
+                    st.info("No crowding risks detected")
+            
+            # Microstructure Evidence
+            with st.expander("📊 Microstructure Evidence"):
+                micro_evidence = sub_scores['microstructure']['evidence']
+                if micro_evidence:
+                    for idx, ev in enumerate(micro_evidence, 1):
+                        if ev.get('type') == 'error':
+                            st.error(f"⚠️ {ev.get('message')}")
+                        else:
+                            st.markdown(f"**Evidence {idx}**")
+                            st.markdown(f"- **Indicator**: {ev.get('indicator', 'N/A')}")
+                            st.markdown(f"- **Value**: {ev.get('value', 'N/A')}")
+                            st.markdown(f"- **Interpretation**: {ev.get('interpretation', 'N/A')}")
+                            st.divider()
+                else:
+                    st.info("No microstructure risks detected")
+            
+            # Event Risk Evidence
+            with st.expander("⚡ Event Risk Evidence"):
+                event_evidence = sub_scores['event_risk']['evidence']
+                if event_evidence:
+                    for idx, ev in enumerate(event_evidence, 1):
+                        if ev.get('type') == 'error':
+                            st.error(f"⚠️ {ev.get('message')}")
+                        else:
+                            st.markdown(f"**Evidence {idx}**")
+                            st.markdown(f"- **Category**: {ev.get('category', 'N/A')}")
+                            st.markdown(f"- **Count**: {ev.get('count', 'N/A')}")
+                            st.markdown(f"- **Interpretation**: {ev.get('interpretation', 'N/A')}")
+                            st.divider()
+                else:
+                    st.info("No event risks detected")
+            
+            st.divider()
+            
+            # 告警触发器
+            if risk['alert_triggers']:
+                st.subheader("⚠️ Alert Triggers")
+                for trigger in risk['alert_triggers']:
+                    st.warning(f"• {trigger}")
+            
+            # 建议
+            st.subheader("💡 Recommendation")
+            st.info(risk['recommendation'])
+            
+            # 时间戳
+            st.caption(f"Analysis Time: {risk['timestamp'][:19]}")
+    
+    else:
+        st.info("👆 Select an asset and click 'Calculate Risk Score' to begin analysis")
+    
+    st.divider()
+    
+    # 使用说明
+    with st.expander("ℹ️ How to Use Early-Warning System"):
+        st.markdown("""
+        ### Early-Warning Risk Scoring System
+        
+        **Purpose**:
+        - Detect elevated risk BEFORE major moves
+        - Provide evidence-based risk assessment
+        - Help answer: "Should I reduce exposure now?"
+        
+        **Four Risk Dimensions**:
+        
+        1. **🌐 Macro Chain (0-25)**:
+           - USD strength/weakness impact
+           - Interest rate movements
+           - Macro news flow
+           - Based on correlations with DXY, 10Y yields
+        
+        2. **👥 Crowding (0-25)**:
+           - RSI overbought/oversold levels
+           - Price deviation from moving averages
+           - Volume spikes indicating crowding
+        
+        3. **📊 Microstructure (0-25)**:
+           - Volatility surges (ATR ratio)
+           - Price gaps
+           - Volume anomalies
+        
+        4. **⚡ Event Risk (0-25)**:
+           - Central bank events (Fed, ECB)
+           - Policy changes (tariffs, regulations)
+           - Geopolitical tensions
+        
+        **Risk Levels**:
+        - 🟢 **LOW (0-25)**: Normal market environment
+        - 🟡 **MEDIUM (26-50)**: Some factors elevated, monitor
+        - 🟠 **HIGH (51-75)**: Multiple risks, consider caution
+        - 🔴 **CRITICAL (76-100)**: Extreme risk, reduce exposure
+        
+        **Current Watchlist**:
+        - Gold (GC=F)
+        - Oil (CL=F)
+        - CNY (CNY=X)
+        - CAD (CAD=X)
+        
+        **Important Notes**:
+        - Risk scores are RELATIVE, not absolute
+        - Use with Signal Scoreboard to validate effectiveness
+        - Combine with other analysis methods
+        - Not a trading signal - a risk management tool
+        
+        **Best Practices**:
+        - Run analysis regularly (daily or before major positions)
+        - Compare scores over time to identify trends
+        - Pay attention to evidence - not just the score
+        - Act on CRITICAL levels, monitor HIGH levels
+        """)
+
+
