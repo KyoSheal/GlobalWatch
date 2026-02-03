@@ -1,10 +1,11 @@
-# 🦁 GlobalWatch: Local AI Financial Intelligence Terminal
+# 🦁 GlobalWatch: AI-Powered Financial Intelligence Terminal
 # 本地化 AI 金融情报终端
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-UI-red)
 ![Ollama](https://img.shields.io/badge/AI-Ollama%20Local-black)
 ![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/Version-V2.5-orange)
 
 [English](#-english-version) | [中文文档](#-中文文档-chinese-version)
 
@@ -12,149 +13,359 @@
 
 # 🇬🇧 English Version
 
-**GlobalWatch** is a privacy-first, real-time financial intelligence terminal that runs entirely on your local machine. 
+**GlobalWatch V2.5** is a privacy-first, real-time financial intelligence terminal that runs entirely on your local machine. 
 
-By combining **Live RSS Feeds** (Reuters, CNBC, Google News) with **Local Large Language Models** (via Ollama), it performs autonomous market analysis, trend detection, and risk assessment without sending sensitive data to the cloud or paying for API keys.
+By combining **Live RSS Feeds** (Reuters, CNBC, BBC) with **Local Large Language Models** (via Ollama), it performs autonomous market analysis, trend detection, and risk assessment without sending sensitive data to the cloud or paying for API keys.
 
-## ✨ Key Features (V2.1)
+## 🚀 What's New in V2.5
 
-* **🌍 Macro & FX Analysis**: Monitors global currency pairs (e.g., USD/CNY, CAD/USD) and commodities (Gold, Oil).
-* **🧠 Long-Term Memory (RAG)**: Uses **ChromaDB** to store past events. The AI "remembers" previous news to detect escalating trends (e.g., "This is the 3rd warning about oil prices this week").
-* **🇺🇸 US Stock Deep Dive**: Dedicated tab for analyzing individual stocks (e.g., NVDA, TSLA). Fetches real-time prices and **Google News** for specific sentiment analysis.
-* **🧭 Risk Sentiment Gauge**: Visual speedometer showing the AI's calculated market panic/greed level (0-10).
-* **📊 Interactive Charts**: Professional Candlestick charts with Moving Averages (MA20) powered by Plotly.
-* **🔔 Desktop Notifications**: Background monitoring with system pop-up alerts when high-impact events occur.
-* **💸 Zero Cost**: No OpenAI/Claude API keys required. Runs on your own GPU.
+### 🚨 Early-Warning Risk Scoring System
+- **Universal Risk Monitor**: Tracks risk levels for any asset (Gold, Oil, CNY, CAD, etc.)
+- **Four-Dimensional Scoring**: 
+  - 🌐 Macro Chain (USD/rates impact)
+  - 👥 Crowding (RSI/overbought levels)
+  - 📊 Microstructure (volatility/gaps)
+  - ⚡ Event Risk (central bank/policy/geopolitical)
+- **0-100 Risk Score**: Combined risk assessment with evidence chain
+- **Risk Levels**: LOW/MEDIUM/HIGH/CRITICAL with color-coded alerts
+
+### 🎯 Trading-Grade Performance Classification
+- **Strict Risk Control**: Determines if signals are suitable for real-money execution
+- **Five-Level Classification**:
+  - 🟢 **Tradable Edge**: Only classification approved for live trading
+  - 🟡 **Directional Signal**: Reference only, no standalone trading
+  - 🟠 **Unstable**: Under observation, trading prohibited
+  - 🔴 **No Edge**: Permanently banned from trading
+  - 🟤 **Insufficient Data**: Sample size too small
+- **Multi-Timeframe Validation**: Requires positive performance across multiple timeframes
+- **Transaction Cost Consideration**: Net expected value after costs
+
+## ✨ Core Features
+
+### 🧠 Evidence-Based Reasoning
+- **Macro Rules Integration**: AI must reference predefined macro logic
+- **Forced Evidence Output**: Every prediction requires news-based evidence
+- **Hallucination Detection**: Automatically validates AI-generated evidence
+- **Degradation Strategy**: Warns when evidence is insufficient
+
+### 📊 Signal Scoreboard
+- **Automatic Signal Recording**: Tracks all AI predictions with timestamps
+- **Multi-Timeframe Backfilling**: Validates performance at 1h/4h/1d/1w intervals
+- **Enhanced Statistics**: Drawdown, volatility, profit factor, win rate
+- **Performance Tracking**: Cumulative returns and accuracy over time
+
+### 🌍 Macro & FX Analysis
+- **Global Currency Monitoring**: USD/CNY, CAD/USD, EUR/GBP, etc.
+- **Commodity Tracking**: Gold, Oil, Bitcoin
+- **Cross-Rate Calculations**: Real-time currency pair analysis
+- **Interactive Charts**: Candlestick charts with MA20
+
+### 🇺🇸 US Stock Analysis
+- **Individual Stock Deep Dive**: NVDA, TSLA, AAPL analysis
+- **Company-Specific News**: Google News integration
+- **Sentiment Analysis**: AI-powered bullish/bearish assessment
+- **Real-Time Pricing**: Live stock price updates
+
+### 🧠 Long-Term Memory (RAG)
+- **ChromaDB Integration**: Vector database for event storage
+- **Trend Detection**: "This is the 3rd oil warning this week"
+- **Historical Context**: AI remembers past events for better analysis
 
 ## 🛠️ Tech Stack
 
 * **Core**: Python 3.10+
 * **UI**: Streamlit
-* **AI Engine**: Ollama (Running `qwen2.5` or `deepseek-r1`)
+* **AI Engine**: Ollama (DeepSeek-R1, Qwen2.5)
 * **Memory**: ChromaDB (Vector Database)
-* **Data**: `yfinance`, `feedparser` (Google News RSS)
+* **Data**: yfinance, feedparser (RSS feeds)
 * **Visualization**: Plotly
 * **Notifications**: Plyer
 
 ## ⚙️ Prerequisites
 
-1.  **Hardware**: PC with NVIDIA GPU (Recommended) or Mac M-Series.
-2.  **Software**: [Ollama](https://ollama.com/) installed.
+1. **Hardware**: PC with NVIDIA GPU (Recommended) or Mac M-Series
+2. **Software**: [Ollama](https://ollama.com/) installed
+3. **AI Model**: DeepSeek-R1:8B (recommended for reasoning) or Qwen2.5:7B
 
 ## 📦 Installation
 
-1.  **Clone the repository**:
-    ```bash
-    git clone [https://github.com/YOUR_USERNAME/GlobalWatch.git](https://github.com/YOUR_USERNAME/GlobalWatch.git)
-    cd GlobalWatch
-    ```
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/GlobalWatch.git
+   cd GlobalWatch
+   ```
 
-2.  **Install dependencies**:
-    ```bash
-    pip install streamlit yfinance feedparser ollama pandas plotly chromadb plyer
-    ```
+2. **Install dependencies**:
+   ```bash
+   pip install streamlit yfinance feedparser ollama pandas plotly chromadb plyer
+   ```
 
-3.  **Download the AI Model**:
-    Open your terminal and pull a model (we recommend Qwen2.5 for speed/performance balance):
-    ```bash
-    ollama pull qwen2.5:7b
-    ```
-    *(Note: You can change the model name in the code `LOCAL_MODEL` variable)*
+3. **Download the AI Model**:
+   ```bash
+   # For reasoning tasks (recommended)
+   ollama pull deepseek-r1:8b
+   
+   # Or for faster performance
+   ollama pull qwen2.5:7b
+   ```
 
 ## 🚀 Usage
 
-Run the application using Streamlit:
+Run the application:
 
 ```bash
-python -m streamlit run GlobalWatch_GodMode.py
-The application will open automatically in your browser.
+python -m streamlit run GlobalWatch_V2.py
+```
 
-How to use:
-Macro/FX Tab: Select your base/quote currencies. The AI will analyze global news and tell you the bullish/bearish trend based on logic (e.g., Oil UP -> CAD UP).
+### 📱 Interface Overview
 
-US Stocks Tab: Enter a ticker (e.g., NVDA). The AI will fetch specific news for that company and give a sentiment rating.
+The application opens with four main tabs:
 
-Settings: Toggle between English/Chinese output or enable/disable desktop notifications in the sidebar.
+#### 🌍 Macro/FX Tab
+- Select currency pairs and commodities
+- View real-time cross rates
+- AI analysis with evidence chain
+- Risk sentiment gauge (0-10)
 
-⚠️ Disclaimer
-This software is for educational and research purposes only. The predictions generated by the AI are based on news sentiment analysis and do not constitute professional financial advice. Algorithmic hallucinations may occur. Always do your own due diligence before trading.
+#### 🇺🇸 US Stocks Tab
+- Enter stock ticker (e.g., NVDA)
+- Company-specific news analysis
+- AI sentiment: Bullish/Bearish/Neutral
+- Price charts with technical indicators
 
-🇨🇳 中文文档 (Chinese Version)
-GlobalWatch 是一个完全在本地运行的、注重隐私的实时金融情报终端。
+#### 📊 Signal Scoreboard Tab
+- **Trading-Grade Classification**: See if signals are approved for live trading
+- **Performance Metrics**: Accuracy, returns, drawdown, profit factor
+- **Multi-Timeframe Analysis**: 1h/4h/1d/1w performance validation
+- **V1 vs V2 Classification**: Reference vs trading-grade classifications
 
-它结合了 实时 RSS 新闻源（路透社、CNBC、谷歌新闻）和 本地大语言模型（Ollama），能够自主进行市场分析、趋势检测和风险评估。全程无需将数据上传云端，也无需支付 API 费用。
+#### 🚨 Early-Warning Tab
+- **Asset Risk Monitoring**: Select from watchlist (Gold/Oil/CNY/CAD)
+- **Four-Dimensional Risk Breakdown**: Detailed risk analysis
+- **Evidence Chain**: Price and news evidence for each risk dimension
+- **Risk Radar Chart**: Visual risk assessment
+- **Alert Triggers**: Automatic risk level warnings
 
-✨ 核心功能 (V2.1)
-🌍 宏观与外汇分析：监控全球货币对（如 USD/CNY, CAD/USD）和大宗商品（黄金、原油）。
+### 🎯 Key Workflows
 
-🧠 长期记忆 (RAG)：内置 ChromaDB 向量数据库。AI 拥有“记忆”，能通过对比历史新闻来识别趋势升级（例如：“这是本周第三次关于油价的警告”）。
+#### For Risk Management:
+1. Check **Early-Warning** tab daily
+2. Monitor assets with MEDIUM+ risk levels
+3. Reduce exposure when risk reaches HIGH/CRITICAL
 
-🇺🇸 美股透视：独立的分页用于分析个股（如 NVDA, TSLA）。自动抓取实时股价和 Google News 专属新闻进行情感分析。
+#### For Trading Decisions:
+1. Run analysis in **Macro/FX** or **US Stocks** tabs
+2. Check **Signal Scoreboard** for trading-grade classification
+3. **Only trade signals classified as 🟢 Tradable Edge**
+4. All other classifications are prohibited for live trading
 
-🧭 风险情绪仪表盘：直观的仪表盘展示 AI 计算的市场恐慌/贪婪指数 (0-10)。
+#### For Performance Validation:
+1. Regularly click "🔄 Update Results" in Signal Scoreboard
+2. Monitor classification changes over time
+3. Wait for sufficient sample size (≥30 for evaluation, ≥50 for trading)
 
-📊 专业图表：基于 Plotly 的交互式 K 线图，包含均线 (MA20) 分析。
+## ⚠️ Important Disclaimers
 
-🔔 桌面弹窗警报：支持后台自动运行，当发生重大风险事件时弹出系统通知。
+### Trading Classification System
+- **🟢 Tradable Edge**: Only classification approved for real-money execution
+- **All Other Classifications**: Prohibited for live trading, no exceptions
+- **Sample Size Requirements**: Minimum 30 samples for evaluation, 50 for trading approval
+- **Multi-Timeframe Validation**: Must show positive performance across multiple timeframes
 
-💸 零成本：不需要 OpenAI/Claude 的付费 Key，利用本地显卡算力。
+### Risk Warnings
+- This software is for **educational and research purposes only**
+- AI predictions are based on news sentiment analysis and **do not constitute financial advice**
+- **Always do your own due diligence** before making trading decisions
+- Past performance does not guarantee future results
+- **Only use 🟢 Tradable Edge signals for live trading**
 
-🛠️ 技术栈
-核心: Python 3.10+
+---
 
-界面: Streamlit
+# 🇨🇳 中文文档 (Chinese Version)
 
-AI 引擎: Ollama (运行 qwen2.5 或 deepseek-r1)
+**GlobalWatch V2.5** 是一个完全在本地运行的、注重隐私的实时金融情报终端。
 
-记忆库: ChromaDB (向量数据库)
+它结合了 **实时 RSS 新闻源**（路透社、CNBC、BBC）和 **本地大语言模型**（Ollama），能够自主进行市场分析、趋势检测和风险评估。全程无需将数据上传云端，也无需支付 API 费用。
 
-数据源: yfinance, feedparser (Google News RSS)
+## 🚀 V2.5 版本新功能
 
-可视化: Plotly
+### 🚨 Early-Warning 风险评分系统
+- **通用风险监控**: 追踪任何资产的风险水平（黄金、原油、人民币、加元等）
+- **四维评分体系**: 
+  - 🌐 宏观链条（美元/利率影响）
+  - 👥 拥挤度（RSI/超买超卖水平）
+  - 📊 微结构（波动率/跳空）
+  - ⚡ 事件风险（央行/政策/地缘政治）
+- **0-100 风险分数**: 综合风险评估，附带证据链
+- **风险等级**: 低/中/高/极端，颜色编码预警
 
-通知: Plyer
+### 🎯 交易级性能分类体系
+- **严格风控**: 判断信号是否适合真金白银执行
+- **五级分类体系**:
+  - 🟢 **Tradable Edge**: 唯一允许实盘交易的分类
+  - 🟡 **Directional Signal**: 仅供参考，禁止单独交易
+  - 🟠 **Unstable**: 观察中，禁止交易
+  - 🔴 **No Edge**: 永久禁止交易
+  - 🟤 **Insufficient Data**: 样本数不足
+- **多时间窗口验证**: 要求在多个时间框架下都表现良好
+- **交易成本考虑**: 扣除成本后的净期望值
 
-⚙️ 环境要求
-硬件: 推荐配备 NVIDIA 显卡的 PC 或 M 系列芯片的 Mac。
+## ✨ 核心功能
 
-软件: 已安装 Ollama。
+### 🧠 基于证据的推理
+- **宏观规则注入**: AI 必须引用预定义的宏观逻辑
+- **强制证据输出**: 每个预测都需要基于新闻的证据
+- **幻觉检测**: 自动验证 AI 生成的证据
+- **降级策略**: 证据不足时发出警告
 
-📦 安装指南
-克隆项目:
+### 📊 信号记分板
+- **自动信号记录**: 追踪所有 AI 预测及时间戳
+- **多时间框架回填**: 在 1h/4h/1d/1w 间隔验证表现
+- **增强统计**: 回撤、波动率、盈亏比、胜率
+- **表现追踪**: 累计收益和准确率随时间变化
 
-Bash
+### 🌍 宏观与外汇分析
+- **全球货币监控**: USD/CNY, CAD/USD, EUR/GBP 等
+- **大宗商品追踪**: 黄金、原油、比特币
+- **交叉汇率计算**: 实时货币对分析
+- **交互式图表**: K线图配 MA20
 
-git clone [https://github.com/YOUR_USERNAME/GlobalWatch.git](https://github.com/YOUR_USERNAME/GlobalWatch.git)
-cd GlobalWatch
-安装依赖库:
+### 🇺🇸 美股分析
+- **个股深度分析**: NVDA, TSLA, AAPL 分析
+- **公司专属新闻**: Google News 集成
+- **情绪分析**: AI 驱动的看涨/看跌评估
+- **实时定价**: 实时股价更新
 
-Bash
+### 🧠 长期记忆 (RAG)
+- **ChromaDB 集成**: 事件存储的向量数据库
+- **趋势检测**: "这是本周第三次石油警告"
+- **历史背景**: AI 记住过去事件以进行更好分析
 
-pip install streamlit yfinance feedparser ollama pandas plotly chromadb plyer
-下载 AI 模型: 在终端运行以下命令（推荐使用 Qwen2.5 以获得最佳速度/逻辑平衡）：
+## 🛠️ 技术栈
 
-Bash
+* **核心**: Python 3.10+
+* **界面**: Streamlit
+* **AI 引擎**: Ollama (DeepSeek-R1, Qwen2.5)
+* **记忆库**: ChromaDB (向量数据库)
+* **数据源**: yfinance, feedparser (RSS 源)
+* **可视化**: Plotly
+* **通知**: Plyer
 
-ollama pull qwen2.5:7b
-(注：你可以在代码的 LOCAL_MODEL 变量中更改模型名称)
+## ⚙️ 环境要求
 
-🚀 运行方法
-使用 Streamlit 启动应用：
+1. **硬件**: 推荐配备 NVIDIA 显卡的 PC 或 M 系列芯片的 Mac
+2. **软件**: 已安装 [Ollama](https://ollama.com/)
+3. **AI 模型**: DeepSeek-R1:8B（推荐用于推理）或 Qwen2.5:7B
 
-Bash
+## 📦 安装指南
 
-python -m streamlit run GlobalWatch_GodMode.py
-程序启动后会自动在浏览器中打开。
+1. **克隆项目**:
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/GlobalWatch.git
+   cd GlobalWatch
+   ```
 
-使用说明:
-宏观/外汇 (Macro/FX): 选择你关注的货币对。AI 会分析全球新闻，基于逻辑（如：油价涨 -> 加币涨）判断多空趋势。
+2. **安装依赖库**:
+   ```bash
+   pip install streamlit yfinance feedparser ollama pandas plotly chromadb plyer
+   ```
 
-美股透视 (US Stocks): 输入股票代码（如 NVDA）。AI 会抓取该公司的专属新闻并给出看涨/看跌评级。
+3. **下载 AI 模型**:
+   ```bash
+   # 用于推理任务（推荐）
+   ollama pull deepseek-r1:8b
+   
+   # 或用于更快性能
+   ollama pull qwen2.5:7b
+   ```
 
-设置 (Settings): 在侧边栏切换 中文/English 输出，或开启/关闭桌面弹窗通知。
+## 🚀 运行方法
 
-⚠️ 免责声明
-本软件仅供教学和研究使用。 AI 生成的预测基于新闻情感分析，不构成任何专业投资建议。大模型可能会产生幻觉。金融市场有风险，投资需谨慎。
+启动应用：
 
-📄 License
-MIT
+```bash
+python -m streamlit run GlobalWatch_V2.py
+```
+
+### 📱 界面概览
+
+应用程序打开后有四个主要标签页：
+
+#### 🌍 宏观/外汇标签页
+- 选择货币对和大宗商品
+- 查看实时交叉汇率
+- AI 分析附带证据链
+- 风险情绪仪表（0-10）
+
+#### 🇺🇸 美股标签页
+- 输入股票代码（如 NVDA）
+- 公司专属新闻分析
+- AI 情绪：看涨/看跌/中性
+- 价格图表配技术指标
+
+#### 📊 信号记分板标签页
+- **交易级分类**: 查看信号是否获准实盘交易
+- **表现指标**: 准确率、收益、回撤、盈亏比
+- **多时间框架分析**: 1h/4h/1d/1w 表现验证
+- **V1 vs V2 分类**: 参考级 vs 交易级分类
+
+#### 🚨 Early-Warning 标签页
+- **资产风险监控**: 从监控列表选择（黄金/原油/CNY/CAD）
+- **四维风险分解**: 详细风险分析
+- **证据链**: 每个风险维度的价格和新闻证据
+- **风险雷达图**: 可视化风险评估
+- **警报触发器**: 自动风险等级警告
+
+### 🎯 关键工作流程
+
+#### 风险管理：
+1. 每日检查 **Early-Warning** 标签页
+2. 监控中等+风险等级的资产
+3. 风险达到高/极端时减少敞口
+
+#### 交易决策：
+1. 在 **宏观/外汇** 或 **美股** 标签页运行分析
+2. 检查 **信号记分板** 的交易级分类
+3. **只交易分类为 🟢 Tradable Edge 的信号**
+4. 所有其他分类都禁止实盘交易
+
+#### 表现验证：
+1. 定期在信号记分板点击 "🔄 Update Results"
+2. 监控分类随时间的变化
+3. 等待足够样本量（≥30 用于评估，≥50 用于交易）
+
+## ⚠️ 重要免责声明
+
+### 交易分类系统
+- **🟢 Tradable Edge**: 唯一获准真金白银执行的分类
+- **所有其他分类**: 禁止实盘交易，无例外
+- **样本量要求**: 最少 30 个样本用于评估，50 个用于交易批准
+- **多时间框架验证**: 必须在多个时间框架显示正表现
+
+### 风险警告
+- 本软件仅供 **教育和研究目的**
+- AI 预测基于新闻情绪分析，**不构成金融建议**
+- 交易前 **务必进行自己的尽职调查**
+- 过往表现不保证未来结果
+- **只使用 🟢 Tradable Edge 信号进行实盘交易**
+
+---
+
+## 📄 Documentation
+
+- **Complete Guide**: `GLOBALWATCH_COMPLETE_GUIDE.md`
+- **Early-Warning System**: `EARLY_WARNING_IMPLEMENTATION.md`
+- **Trading Classification**: `TRADING_GRADE_CLASSIFICATION.md`
+- **Quick Reference**: `TRADING_GRADE_QUICK_REF.md`
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read our contributing guidelines and submit pull requests.
+
+## 📄 License
+
+MIT License - see LICENSE file for details.
+
+---
+
+**Remember: Only 🟢 Tradable Edge signals are approved for live trading. No exceptions!**

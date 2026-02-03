@@ -1023,13 +1023,13 @@ def calculate_early_warning_score(asset_name, recent_news):
 
 def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
     """
-    获取信号统计
+    获取信号统计（升级版 - 支持交易级分类）
     Args:
         theme: 主题过滤 (FX/MACRO/STOCK/None)
         asset: 资产过滤 (None 表示全部)
         timeframe: 时间框架 (1h/4h/1d/1w)
     Returns:
-        dict: 统计数据
+        dict: 统计数据（包含交易级指标）
     """
     try:
         # 构造查询条件
@@ -1053,7 +1053,14 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
                 "max_return": 0.0,
                 "min_return": 0.0,
                 "sample_size": 0,
-                "statistical_significance": False
+                "statistical_significance": False,
+                "cumulative_return": 0.0,
+                "max_drawdown": 0.0,
+                "volatility": 0.0,
+                "win_rate": 0.0,
+                "avg_win": 0.0,
+                "avg_loss": 0.0,
+                "profit_factor": 0.0
             }
         
         # 提取对应时间框架的数据
@@ -1063,6 +1070,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
         correct_count = 0
         wrong_count = 0
         returns = []
+        timestamps = []
         
         for metadata in results['metadatas']:
             correct_status = metadata.get(correct_field, "")
@@ -1071,18 +1079,68 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             if correct_status == "CORRECT":
                 correct_count += 1
                 returns.append(return_value)
+                timestamps.append(metadata.get('timestamp', ''))
             elif correct_status == "WRONG":
                 wrong_count += 1
                 returns.append(return_value)
+                timestamps.append(metadata.get('timestamp', ''))
         
         total_verified = correct_count + wrong_count
         
         if total_verified == 0:
             accuracy = 0.0
             avg_return = 0.0
+            cumulative_return = 0.0
+            max_drawdown = 0.0
+            volatility = 0.0
+            win_rate = 0.0
+            avg_win = 0.0
+            avg_loss = 0.0
+            profit_factor = 0.0
         else:
             accuracy = correct_count / total_verified * 100
             avg_return = sum(returns) / len(returns) if returns else 0.0
+            
+            # 累计收益
+            cumulative_return = sum(returns)
+            
+            # 最大回撤计算
+            cumulative_curve = []
+            running_sum = 0
+            for r in returns:
+                running_sum += r
+                cumulative_curve.append(running_sum)
+            
+            max_drawdown = 0.0
+            if cumulative_curve:
+                peak = cumulative_curve[0]
+                for value in cumulative_curve:
+                    if value > peak:
+                        peak = value
+                    drawdown = peak - value
+                    if drawdown > max_drawdown:
+                        max_drawdown = drawdown
+            
+            # 波动率（收益标准差）
+            if len(returns) > 1:
+                mean_return = sum(returns) / len(returns)
+                variance = sum((r - mean_return) ** 2 for r in returns) / (len(returns) - 1)
+                volatility = variance ** 0.5
+            else:
+                volatility = 0.0
+            
+            # 胜率和盈亏比
+            wins = [r for r in returns if r > 0]
+            losses = [r for r in returns if r < 0]
+            
+            win_rate = len(wins) / len(returns) * 100 if returns else 0.0
+            avg_win = sum(wins) / len(wins) if wins else 0.0
+            avg_loss = sum(losses) / len(losses) if losses else 0.0
+            
+            # Profit Factor
+            total_wins = sum(wins) if wins else 0.0
+            total_losses = abs(sum(losses)) if losses else 0.0
+            profit_factor = total_wins / total_losses if total_losses > 0 else 0.0
         
         return {
             "total_signals": len(results['ids']),
@@ -1092,7 +1150,16 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             "max_return": max(returns) if returns else 0.0,
             "min_return": min(returns) if returns else 0.0,
             "sample_size": total_verified,
-            "statistical_significance": total_verified >= 30  # 至少30个样本
+            "statistical_significance": total_verified >= 30,
+            "cumulative_return": cumulative_return,
+            "max_drawdown": max_drawdown,
+            "volatility": volatility,
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "profit_factor": profit_factor,
+            "returns_list": returns,  # 用于多时间窗口验证
+            "timestamps": timestamps
         }
     except Exception as e:
         print(f"Error getting statistics: {e}")
@@ -1101,8 +1168,247 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             "accuracy": 0.0,
             "avg_return": 0.0,
             "sample_size": 0,
-            "statistical_significance": False
+            "statistical_significance": False,
+            "cumulative_return": 0.0,
+            "max_drawdown": 0.0,
+            "volatility": 0.0,
+            "win_rate": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "profit_factor": 0.0
         }
+
+def classify_trading_performance(stats_dict, theme=None, asset=None, 
+                                  transaction_cost=0.1, max_dd_threshold=15.0):
+    """
+    交易级性能分类体系（Trading-Grade Performance Classification）
+    
+    这是决定是否允许 real-money execution 的唯一依据
+    
+    Args:
+        stats_dict: 统计数据字典（来自 get_signal_statistics）
+        theme: 主题（用于多时间窗口验证）
+        asset: 资产（用于多时间窗口验证）
+        transaction_cost: 估算交易成本（百分比，默认 0.1%）
+        max_dd_threshold: 最大回撤阈值（百分比，默认 15%）
+    
+    Returns:
+        dict: {
+            "classification_v2": str,  # 新交易级分类
+            "classification_v1": str,  # 原分类（仅供参考）
+            "decision_allowed": bool,  # 是否允许实盘交易
+            "reason_summary": str,     # 人类可读的原因
+            "risk_warnings": list,     # 风险警告列表
+            "net_expected_value": float,  # 净期望值
+            "multi_timeframe_validated": bool  # 多时间窗口验证
+        }
+    """
+    
+    # 提取关键指标
+    trades_count = stats_dict.get('sample_size', 0)
+    accuracy = stats_dict.get('accuracy', 0.0)
+    avg_return = stats_dict.get('avg_return', 0.0)
+    cumulative_return = stats_dict.get('cumulative_return', 0.0)
+    max_drawdown = stats_dict.get('max_drawdown', 0.0)
+    volatility = stats_dict.get('volatility', 0.0)
+    win_rate = stats_dict.get('win_rate', 0.0)
+    profit_factor = stats_dict.get('profit_factor', 0.0)
+    
+    # 计算净期望值
+    net_expected_value = avg_return - transaction_cost
+    
+    # 初始化返回值
+    classification_v2 = ""
+    classification_v1 = ""
+    decision_allowed = False
+    reason_summary = ""
+    risk_warnings = []
+    multi_timeframe_validated = False
+    
+    # ========== 第一步：V1 分类（原分类，仅供参考）==========
+    if trades_count == 0:
+        classification_v1 = "No Data"
+    elif accuracy > 55 and avg_return > 0:
+        classification_v1 = "Positive Edge (V1)"
+    elif accuracy > 55 and avg_return <= 0:
+        classification_v1 = "High Accuracy, Low Returns (V1)"
+    elif accuracy <= 55 and avg_return > 0:
+        classification_v1 = "Lucky Streak (V1)"
+    else:
+        classification_v1 = "No Edge (V1)"
+    
+    # ========== 第二步：最低可评估门槛 ==========
+    if trades_count < 30:
+        classification_v2 = "🟤 Insufficient Data"
+        decision_allowed = False
+        reason_summary = f"样本数不足（{trades_count}/30）。需要至少 30 个已验证信号才能进行可靠评估。"
+        risk_warnings.append("⚠️ 样本量过小，任何统计结论都不可靠")
+        risk_warnings.append("⚠️ 禁止用于实盘交易")
+        
+        return {
+            "classification_v2": classification_v2,
+            "classification_v1": classification_v1,
+            "decision_allowed": decision_allowed,
+            "reason_summary": reason_summary,
+            "risk_warnings": risk_warnings,
+            "net_expected_value": net_expected_value,
+            "multi_timeframe_validated": False
+        }
+    
+    # ========== 第三步：多时间窗口验证 ==========
+    # 检查至少 2 个时间窗口的 net_expected_value 是否为正
+    if theme or asset:
+        timeframes_to_check = ["1h", "4h", "1d", "1w"]
+        positive_timeframes = []
+        
+        for tf in timeframes_to_check:
+            tf_stats = get_signal_statistics(theme=theme, asset=asset, timeframe=tf)
+            tf_net_ev = tf_stats.get('avg_return', 0.0) - transaction_cost
+            tf_sample = tf_stats.get('sample_size', 0)
+            
+            if tf_sample >= 10 and tf_net_ev > 0:  # 至少 10 个样本且为正
+                positive_timeframes.append(tf)
+        
+        multi_timeframe_validated = len(positive_timeframes) >= 2
+    else:
+        # 无法验证多时间窗口（未指定 theme/asset）
+        multi_timeframe_validated = False
+    
+    # ========== 第四步：交易级分类 ==========
+    
+    # 🟢 Tradable Edge（允许实盘）
+    if (trades_count >= 50 and 
+        net_expected_value > 0 and 
+        max_drawdown <= max_dd_threshold and
+        multi_timeframe_validated):
+        
+        classification_v2 = "🟢 Tradable Edge"
+        decision_allowed = True
+        reason_summary = (
+            f"✅ 满足所有交易级标准：\n"
+            f"• 样本数充足（{trades_count} ≥ 50）\n"
+            f"• 净期望值为正（{net_expected_value:.2f}% > 0）\n"
+            f"• 回撤可控（{max_drawdown:.2f}% ≤ {max_dd_threshold}%）\n"
+            f"• 多时间窗口验证通过\n"
+            f"→ 允许进入实盘交易"
+        )
+        
+        # 即使允许交易，也要给出风险提示
+        if profit_factor < 1.5:
+            risk_warnings.append(f"⚠️ Profit Factor 较低（{profit_factor:.2f}），建议谨慎控制仓位")
+        if volatility > 2.0:
+            risk_warnings.append(f"⚠️ 收益波动较大（{volatility:.2f}%），注意风险管理")
+    
+    # 🟡 Directional Signal（方向参考信号）
+    elif (accuracy >= 58 and abs(net_expected_value) < 0.2):
+        classification_v2 = "🟡 Directional Signal"
+        decision_allowed = False
+        reason_summary = (
+            f"方向准确率较高（{accuracy:.1f}%），但净期望值接近零（{net_expected_value:.2f}%）。\n"
+            f"交易成本侵蚀了大部分收益。\n"
+            f"→ 仅允许用于：仓位调整、风险确认、多信号共识过滤\n"
+            f"→ 禁止单独触发交易"
+        )
+        risk_warnings.append("⚠️ 不允许单独用于实盘交易")
+        risk_warnings.append("✓ 可作为辅助信号使用")
+    
+    elif (avg_return > 0 and net_expected_value <= 0):
+        classification_v2 = "🟡 Directional Signal"
+        decision_allowed = False
+        reason_summary = (
+            f"平均收益为正（{avg_return:.2f}%），但被交易成本明显侵蚀。\n"
+            f"净期望值：{net_expected_value:.2f}%\n"
+            f"→ 仅允许用于辅助决策，禁止单独交易"
+        )
+        risk_warnings.append("⚠️ 交易成本过高，侵蚀收益")
+        risk_warnings.append("⚠️ 不允许单独用于实盘交易")
+    
+    # 🟠 Unstable / Regime-Dependent（不稳定或依赖行情）
+    elif (net_expected_value > 0 and 
+          (trades_count < 50 or max_drawdown > max_dd_threshold or not multi_timeframe_validated)):
+        
+        classification_v2 = "🟠 Unstable / Regime-Dependent"
+        decision_allowed = False
+        
+        reasons = []
+        if trades_count < 50:
+            reasons.append(f"样本量接近下限（{trades_count}/50）")
+        if max_drawdown > max_dd_threshold:
+            reasons.append(f"回撤过大（{max_drawdown:.2f}% > {max_dd_threshold}%）")
+        if not multi_timeframe_validated:
+            reasons.append("未通过多时间窗口验证")
+        
+        reason_summary = (
+            f"净期望值为正（{net_expected_value:.2f}%），但存在以下问题：\n" +
+            "\n".join(f"• {r}" for r in reasons) +
+            f"\n→ 标记为「观察中」\n"
+            f"→ 不允许自动交易\n"
+            f"→ 必须等待更多数据或行情切换验证"
+        )
+        risk_warnings.append("⚠️ 系统不稳定，禁止实盘交易")
+        risk_warnings.append("✓ 继续观察，积累更多数据")
+    
+    # 处理 Lucky Streak（重点修正）
+    elif (accuracy <= 55 and avg_return > 0):
+        # Lucky Streak 不再作为独立正向分类
+        # 检查是否有非对称收益结构证据
+        avg_win = stats_dict.get('avg_win', 0.0)
+        avg_loss = stats_dict.get('avg_loss', 0.0)
+        
+        # 非对称收益：平均盈利 > 2 * 平均亏损（绝对值）
+        has_fat_tail = avg_win > 2 * abs(avg_loss) if avg_loss != 0 else False
+        
+        if has_fat_tail and profit_factor > 2.0:
+            classification_v2 = "🟠 Unstable / Regime-Dependent"
+            reason_summary = (
+                f"准确率较低（{accuracy:.1f}%），但存在非对称收益结构：\n"
+                f"• 平均盈利：{avg_win:.2f}%\n"
+                f"• 平均亏损：{avg_loss:.2f}%\n"
+                f"• Profit Factor：{profit_factor:.2f}\n"
+                f"→ 可能是 fat-tail payoff 策略\n"
+                f"→ 需要更多数据验证，暂不允许交易"
+            )
+            risk_warnings.append("⚠️ 低准确率 + 高盈亏比，需验证是否可持续")
+        else:
+            classification_v2 = "🔴 No Edge"
+            reason_summary = (
+                f"准确率低（{accuracy:.1f}%），收益为正但无非对称结构证据。\n"
+                f"大概率是运气（Lucky Streak）。\n"
+                f"→ 永久禁止用于交易"
+            )
+            risk_warnings.append("🚫 疑似运气成分，禁止交易")
+        
+        decision_allowed = False
+    
+    # 🔴 No Edge（无优势）
+    else:
+        classification_v2 = "🔴 No Edge"
+        decision_allowed = False
+        
+        reasons = []
+        if net_expected_value <= 0:
+            reasons.append(f"净期望值为负或零（{net_expected_value:.2f}%）")
+        if max_drawdown > max_dd_threshold * 1.5:  # 严重超标
+            reasons.append(f"回撤严重超标（{max_drawdown:.2f}%）")
+        if accuracy < 45 and avg_return <= 0:
+            reasons.append(f"准确率和收益均无统计意义")
+        
+        reason_summary = (
+            "系统无交易优势：\n" +
+            "\n".join(f"• {r}" for r in reasons) +
+            f"\n→ 永久禁止用于交易（除非策略逻辑发生实质性变化）"
+        )
+        risk_warnings.append("🚫 无交易价值，禁止使用")
+    
+    return {
+        "classification_v2": classification_v2,
+        "classification_v1": classification_v1,
+        "decision_allowed": decision_allowed,
+        "reason_summary": reason_summary,
+        "risk_warnings": risk_warnings,
+        "net_expected_value": net_expected_value,
+        "multi_timeframe_validated": multi_timeframe_validated
+    }
 
 def get_full_market_context():
     data = {}
@@ -1740,6 +2046,147 @@ with tab_scoreboard:
     
     st.divider()
     
+    # ========== 新增：交易级性能分类 ==========
+    st.subheader("🎯 Trading-Grade Performance Classification")
+    st.caption("⚠️ 这是决定是否允许 real-money execution 的唯一依据")
+    
+    # 获取交易级分类
+    classification = classify_trading_performance(
+        stats, 
+        theme=theme, 
+        asset=None,  # 可以改为特定资产
+        transaction_cost=0.1,  # 0.1% 交易成本
+        max_dd_threshold=15.0  # 15% 最大回撤阈值
+    )
+    
+    # 显示分类结果
+    col_class, col_decision = st.columns([2, 1])
+    
+    with col_class:
+        # 分类标签
+        class_v2 = classification['classification_v2']
+        
+        # 根据分类设置颜色
+        if "🟢" in class_v2:
+            st.success(f"### {class_v2}")
+        elif "🟡" in class_v2:
+            st.warning(f"### {class_v2}")
+        elif "🟠" in class_v2:
+            st.warning(f"### {class_v2}")
+        elif "🔴" in class_v2:
+            st.error(f"### {class_v2}")
+        else:
+            st.info(f"### {class_v2}")
+    
+    with col_decision:
+        # 交易决策
+        if classification['decision_allowed']:
+            st.success("### ✅ TRADABLE")
+            st.caption("允许实盘交易")
+        else:
+            st.error("### 🚫 NOT TRADABLE")
+            st.caption("禁止实盘交易")
+    
+    # 显示详细原因
+    with st.expander("📋 Classification Details", expanded=True):
+        st.markdown("**原因说明：**")
+        st.info(classification['reason_summary'])
+        
+        # 风险警告
+        if classification['risk_warnings']:
+            st.markdown("**风险警告：**")
+            for warning in classification['risk_warnings']:
+                st.markdown(f"- {warning}")
+        
+        # 关键指标
+        st.markdown("**关键指标：**")
+        col_i1, col_i2, col_i3 = st.columns(3)
+        
+        col_i1.metric(
+            "Net Expected Value",
+            f"{classification['net_expected_value']:.2f}%",
+            help="平均收益 - 交易成本"
+        )
+        
+        col_i2.metric(
+            "Max Drawdown",
+            f"{stats['max_drawdown']:.2f}%",
+            help="最大回撤"
+        )
+        
+        col_i3.metric(
+            "Multi-TF Validated",
+            "✅ Yes" if classification['multi_timeframe_validated'] else "❌ No",
+            help="是否通过多时间窗口验证"
+        )
+    
+    # V1 分类（仅供参考）
+    with st.expander("📊 V1 Classification (Reference Only)", expanded=False):
+        st.caption("⚠️ 以下分类仅供分析参考，不可用于交易决策")
+        st.markdown(f"**V1 Classification**: {classification['classification_v1']}")
+        
+        st.markdown("**V1 分类说明：**")
+        if "Positive Edge" in classification['classification_v1']:
+            st.success("✅ **Positive Edge (V1)**: 高准确率 + 正收益")
+        elif "High Accuracy" in classification['classification_v1']:
+            st.warning("⚠️ **High Accuracy, Low Returns (V1)**: 方向对但收益小")
+        elif "Lucky Streak" in classification['classification_v1']:
+            st.info("ℹ️ **Lucky Streak (V1)**: 低准确率但正收益（可能是运气）")
+        elif "No Edge" in classification['classification_v1']:
+            st.error("❌ **No Edge (V1)**: 低准确率 + 负收益")
+        else:
+            st.info("No data")
+    
+    st.divider()
+    
+    # 增强的统计指标
+    st.subheader("📊 Enhanced Statistics")
+    
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    
+    col_s1.metric(
+        "Cumulative Return",
+        f"{stats['cumulative_return']:+.2f}%",
+        help="所有信号的累计收益"
+    )
+    
+    col_s2.metric(
+        "Win Rate",
+        f"{stats['win_rate']:.1f}%",
+        help="盈利信号占比"
+    )
+    
+    col_s3.metric(
+        "Profit Factor",
+        f"{stats['profit_factor']:.2f}",
+        help="总盈利 / 总亏损"
+    )
+    
+    col_s4.metric(
+        "Volatility",
+        f"{stats['volatility']:.2f}%",
+        help="收益标准差"
+    )
+    
+    # 盈亏分布
+    col_w, col_l = st.columns(2)
+    
+    with col_w:
+        st.metric(
+            "Avg Win",
+            f"{stats['avg_win']:+.2f}%",
+            help="平均盈利"
+        )
+    
+    with col_l:
+        st.metric(
+            "Avg Loss",
+            f"{stats['avg_loss']:+.2f}%",
+            help="平均亏损"
+        )
+    
+    st.divider()
+    
     # 统计显著性警告
     if not stats['statistical_significance']:
         st.warning(f"""
@@ -1752,33 +2199,6 @@ with tab_scoreboard:
         """)
     else:
         st.success(f"✅ Sample size: {stats['sample_size']} - Statistically significant")
-    
-    # 详细统计
-    st.subheader("📊 Detailed Statistics")
-    
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.markdown("**Return Distribution**")
-        st.metric("Max Return", f"{stats['max_return']:+.2f}%")
-        st.metric("Min Return", f"{stats['min_return']:+.2f}%")
-        st.metric("Avg Return", f"{stats['avg_return']:+.2f}%")
-    
-    with col_b:
-        st.markdown("**Performance Analysis**")
-        
-        # 判断是否赚钱
-        if stats['sample_size'] > 0:
-            if stats['accuracy'] > 55 and stats['avg_return'] > 0:
-                st.success("✅ **Positive Edge**: High accuracy + positive returns")
-            elif stats['accuracy'] > 55 and stats['avg_return'] <= 0:
-                st.warning("⚠️ **High Accuracy, Low Returns**: Correct direction but small moves")
-            elif stats['accuracy'] <= 55 and stats['avg_return'] > 0:
-                st.info("ℹ️ **Lucky Streak**: Positive returns despite low accuracy")
-            else:
-                st.error("❌ **No Edge**: Low accuracy + negative returns")
-        else:
-            st.info("No data available yet")
     
     st.divider()
     
@@ -1819,7 +2239,7 @@ with tab_scoreboard:
     st.divider()
     
     # 使用说明
-    with st.expander("ℹ️ How to Use Signal Scoreboard"):
+    with st.expander("ℹ️ How to Use Signal Scoreboard (V2 - Trading-Grade)"):
         st.markdown("""
         ### Signal Tracking System
         
@@ -1832,21 +2252,105 @@ with tab_scoreboard:
         - System checks if enough time has passed (1h/4h/1d/1w)
         - Fetches actual prices and calculates returns
         
-        **Interpreting Results**:
-        - **Accuracy**: % of predictions where direction was correct
-        - **Avg Return**: Average % return per signal
-        - **Statistical Significance**: Need 30+ samples for reliable conclusions
+        ---
         
-        **Performance Categories**:
-        - ✅ **Positive Edge**: Accuracy > 55% AND Avg Return > 0%
-        - ⚠️ **High Accuracy, Low Returns**: Correct often but small moves
-        - ℹ️ **Lucky Streak**: Positive returns despite low accuracy (unsustainable)
-        - ❌ **No Edge**: Low accuracy AND negative returns
+        ### 🎯 Trading-Grade Performance Classification (V2)
+        
+        **这是决定是否允许 real-money execution 的唯一依据**
+        
+        #### 分类体系：
+        
+        **🟢 Tradable Edge（允许实盘）**
+        - 样本数 ≥ 50
+        - 净期望值 > 0（扣除交易成本后）
+        - 最大回撤 ≤ 15%
+        - 至少 2 个时间窗口验证通过
+        - **→ 只有此分类允许实盘交易**
+        
+        **🟡 Directional Signal（方向参考）**
+        - 准确率 ≥ 58% 但净期望值 ≈ 0
+        - 或收益被交易成本侵蚀
+        - **→ 仅用于：仓位调整、风险确认、多信号过滤**
+        - **→ 禁止单独触发交易**
+        
+        **🟠 Unstable / Regime-Dependent（不稳定）**
+        - 净期望值 > 0
+        - 但样本量不足 或 回撤过大 或 未通过多时间窗口验证
+        - **→ 标记为「观察中」**
+        - **→ 禁止自动交易**
+        - **→ 需要更多数据验证**
+        
+        **🔴 No Edge（无优势）**
+        - 净期望值 ≤ 0
+        - 或回撤严重超标
+        - 或准确率和收益均无意义
+        - **→ 永久禁止交易**
+        
+        **🟤 Insufficient Data（数据不足）**
+        - 样本数 < 30
+        - **→ 任何结论都不可靠**
+        - **→ 禁止交易**
+        
+        ---
+        
+        #### Lucky Streak 的处理（重要）：
+        
+        - 原 V1 的 "Lucky Streak"（低准确率 + 正收益）不再作为正向分类
+        - 一律并入 🟠 Unstable 或 🔴 No Edge
+        - **除非**存在明确的非对称收益结构（fat-tail payoff）：
+          - 平均盈利 > 2 × 平均亏损（绝对值）
+          - Profit Factor > 2.0
+        
+        ---
+        
+        #### 关键指标说明：
+        
+        - **Net Expected Value**: 平均收益 - 交易成本（默认 0.1%）
+        - **Max Drawdown**: 从峰值到谷底的最大跌幅
+        - **Profit Factor**: 总盈利 / 总亏损（> 1 为盈利）
+        - **Win Rate**: 盈利信号占比
+        - **Volatility**: 收益标准差（波动性）
+        - **Multi-TF Validated**: 是否在多个时间窗口都为正
+        
+        ---
+        
+        #### V1 vs V2 分类：
+        
+        - **V1 分类**（旧版）：仅供分析参考，不可用于交易决策
+        - **V2 分类**（新版）：交易级标准，是实盘交易的唯一依据
+        
+        ---
+        
+        ### ⚠️ 重要原则
+        
+        1. **样本数不足时，系统会主动拒绝**
+           - 即使看起来"很准"，样本 < 30 也不允许交易
+        
+        2. **清楚区分「分析上有意思」vs「可以用真钱」**
+           - 分析上有意思 → V1 分类
+           - 可以用真钱 → 只有 V2 的 🟢 Tradable Edge
+        
+        3. **Real-money execution 只接受 Tradable Edge**
+           - 其他所有分类都禁止实盘交易
+           - 没有例外
+        
+        ---
+        
+        ### 📊 使用建议
+        
+        1. **定期回填结果**：每天点击 "🔄 Update Results"
+        2. **关注分类变化**：从 Unstable → Tradable Edge 需要时间
+        3. **多时间窗口验证**：切换不同 timeframe 查看一致性
+        4. **风险管理**：即使是 Tradable Edge，也要控制仓位
+        5. **持续监控**：市场环境变化可能导致分类降级
+        
+        ---
         
         **Important Notes**:
-        - Returns are theoretical (no transaction costs)
+        - Returns are theoretical (no transaction costs in calculation, but considered in classification)
         - Past performance doesn't guarantee future results
         - Use this data to validate your strategy before risking real money
+        - Only 🟢 Tradable Edge signals are approved for live trading
         """)
 
 
