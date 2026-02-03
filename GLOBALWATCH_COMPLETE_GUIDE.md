@@ -298,7 +298,13 @@ if True:
 
 ## 🔄 版本历史
 
-### V2.3 (Current) - Robust JSON Parsing
+### V2.4 (Current) - Signal Scoreboard
+- ✅ 自动信号记录
+- ✅ 多时间框架回填 (1h/4h/1d/1w)
+- ✅ 多维统计分析
+- ✅ 性能可视化看板
+
+### V2.3 - Robust JSON Parsing
 - ✅ 三层防护 JSON 解析
 - ✅ 永不崩溃的错误处理
 - ✅ 友好的错误提示

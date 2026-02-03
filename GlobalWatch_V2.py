@@ -27,6 +27,9 @@ LOCAL_MODEL = "deepseek-r1:8b"
 chroma_client = chromadb.PersistentClient(path="./memory_db")
 collection = chroma_client.get_or_create_collection(name="market_events")
 
+# 初始化信号追踪数据库
+signals_collection = chroma_client.get_or_create_collection(name="trading_signals")
+
 # 宏观逻辑库
 MACRO_LOGIC_KNOWLEDGE = """
 GLOBAL MACRO RULES:
@@ -226,6 +229,334 @@ def send_notification(title, msg):
         try:
             notification.notify(title=title, message=msg, app_name='GlobalWatch', timeout=10)
         except: pass
+
+# ================= 2.5. Signal Scoreboard 系统 =================
+
+def get_asset_ticker(asset_name):
+    """
+    从资产名称获取 ticker
+    Args:
+        asset_name: 如 "CNY/CAD", "Oil", "NVDA"
+    Returns:
+        ticker: yfinance ticker 或 None
+    """
+    # 处理货币对
+    if '/' in asset_name:
+        parts = asset_name.split('/')
+        base, quote = parts[0].strip(), parts[1].strip()
+        
+        # 查找对应的 ticker
+        for name, info in ASSETS_DB.items():
+            if base in name:
+                return info['ticker']
+        
+        # 如果是外汇对，尝试构造
+        if base != 'USD' and quote == 'USD':
+            return f"{base}=X"
+        elif base == 'USD' and quote != 'USD':
+            return f"{quote}=X"
+    
+    # 处理商品
+    if asset_name.lower() in ['oil', 'crude oil', 'crude']:
+        return "CL=F"
+    if asset_name.lower() in ['gold', 'xau']:
+        return "GC=F"
+    
+    # 处理个股（直接返回）
+    if asset_name.isupper() and len(asset_name) <= 5:
+        return asset_name
+    
+    return None
+
+def get_current_price(ticker):
+    """
+    获取当前价格
+    Args:
+        ticker: yfinance ticker
+    Returns:
+        price: float 或 None
+    """
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="1d")
+        if not hist.empty:
+            return float(hist['Close'].iloc[-1])
+    except:
+        pass
+    return None
+
+def record_signal(asset, direction, confidence, predictions_dict, news_sources):
+    """
+    记录交易信号
+    Args:
+        asset: 资产名称
+        direction: Bullish/Bearish/Neutral
+        confidence: 信心分数 (0-10)
+        predictions_dict: 完整的 predictions 字典
+        news_sources: 新闻来源列表
+    """
+    try:
+        signal_id = str(uuid.uuid4())
+        timestamp = datetime.now().isoformat()
+        
+        # 获取 ticker 和当前价格
+        ticker = get_asset_ticker(asset)
+        current_price = get_current_price(ticker) if ticker else None
+        
+        # 确定主题
+        theme = "UNKNOWN"
+        if '/' in asset:
+            theme = "FX"
+        elif asset.upper() in ['OIL', 'GOLD', 'CRUDE']:
+            theme = "MACRO"
+        elif ticker and len(asset) <= 5 and asset.isupper():
+            theme = "STOCK"
+        
+        # 提取新闻来源
+        sources = list(set([src for src in news_sources if src]))
+        
+        # 构造元数据
+        metadata = {
+            "signal_id": signal_id,
+            "timestamp": timestamp,
+            "asset": asset,
+            "ticker": ticker or "UNKNOWN",
+            "direction": direction,
+            "confidence": float(confidence),
+            "theme": theme,
+            "initial_price": float(current_price) if current_price else 0.0,
+            "sources": ",".join(sources[:3]),  # 最多3个来源
+            "status": "PENDING",  # PENDING / VERIFIED
+            # 回填字段（初始为空）
+            "price_1h": 0.0,
+            "price_4h": 0.0,
+            "price_1d": 0.0,
+            "price_1w": 0.0,
+            "correct_1h": "",
+            "correct_4h": "",
+            "correct_1d": "",
+            "correct_1w": "",
+            "return_1h": 0.0,
+            "return_4h": 0.0,
+            "return_1d": 0.0,
+            "return_1w": 0.0
+        }
+        
+        # 存储到 ChromaDB
+        signals_collection.add(
+            documents=[json.dumps(predictions_dict)],
+            metadatas=[metadata],
+            ids=[signal_id]
+        )
+        
+        return signal_id
+    except Exception as e:
+        print(f"Error recording signal: {e}")
+        return None
+
+def backfill_signal_results():
+    """
+    回填信号结果
+    检查所有 PENDING 信号，如果时间到了就回填价格和结果
+    """
+    try:
+        # 获取所有 PENDING 信号
+        results = signals_collection.get(
+            where={"status": "PENDING"}
+        )
+        
+        if not results or not results['ids']:
+            return
+        
+        now = datetime.now()
+        updated_count = 0
+        
+        for i, signal_id in enumerate(results['ids']):
+            metadata = results['metadatas'][i]
+            
+            signal_time = datetime.fromisoformat(metadata['timestamp'])
+            ticker = metadata['ticker']
+            initial_price = metadata['initial_price']
+            direction = metadata['direction']
+            
+            if ticker == "UNKNOWN" or initial_price == 0.0:
+                continue
+            
+            # 计算时间差
+            time_diff = (now - signal_time).total_seconds() / 3600  # 小时
+            
+            updated = False
+            
+            # 回填 1h
+            if time_diff >= 1 and metadata['price_1h'] == 0.0:
+                price_1h = get_historical_price(ticker, signal_time + timedelta(hours=1))
+                if price_1h:
+                    metadata['price_1h'] = price_1h
+                    metadata['return_1h'] = (price_1h - initial_price) / initial_price * 100
+                    metadata['correct_1h'] = check_direction(direction, metadata['return_1h'])
+                    updated = True
+            
+            # 回填 4h
+            if time_diff >= 4 and metadata['price_4h'] == 0.0:
+                price_4h = get_historical_price(ticker, signal_time + timedelta(hours=4))
+                if price_4h:
+                    metadata['price_4h'] = price_4h
+                    metadata['return_4h'] = (price_4h - initial_price) / initial_price * 100
+                    metadata['correct_4h'] = check_direction(direction, metadata['return_4h'])
+                    updated = True
+            
+            # 回填 1d
+            if time_diff >= 24 and metadata['price_1d'] == 0.0:
+                price_1d = get_historical_price(ticker, signal_time + timedelta(days=1))
+                if price_1d:
+                    metadata['price_1d'] = price_1d
+                    metadata['return_1d'] = (price_1d - initial_price) / initial_price * 100
+                    metadata['correct_1d'] = check_direction(direction, metadata['return_1d'])
+                    updated = True
+            
+            # 回填 1w
+            if time_diff >= 168 and metadata['price_1w'] == 0.0:
+                price_1w = get_historical_price(ticker, signal_time + timedelta(weeks=1))
+                if price_1w:
+                    metadata['price_1w'] = price_1w
+                    metadata['return_1w'] = (price_1w - initial_price) / initial_price * 100
+                    metadata['correct_1w'] = check_direction(direction, metadata['return_1w'])
+                    metadata['status'] = "VERIFIED"  # 全部回填完成
+                    updated = True
+            
+            # 更新元数据
+            if updated:
+                signals_collection.update(
+                    ids=[signal_id],
+                    metadatas=[metadata]
+                )
+                updated_count += 1
+        
+        return updated_count
+    except Exception as e:
+        print(f"Error backfilling signals: {e}")
+        return 0
+
+def get_historical_price(ticker, target_time):
+    """
+    获取历史价格（尽可能接近目标时间）
+    """
+    try:
+        t = yf.Ticker(ticker)
+        # 获取目标时间前后1天的数据
+        start = target_time - timedelta(days=1)
+        end = target_time + timedelta(days=1)
+        hist = t.history(start=start, end=end, interval="1h")
+        
+        if not hist.empty:
+            # 找到最接近目标时间的价格
+            closest_idx = (hist.index - target_time).abs().argmin()
+            return float(hist['Close'].iloc[closest_idx])
+    except:
+        pass
+    return None
+
+def check_direction(predicted_direction, actual_return):
+    """
+    检查方向是否正确
+    Args:
+        predicted_direction: Bullish/Bearish/Neutral
+        actual_return: 实际收益率 (%)
+    Returns:
+        "CORRECT" / "WRONG" / "NEUTRAL"
+    """
+    if predicted_direction == "Neutral":
+        return "NEUTRAL"
+    
+    if predicted_direction == "Bullish":
+        return "CORRECT" if actual_return > 0 else "WRONG"
+    elif predicted_direction == "Bearish":
+        return "CORRECT" if actual_return < 0 else "WRONG"
+    
+    return "UNKNOWN"
+
+def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
+    """
+    获取信号统计
+    Args:
+        theme: 主题过滤 (FX/MACRO/STOCK/None)
+        asset: 资产过滤 (None 表示全部)
+        timeframe: 时间框架 (1h/4h/1d/1w)
+    Returns:
+        dict: 统计数据
+    """
+    try:
+        # 构造查询条件
+        where_clause = {}
+        if theme:
+            where_clause["theme"] = theme
+        if asset:
+            where_clause["asset"] = asset
+        
+        # 获取信号
+        if where_clause:
+            results = signals_collection.get(where=where_clause)
+        else:
+            results = signals_collection.get()
+        
+        if not results or not results['ids']:
+            return {
+                "total_signals": 0,
+                "accuracy": 0.0,
+                "avg_return": 0.0,
+                "max_return": 0.0,
+                "min_return": 0.0,
+                "sample_size": 0,
+                "statistical_significance": False
+            }
+        
+        # 提取对应时间框架的数据
+        correct_field = f"correct_{timeframe}"
+        return_field = f"return_{timeframe}"
+        
+        correct_count = 0
+        wrong_count = 0
+        returns = []
+        
+        for metadata in results['metadatas']:
+            correct_status = metadata.get(correct_field, "")
+            return_value = metadata.get(return_field, 0.0)
+            
+            if correct_status == "CORRECT":
+                correct_count += 1
+                returns.append(return_value)
+            elif correct_status == "WRONG":
+                wrong_count += 1
+                returns.append(return_value)
+        
+        total_verified = correct_count + wrong_count
+        
+        if total_verified == 0:
+            accuracy = 0.0
+            avg_return = 0.0
+        else:
+            accuracy = correct_count / total_verified * 100
+            avg_return = sum(returns) / len(returns) if returns else 0.0
+        
+        return {
+            "total_signals": len(results['ids']),
+            "verified_signals": total_verified,
+            "accuracy": accuracy,
+            "avg_return": avg_return,
+            "max_return": max(returns) if returns else 0.0,
+            "min_return": min(returns) if returns else 0.0,
+            "sample_size": total_verified,
+            "statistical_significance": total_verified >= 30  # 至少30个样本
+        }
+    except Exception as e:
+        print(f"Error getting statistics: {e}")
+        return {
+            "total_signals": 0,
+            "accuracy": 0.0,
+            "avg_return": 0.0,
+            "sample_size": 0,
+            "statistical_significance": False
+        }
 
 def get_full_market_context():
     data = {}
@@ -487,6 +818,30 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
             original_advice = res.get('advice', '')
             res['advice'] = f"{original_advice}\n\n⚠️ WARNING: No valid evidence found. Predictions may be unreliable. Please verify independently."
         
+        # 【新增】记录交易信号
+        if res.get("status") == "alert" and res.get("predictions"):
+            predictions = res.get("predictions", {})
+            impact_score = res.get("impact_score", 0)
+            news_sources = [item.get('source') for item in news]
+            
+            # 为每个预测记录信号
+            for asset, prediction_text in predictions.items():
+                # 提取方向
+                direction = "Neutral"
+                if "Bullish" in prediction_text or "bullish" in prediction_text or "↑" in prediction_text:
+                    direction = "Bullish"
+                elif "Bearish" in prediction_text or "bearish" in prediction_text or "↓" in prediction_text:
+                    direction = "Bearish"
+                
+                # 记录信号
+                record_signal(
+                    asset=asset,
+                    direction=direction,
+                    confidence=impact_score,
+                    predictions_dict=predictions,
+                    news_sources=news_sources
+                )
+        
         if res.get("status") == "alert":
             save_to_memory(res.get("summary"), res.get("impact_score", 0), res.get("advice"))
         return res
@@ -565,7 +920,7 @@ st.title("🦁 GlobalWatch: DeepSeek-R1 推理版")
 st.caption("🚀 Powered by Chain-of-Thought Reasoning")
 st.divider()
 
-tab_macro, tab_stock = st.tabs(["🌍 宏观/外汇 (Macro/FX)", "🇺🇸 美股透视 (US Stocks)"])
+tab_macro, tab_stock, tab_scoreboard = st.tabs(["🌍 宏观/外汇 (Macro/FX)", "🇺🇸 美股透视 (US Stocks)", "📊 Signal Scoreboard"])
 
 # === TAB 1: 宏观外汇 ===
 with tab_macro:
@@ -761,3 +1116,189 @@ with tab_stock:
                     st.warning("No news found.")
             except Exception as e:
                 st.error(f"Error: {e}")
+
+
+# === TAB 3: Signal Scoreboard ===
+with tab_scoreboard:
+    st.header("📊 Signal Scoreboard - Performance Tracking")
+    st.caption("Track the accuracy and profitability of AI predictions over time")
+    
+    # 回填按钮
+    col_refresh, col_info = st.columns([1, 3])
+    if col_refresh.button("🔄 Update Results"):
+        with st.spinner("Backfilling signal results..."):
+            updated = backfill_signal_results()
+            if updated:
+                st.success(f"✅ Updated {updated} signals")
+            else:
+                st.info("No signals to update")
+            st.rerun()
+    
+    col_info.caption("Click to check and update signal results based on actual market movements")
+    
+    st.divider()
+    
+    # 过滤器
+    col_theme, col_timeframe = st.columns(2)
+    theme_filter = col_theme.selectbox(
+        "Theme Filter",
+        ["All", "FX", "MACRO", "STOCK"],
+        index=0
+    )
+    timeframe = col_timeframe.selectbox(
+        "Timeframe",
+        ["1h", "4h", "1d", "1w"],
+        index=2
+    )
+    
+    theme = None if theme_filter == "All" else theme_filter
+    
+    # 获取统计数据
+    stats = get_signal_statistics(theme=theme, timeframe=timeframe)
+    
+    # 显示关键指标
+    st.subheader("📈 Key Metrics")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    col1.metric(
+        "Total Signals",
+        stats['total_signals'],
+        help="Total number of predictions made"
+    )
+    
+    col2.metric(
+        "Verified Signals",
+        stats['verified_signals'],
+        help=f"Signals with {timeframe} results available"
+    )
+    
+    # 准确率颜色
+    accuracy = stats['accuracy']
+    accuracy_delta = accuracy - 50  # 相对于随机猜测
+    col3.metric(
+        "Accuracy",
+        f"{accuracy:.1f}%",
+        f"{accuracy_delta:+.1f}% vs random",
+        delta_color="normal" if accuracy_delta > 0 else "inverse"
+    )
+    
+    # 平均收益颜色
+    avg_return = stats['avg_return']
+    col4.metric(
+        "Avg Return",
+        f"{avg_return:+.2f}%",
+        "per signal",
+        delta_color="normal" if avg_return > 0 else "inverse"
+    )
+    
+    st.divider()
+    
+    # 统计显著性警告
+    if not stats['statistical_significance']:
+        st.warning(f"""
+        ⚠️ **Statistical Significance Warning**
+        
+        Sample size: {stats['sample_size']} (minimum 30 required)
+        
+        The current sample size is too small to draw reliable conclusions. 
+        Continue running analyses to build a larger dataset.
+        """)
+    else:
+        st.success(f"✅ Sample size: {stats['sample_size']} - Statistically significant")
+    
+    # 详细统计
+    st.subheader("📊 Detailed Statistics")
+    
+    col_a, col_b = st.columns(2)
+    
+    with col_a:
+        st.markdown("**Return Distribution**")
+        st.metric("Max Return", f"{stats['max_return']:+.2f}%")
+        st.metric("Min Return", f"{stats['min_return']:+.2f}%")
+        st.metric("Avg Return", f"{stats['avg_return']:+.2f}%")
+    
+    with col_b:
+        st.markdown("**Performance Analysis**")
+        
+        # 判断是否赚钱
+        if stats['sample_size'] > 0:
+            if stats['accuracy'] > 55 and stats['avg_return'] > 0:
+                st.success("✅ **Positive Edge**: High accuracy + positive returns")
+            elif stats['accuracy'] > 55 and stats['avg_return'] <= 0:
+                st.warning("⚠️ **High Accuracy, Low Returns**: Correct direction but small moves")
+            elif stats['accuracy'] <= 55 and stats['avg_return'] > 0:
+                st.info("ℹ️ **Lucky Streak**: Positive returns despite low accuracy")
+            else:
+                st.error("❌ **No Edge**: Low accuracy + negative returns")
+        else:
+            st.info("No data available yet")
+    
+    st.divider()
+    
+    # 最近信号
+    st.subheader("🕐 Recent Signals")
+    
+    try:
+        # 获取最近10条信号
+        recent_results = signals_collection.get(
+            limit=10,
+            where={"theme": theme} if theme else None
+        )
+        
+        if recent_results and recent_results['ids']:
+            signal_data = []
+            
+            for i, signal_id in enumerate(recent_results['ids']):
+                metadata = recent_results['metadatas'][i]
+                
+                signal_data.append({
+                    "Time": metadata['timestamp'][:16],
+                    "Asset": metadata['asset'],
+                    "Direction": metadata['direction'],
+                    "Confidence": f"{metadata['confidence']:.1f}",
+                    "Theme": metadata['theme'],
+                    f"Result ({timeframe})": metadata.get(f"correct_{timeframe}", "PENDING"),
+                    f"Return ({timeframe})": f"{metadata.get(f'return_{timeframe}', 0.0):+.2f}%"
+                })
+            
+            df = pd.DataFrame(signal_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No signals recorded yet. Run some analyses to start tracking!")
+    
+    except Exception as e:
+        st.error(f"Error loading recent signals: {e}")
+    
+    st.divider()
+    
+    # 使用说明
+    with st.expander("ℹ️ How to Use Signal Scoreboard"):
+        st.markdown("""
+        ### Signal Tracking System
+        
+        **Automatic Recording**:
+        - Every time you run an analysis, predictions are automatically recorded
+        - Initial price is captured at the time of prediction
+        
+        **Result Backfilling**:
+        - Click "🔄 Update Results" to check and update signal outcomes
+        - System checks if enough time has passed (1h/4h/1d/1w)
+        - Fetches actual prices and calculates returns
+        
+        **Interpreting Results**:
+        - **Accuracy**: % of predictions where direction was correct
+        - **Avg Return**: Average % return per signal
+        - **Statistical Significance**: Need 30+ samples for reliable conclusions
+        
+        **Performance Categories**:
+        - ✅ **Positive Edge**: Accuracy > 55% AND Avg Return > 0%
+        - ⚠️ **High Accuracy, Low Returns**: Correct often but small moves
+        - ℹ️ **Lucky Streak**: Positive returns despite low accuracy (unsustainable)
+        - ❌ **No Edge**: Low accuracy AND negative returns
+        
+        **Important Notes**:
+        - Returns are theoretical (no transaction costs)
+        - Past performance doesn't guarantee future results
+        - Use this data to validate your strategy before risking real money
+        """)
