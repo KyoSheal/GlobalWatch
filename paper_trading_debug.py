@@ -39,7 +39,6 @@ class PaperTradingEngine:
         self.cash = self.config['initial_cash_usd']
         self.initial_cash = self.cash
         self.positions = {}  # {ticker: quantity}
-        self.cost_basis = {}  # {ticker: average_cost} 追踪成本基础
         self.equity_curve = []  # [(timestamp, equity, cash, positions_value)]
         self.trades_log = []  # 交易记录
         self.portfolio_snapshots = []  # 组合快照
@@ -281,18 +280,7 @@ class PaperTradingEngine:
                     total_required = required_cash + cost
                 
                 self.cash -= total_required
-                old_qty = self.positions.get(ticker, 0)
-                old_cost = self.cost_basis.get(ticker, 0)
-                
-                # 更新持仓
-                self.positions[ticker] = old_qty + buy_qty
-                
-                # 更新成本基础（加权平均）
-                if old_qty > 0:
-                    total_cost = (old_qty * old_cost) + (buy_qty * price)
-                    self.cost_basis[ticker] = total_cost / (old_qty + buy_qty)
-                else:
-                    self.cost_basis[ticker] = price
+                self.positions[ticker] = self.positions.get(ticker, 0) + buy_qty
                 
                 trades.append({
                     'timestamp': datetime.now().isoformat(),
@@ -413,32 +401,6 @@ class PaperTradingEngine:
         print(f"Drawdown: {snapshot['drawdown']:.2%}")
         print(f"Status: {snapshot['status']}")
         
-        # 显示持仓详情
-        if snapshot['positions']:
-            print(f"\n📊 Current Holdings:")
-            print(f"{'Ticker':<8} {'Qty':>6} {'Price':>10} {'Value':>12} {'Weight':>8} {'P&L':>10}")
-            print("-" * 60)
-            
-            for ticker, pos in sorted(snapshot['positions'].items(), key=lambda x: x[1]['value'], reverse=True):
-                qty = pos['quantity']
-                current_price = pos['price']
-                value = pos['value']
-                weight = value / snapshot['total_equity'] * 100
-                
-                # 计算盈亏（如果有历史交易记录）
-                cost_basis = self.get_cost_basis(ticker)
-                if cost_basis:
-                    pnl = (current_price - cost_basis) / cost_basis * 100
-                    pnl_str = f"{pnl:+.2f}%"
-                    pnl_color = "📈" if pnl > 0 else "📉" if pnl < 0 else "➡️"
-                else:
-                    pnl_str = "N/A"
-                    pnl_color = "➡️"
-                
-                print(f"{ticker:<8} {qty:>6} ${current_price:>9.2f} ${value:>11,.2f} {weight:>7.1f}% {pnl_color} {pnl_str:>8}")
-            
-            print("-" * 60)
-        
         if self.check_risk_controls():
             print("⚠️ Risk control triggered, skipping rebalance")
             return
@@ -483,6 +445,8 @@ class PaperTradingEngine:
         
         try:
             while datetime.now() < self.end_time:
+                print(f"[DEBUG] Loop iteration at {datetime.now().strftime('%H:%M:%S')}")
+                sys.stdout.flush()
                 self.run_cycle()
                 
                 sleep_seconds = self.config['rebalance_minutes'] * 60
@@ -494,12 +458,17 @@ class PaperTradingEngine:
                 print(f"\n💤 Sleeping for {self.config['rebalance_minutes']} minutes...")
                 print(f"   Next cycle at: {(datetime.now() + timedelta(seconds=sleep_seconds)).strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                print(f"[DEBUG] About to sleep at {datetime.now().strftime('%H:%M:%S')}")
+
+                print(f"\n[DEBUG] About to sleep at {datetime.now().strftime('%H:%M:%S')}")
                 print(f"[DEBUG] Sleep duration: {sleep_seconds} seconds")
-                import sys; sys.stdout.flush()
+                sys.stdout.flush()  # 强制刷新输出
+                
                 time.sleep(sleep_seconds)
+                
                 print(f"[DEBUG] Woke up at {datetime.now().strftime('%H:%M:%S')}")
-                import sys; sys.stdout.flush()
+                print(f"[DEBUG] Continuing to next cycle...")
+                sys.stdout.flush()
+
             
             print(f"\n{'='*60}")
             print("📊 Final Snapshot")
@@ -696,7 +665,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-    def get_cost_basis(self, ticker):
-        """获取股票的成本基础（平均买入价）"""
-        return self.cost_basis.get(ticker, None)
