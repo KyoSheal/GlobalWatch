@@ -76,6 +76,129 @@ def parse_deepseek_output(text):
     
     return thought_process, json_text
 
+def extract_json_from_text(text):
+    """
+    从文本中提取第一个合法的 JSON 对象
+    支持前后有多余文本、markdown、解释性内容
+    
+    Args:
+        text: 原始文本
+    Returns:
+        json_str: 提取的 JSON 字符串，如果未找到返回 None
+    """
+    # 策略 1: 查找 { ... } 包裹的内容
+    brace_count = 0
+    start_idx = -1
+    
+    for i, char in enumerate(text):
+        if char == '{':
+            if brace_count == 0:
+                start_idx = i
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0 and start_idx != -1:
+                # 找到完整的 JSON 对象
+                json_candidate = text[start_idx:i+1]
+                try:
+                    # 验证是否为合法 JSON
+                    json.loads(json_candidate)
+                    return json_candidate
+                except:
+                    # 继续查找下一个
+                    start_idx = -1
+                    continue
+    
+    # 策略 2: 使用正则表达式查找
+    json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+    matches = re.finditer(json_pattern, text, re.DOTALL)
+    for match in matches:
+        json_candidate = match.group(0)
+        try:
+            json.loads(json_candidate)
+            return json_candidate
+        except:
+            continue
+    
+    return None
+
+def self_repair_json(raw_output, model):
+    """
+    自修复：将原始输出喂回模型，要求其只输出合法 JSON
+    
+    Args:
+        raw_output: 原始模型输出
+        model: 模型名称
+    Returns:
+        repaired_json_str: 修复后的 JSON 字符串，如果失败返回 None
+    """
+    repair_prompt = f"""
+The following output contains a JSON object but may have extra text or formatting issues.
+Please extract and output ONLY the valid JSON object, with NO explanations, NO markdown, NO extra text.
+
+Original output:
+{raw_output}
+
+Output ONLY the JSON:
+"""
+    
+    try:
+        response = ollama.chat(
+            model=model, 
+            messages=[{'role': 'user', 'content': repair_prompt}],
+            options={"num_ctx": 4096, "temperature": 0}  # 低温度确保确定性输出
+        )
+        repaired_text = response['message']['content'].strip()
+        
+        # 尝试提取 JSON
+        json_str = extract_json_from_text(repaired_text)
+        if json_str:
+            # 验证是否合法
+            json.loads(json_str)
+            return json_str
+    except Exception as e:
+        pass
+    
+    return None
+
+def robust_json_parse(raw_content, model, max_retries=1):
+    """
+    鲁棒 JSON 解析：提取 + 自修复 + 降级返回
+    
+    Args:
+        raw_content: 模型原始输出
+        model: 模型名称（用于自修复）
+        max_retries: 最大自修复尝试次数
+    Returns:
+        dict: 解析后的 JSON 对象，或降级错误结构
+    """
+    # 第一步：尝试直接提取 JSON
+    json_str = extract_json_from_text(raw_content)
+    
+    if json_str:
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            pass  # 继续尝试自修复
+    
+    # 第二步：自修复
+    for attempt in range(max_retries):
+        repaired_json_str = self_repair_json(raw_content, model)
+        if repaired_json_str:
+            try:
+                return json.loads(repaired_json_str)
+            except json.JSONDecodeError:
+                continue
+    
+    # 第三步：降级返回
+    return {
+        "status": "error",
+        "reason": "Failed to parse JSON after extraction and self-repair attempts",
+        "raw_output": raw_content[:500] + "..." if len(raw_content) > 500 else raw_content,
+        "evidence": [],
+        "_parse_error": True
+    }
+
 # ================= 2. 基础功能函数 =================
 
 def save_to_memory(summary, impact_score, advice):
@@ -114,18 +237,81 @@ def get_full_market_context():
         except: data[name] = "N/A"
     return data
 
+def normalize_title(title):
+    """归一化标题用于去重：小写 + 去标点 + 去多余空格"""
+    import string
+    # 转小写
+    normalized = title.lower()
+    # 移除标点
+    normalized = normalized.translate(str.maketrans('', '', string.punctuation))
+    # 去除多余空格
+    normalized = ' '.join(normalized.split())
+    return normalized
+
 def get_rss_news():
+    """
+    返回结构化新闻列表
+    Returns:
+        List[Dict]: [{"source": str, "title": str, "published": str|None, "link": str}]
+    """
     news = []
-    seen = set()
+    seen_links = set()
+    seen_titles = set()
+    
     for src, url in RSS_FEEDS.items():
         try:
             f = feedparser.parse(url)
-            for e in f.entries[:2]:
-                if e.title not in seen:
-                    news.append(f"[{src}] {e.title}")
-                    seen.add(e.title)
-        except: continue
-    return news[:8]
+            src_count = 0
+            
+            for e in f.entries:
+                if src_count >= 2:  # 每个源最多2条
+                    break
+                
+                # 提取字段
+                title = e.get('title', '').strip()
+                link = e.get('link', '').strip()
+                
+                if not title or not link:
+                    continue
+                
+                # 去重逻辑 1: 链接完全相同
+                if link in seen_links:
+                    continue
+                
+                # 去重逻辑 2: 标题归一化后相同
+                normalized_title = normalize_title(title)
+                if normalized_title in seen_titles:
+                    continue
+                
+                # 提取发布时间
+                published = None
+                if hasattr(e, 'published_parsed') and e.published_parsed:
+                    try:
+                        published = time.strftime("%Y-%m-%dT%H:%M:%SZ", e.published_parsed)
+                    except:
+                        pass
+                elif hasattr(e, 'updated_parsed') and e.updated_parsed:
+                    try:
+                        published = time.strftime("%Y-%m-%dT%H:%M:%SZ", e.updated_parsed)
+                    except:
+                        pass
+                
+                # 添加结构化新闻
+                news.append({
+                    "source": src,
+                    "title": title,
+                    "published": published,
+                    "link": link
+                })
+                
+                seen_links.add(link)
+                seen_titles.add(normalized_title)
+                src_count += 1
+                
+        except Exception as e:
+            continue
+    
+    return news[:8]  # 总数上限
 
 def get_stock_news(ticker_symbol):
     try:
@@ -181,38 +367,93 @@ def get_cross_rate(asset_a, asset_b):
     v1, v2 = get_val(asset_a), get_val(asset_b)
     return v1/v2 if v1 and v2 else None
 
-# ================= 3. AI 分析核心 (DeepSeek Logic) =================
+# ================= 3. Evidence 验证函数 =================
+
+def validate_evidence(evidence_list, input_news):
+    """
+    验证 AI 返回的 evidence 是否引用了真实的输入新闻
+    Args:
+        evidence_list: AI 返回的 evidence 数组
+        input_news: 结构化新闻列表 List[Dict] with keys: source, title, published, link
+    Returns:
+        validated_evidence: 验证后的 evidence 列表（无效的标记 _invalid）
+        valid_count: 有效证据数量
+    """
+    validated = []
+    valid_count = 0
+    
+    for ev in evidence_list:
+        headline = ev.get('headline', '').strip()
+        is_valid = False
+        
+        # 检查 headline 是否存在于任何输入新闻的 title 中（子串匹配）
+        for news_item in input_news:
+            news_title = news_item.get('title', '')
+            # 双向子串匹配
+            if headline.lower() in news_title.lower() or news_title.lower() in headline.lower():
+                is_valid = True
+                break
+        
+        if is_valid:
+            valid_count += 1
+        else:
+            ev['_invalid'] = True
+            ev['_warning'] = 'Headline not found in input news (possible hallucination)'
+        
+        validated.append(ev)
+    
+    return validated, valid_count
+
+# ================= 4. AI 分析核心 (DeepSeek Logic with Evidence) =================
 
 def analyze_all(news, user_pairs, macro_data, lang_mode):
     if not news: return {"status": "no_update"}
     
-    headlines = " ".join(news)
+    # 将结构化新闻转换为文本用于 prompt
+    headlines = " ".join([f"[{item['source']}] {item['title']}" for item in news])
     history = recall_history(headlines)
     lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "中文" else "OUTPUT LANGUAGE: ENGLISH"
 
-    # 【Prompt 升级】 鼓励 DeepSeek 进行深度思考
+    # 【核心改进】注入 MACRO_LOGIC_KNOWLEDGE + 强制 evidence 输出
     prompt = f"""
     You are a Financial Logic Engine. {lang_instruction}
     
+    MACRO RULES (You MUST reference these rules in your analysis):
+    {MACRO_LOGIC_KNOWLEDGE}
+    
     CONTEXT:
-    - News: {headlines}
-    - Macro: {json.dumps(macro_data)}
-    - Memory: {history}
+    - News Headlines: {headlines}
+    - Macro Data: {json.dumps(macro_data)}
+    - Historical Memory: {history}
     
-    TARGETS: {", ".join(user_pairs)}
+    TARGET PAIRS: {", ".join(user_pairs)}
     
-    TASK:
-    1. First, THINK deeply (<think>...</think>) about the causal chains (e.g. Oil -> Inflation -> Rates -> Tech Stocks).
-    2. Then, output the final JSON.
+    CRITICAL REQUIREMENTS:
+    1. First, THINK deeply (<think>...</think>) about causal chains using the MACRO RULES above.
+    2. Extract EVIDENCE from the News Headlines (you MUST quote actual headlines, DO NOT fabricate).
+    3. Link each prediction to specific evidence and macro rules.
+    4. If no relevant news exists, set status to "no_update" and evidence to empty array.
 
     STRICT JSON OUTPUT FORMAT:
     {{
         "status": "alert" or "no_update",
         "impact_score": 0-10,
-        "summary": "...",
-        "predictions": {{ "Pair": "Bullish/Bearish" }},
-        "advice": "..."
+        "summary": "Brief event description",
+        "evidence": [
+            {{
+                "source": "Reuters|CNBC|BBC",
+                "headline": "EXACT headline from input news",
+                "why_it_matters": "Explain how this triggers MACRO RULE X and affects asset Y"
+            }}
+        ],
+        "predictions": {{ "Pair": "Bullish/Bearish (based on evidence)" }},
+        "advice": "Actionable advice based on evidence"
     }}
+    
+    VALIDATION RULES:
+    - evidence.headline MUST be a substring of the input News Headlines
+    - If evidence is empty, predictions must indicate "insufficient evidence"
+    - summary/predictions/advice MUST be traceable to evidence items
     """
     
     try:
@@ -220,15 +461,44 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
         response = ollama.chat(model=LOCAL_MODEL, messages=[{'role': 'user', 'content': prompt}], options={"num_ctx": 8192})
         raw_content = response['message']['content']
         
-        # 解析思考与结果
-        thought, json_str = parse_deepseek_output(raw_content)
-        res = json.loads(json_str)
-        res['thought_process'] = thought # 将思考存入结果
+        # 【鲁棒解析】使用 robust_json_parse 替代直接 json.loads
+        thought, json_text = parse_deepseek_output(raw_content)
+        
+        # 尝试鲁棒解析
+        res = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
+        
+        # 如果解析失败（返回降级结构），直接返回
+        if res.get('_parse_error'):
+            res['thought_process'] = thought
+            return res
+        
+        # 解析成功，继续处理
+        res['thought_process'] = thought
+        
+        # 【新增】验证 evidence 字段（传入结构化新闻）
+        evidence = res.get('evidence', [])
+        validated_evidence, valid_count = validate_evidence(evidence, news)
+        res['evidence'] = validated_evidence
+        res['_valid_evidence_count'] = valid_count
+        
+        # 【新增】证据不足降级策略
+        if valid_count == 0 and res.get('status') == 'alert':
+            res['_evidence_warning'] = True
+            original_advice = res.get('advice', '')
+            res['advice'] = f"{original_advice}\n\n⚠️ WARNING: No valid evidence found. Predictions may be unreliable. Please verify independently."
         
         if res.get("status") == "alert":
             save_to_memory(res.get("summary"), res.get("impact_score", 0), res.get("advice"))
         return res
-    except Exception as e: return {"status": "error", "msg": str(e)}
+    except Exception as e: 
+        # 最终兜底：返回降级结构
+        return {
+            "status": "error",
+            "reason": f"Unexpected error: {str(e)}",
+            "raw_output": "",
+            "evidence": [],
+            "_parse_error": True
+        }
 
 def analyze_single_stock(ticker, news, lang_mode):
     lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "中文" else "OUTPUT LANGUAGE: ENGLISH"
@@ -253,8 +523,20 @@ def analyze_single_stock(ticker, news, lang_mode):
     try:
         response = ollama.chat(model=LOCAL_MODEL, messages=[{'role': 'user', 'content': prompt}], options={"num_ctx": 8192})
         raw_content = response['message']['content']
-        thought, json_str = parse_deepseek_output(raw_content)
-        res = json.loads(json_str)
+        thought, json_text = parse_deepseek_output(raw_content)
+        
+        # 【鲁棒解析】使用 robust_json_parse
+        res = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
+        
+        # 如果解析失败，返回降级结构
+        if res.get('_parse_error'):
+            return {
+                "sentiment": "AI Error",
+                "reason": f"Parse Error: {res.get('reason', 'Unknown')}",
+                "key_risk": "Unable to analyze due to parsing failure",
+                "thought_process": thought
+            }
+        
         res['thought_process'] = thought
         return res
     except Exception as e:
@@ -266,6 +548,11 @@ st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", pag
 
 st.sidebar.header("⚙️ Settings")
 st.sidebar.caption(f"Brain: {LOCAL_MODEL}") # 显示当前模型
+
+# 新增：展示宏观规则库
+with st.sidebar.expander("📚 Macro Rules Library"):
+    st.text(MACRO_LOGIC_KNOWLEDGE)
+
 lang_mode = st.sidebar.radio("Language", ["中文", "English"], index=0)
 refresh_label = st.sidebar.selectbox("Refresh Rate", list(REFRESH_OPTIONS.keys()), index=0)
 refresh_sec = REFRESH_OPTIONS[refresh_label]
@@ -335,14 +622,65 @@ with tab_macro:
     if 'res' in st.session_state:
         res = st.session_state['res']
         
+        # === 新增：解析错误处理 ===
+        if res.get('_parse_error'):
+            st.error("🚨 AI Output Parsing Error")
+            st.markdown(f"**Reason**: {res.get('reason', 'Unknown error')}")
+            
+            with st.expander("🔍 Raw Output (Debug)", expanded=False):
+                st.code(res.get('raw_output', 'No output available'), language="text")
+            
+            st.warning("⚠️ The AI failed to generate valid JSON output. This may be due to:")
+            st.markdown("""
+            - Model output format issues
+            - Context length exceeded
+            - Unexpected model behavior
+            
+            **Suggested actions**:
+            - Try again with a different model
+            - Reduce the number of news items
+            - Check Ollama logs for errors
+            """)
+            
+            # 仍然显示思维过程（如果有）
+            if res.get('thought_process'):
+                with st.expander("🧠 DeepSeek 的思维过程 (Click to expand)", expanded=False):
+                    st.markdown(res.get('thought_process', 'No thoughts recorded.'))
+        # ================================
+        
         # === V3.0 新增：展示思维链 ===
-        with st.expander("🧠 DeepSeek 的思维过程 (Click to expand)", expanded=False):
-            st.markdown(res.get('thought_process', 'No thoughts recorded.'))
+        elif res.get("status") != "error":
+            with st.expander("🧠 DeepSeek 的思维过程 (Click to expand)", expanded=False):
+                st.markdown(res.get('thought_process', 'No thoughts recorded.'))
         # ==========================
 
         if res.get("status") == "alert":
             st.error(f"🚨 ALERT (Score: {res.get('impact_score')})")
             st.markdown(f"**Event**: {res.get('summary')}")
+            
+            # === 新增：Evidence Chain 展示 ===
+            evidence = res.get('evidence', [])
+            valid_count = res.get('_valid_evidence_count', 0)
+            
+            if evidence:
+                with st.expander(f"📋 Evidence Chain ({valid_count}/{len(evidence)} valid)", expanded=True):
+                    for idx, ev in enumerate(evidence, 1):
+                        is_invalid = ev.get('_invalid', False)
+                        icon = "⚠️" if is_invalid else "✅"
+                        
+                        st.markdown(f"**{icon} Evidence {idx}**")
+                        st.markdown(f"- **Source**: {ev.get('source', 'Unknown')}")
+                        st.markdown(f"- **Headline**: _{ev.get('headline', 'N/A')}_")
+                        st.markdown(f"- **Why it matters**: {ev.get('why_it_matters', 'N/A')}")
+                        
+                        if is_invalid:
+                            st.warning(ev.get('_warning', 'Invalid evidence'))
+                        st.divider()
+            
+            if res.get('_evidence_warning'):
+                st.warning("⚠️ No valid evidence found. AI predictions may be unreliable.")
+            # ================================
+            
             col_p, col_a = st.columns(2)
             col_p.write(res.get("predictions"))
             col_a.warning(res.get("advice"))
@@ -350,8 +688,36 @@ with tab_macro:
             st.success("✅ Market is Stable")
             st.caption(res.get("advice"))
         
-        with st.expander("News Source"):
-            for n in st.session_state.get('news', []): st.write(n)
+        with st.expander("📰 News Source"):
+            news_list = st.session_state.get('news', [])
+            if news_list:
+                for idx, news_item in enumerate(news_list, 1):
+                    # 结构化新闻展示
+                    source = news_item.get('source', 'Unknown')
+                    title = news_item.get('title', 'N/A')
+                    published = news_item.get('published', None)
+                    link = news_item.get('link', '')
+                    
+                    # 格式化时间显示
+                    time_str = ""
+                    if published:
+                        try:
+                            # 转换为更友好的格式
+                            from datetime import datetime
+                            dt = datetime.fromisoformat(published.replace('Z', '+00:00'))
+                            time_str = f"🕒 {dt.strftime('%Y-%m-%d %H:%M UTC')}"
+                        except:
+                            time_str = f"🕒 {published}"
+                    
+                    # 显示新闻
+                    st.markdown(f"**{idx}. [{source}]** {title}")
+                    if time_str:
+                        st.caption(time_str)
+                    if link:
+                        st.markdown(f"[🔗 Read More]({link})")
+                    st.divider()
+            else:
+                st.caption("No news available")
 
 # === TAB 2: 美股个股分析 ===
 with tab_stock:
