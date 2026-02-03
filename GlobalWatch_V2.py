@@ -12,6 +12,7 @@ from plotly.subplots import make_subplots
 import chromadb
 import uuid
 import urllib.parse
+import os
 
 # === 0. 基础设置 ===
 try:
@@ -20,8 +21,53 @@ try:
 except ImportError:
     TOAST_AVAILABLE = False
 
+# === 0.1. 日志工具函数 ===
+def log_error(message):
+    """
+    记录错误到文件和控制台
+    Args:
+        message: 错误消息
+    """
+    try:
+        # 确保 outputs 目录存在
+        os.makedirs("outputs", exist_ok=True)
+        
+        # 写入日志文件
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        
+        with open("outputs/error.log", "a", encoding="utf-8") as f:
+            f.write(log_entry)
+    except Exception as e:
+        # 日志本身失败也不能崩溃
+        print(f"Logging failed: {e}")
+
+def safe_format_number(value, decimals=2, default="N/A"):
+    """
+    安全格式化数字，处理 None/NaN/inf
+    Args:
+        value: 数值
+        decimals: 小数位数
+        default: 默认值（当无法格式化时）
+    Returns:
+        格式化后的字符串
+    """
+    try:
+        if value is None:
+            return default
+        if pd.isna(value) or not pd.api.types.is_number(value):
+            return default
+        if not (-1e10 < value < 1e10):  # 检查 inf
+            return default
+        return f"{value:,.{decimals}f}"
+    except Exception as e:
+        log_error(f"safe_format_number error: {str(e)}")
+        return default
+
 # 【关键修改】切换为推理模型 (请确保终端已运行 ollama pull deepseek-r1:8b)
 LOCAL_MODEL = "deepseek-r1:8b" 
+# Temperature range: 0.1 ~ 0.3 (configured in ollama.chat calls)
+TEMPERATURE = 0.2  # Default temperature for model calls
 
 # 初始化记忆库
 chroma_client = chromadb.PersistentClient(path="./memory_db")
@@ -131,7 +177,7 @@ def extract_json_from_text(text):
                     # 验证是否为合法 JSON
                     json.loads(json_candidate)
                     return json_candidate
-                except:
+                except Exception as e:
                     # 继续查找下一个
                     start_idx = -1
                     continue
@@ -144,7 +190,7 @@ def extract_json_from_text(text):
         try:
             json.loads(json_candidate)
             return json_candidate
-        except:
+        except Exception as e:
             continue
     
     return None
@@ -246,13 +292,17 @@ def recall_history(query_text, n_results=2):
                 meta = results['metadatas'][0][i]
                 history.append(f"- [{meta['time']}] {doc}")
         return "\n".join(history) if history else "No history."
-    except: return "Memory Empty."
+    except Exception as e:
+        log_error(f"recall_history error: {str(e)}")
+        return "Memory Empty."
 
 def send_notification(title, msg):
     if TOAST_AVAILABLE:
         try:
             notification.notify(title=title, message=msg, app_name='GlobalWatch', timeout=10)
-        except: pass
+        except Exception as e:
+            log_error(f"send_notification error: {str(e)}")
+            pass
 
 # ================= 2.5. Signal Scoreboard 系统 =================
 
@@ -305,7 +355,8 @@ def get_current_price(ticker):
         hist = t.history(period="1d")
         if not hist.empty:
             return float(hist['Close'].iloc[-1])
-    except:
+    except Exception as e:
+        log_error(f"get_current_price error for {ticker}: {str(e)}")
         pass
     return None
 
@@ -476,7 +527,8 @@ def get_historical_price(ticker, target_time):
             # 找到最接近目标时间的价格
             closest_idx = (hist.index - target_time).abs().argmin()
             return float(hist['Close'].iloc[closest_idx])
-    except:
+    except Exception as e:
+        log_error(f"get_historical_price error for {ticker}: {str(e)}")
         pass
     return None
 
@@ -516,7 +568,8 @@ def calculate_rsi(ticker, period=14):
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         return float(rsi.iloc[-1])
-    except:
+    except Exception as e:
+        log_error(f"calculate_rsi error for {ticker}: {str(e)}")
         return None
 
 def calculate_ma(ticker, period=20):
@@ -527,7 +580,8 @@ def calculate_ma(ticker, period=20):
         if hist.empty or len(hist) < period:
             return None
         return float(hist['Close'].rolling(window=period).mean().iloc[-1])
-    except:
+    except Exception as e:
+        log_error(f"calculate_ma error for {ticker}: {str(e)}")
         return None
 
 def calculate_atr(ticker, period=14):
@@ -545,7 +599,8 @@ def calculate_atr(ticker, period=14):
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         atr = tr.rolling(window=period).mean()
         return float(atr.iloc[-1])
-    except:
+    except Exception as e:
+        log_error(f"calculate_atr error for {ticker}: {str(e)}")
         return None
 
 def get_price_change(ticker, period="1w"):
@@ -567,7 +622,8 @@ def get_price_change(ticker, period="1w"):
         
         current_price = hist['Close'].iloc[-1]
         return float((current_price - old_price) / old_price * 100)
-    except:
+    except Exception as e:
+        log_error(f"get_price_change error for {ticker}: {str(e)}")
         return 0.0
 
 def calculate_gap(ticker):
@@ -582,7 +638,8 @@ def calculate_gap(ticker):
         current_open = hist['Open'].iloc[-1]
         gap = (current_open - prev_close) / prev_close * 100
         return float(gap)
-    except:
+    except Exception as e:
+        log_error(f"calculate_gap error for {ticker}: {str(e)}")
         return 0.0
 
 def get_current_volume(ticker):
@@ -593,7 +650,8 @@ def get_current_volume(ticker):
         if hist.empty:
             return 0
         return int(hist['Volume'].iloc[-1])
-    except:
+    except Exception as e:
+        log_error(f"get_current_volume error for {ticker}: {str(e)}")
         return 0
 
 def get_avg_volume(ticker, period=20):
@@ -604,7 +662,8 @@ def get_avg_volume(ticker, period=20):
         if hist.empty or len(hist) < period:
             return 1  # 避免除零
         return int(hist['Volume'].rolling(window=period).mean().iloc[-1])
-    except:
+    except Exception as e:
+        log_error(f"get_avg_volume error for {ticker}: {str(e)}")
         return 1
 
 def count_keyword_mentions(keywords, news_list):
@@ -1048,6 +1107,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
         if not results or not results['ids']:
             return {
                 "total_signals": 0,
+                "verified_signals": 0,
                 "accuracy": 0.0,
                 "avg_return": 0.0,
                 "max_return": 0.0,
@@ -1060,7 +1120,9 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
                 "win_rate": 0.0,
                 "avg_win": 0.0,
                 "avg_loss": 0.0,
-                "profit_factor": 0.0
+                "profit_factor": 0.0,
+                "returns_list": [],
+                "timestamps": []
             }
         
         # 提取对应时间框架的数据
@@ -1417,7 +1479,9 @@ def get_full_market_context():
             t = yf.Ticker(ticker)
             hist = t.history(period="1d")
             if not hist.empty: data[name] = round(hist['Close'].iloc[-1], 2)
-        except: data[name] = "N/A"
+        except Exception as e:
+            log_error(f"get_full_market_context error for {name}/{ticker}: {str(e)}")
+            data[name] = "N/A"
     return data
 
 def normalize_title(title):
@@ -1471,12 +1535,12 @@ def get_rss_news():
                 if hasattr(e, 'published_parsed') and e.published_parsed:
                     try:
                         published = time.strftime("%Y-%m-%dT%H:%M:%SZ", e.published_parsed)
-                    except:
+                    except Exception as e:
                         pass
                 elif hasattr(e, 'updated_parsed') and e.updated_parsed:
                     try:
                         published = time.strftime("%Y-%m-%dT%H:%M:%SZ", e.updated_parsed)
-                    except:
+                    except Exception as e:
                         pass
                 
                 # 添加结构化新闻
@@ -1492,6 +1556,7 @@ def get_rss_news():
                 src_count += 1
                 
         except Exception as e:
+            log_error(f"get_rss_news error for {src}: {str(e)}")
             continue
     
     return news[:8]  # 总数上限
@@ -1518,7 +1583,9 @@ def plot_candle_chart(ticker, title, height=300):
         fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange', width=1), name='MA 20'))
         fig.update_layout(height=height, margin=dict(l=0,r=0,t=30,b=0), title=dict(text=title, font=dict(color="white")), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig)
-    except: st.caption("No Chart Data")
+    except Exception as e:
+        log_error(f"plot_candle_chart error for {ticker}: {str(e)}")
+        st.caption("No Chart Data")
 
 def plot_gauge(score):
     fig = go.Figure(go.Indicator(
@@ -1546,7 +1613,9 @@ def get_cross_rate(asset_a, asset_b):
         try:
             h = yf.Ticker(info['ticker']).history(period="1d")
             return 1.0/h['Close'].iloc[-1] if info['type'] == "fiat_quote" else h['Close'].iloc[-1]
-        except: return None
+        except Exception as e:
+            log_error(f"get_cross_rate.get_val error for {name}: {str(e)}")
+            return None
     v1, v2 = get_val(asset_a), get_val(asset_b)
     return v1/v2 if v1 and v2 else None
 
@@ -1913,7 +1982,7 @@ with tab_macro:
                             from datetime import datetime
                             dt = datetime.fromisoformat(published.replace('Z', '+00:00'))
                             time_str = f"🕒 {dt.strftime('%Y-%m-%d %H:%M UTC')}"
-                        except:
+                        except Exception as e:
                             time_str = f"🕒 {published}"
                     
                     # 显示新闻

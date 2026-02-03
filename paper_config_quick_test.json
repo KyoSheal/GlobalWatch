@@ -1,0 +1,65 @@
+{
+  "paper_mode": true,
+  "initial_cash_usd": 20000,
+  "duration_hours": 0.5,
+  "rebalance_minutes": 5,
+  "universe": [
+    {
+      "ticker": "SPY",
+      "name": "S&P 500 ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "QQQ",
+      "name": "Nasdaq 100 ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "AAPL",
+      "name": "Apple Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MSFT",
+      "name": "Microsoft Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "GLD",
+      "name": "Gold ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "CASH",
+      "name": "Cash Equivalent",
+      "asset_type": "CASH"
+    }
+  ],
+  "objectives": {
+    "goal": "capital_preservation_and_growth",
+    "risk_level": "medium",
+    "max_drawdown_pct": 0.08,
+    "max_weight_per_asset": 0.25,
+    "min_cash_pct": 0.10,
+    "transaction_cost_pct": 0.0005,
+    "max_rebalance_pct": 0.20
+  },
+  "strategy": {
+    "type": "momentum_vol_targeting",
+    "lookback_days": 20,
+    "vol_target": 0.10,
+    "momentum_weight": 0.6,
+    "vol_weight": 0.4
+  },
+  "reporting": {
+    "equity_curve_path": "outputs/equity_curve_quick.png",
+    "trades_log_path": "outputs/paper_trades_quick.csv",
+    "portfolio_snapshots_path": "outputs/portfolio_snapshots_quick.jsonl",
+    "summary_report_path": "outputs/paper_summary_quick.txt"
+  },
+  "safety": {
+    "no_real_broker": true,
+    "simulation_only": true,
+    "random_seed": 42
+  }
+}

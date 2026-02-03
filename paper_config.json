@@ -1,0 +1,130 @@
+{
+  "paper_mode": true,
+  "initial_cash_usd": 20000,
+  "duration_hours": 48,
+  "rebalance_minutes": 15,
+  "universe": [
+    {
+      "ticker": "SPY",
+      "name": "S&P 500 ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "QQQ",
+      "name": "Nasdaq 100 ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "DIA",
+      "name": "Dow Jones ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "IWM",
+      "name": "Russell 2000 ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "AAPL",
+      "name": "Apple Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MSFT",
+      "name": "Microsoft Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "NVDA",
+      "name": "NVIDIA Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "AMZN",
+      "name": "Amazon.com Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "GOOGL",
+      "name": "Alphabet Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "META",
+      "name": "Meta Platforms Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "TSLA",
+      "name": "Tesla Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "JPM",
+      "name": "JPMorgan Chase",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "XOM",
+      "name": "Exxon Mobil",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "JNJ",
+      "name": "Johnson & Johnson",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "PG",
+      "name": "Procter & Gamble",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "KO",
+      "name": "Coca-Cola",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "GLD",
+      "name": "Gold ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "TLT",
+      "name": "Treasury Bond ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "CASH",
+      "name": "Cash Equivalent",
+      "asset_type": "CASH"
+    }
+  ],
+  "objectives": {
+    "goal": "capital_preservation_and_growth",
+    "risk_level": "medium",
+    "max_drawdown_pct": 0.08,
+    "max_weight_per_asset": 0.25,
+    "min_cash_pct": 0.10,
+    "transaction_cost_pct": 0.0005,
+    "max_rebalance_pct": 0.20
+  },
+  "strategy": {
+    "type": "momentum_vol_targeting",
+    "lookback_days": 20,
+    "vol_target": 0.10,
+    "momentum_weight": 0.6,
+    "vol_weight": 0.4
+  },
+  "reporting": {
+    "equity_curve_path": "outputs/equity_curve.png",
+    "trades_log_path": "outputs/paper_trades.csv",
+    "portfolio_snapshots_path": "outputs/portfolio_snapshots.jsonl",
+    "summary_report_path": "outputs/paper_summary.txt"
+  },
+  "safety": {
+    "no_real_broker": true,
+    "simulation_only": true,
+    "random_seed": 42
+  }
+}
