@@ -100,16 +100,62 @@ class PaperTradingEngine:
             return None
 
     def get_current_price(self, ticker):
-        """获取当前价格"""
+        """获取当前价格（实时或最新）- 强制刷新，避免缓存"""
         if ticker == 'CASH':
             return 1.0
         
         try:
-            hist = self.get_market_data(ticker, period='5d', interval='1d')
-            if hist is not None and not hist.empty:
-                return float(hist['Close'].iloc[-1])
-        except:
-            pass
+            # 创建新的 Ticker 对象，避免缓存
+            t = yf.Ticker(ticker)
+            
+            # 方法1: 尝试获取最新的分钟级数据（最可靠）
+            try:
+                # 使用 5m 间隔，period='1d' 获取今天的数据
+                hist = t.history(period='1d', interval='5m')
+                if not hist.empty:
+                    price = float(hist['Close'].iloc[-1])
+                    timestamp = hist.index[-1]
+                    print(f"[PRICE] {ticker}: ${price:.2f} (from 5m history at {timestamp.strftime('%H:%M')})")
+                    return price
+            except Exception as e:
+                print(f"[PRICE] {ticker}: 5m history failed - {e}")
+            
+            # 方法2: 尝试 1m 间隔
+            try:
+                hist = t.history(period='1d', interval='1m')
+                if not hist.empty:
+                    price = float(hist['Close'].iloc[-1])
+                    timestamp = hist.index[-1]
+                    print(f"[PRICE] {ticker}: ${price:.2f} (from 1m history at {timestamp.strftime('%H:%M')})")
+                    return price
+            except Exception as e:
+                print(f"[PRICE] {ticker}: 1m history failed - {e}")
+            
+            # 方法3: 尝试 info（可能有缓存）
+            try:
+                info = t.info
+                for price_field in ['currentPrice', 'regularMarketPrice', 'ask', 'bid']:
+                    if price_field in info and info[price_field]:
+                        price = float(info[price_field])
+                        if price > 0:
+                            print(f"[PRICE] {ticker}: ${price:.2f} (from info.{price_field})")
+                            return price
+            except Exception as e:
+                print(f"[PRICE] {ticker}: info failed - {e}")
+            
+            # 方法4: 降级到日线数据（最后手段）
+            try:
+                hist = t.history(period='5d', interval='1d')
+                if not hist.empty:
+                    price = float(hist['Close'].iloc[-1])
+                    date = hist.index[-1]
+                    print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {date.strftime('%Y-%m-%d')}) ⚠️ NOT REAL-TIME")
+                    return price
+            except Exception as e:
+                print(f"[PRICE] {ticker}: daily history failed - {e}")
+                
+        except Exception as e:
+            print(f"[ERROR] All price methods failed for {ticker}: {e}")
         
         return None
     
@@ -397,6 +443,10 @@ class PaperTradingEngine:
         self.equity_curve.append((datetime.now(), total_equity, self.cash, positions_value))
         
         return snapshot
+
+    def get_cost_basis(self, ticker):
+        """获取股票的成本基础（平均买入价）"""
+        return self.cost_basis.get(ticker, None)
 
     def run_cycle(self):
         """运行一个周期"""
@@ -696,7 +746,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-    def get_cost_basis(self, ticker):
-        """获取股票的成本基础（平均买入价）"""
-        return self.cost_basis.get(ticker, None)
