@@ -7,6 +7,7 @@ GlobalWatch Paper Trading Module
 
 import json
 import os
+import sys
 import time
 import pandas as pd
 import numpy as np
@@ -17,6 +18,10 @@ import matplotlib
 matplotlib.use('Agg')  # 非交互式后端
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+# 设置无缓冲输出，解决 Windows Terminal 延迟问题
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 # 安全检查：确保不会连接真实 broker
 REAL_BROKER_KEYWORDS = ['alpaca', 'interactive_brokers', 'ib_insync', 'robinhood', 'td_ameritrade']
@@ -115,7 +120,13 @@ class PaperTradingEngine:
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
                     timestamp = hist.index[-1]
-                    print(f"[PRICE] {ticker}: ${price:.2f} (from 5m history at {timestamp.strftime('%H:%M')})")
+                    # 计算数据延迟
+                    import pytz
+                    now_et = datetime.now(pytz.timezone('US/Eastern'))
+                    data_age_minutes = (now_et - timestamp).total_seconds() / 60
+                    
+                    market_status = "🟢 LIVE" if data_age_minutes < 10 else "🟡 RECENT" if data_age_minutes < 60 else "🔴 STALE"
+                    print(f"[PRICE] {ticker}: ${price:.2f} (5m @ {timestamp.strftime('%H:%M ET')}, {data_age_minutes:.0f}min ago) {market_status}")
                     return price
             except Exception as e:
                 print(f"[PRICE] {ticker}: 5m history failed - {e}")
@@ -126,7 +137,11 @@ class PaperTradingEngine:
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
                     timestamp = hist.index[-1]
-                    print(f"[PRICE] {ticker}: ${price:.2f} (from 1m history at {timestamp.strftime('%H:%M')})")
+                    import pytz
+                    now_et = datetime.now(pytz.timezone('US/Eastern'))
+                    data_age_minutes = (now_et - timestamp).total_seconds() / 60
+                    market_status = "🟢 LIVE" if data_age_minutes < 5 else "🟡 RECENT" if data_age_minutes < 60 else "🔴 STALE"
+                    print(f"[PRICE] {ticker}: ${price:.2f} (1m @ {timestamp.strftime('%H:%M ET')}, {data_age_minutes:.0f}min ago) {market_status}")
                     return price
             except Exception as e:
                 print(f"[PRICE] {ticker}: 1m history failed - {e}")
@@ -352,6 +367,10 @@ class PaperTradingEngine:
         
         self.trades_log.extend(trades)
         
+        # 实时保存交易记录（不等到程序结束）
+        if trades:
+            self.save_trades_immediately()
+        
         return trades
 
     def check_risk_controls(self):
@@ -442,7 +461,63 @@ class PaperTradingEngine:
         self.portfolio_snapshots.append(snapshot)
         self.equity_curve.append((datetime.now(), total_equity, self.cash, positions_value))
         
+        # 每个周期生成实时摘要
+        self.generate_live_summary()
+        
         return snapshot
+
+    def save_trades_immediately(self):
+        """实时保存交易记录"""
+        trades_path = self.config['reporting']['trades_log_path']
+        if self.trades_log:
+            trades_df = pd.DataFrame(self.trades_log)
+            trades_df.to_csv(trades_path, index=False)
+        print(f"💾 Trades updated: {trades_path}")
+        import sys; sys.stdout.flush()  # 强制刷新输出
+
+    def generate_live_summary(self):
+        """生成实时摘要（不等程序结束）"""
+        if not self.portfolio_snapshots:
+            return
+        
+        final_snapshot = self.portfolio_snapshots[-1]
+        
+        summary_path = self.config['reporting']['summary_report_path'].replace('.txt', '_live.txt')
+        
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write("="*60 + "\n")
+            f.write("GlobalWatch Paper Trading LIVE Summary\n")
+            f.write("="*60 + "\n\n")
+            
+            f.write(f"Current Status: {self.status}\n")
+            f.write(f"Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Cycle: {self.current_cycle}\n\n")
+            
+            f.write(f"Performance:\n")
+            f.write(f"  Initial Cash: ${self.initial_cash:,.2f}\n")
+            f.write(f"  Current Equity: ${final_snapshot['total_equity']:,.2f}\n")
+            f.write(f"  Current Return: {final_snapshot['total_return']:.2%}\n")
+            f.write(f"  Current Drawdown: {final_snapshot['drawdown']:.2%}\n\n")
+            
+            f.write(f"Current Portfolio:\n")
+            f.write(f"  Cash: ${final_snapshot['cash']:,.2f} ({final_snapshot['cash']/final_snapshot['total_equity']:.1%})\n")
+            f.write(f"  Positions Value: ${final_snapshot['positions_value']:,.2f}\n\n")
+            
+            if final_snapshot['positions']:
+                f.write(f"  Current Holdings:\n")
+                for ticker, pos in sorted(final_snapshot['positions'].items(), key=lambda x: x[1]['value'], reverse=True):
+                    weight = pos['value'] / final_snapshot['total_equity']
+                    f.write(f"    {ticker}: {pos['quantity']} shares @ ${pos['price']:.2f} = ${pos['value']:,.2f} ({weight:.1%})\n")
+            
+            f.write(f"\nTotal Trades So Far: {len(self.trades_log)}\n")
+            
+            f.write("\n" + "="*60 + "\n")
+            f.write("⚠️  LIVE DATA - Updates every 15 minutes\n")
+            f.write("⚠️  SIMULATION ONLY - NO REAL MONEY\n")
+            f.write("="*60 + "\n")
+        
+        print(f"📊 Live summary updated: {summary_path}")
+        import sys; sys.stdout.flush()  # 强制刷新输出
 
     def get_cost_basis(self, ticker):
         """获取股票的成本基础（平均买入价）"""
@@ -546,10 +621,10 @@ class PaperTradingEngine:
                 
                 print(f"[DEBUG] About to sleep at {datetime.now().strftime('%H:%M:%S')}")
                 print(f"[DEBUG] Sleep duration: {sleep_seconds} seconds")
-                import sys; sys.stdout.flush()
+                import sys; sys.stdout.flush()  # 强制刷新输出
                 time.sleep(sleep_seconds)
                 print(f"[DEBUG] Woke up at {datetime.now().strftime('%H:%M:%S')}")
-                import sys; sys.stdout.flush()
+                import sys; sys.stdout.flush()  # 强制刷新输出
             
             print(f"\n{'='*60}")
             print("📊 Final Snapshot")

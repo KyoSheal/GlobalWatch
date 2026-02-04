@@ -1,6 +1,6 @@
 {
   "paper_mode": true,
-  "initial_cash_usd": 20000,
+  "initial_cash_usd": 30000,
   "duration_hours": 48,
   "rebalance_minutes": 15,
   "universe": [
