@@ -19,6 +19,15 @@ By combining **Live RSS Feeds** (Reuters, CNBC, BBC) with **Local Large Language
 
 ## 🚀 What's New in V2.5
 
+### 📈 Paper Trading System
+- **48-Hour Simulation**: Automated paper trading with real-time price updates
+- **Momentum + Volatility Strategy**: Dynamic portfolio rebalancing every 15 minutes
+- **Real-Time Monitoring**: Live summary updates, trade logs, and P&L tracking
+- **Resume from Checkpoint**: Interrupt and resume trading sessions seamlessly
+- **19-Asset Universe**: ETFs (SPY, QQQ, DIA, IWM, GLD, TLT) + Tech stocks (AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA) + Defensive stocks (JPM, XOM, JNJ, PG, KO)
+- **Risk Controls**: Max drawdown limits, position sizing, transaction costs
+- **Comprehensive Reporting**: Equity curves, trade logs, performance metrics
+
 ### 🚨 Early-Warning Risk Scoring System
 - **Universal Risk Monitor**: Tracks risk levels for any asset (Gold, Oil, CNY, CAD, etc.)
 - **Four-Dimensional Scoring**: 
@@ -111,11 +120,63 @@ By combining **Live RSS Feeds** (Reuters, CNBC, BBC) with **Local Large Language
 
 ## 🚀 Usage
 
-Run the application:
+### GlobalWatch UI (Market Analysis)
+
+Run the main application:
 
 ```bash
 python -m streamlit run GlobalWatch_V2.py
 ```
+
+Or use the batch file:
+```bash
+Start_GlobalWatch.bat
+```
+
+### Paper Trading System
+
+#### Quick Start (1-hour test)
+```bash
+python -u paper_trading.py paper_config_quick_test.json
+```
+
+#### Full 48-Hour Simulation
+```bash
+python -u paper_trading.py paper_config.json
+```
+
+Or use the unbuffered batch file (recommended for Windows Terminal):
+```bash
+Start_Paper_Trading_Unbuffered.bat
+```
+
+#### Auto-Start at Market Open
+Set up automatic trading at 6:35 AM PST (5 minutes after US market open):
+```bash
+# Run as Administrator
+Setup_Auto_Schedule.bat
+```
+
+This creates a Windows scheduled task that automatically starts paper trading every trading day.
+
+#### Monitor Live Progress
+```bash
+# View real-time summary (updates every 15 minutes)
+type outputs\paper_summary_live.txt
+
+# View trade log
+type outputs\paper_trades.csv
+
+# View detailed snapshots
+type outputs\portfolio_snapshots.jsonl
+```
+
+#### Resume from Checkpoint
+If you interrupt the program (Ctrl+C), simply restart it:
+```bash
+python -u paper_trading.py paper_config.json
+```
+The system will detect the checkpoint and ask if you want to continue from where you left off.
 
 ### 📱 Interface Overview
 
@@ -188,6 +249,15 @@ The application opens with four main tabs:
 它结合了 **实时 RSS 新闻源**（路透社、CNBC、BBC）和 **本地大语言模型**（Ollama），能够自主进行市场分析、趋势检测和风险评估。全程无需将数据上传云端，也无需支付 API 费用。
 
 ## 🚀 V2.5 版本新功能
+
+### 📈 纸上交易系统
+- **48小时模拟**: 自动化纸上交易，实时价格更新
+- **动量+波动率策略**: 每15分钟动态组合再平衡
+- **实时监控**: 实时摘要更新、交易日志、盈亏追踪
+- **断点续传**: 无缝中断和恢复交易会话
+- **19资产池**: ETF（SPY, QQQ, DIA, IWM, GLD, TLT）+ 科技股（AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA）+ 防御性股票（JPM, XOM, JNJ, PG, KO）
+- **风险控制**: 最大回撤限制、仓位管理、交易成本
+- **全面报告**: 资金曲线、交易日志、表现指标
 
 ### 🚨 Early-Warning 风险评分系统
 - **通用风险监控**: 追踪任何资产的风险水平（黄金、原油、人民币、加元等）
@@ -281,11 +351,63 @@ The application opens with four main tabs:
 
 ## 🚀 运行方法
 
-启动应用：
+### GlobalWatch 界面（市场分析）
+
+启动主应用：
 
 ```bash
 python -m streamlit run GlobalWatch_V2.py
 ```
+
+或使用批处理文件：
+```bash
+Start_GlobalWatch.bat
+```
+
+### 纸上交易系统
+
+#### 快速测试（1小时）
+```bash
+python -u paper_trading.py paper_config_quick_test.json
+```
+
+#### 完整48小时模拟
+```bash
+python -u paper_trading.py paper_config.json
+```
+
+或使用无缓冲批处理文件（推荐用于 Windows Terminal）：
+```bash
+Start_Paper_Trading_Unbuffered.bat
+```
+
+#### 开盘自动启动
+设置在美股开盘后5分钟（太平洋时间 6:35 AM）自动启动交易：
+```bash
+# 以管理员身份运行
+Setup_Auto_Schedule.bat
+```
+
+这会创建一个 Windows 计划任务，在每个交易日自动启动纸上交易。
+
+#### 监控实时进度
+```bash
+# 查看实时摘要（每15分钟更新）
+type outputs\paper_summary_live.txt
+
+# 查看交易日志
+type outputs\paper_trades.csv
+
+# 查看详细快照
+type outputs\portfolio_snapshots.jsonl
+```
+
+#### 断点续传
+如果中断程序（Ctrl+C），只需重新启动：
+```bash
+python -u paper_trading.py paper_config.json
+```
+系统会检测到检查点并询问是否从上次中断处继续。
 
 ### 📱 界面概览
 
@@ -353,10 +475,22 @@ python -m streamlit run GlobalWatch_V2.py
 
 ## 📄 Documentation
 
+### GlobalWatch UI
 - **Complete Guide**: `GLOBALWATCH_COMPLETE_GUIDE.md`
 - **Early-Warning System**: `EARLY_WARNING_IMPLEMENTATION.md`
 - **Trading Classification**: `TRADING_GRADE_CLASSIFICATION.md`
 - **Quick Reference**: `TRADING_GRADE_QUICK_REF.md`
+
+### Paper Trading System
+- **Real-Time Price Fix**: `REAL_TIME_PRICE_FIX.md` - How real-time price fetching works
+- **Price Fetching Enhanced**: `PRICE_FETCHING_ENHANCED.md` - 4-tier price fetching mechanism
+- **Real-Time Monitoring**: `REAL_TIME_MONITORING.md` - How to monitor live trading progress
+- **Resume Feature**: `RESUME_FEATURE.md` - Checkpoint and resume functionality
+- **Restart Instructions**: `RESTART_INSTRUCTIONS.md` - Quick restart guide
+
+### Configuration Files
+- **`paper_config.json`**: 48-hour full simulation (19 assets, $30,000 initial capital)
+- **`paper_config_quick_test.json`**: 1-hour quick test (6 assets, $20,000 initial capital)
 
 ## 🤝 Contributing
 

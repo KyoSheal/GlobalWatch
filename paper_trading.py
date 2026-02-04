@@ -56,6 +56,9 @@ class PaperTradingEngine:
         self.peak_equity = self.cash
         self.status = "READY"  # READY/RUNNING/PAUSED/COMPLETED
         
+        # 尝试恢复之前的状态
+        self.resume_from_checkpoint()
+        
         # 创建输出目录
         os.makedirs('outputs', exist_ok=True)
         
@@ -85,6 +88,140 @@ class PaperTradingEngine:
         assert self.config['safety']['simulation_only'] == True, "simulation_only must be True"
         
         print("✅ Safety checks passed: SIMULATION ONLY mode confirmed")
+    
+    def resume_from_checkpoint(self):
+        """从检查点恢复之前的运行状态"""
+        snapshots_path = self.config['reporting']['portfolio_snapshots_path']
+        trades_path = self.config['reporting']['trades_log_path']
+        
+        # 检查是否存在检查点文件
+        if not os.path.exists(snapshots_path):
+            print("ℹ️  No checkpoint found - starting fresh")
+            return
+        
+        try:
+            print("\n" + "="*60)
+            print("🔄 CHECKPOINT DETECTED - Attempting to resume")
+            print("="*60)
+            
+            # 1. 读取快照文件
+            with open(snapshots_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                if not lines:
+                    print("⚠️  Checkpoint file is empty - starting fresh")
+                    return
+                
+                # 加载所有快照
+                for line in lines:
+                    snapshot = json.loads(line.strip())
+                    self.portfolio_snapshots.append(snapshot)
+            
+            # 2. 恢复最后的状态
+            last_snapshot = self.portfolio_snapshots[-1]
+            
+            self.cash = last_snapshot['cash']
+            self.current_cycle = last_snapshot['cycle'] + 1  # 继续下一个周期
+            self.status = "RESUMED"
+            
+            # 恢复持仓
+            self.positions = {}
+            for ticker, pos in last_snapshot['positions'].items():
+                self.positions[ticker] = pos['quantity']
+            
+            # 恢复权益曲线
+            for snapshot in self.portfolio_snapshots:
+                timestamp = datetime.fromisoformat(snapshot['timestamp'])
+                self.equity_curve.append((
+                    timestamp,
+                    snapshot['total_equity'],
+                    snapshot['cash'],
+                    snapshot['positions_value']
+                ))
+            
+            # 更新峰值权益
+            self.peak_equity = max(s['total_equity'] for s in self.portfolio_snapshots)
+            
+            # 3. 读取交易记录
+            if os.path.exists(trades_path):
+                trades_df = pd.read_csv(trades_path)
+                self.trades_log = trades_df.to_dict('records')
+                
+                # 从交易记录重建成本基础
+                self.rebuild_cost_basis()
+            
+            # 4. 显示恢复信息
+            print(f"✅ Successfully resumed from checkpoint")
+            print(f"   Last cycle: {last_snapshot['cycle']}")
+            print(f"   Last update: {last_snapshot['timestamp']}")
+            print(f"   Cash: ${self.cash:,.2f}")
+            print(f"   Positions: {len(self.positions)} holdings")
+            print(f"   Total equity: ${last_snapshot['total_equity']:,.2f}")
+            print(f"   Return: {last_snapshot['total_return']:.2%}")
+            print(f"   Historical snapshots: {len(self.portfolio_snapshots)}")
+            print(f"   Historical trades: {len(self.trades_log)}")
+            
+            # 显示当前持仓
+            if self.positions:
+                print(f"\n   Current Holdings:")
+                for ticker, qty in sorted(self.positions.items()):
+                    cost = self.cost_basis.get(ticker, 0)
+                    print(f"     {ticker}: {qty} shares (avg cost: ${cost:.2f})")
+            
+            print("="*60 + "\n")
+            
+            # 询问用户是否继续
+            response = input("Continue from checkpoint? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Starting fresh as requested...")
+                self.clear_checkpoint()
+                return
+            
+        except Exception as e:
+            print(f"⚠️  Failed to resume from checkpoint: {e}")
+            print("   Starting fresh...")
+            self.clear_checkpoint()
+    
+    def rebuild_cost_basis(self):
+        """从交易记录重建成本基础"""
+        self.cost_basis = {}
+        position_qty = {}
+        
+        for trade in self.trades_log:
+            ticker = trade['ticker']
+            side = trade['side']
+            qty = trade['quantity']
+            price = trade['price']
+            
+            if side == 'BUY':
+                old_qty = position_qty.get(ticker, 0)
+                old_cost = self.cost_basis.get(ticker, 0)
+                
+                # 加权平均成本
+                if old_qty > 0:
+                    total_cost = (old_qty * old_cost) + (qty * price)
+                    position_qty[ticker] = old_qty + qty
+                    self.cost_basis[ticker] = total_cost / position_qty[ticker]
+                else:
+                    position_qty[ticker] = qty
+                    self.cost_basis[ticker] = price
+                    
+            elif side == 'SELL':
+                position_qty[ticker] = position_qty.get(ticker, 0) - qty
+                if position_qty[ticker] <= 0:
+                    position_qty[ticker] = 0
+                    self.cost_basis[ticker] = 0
+    
+    def clear_checkpoint(self):
+        """清除检查点，重新开始"""
+        self.cash = self.config['initial_cash_usd']
+        self.positions = {}
+        self.cost_basis = {}
+        self.equity_curve = []
+        self.trades_log = []
+        self.portfolio_snapshots = []
+        self.current_cycle = 0
+        self.peak_equity = self.cash
+        self.status = "READY"
     
     def get_market_data(self, ticker, period='1mo', interval='1d'):
         """获取市场数据"""
