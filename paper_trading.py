@@ -49,6 +49,12 @@ class MacroSignalAdapter:
         self.config = config
         self.macro_config = config.get('macro_integration', {})
         self.enabled = self.macro_config.get('enabled', False) and CHROMADB_AVAILABLE
+        self.quality_window = int(self.macro_config.get('quality_window', 50))
+        if self.quality_window <= 0:
+            self.quality_window = 50
+        self.theme_accuracy_history = {}
+        self.source_accuracy_history = {}
+        self.quality_seen_signal_ids = set()
         
         if not self.enabled:
             print("[MACRO] Macro integration disabled")
@@ -65,6 +71,125 @@ class MacroSignalAdapter:
         except Exception as e:
             print(f"[MACRO] ⚠️ Failed to connect to ChromaDB: {e}")
             self.enabled = False
+
+    def _extract_source_key(self, metadata):
+        """提取信号来源键（source/publisher/channel 等字段）。"""
+        source = (
+            metadata.get('source')
+            or metadata.get('source_name')
+            or metadata.get('publisher')
+            or metadata.get('channel')
+            or metadata.get('origin')
+            or 'unknown'
+        )
+        return str(source).strip().lower()
+
+    def _to_float_optional(self, value):
+        """将可选数值字段安全转换为 float（失败返回 None）。"""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_correct_flag(self, value):
+        """解析 correct_* 字段为 [0,1] 区间。"""
+        if value is None:
+            return None
+
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+
+        if isinstance(value, (int, float)):
+            return float(np.clip(value, 0.0, 1.0))
+
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ('true', 't', 'yes', 'y', '1'):
+                return 1.0
+            if text in ('false', 'f', 'no', 'n', '0'):
+                return 0.0
+            try:
+                return float(np.clip(float(text), 0.0, 1.0))
+            except ValueError:
+                return None
+
+        return None
+
+    def _append_rolling_accuracy(self, history_map, key, correct_value):
+        """向 rolling accuracy 序列追加样本并保留固定窗口。"""
+        if correct_value is None:
+            return
+
+        values = history_map.setdefault(key, [])
+        values.append(float(correct_value))
+
+        if len(values) > self.quality_window:
+            del values[:-self.quality_window]
+
+    def _update_quality_calibration(self, signals):
+        """读取 VERIFIED/correct_* 回填字段并更新 theme/source 的 accuracy。"""
+        summary = {
+            'verified_count': 0,
+            'with_correct_1d': 0,
+            'with_correct_4h': 0,
+            'with_return_1d': 0,
+            'new_quality_updates': 0
+        }
+
+        for signal in signals:
+            metadata = signal.get('metadata', {})
+            status = str(metadata.get('status', 'UNKNOWN')).upper()
+            correct_1d = self._parse_correct_flag(metadata.get('correct_1d'))
+            correct_4h = self._parse_correct_flag(metadata.get('correct_4h'))
+            return_1d = self._to_float_optional(metadata.get('return_1d'))
+
+            if status == 'VERIFIED':
+                summary['verified_count'] += 1
+            if correct_1d is not None:
+                summary['with_correct_1d'] += 1
+            if correct_4h is not None:
+                summary['with_correct_4h'] += 1
+            if return_1d is not None:
+                summary['with_return_1d'] += 1
+
+            signal_id = signal.get('id')
+            if signal_id is not None and signal_id in self.quality_seen_signal_ids:
+                continue
+
+            if signal_id is not None:
+                self.quality_seen_signal_ids.add(signal_id)
+
+            if correct_1d is None:
+                continue
+
+            theme_key = str(metadata.get('theme', 'unknown')).strip().lower()
+            source_key = self._extract_source_key(metadata)
+
+            self._append_rolling_accuracy(self.theme_accuracy_history, theme_key, correct_1d)
+            self._append_rolling_accuracy(self.source_accuracy_history, source_key, correct_1d)
+            summary['new_quality_updates'] += 1
+
+        return summary
+
+    def _get_accuracy_factor(self, theme, source):
+        """返回 accuracy_factor 以及采用的 rolling accuracy 信息。"""
+        theme_key = str(theme or 'unknown').strip().lower()
+        source_key = str(source or 'unknown').strip().lower()
+
+        if source_key in self.source_accuracy_history and self.source_accuracy_history[source_key]:
+            acc = float(np.mean(self.source_accuracy_history[source_key]))
+            scope = f"source:{source_key}"
+        elif theme_key in self.theme_accuracy_history and self.theme_accuracy_history[theme_key]:
+            acc = float(np.mean(self.theme_accuracy_history[theme_key]))
+            scope = f"theme:{theme_key}"
+        else:
+            acc = 0.5
+            scope = "default"
+
+        accuracy_factor = float(np.clip(0.7 + 0.6 * (acc - 0.5), 0.7, 1.3))
+        return accuracy_factor, acc, scope
     
     def fetch_recent_signals(self, n=50):
         """获取最近的 N 条信号（仅 PENDING 或 VERIFIED）"""
@@ -155,6 +280,9 @@ class MacroSignalAdapter:
         if not all_signals:
             print("[MACRO] No signals to analyze")
             return 0.0, [], {}, {}
+
+        # 先更新基于 VERIFIED/correct_* 的质量校准
+        quality_summary = self._update_quality_calibration(all_signals)
         
         # A1) 配置参数
         confirm_k, confirm_n = self.macro_config.get('confirm_k_of_n', [2, 3])
@@ -187,7 +315,12 @@ class MacroSignalAdapter:
                     'metadata': metadata,
                     'document': signal.get('document', ''),
                     'timestamp': timestamp_str,
-                    'age_hours': age_hours
+                    'age_hours': age_hours,
+                    'status': str(metadata.get('status', 'UNKNOWN')).upper(),
+                    'correct_1d': self._parse_correct_flag(metadata.get('correct_1d')),
+                    'correct_4h': self._parse_correct_flag(metadata.get('correct_4h')),
+                    'return_1d': self._to_float_optional(metadata.get('return_1d')),
+                    'source_key': self._extract_source_key(metadata)
                 })
                 
             except Exception as e:
@@ -233,22 +366,42 @@ class MacroSignalAdapter:
                 direction = metadata.get('direction', 'neutral').lower()
                 confidence = metadata.get('confidence', 50.0) / 100.0
                 age_hours = sig['age_hours']
+                theme_key = metadata.get('theme', theme)
+                source_key = sig.get('source_key', self._extract_source_key(metadata))
+                accuracy_factor, rolling_acc, accuracy_scope = self._get_accuracy_factor(theme_key, source_key)
+                confidence_effective = confidence * accuracy_factor
                 
                 if 'bullish' in direction or 'long' in direction:
                     bullish_count += 1
                     bullish_items.append({
                         'confidence': confidence,
+                        'confidence_effective': confidence_effective,
+                        'accuracy_factor': accuracy_factor,
+                        'rolling_accuracy': rolling_acc,
+                        'accuracy_scope': accuracy_scope,
                         'age_hours': age_hours,
                         'timestamp': sig['timestamp'],
-                        'document': sig['document']
+                        'document': sig['document'],
+                        'status': sig.get('status', 'UNKNOWN'),
+                        'correct_1d': sig.get('correct_1d'),
+                        'correct_4h': sig.get('correct_4h'),
+                        'return_1d': sig.get('return_1d')
                     })
                 elif 'bearish' in direction or 'short' in direction:
                     bearish_count += 1
                     bearish_items.append({
                         'confidence': confidence,
+                        'confidence_effective': confidence_effective,
+                        'accuracy_factor': accuracy_factor,
+                        'rolling_accuracy': rolling_acc,
+                        'accuracy_scope': accuracy_scope,
                         'age_hours': age_hours,
                         'timestamp': sig['timestamp'],
-                        'document': sig['document']
+                        'document': sig['document'],
+                        'status': sig.get('status', 'UNKNOWN'),
+                        'correct_1d': sig.get('correct_1d'),
+                        'correct_4h': sig.get('correct_4h'),
+                        'return_1d': sig.get('return_1d')
                     })
                 else:
                     neutral_count += 1
@@ -279,14 +432,20 @@ class MacroSignalAdapter:
             # A3) 确认后才计算强度（时间衰减）
             if confirmed_direction:
                 strength = 0.0
-                confidence_sum = 0.0
+                confidence_raw_sum = 0.0
+                confidence_effective_sum = 0.0
+                accuracy_factor_sum = 0.0
                 
                 for item in confirmed_items:
                     time_weight = np.exp(-decay_lambda * item['age_hours'])
-                    strength += item['confidence'] * time_weight
-                    confidence_sum += item['confidence']
+                    strength += item['confidence_effective'] * time_weight
+                    confidence_raw_sum += item['confidence']
+                    confidence_effective_sum += item['confidence_effective']
+                    accuracy_factor_sum += item['accuracy_factor']
                 
-                confidence_effective = confidence_sum / len(confirmed_items) if confirmed_items else 0.0
+                confidence_raw_avg = confidence_raw_sum / len(confirmed_items) if confirmed_items else 0.0
+                confidence_effective = confidence_effective_sum / len(confirmed_items) if confirmed_items else 0.0
+                accuracy_factor_avg = accuracy_factor_sum / len(confirmed_items) if confirmed_items else 1.0
                 
                 # 提取 top sources（最多3条）
                 top_sources = []
@@ -302,7 +461,9 @@ class MacroSignalAdapter:
                     'theme': theme,
                     'direction': confirmed_direction,
                     'strength': strength,
+                    'confidence_raw': confidence_raw_avg,
                     'confidence_effective': confidence_effective,
+                    'accuracy_factor': accuracy_factor_avg,
                     'top_sources': top_sources,
                     'newest_timestamp': newest_timestamp,
                     'count': len(confirmed_items)
@@ -312,7 +473,9 @@ class MacroSignalAdapter:
                 print(f"  [DEBUG] {theme}: direction={confirmed_direction}, "
                       f"count={bullish_count if confirmed_direction=='bullish' else bearish_count}/"
                       f"{bearish_count if confirmed_direction=='bullish' else bullish_count}, "
-                      f"strength={strength:.3f}, newest={newest_timestamp[:19]}")
+                      f"strength={strength:.3f}, conf_raw={confidence_raw_avg:.3f}, "
+                      f"conf_eff={confidence_effective:.3f}, acc_factor={accuracy_factor_avg:.3f}, "
+                      f"newest={newest_timestamp[:19]}")
         
         print("-" * 70)
         
@@ -370,7 +533,13 @@ class MacroSignalAdapter:
             'valid_signals_in_window': len(valid_signals),
             'themes_analyzed': len(theme_groups),
             'confirmed_topics': len(confirmed_topics),
-            'risk_score': risk_score
+            'risk_score': risk_score,
+            'quality_verified_count': quality_summary.get('verified_count', 0),
+            'quality_with_correct_1d': quality_summary.get('with_correct_1d', 0),
+            'quality_with_correct_4h': quality_summary.get('with_correct_4h', 0),
+            'quality_with_return_1d': quality_summary.get('with_return_1d', 0),
+            'quality_new_updates': quality_summary.get('new_quality_updates', 0),
+            'quality_window': self.quality_window
         }
         
         return risk_score, confirmed_topics, macro_tilts, signal_summary
