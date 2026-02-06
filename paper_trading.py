@@ -36,7 +36,7 @@ REAL_BROKER_KEYWORDS = ['alpaca', 'interactive_brokers', 'ib_insync', 'robinhood
 for keyword in REAL_BROKER_KEYWORDS:
     try:
         __import__(keyword)
-        raise RuntimeError(f"鈿狅笍 SAFETY VIOLATION: Detected real broker library '{keyword}'. Paper trading is SIMULATION ONLY!")
+        raise RuntimeError(f"[SAFETY] Violation: detected real broker library '{keyword}'. Paper trading is simulation only.")
     except ImportError:
         pass  # Good, no real broker library
 
@@ -413,19 +413,19 @@ class MacroSignalAdapter:
             if bullish_count >= confirm_k and bullish_count > bearish_count:
                 confirmed_direction = 'bullish'
                 confirmed_items = bullish_items
-                status = f"鉁?BULLISH ({bullish_count}/{len(signals_list)})"
+                status = f"[OK] BULLISH ({bullish_count}/{len(signals_list)})"
             elif bearish_count >= confirm_k and bearish_count > bullish_count:
                 confirmed_direction = 'bearish'
                 confirmed_items = bearish_items
-                status = f"鉁?BEARISH ({bearish_count}/{len(signals_list)})"
+                status = f"[OK] BEARISH ({bearish_count}/{len(signals_list)})"
             else:
                 # 鏈‘璁?
                 max_count = max(bullish_count, bearish_count)
                 needed = confirm_k - max_count
                 if needed > 0:
-                    status = f"鈴?NEED {needed} MORE"
+                    status = f"[WAIT] NEED {needed} MORE"
                 else:
-                    status = f"鈿栵笍 CONFLICTED ({bullish_count}v{bearish_count})"
+                    status = f"[WARN] CONFLICTED ({bullish_count}v{bearish_count})"
             
             print(f"{theme:<20} {bullish_count:>5} {bearish_count:>5} {neutral_count:>5} {status:<20}")
             
@@ -2732,7 +2732,7 @@ class PaperTradingEngine:
                 f.write(f"  State: {final_snapshot['regime_state'].upper()}")
                 
                 if final_snapshot.get('risk_caps_applied'):
-                    f.write(" 鈿狅笍 RISK CAPS ACTIVE\n")
+                    f.write(" [RISK CAPS ACTIVE]\n")
                 else:
                     f.write("\n")
                 
@@ -2760,9 +2760,9 @@ class PaperTradingEngine:
                 f.write(f"  Excess Return: {final_snapshot['excess_return']:.2%}")
                 
                 if final_snapshot['win_flag']:
-                    f.write(" 鉁?OUTPERFORM\n")
+                    f.write(" [OUTPERFORM]\n")
                 else:
-                    f.write(" 鉂?UNDERPERFORM\n")
+                    f.write(" [UNDERPERFORM]\n")
                 
                 f.write(f"  Benchmark Dispersion: {final_snapshot['bench_dispersion']:.2%}\n\n")
                 
@@ -2784,8 +2784,8 @@ class PaperTradingEngine:
             f.write(f"\nTotal Trades So Far: {len(self.trades_log)}\n")
             
             f.write("\n" + "="*60 + "\n")
-            f.write("鈿狅笍  LIVE DATA - Updates every cycle\n")
-            f.write("鈿狅笍  SIMULATION ONLY - NO REAL MONEY\n")
+            f.write("[LIVE] Updates every cycle\n")
+            f.write("[SIMULATION ONLY] NO REAL MONEY\n")
             f.write("="*60 + "\n")
         
         print(f"[OK] Live summary updated: {summary_path}")
@@ -2913,7 +2913,7 @@ class PaperTradingEngine:
                 if above_ma:
                     above_ma_count += 1
                 
-                status = "鉁?ABOVE" if above_ma else "鉂?BELOW"
+                status = "ABOVE" if above_ma else "BELOW"
                 print(f"[REGIME] {ticker}: ${latest_close:.2f} vs MA50 ${latest_ma50:.2f} {status}")
                 
             except Exception as e:
@@ -3007,9 +3007,9 @@ class PaperTradingEngine:
         print(f"Status: {snapshot['status']}")
 
         if snapshot.get('regime_state'):
-            regime_icon = "馃煝" if snapshot['regime_state'] == 'risk_on' else "馃煛" if snapshot['regime_state'] == 'neutral' else "馃敶"
-            risk_caps = " 鈿狅笍 RISK CAPS" if snapshot.get('risk_caps_applied') else ""
-            print(f"Market Regime: {regime_icon} {snapshot['regime_state'].upper()} (trend: {snapshot['trend_score']:.1%}){risk_caps}")
+            regime_flag = "RISK-ON" if snapshot['regime_state'] == 'risk_on' else "NEUTRAL" if snapshot['regime_state'] == 'neutral' else "RISK-OFF"
+            risk_caps = " [RISK CAPS]" if snapshot.get('risk_caps_applied') else ""
+            print(f"Market Regime: {regime_flag} (trend: {snapshot['trend_score']:.1%}){risk_caps}")
 
         if snapshot['positions']:
             print(f"\nCurrent Holdings:")
@@ -3026,10 +3026,10 @@ class PaperTradingEngine:
                 if cost_basis:
                     pnl = (current_price - cost_basis) / cost_basis * 100
                     pnl_str = f"{pnl:+.2f}%"
-                    pnl_color = "馃搱" if pnl > 0 else "馃搲" if pnl < 0 else "鉃★笍"
+                    pnl_color = "UP" if pnl > 0 else "DOWN" if pnl < 0 else "FLAT"
                 else:
                     pnl_str = "N/A"
-                    pnl_color = "鉃★笍"
+                    pnl_color = "NA"
 
                 print(f"{ticker:<8} {qty:>6} ${current_price:>9.2f} ${value:>11,.2f} {weight:>7.1f}% {pnl_color} {pnl_str:>8}")
 
@@ -3267,7 +3267,7 @@ class PaperTradingEngine:
                 f.write(f"  State: {final_snapshot['regime_state'].upper()}")
                 
                 if final_snapshot.get('risk_caps_applied'):
-                    f.write(" 鈿狅笍 RISK CAPS ACTIVE\n")
+                    f.write(" [RISK CAPS ACTIVE]\n")
                 else:
                     f.write("\n")
                 
@@ -3295,9 +3295,9 @@ class PaperTradingEngine:
                 f.write(f"  Excess Return: {final_snapshot['excess_return']:.2%}")
                 
                 if final_snapshot['win_flag']:
-                    f.write(" 鉁?OUTPERFORM\n")
+                    f.write(" [OUTPERFORM]\n")
                 else:
-                    f.write(" 鉂?UNDERPERFORM\n")
+                    f.write(" [UNDERPERFORM]\n")
                 
                 f.write(f"  Benchmark Dispersion: {final_snapshot['bench_dispersion']:.2%}\n\n")
                 
@@ -3324,8 +3324,8 @@ class PaperTradingEngine:
                 f.write(f"  Total Transaction Costs: ${total_cost:,.2f}\n")
             
             f.write("\n" + "="*60 + "\n")
-            f.write("鈿狅笍  SIMULATION ONLY - NO REAL MONEY\n")
-            f.write("鈿狅笍  Past performance does not guarantee future results\n")
+            f.write("[SIMULATION ONLY] NO REAL MONEY\n")
+            f.write("[DISCLAIMER] Past performance does not guarantee future results\n")
             f.write("="*60 + "\n")
         
         print(f"[OK] Summary report saved: {report_path}")
