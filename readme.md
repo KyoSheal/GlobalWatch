@@ -33,6 +33,8 @@ By combining **Live RSS Feeds** (Reuters, CNBC, BBC) with **Local Large Language
   - Cooldown protection (12-hour minimum between rebalances)
   - Weight threshold filtering (2.5% minimum change)
   - Minimum notional filtering ($400 minimum trade size)
+  - Turnover cap (20% max portfolio turnover per rebalance)
+  - Price freshness checks (STALE price protection)
   - Max drawdown limits, position sizing, transaction costs
 - **Comprehensive Reporting**: 
   - Benchmark comparison (vs QQQ, SPY, VTI, DIA)
@@ -58,18 +60,36 @@ By combining **Live RSS Feeds** (Reuters, CNBC, BBC) with **Local Large Language
 - **Time-Decay Weighting**: Applied after confirmation for strength calculation only
 - **Theme Voting**: Aggregates signals by theme (oil_bullish, risk_off, usd_strong, etc.)
 - **Risk Scoring**: 0-10 scale, higher = more risk-off
-- **Asset Tilts**: Applies macro-driven weight adjustments (±2% max per asset)
-- **Cash Adjustment**: Increases cash allocation based on macro risk score
+- **Signal Smoothing**: Median or EWMA smoothing over last 3 cycles to prevent whipsaws
+- **Macro Cooldown**: 2-cycle cooldown after significant cash target changes (>5%)
+- **Asset Tilts**: Applies macro-driven weight adjustments (±2% max per asset, universe-filtered)
+- **Cash Adjustment**: Increases cash allocation based on smoothed macro risk score
 
 ### 📝 Trade Reasoning Logs
 Every trade now includes complete context:
 - **Regime State**: Market condition at trade time
 - **Trend Score**: % of indices above MA50
 - **Cash Target**: Dynamic minimum cash requirement
-- **Macro Risk Score**: GlobalWatch risk assessment (0-10)
+- **Macro Risk Score**: GlobalWatch risk assessment (0-10, smoothed)
 - **Macro Topics**: Confirmed themes (e.g., "oil_bullish:bullish; risk_off:bearish")
 - **Macro Tilts**: Active asset tilts (e.g., "XOM:+2.00%; TLT:+2.00%")
-- **Decision Trace**: Execution path (e.g., "cooldown_pass | weight_threshold_pass | min_notional_pass | macro_tilt_+2.00% | risk_on_add-risk")
+- **Price Status**: Data freshness (LIVE/RECENT/STALE) and age in minutes
+- **Decision Trace**: Execution path (e.g., "cooldown_pass | weight_threshold_pass | min_notional_pass | stale_check_pass | turnover_cap_scale_85% | macro_tilt_+2.00% | risk_on_add-risk")
+
+### 🛡️ Five-Layer Protection System
+The paper trading engine implements five critical protection layers to prevent execution errors:
+
+1. **Cooldown Protection**: Minimum 12-hour interval between rebalances to prevent overtrading
+2. **Weight Threshold Filter**: Only trades positions with ≥2.5% weight change to reduce noise
+3. **Minimum Notional Filter**: Enforces $400 minimum trade size to avoid dust trades
+4. **Turnover Cap**: Limits total portfolio turnover to 20% per rebalance, scales down trades proportionally if exceeded
+5. **Price Freshness Guard**: 
+   - Blocks BUY orders on STALE prices (any age)
+   - Allows SELL orders on STALE prices (risk reduction)
+   - Aborts entire rebalance if >30% of candidate tickers have STALE prices
+   - Skips individual tickers if price age >60 minutes
+
+All protection triggers are logged in decision_trace for full transparency.
 
 ### 🚨 Early-Warning Risk Scoring System
 - **Universal Risk Monitor**: Tracks risk levels for any asset (Gold, Oil, CNY, CAD, etc.)
@@ -579,27 +599,64 @@ python -u paper_trading.py paper_config.json
   - Regime Filter enabled (MA50 trend analysis)
   - Macro Integration enabled (GlobalWatch ChromaDB)
   - Benchmark comparison (QQQ, SPY, VTI, DIA)
-  - Advanced execution controls (cooldown, thresholds, notional limits)
+  - Five-layer protection system (cooldown, weight threshold, min notional, turnover cap, price freshness)
+  - Macro signal smoothing (median over 3 cycles) and cooldown (2 cycles)
+  - Price freshness controls (60-min skip threshold, 30% STALE abort ratio)
 - **`paper_config_quick_test.json`**: 1-hour quick test (6 assets, $20,000 initial capital)
+
+### Key Configuration Parameters
+**Execution Controls**:
+- `rebalance_cooldown_minutes`: 720 (12 hours between rebalances)
+- `weight_threshold`: 0.025 (2.5% minimum weight change)
+- `min_trade_notional_usd`: 400 (minimum trade size)
+- `max_turnover_pct_per_rebalance`: 0.20 (20% max portfolio turnover)
+- `stale_price_skip_minutes`: 60 (skip trades if price >60 min old)
+- `stale_abort_ratio`: 0.5 (abort if >50% of prices STALE)
+- `max_stale_ratio`: 0.3 (abort if >30% of candidates STALE)
+
+**Macro Integration**:
+- `confirm_k_of_n`: [2, 3] (require 2 of last 3 signals same direction)
+- `signal_max_age_hours`: 48 (only use signals <48 hours old)
+- `decay_lambda_per_hour`: 0.15 (time decay for strength calculation)
+- `macro_cash_slope`: 0.02 (2% cash increase per risk score point)
+- `tilt_max_delta`: 0.02 (±2% max tilt per asset)
+- `smoothing_window`: 3 (median over last 3 risk scores)
+- `smoothing_method`: "median" (or "ewma")
+- `ewma_alpha`: 0.4 (EWMA smoothing parameter)
+- `cooldown_cycles`: 2 (freeze cash target for 2 cycles after >5% change)
 
 ### Paper Trading Output Files
 - **`outputs/paper_summary_live.txt`**: Real-time summary (updates every cycle)
   - Current performance metrics
   - Market regime state
-  - Macro signals from GlobalWatch
+  - Macro signals from GlobalWatch (smoothed risk score)
   - Benchmark comparison
   - Current holdings
 - **`outputs/paper_summary.txt`**: Final report after completion
 - **`outputs/paper_trades.csv`**: Complete trade log with reasoning
   - Columns: timestamp, ticker, side, quantity, price, cost, reason
-  - **New columns**: regime_state, trend_score, cash_target, macro_risk_score, macro_topics, macro_tilts, decision_trace
+  - **Context fields**: regime_state, trend_score, cash_target, macro_risk_score, macro_topics, macro_tilts
+  - **Protection fields**: decision_trace, price_age_minutes, price_status
 - **`outputs/portfolio_snapshots.jsonl`**: Detailed snapshots (one per cycle)
+  - **New fields**: stale_count, stale_ratio, price_stale_skip, turnover_notional, turnover_limit, turnover_scale, turnover_capped
+  - **Macro fields**: macro_risk_score_smoothed, macro_tilts_ignored, macro_cooldown_remaining
 - **`outputs/equity_curve.png`**: Visual performance chart
+
+### Engine Version Fingerprint
+The paper trading engine prints a version fingerprint at startup:
+- **ENGINE_VERSION**: v2.5-ABCDEF-2026-02-05
+- **HAS_MACRO_SMOOTH**: True (macro signal smoothing enabled)
+- **PRICE_API_RETURNS_TUPLE**: True (price freshness tracking)
+- **HAS_STALE_PRICE_SKIP**: True (STALE price protection)
+- **HAS_TURNOVER_CAP**: True (turnover limiting)
+- **HAS_MACRO_COOLDOWN**: True (macro cooldown mechanism)
+- **HAS_REGIME_FILTER**: True (MA50 regime detection)
+- **HAS_MACRO_INTEGRATION**: True (GlobalWatch integration)
 
 ### Example Trade Log Entry
 ```csv
-timestamp,ticker,side,quantity,price,cost,reason,regime_state,trend_score,cash_target,macro_risk_score,macro_topics,macro_tilts,decision_trace
-2026-02-05T10:30:00,XOM,BUY,15,146.50,1.10,rebalance,risk_on,0.75,0.10,3.2,oil_bullish:bullish,XOM:+2.00%; TLT:+2.00%,cooldown_pass | weight_threshold_pass | min_notional_pass | macro_tilt_+2.00% | risk_on_add-risk
+timestamp,ticker,side,quantity,price,cost,reason,regime_state,trend_score,cash_target,macro_risk_score,macro_topics,macro_tilts,decision_trace,price_age_minutes,price_status
+2026-02-05T10:30:00,XOM,BUY,15,146.50,1.10,rebalance,risk_on,0.75,0.10,3.2,oil_bullish:bullish,XOM:+2.00%; TLT:+2.00%,cooldown_pass | weight_threshold_pass | min_notional_pass | stale_check_pass | turnover_cap_scale_92% | macro_tilt_+2.00% | risk_on_add-risk,2.5,LIVE
 ```
 
 ## 🤝 Contributing
