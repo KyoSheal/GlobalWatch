@@ -673,6 +673,8 @@ class PaperTradingEngine:
         execution_config.setdefault('macro_refresh_minutes', 60)
         execution_config.setdefault('max_stale_ratio', 0.3)
         execution_config.setdefault('circuit_breaker_forced_days', 1)
+        execution_config.setdefault('fill_gap_max', 0.03)
+        execution_config.setdefault('fill_gap_max_iters', 2)
         stale_policy = execution_config.setdefault('price_stale_policy', {})
         stale_policy.setdefault('allow_buy', ['LIVE', 'RECENT'])
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
@@ -690,6 +692,8 @@ class PaperTradingEngine:
         assert self.config.get('execution', {}).get('macro_refresh_minutes', 60) > 0, "execution.macro_refresh_minutes must be > 0"
         assert self.config.get('execution', {}).get('max_stale_ratio', 0.3) >= 0, "execution.max_stale_ratio must be >= 0"
         assert self.config.get('execution', {}).get('circuit_breaker_forced_days', 1) > 0, "execution.circuit_breaker_forced_days must be > 0"
+        assert self.config.get('execution', {}).get('fill_gap_max', 0.03) >= 0, "execution.fill_gap_max must be >= 0"
+        assert int(self.config.get('execution', {}).get('fill_gap_max_iters', 2)) >= 1, "execution.fill_gap_max_iters must be >= 1"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         
@@ -979,6 +983,10 @@ class PaperTradingEngine:
             'max_weight_per_asset_effective': self.cached_macro.get(
                 'max_weight_per_asset_effective',
                 self.current_macro.get('max_weight_per_asset_effective', {}) if isinstance(self.current_macro, dict) else {}
+            ),
+            'allocation_diagnostics': self.cached_macro.get(
+                'allocation_diagnostics',
+                self.current_macro.get('allocation_diagnostics', {}) if isinstance(self.current_macro, dict) else {}
             )
         }
 
@@ -1040,10 +1048,24 @@ class PaperTradingEngine:
     def calculate_target_weights(self):
         """计算目标权重：风险雷达（现金）+ 趋势放大器（tilt/上限）"""
 
-        def _apply_caps_and_normalize(weights_map, cap_map, invested_budget):
-            """先裁剪到上限；仅当超出 invested_budget 时做归一化下调。"""
+        def _apply_caps_and_normalize(weights_map, cap_map, invested_budget, fill_gap_max, fill_gap_max_iters, score_map):
+            """先裁剪、仅超预算下调；小缺口时可在 headroom 内软补足。"""
             weights = {k: max(0.0, float(v)) for k, v in weights_map.items() if float(v) > 0}
             capped = set()
+            diagnostics = {
+                'invested_budget': float(max(0.0, invested_budget)),
+                'total_before_caps': float(sum(weights.values())),
+                'total_after_caps': 0.0,
+                'downscaled': False,
+                'downscale_factor': 1.0,
+                'remaining_gap': 0.0,
+                'fill_gap_max': float(max(0.0, fill_gap_max)),
+                'fill_applied': False,
+                'fill_amount': 0.0,
+                'fill_reason': 'no_gap',
+                'fill_remaining_end': 0.0,
+                'capped_assets': []
+            }
 
             for ticker in list(weights.keys()):
                 cap = float(cap_map.get(ticker, 1.0))
@@ -1052,16 +1074,96 @@ class PaperTradingEngine:
                     capped.add(ticker)
 
             total = sum(weights.values())
+            diagnostics['total_after_caps'] = float(total)
+            diagnostics['capped_assets'] = sorted(capped)
             if total <= 0 or invested_budget <= 0:
-                return {}, sorted(capped)
+                diagnostics['remaining_gap'] = float(max(0.0, invested_budget))
+                diagnostics['fill_reason'] = 'no_weights'
+                diagnostics['fill_remaining_end'] = diagnostics['remaining_gap']
+                return {}, diagnostics
 
             if total > invested_budget:
                 scale = invested_budget / total
                 for ticker in list(weights.keys()):
                     weights[ticker] *= scale
-                return {k: v for k, v in weights.items() if v > 1e-10}, sorted(capped)
+                diagnostics['downscaled'] = True
+                diagnostics['downscale_factor'] = float(scale)
 
-            return {k: v for k, v in weights.items() if v > 1e-10}, sorted(capped)
+            # Small gap fill: only if gap is small, and never force-buy large gaps
+            total = sum(weights.values())
+            remaining = max(0.0, invested_budget - total)
+            diagnostics['remaining_gap'] = float(remaining)
+
+            if remaining <= 1e-10:
+                diagnostics['fill_reason'] = 'no_gap'
+            elif remaining > fill_gap_max:
+                diagnostics['fill_reason'] = 'gap_too_large'
+            else:
+                fill_amount = 0.0
+                fill_reason = 'filled'
+                max_iters = max(1, int(fill_gap_max_iters))
+                for _ in range(max_iters):
+                    total_now = sum(weights.values())
+                    remaining_now = max(0.0, invested_budget - total_now)
+                    if remaining_now <= 1e-10:
+                        break
+
+                    headroom = {
+                        k: max(0.0, float(cap_map.get(k, 1.0)) - weights.get(k, 0.0))
+                        for k in cap_map.keys()
+                    }
+                    headroom = {k: h for k, h in headroom.items() if h > 1e-10}
+                    if not headroom:
+                        fill_reason = 'no_headroom'
+                        break
+
+                    # 优先按当前权重比例补足；若当前权重全为0则按 score 比例；再退化为均匀分配
+                    base_sum = sum(weights.get(k, 0.0) for k in headroom.keys())
+                    if base_sum > 1e-12:
+                        ratios = {k: weights.get(k, 0.0) / base_sum for k in headroom.keys()}
+                    else:
+                        score_sum = sum(max(0.0, float(score_map.get(k, 0.0))) for k in headroom.keys())
+                        if score_sum > 1e-12:
+                            ratios = {k: max(0.0, float(score_map.get(k, 0.0))) / score_sum for k in headroom.keys()}
+                        else:
+                            eq = 1.0 / len(headroom)
+                            ratios = {k: eq for k in headroom.keys()}
+
+                    proposal = {k: remaining_now * ratios[k] for k in headroom.keys()}
+                    alloc = {k: min(proposal[k], headroom[k]) for k in headroom.keys()}
+                    used = sum(alloc.values())
+                    if used <= 1e-10:
+                        fill_reason = 'no_allocatable_headroom'
+                        break
+
+                    for k, a in alloc.items():
+                        if a > 0:
+                            weights[k] = weights.get(k, 0.0) + a
+                            if abs(float(cap_map.get(k, 1.0)) - weights[k]) <= 1e-10:
+                                capped.add(k)
+
+                    fill_amount += used
+
+                diagnostics['fill_applied'] = fill_amount > 1e-10
+                diagnostics['fill_amount'] = float(fill_amount)
+                diagnostics['fill_reason'] = fill_reason
+                diagnostics['capped_assets'] = sorted(capped)
+
+            # Safety: never exceed invested_budget
+            final_total = sum(weights.values())
+            if final_total > invested_budget + 1e-9:
+                safety_scale = invested_budget / final_total if final_total > 0 else 1.0
+                for ticker in list(weights.keys()):
+                    weights[ticker] *= safety_scale
+                final_total = sum(weights.values())
+                diagnostics['downscaled'] = True
+                diagnostics['downscale_factor'] = float(diagnostics['downscale_factor'] * safety_scale)
+
+            diagnostics['remaining_gap'] = float(max(0.0, invested_budget - final_total))
+            diagnostics['fill_remaining_end'] = diagnostics['remaining_gap']
+            diagnostics['capped_assets'] = sorted(capped)
+
+            return {k: v for k, v in weights.items() if v > 1e-10}, diagnostics
 
         # ========== 步骤1: Regime 基线 ==========
         regime_state, trend_score, regime_details, base_cash_from_regime, base_max_weight = self.compute_regime_state()
@@ -1160,6 +1262,9 @@ class PaperTradingEngine:
         vol_target = strategy['vol_target']
         momentum_weight = strategy['momentum_weight']
         vol_weight = strategy['vol_weight']
+        execution_cfg = self.config.get('execution', {})
+        fill_gap_max = float(execution_cfg.get('fill_gap_max', 0.03))
+        fill_gap_max_iters = int(execution_cfg.get('fill_gap_max_iters', 2))
 
         asset_scores = {}
 
@@ -1224,8 +1329,17 @@ class PaperTradingEngine:
             tilt_delta = float(np.clip(applied_tilts.get(ticker, 0.0), -tilt_max_delta, tilt_max_delta))
             max_weight_effective[ticker] = float(np.clip(base_max_weight + tilt_delta, 0.0, 1.0))
 
-        # 再应用“上限裁剪 + 归一化”
-        adjusted_weights, capped_assets = _apply_caps_and_normalize(scaled_weights, max_weight_effective, invested_budget)
+        # 再应用“上限裁剪 + 下调 + 小缺口软补足”
+        score_map = {k: max(0.0, float(v['score'])) for k, v in positive_assets.items()}
+        adjusted_weights, alloc_diag = _apply_caps_and_normalize(
+            scaled_weights,
+            max_weight_effective,
+            invested_budget,
+            fill_gap_max,
+            fill_gap_max_iters,
+            score_map
+        )
+        capped_assets = alloc_diag.get('capped_assets', [])
 
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))
         adjusted_weights['CASH'] = cash_weight
@@ -1236,11 +1350,19 @@ class PaperTradingEngine:
         self.current_macro['capped_assets'] = list(capped_assets)
         self.current_macro['max_weight_per_asset_effective'] = dict(max_weight_effective)
         self.current_macro['cash_target'] = cash_target
+        self.current_macro['allocation_diagnostics'] = dict(alloc_diag)
 
         self.current_regime['dynamic_max_weight'] = base_max_weight
         self.current_regime['cash_target'] = cash_target
         self.current_regime['max_weight_per_asset_effective'] = dict(max_weight_effective)
         self.current_regime['capped_assets'] = list(capped_assets)
+        self.current_regime['allocation_diagnostics'] = dict(alloc_diag)
+
+        print(f"[ALLOC] budget={alloc_diag['invested_budget']:.2%}, before_caps={alloc_diag['total_before_caps']:.2%}, "
+              f"after_caps={alloc_diag['total_after_caps']:.2%}, downscaled={alloc_diag['downscaled']}, "
+              f"scale={alloc_diag['downscale_factor']:.6f}, gap={alloc_diag['remaining_gap']:.2%}, "
+              f"fill_applied={alloc_diag['fill_applied']}, fill_amount={alloc_diag['fill_amount']:.2%}, "
+              f"fill_reason={alloc_diag['fill_reason']}")
 
         return adjusted_weights
 
@@ -1263,6 +1385,19 @@ class PaperTradingEngine:
         
         # ========== 准备交易上下文信息 ==========
         trade_context = self._build_trade_context()
+        alloc_trace = [
+            f"alloc_budget_{trade_context.get('invested_budget', 0.0):.2%}",
+            f"alloc_before_caps_{trade_context.get('total_before_caps', 0.0):.2%}",
+            f"alloc_after_caps_{trade_context.get('total_after_caps', 0.0):.2%}",
+            f"alloc_downscaled_{str(bool(trade_context.get('downscaled', False))).lower()}",
+            f"alloc_scale_{float(trade_context.get('downscale_factor', 1.0)):.6f}",
+            f"alloc_gap_{trade_context.get('remaining_gap', 0.0):.2%}",
+            f"alloc_fill_gap_max_{trade_context.get('fill_gap_max', 0.0):.2%}",
+            f"alloc_fill_applied_{str(bool(trade_context.get('fill_applied', False))).lower()}",
+            f"alloc_fill_amount_{trade_context.get('fill_amount', 0.0):.2%}",
+            f"alloc_fill_reason_{str(trade_context.get('fill_reason', 'na'))}",
+            f"alloc_capped_{','.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else 'none'}"
+        ]
         
         # ========== 保护器 1: Cooldown 检查 ==========
         execution_config = self.config.get('execution', {})
@@ -1549,6 +1684,7 @@ class PaperTradingEngine:
                 decision_trace.append(f'turnover_cap_scale_{turnover_scale:.2%}')
             if trade_context['regime_state'] in ('risk_off', 'risk_off_forced'):
                 decision_trace.append('risk_off_de-risk')
+            decision_trace.extend(alloc_trace)
             
             # 构建完整的交易记录
             trades.append({
@@ -1634,6 +1770,7 @@ class PaperTradingEngine:
                 decision_trace.append('risk_on_add-risk')
             if total_required >= cash_before_trade * 0.99:
                 decision_trace.append('cash_limited')
+            decision_trace.extend(alloc_trace)
             
             # 构建完整的交易记录
             trades.append({
@@ -1668,6 +1805,18 @@ class PaperTradingEngine:
             trade['turnover_limit'] = turnover_limit
             trade['turnover_scale'] = turnover_scale
             trade['turnover_capped'] = turnover_capped
+            trade['invested_budget'] = trade_context.get('invested_budget', 0.0)
+            trade['total_before_caps'] = trade_context.get('total_before_caps', 0.0)
+            trade['total_after_caps'] = trade_context.get('total_after_caps', 0.0)
+            trade['downscaled'] = trade_context.get('downscaled', False)
+            trade['downscale_factor'] = trade_context.get('downscale_factor', 1.0)
+            trade['remaining_gap'] = trade_context.get('remaining_gap', 0.0)
+            trade['fill_gap_max'] = trade_context.get('fill_gap_max', self.config.get('execution', {}).get('fill_gap_max', 0.03))
+            trade['fill_applied'] = trade_context.get('fill_applied', False)
+            trade['fill_amount'] = trade_context.get('fill_amount', 0.0)
+            trade['fill_reason'] = trade_context.get('fill_reason', '')
+            trade['fill_remaining_end'] = trade_context.get('fill_remaining_end', trade_context.get('remaining_gap', 0.0))
+            trade['capped_assets'] = ';'.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else ''
         
         # ========== 更新交易记录和 cooldown 时间 ==========
         if trades:
@@ -1692,6 +1841,7 @@ class PaperTradingEngine:
         macro_risk_score_smoothed = self.current_macro.get('macro_risk_score_smoothed', 0.0)
         confirmed_topics = self.current_macro.get('confirmed_topics', [])
         macro_tilts = self.current_macro.get('applied_tilts', self.current_macro.get('macro_tilts', {}))
+        alloc_diag = self.current_regime.get('allocation_diagnostics', self.current_macro.get('allocation_diagnostics', {}))
         
         # 格式化 macro_topics 为字符串
         if confirmed_topics:
@@ -1713,7 +1863,19 @@ class PaperTradingEngine:
             'macro_risk_score_raw': macro_risk_score_raw,  # 保留原始值
             'macro_topics': topics_str,
             'macro_tilts': tilts_str,
-            'macro_tilts_dict': macro_tilts  # 保留字典格式供内部使用
+            'macro_tilts_dict': macro_tilts,  # 保留字典格式供内部使用
+            'invested_budget': alloc_diag.get('invested_budget', 0.0),
+            'total_before_caps': alloc_diag.get('total_before_caps', 0.0),
+            'total_after_caps': alloc_diag.get('total_after_caps', 0.0),
+            'downscaled': alloc_diag.get('downscaled', False),
+            'downscale_factor': alloc_diag.get('downscale_factor', 1.0),
+            'remaining_gap': alloc_diag.get('remaining_gap', 0.0),
+            'fill_gap_max': alloc_diag.get('fill_gap_max', self.config.get('execution', {}).get('fill_gap_max', 0.03)),
+            'fill_applied': alloc_diag.get('fill_applied', False),
+            'fill_amount': alloc_diag.get('fill_amount', 0.0),
+            'fill_reason': alloc_diag.get('fill_reason', 'na'),
+            'fill_remaining_end': alloc_diag.get('fill_remaining_end', alloc_diag.get('remaining_gap', 0.0)),
+            'capped_assets': alloc_diag.get('capped_assets', self.current_regime.get('capped_assets', []))
         }
 
     def _compute_position_score_for_derisk(self, ticker):
@@ -2045,6 +2207,17 @@ class PaperTradingEngine:
             'macro_tilts': self.current_macro.get('macro_tilts', {}),
             'applied_tilts': self.current_macro.get('applied_tilts', {}),
             'capped_assets': self.current_macro.get('capped_assets', []),
+            'invested_budget': self.current_regime.get('allocation_diagnostics', {}).get('invested_budget', 0.0),
+            'total_before_caps': self.current_regime.get('allocation_diagnostics', {}).get('total_before_caps', 0.0),
+            'total_after_caps': self.current_regime.get('allocation_diagnostics', {}).get('total_after_caps', 0.0),
+            'downscaled': self.current_regime.get('allocation_diagnostics', {}).get('downscaled', False),
+            'downscale_factor': self.current_regime.get('allocation_diagnostics', {}).get('downscale_factor', 1.0),
+            'remaining_gap': self.current_regime.get('allocation_diagnostics', {}).get('remaining_gap', 0.0),
+            'fill_gap_max': self.current_regime.get('allocation_diagnostics', {}).get('fill_gap_max', self.config.get('execution', {}).get('fill_gap_max', 0.03)),
+            'fill_applied': self.current_regime.get('allocation_diagnostics', {}).get('fill_applied', False),
+            'fill_amount': self.current_regime.get('allocation_diagnostics', {}).get('fill_amount', 0.0),
+            'fill_reason': self.current_regime.get('allocation_diagnostics', {}).get('fill_reason', ''),
+            'fill_remaining_end': self.current_regime.get('allocation_diagnostics', {}).get('fill_remaining_end', 0.0),
             'macro_tilts_ignored': self.current_macro.get('macro_tilts_ignored', {}),  # E3) 被忽略的 tilts
             'macro_cooldown_remaining': self.macro_cooldown_remaining,  # E2) 冷却剩余周期
             # B3) Price Staleness 字段

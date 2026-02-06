@@ -127,6 +127,8 @@
     "stale_price_skip_minutes": 60,
     "stale_abort_ratio": 0.5,
     "max_stale_ratio": 0.3,
+    "fill_gap_max": 0.03,
+    "fill_gap_max_iters": 2,
     "price_stale_policy": {
       "allow_buy": ["LIVE", "RECENT"],
       "allow_sell": ["LIVE", "RECENT", "STALE"]
