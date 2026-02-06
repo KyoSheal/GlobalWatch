@@ -434,6 +434,7 @@ class PaperTradingEngine:
         self.last_rebalance_time = None  # 用于 cooldown 检查
         self.current_regime = {}  # 当前市场状态（Regime Filter）
         self.current_macro = {}  # 当前宏观信号（Macro Integration）
+        self.current_stale_info = {}  # B3) 当前价格新鲜度信息
         
         # 价格缓存（避免重复请求）
         self.price_cache = {}  # {ticker: (price, timestamp)}
@@ -628,29 +629,43 @@ class PaperTradingEngine:
             return None
 
     def get_current_price(self, ticker):
-        """获取当前价格（实时或最新）- 强制刷新，避免缓存"""
+        """获取当前价格（实时或最新）
+        
+        B1) 返回三元组：(price, data_age_minutes, market_status)
+        - market_status ∈ {"LIVE", "RECENT", "STALE"}
+        - data_age_minutes: 数据时间戳与 now 的分钟差
+        - 若无法获取时间戳，market_status = "STALE", data_age_minutes = 99999
+        
+        Returns:
+            (price, data_age_minutes, market_status) or (None, 99999, "STALE")
+        """
         if ticker == 'CASH':
-            return 1.0
+            return (1.0, 0, "LIVE")
         
         try:
+            import pytz
+            now_et = datetime.now(pytz.timezone('US/Eastern'))
+            
             # 创建新的 Ticker 对象，避免缓存
             t = yf.Ticker(ticker)
             
-            # 方法1: 尝试获取最新的分钟级数据（最可靠）
+            # 方法1: 尝试获取最新的分钟级数据（5m 间隔）
             try:
-                # 使用 5m 间隔，period='1d' 获取今天的数据
                 hist = t.history(period='1d', interval='5m')
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
                     timestamp = hist.index[-1]
-                    # 计算数据延迟
-                    import pytz
-                    now_et = datetime.now(pytz.timezone('US/Eastern'))
                     data_age_minutes = (now_et - timestamp).total_seconds() / 60
                     
-                    market_status = "🟢 LIVE" if data_age_minutes < 10 else "🟡 RECENT" if data_age_minutes < 60 else "🔴 STALE"
+                    if data_age_minutes < 10:
+                        market_status = "LIVE"
+                    elif data_age_minutes < 60:
+                        market_status = "RECENT"
+                    else:
+                        market_status = "STALE"
+                    
                     print(f"[PRICE] {ticker}: ${price:.2f} (5m @ {timestamp.strftime('%H:%M ET')}, {data_age_minutes:.0f}min ago) {market_status}")
-                    return price
+                    return (price, data_age_minutes, market_status)
             except Exception as e:
                 print(f"[PRICE] {ticker}: 5m history failed - {e}")
             
@@ -660,42 +675,49 @@ class PaperTradingEngine:
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
                     timestamp = hist.index[-1]
-                    import pytz
-                    now_et = datetime.now(pytz.timezone('US/Eastern'))
                     data_age_minutes = (now_et - timestamp).total_seconds() / 60
-                    market_status = "🟢 LIVE" if data_age_minutes < 5 else "🟡 RECENT" if data_age_minutes < 60 else "🔴 STALE"
+                    
+                    if data_age_minutes < 5:
+                        market_status = "LIVE"
+                    elif data_age_minutes < 60:
+                        market_status = "RECENT"
+                    else:
+                        market_status = "STALE"
+                    
                     print(f"[PRICE] {ticker}: ${price:.2f} (1m @ {timestamp.strftime('%H:%M ET')}, {data_age_minutes:.0f}min ago) {market_status}")
-                    return price
+                    return (price, data_age_minutes, market_status)
             except Exception as e:
                 print(f"[PRICE] {ticker}: 1m history failed - {e}")
             
-            # 方法3: 尝试 info（可能有缓存）
+            # 方法3: 尝试 info（无时间戳，视为 STALE）
             try:
                 info = t.info
                 for price_field in ['currentPrice', 'regularMarketPrice', 'ask', 'bid']:
                     if price_field in info and info[price_field]:
                         price = float(info[price_field])
                         if price > 0:
-                            print(f"[PRICE] {ticker}: ${price:.2f} (from info.{price_field})")
-                            return price
+                            print(f"[PRICE] {ticker}: ${price:.2f} (from info.{price_field}) STALE (no timestamp)")
+                            return (price, 99999, "STALE")
             except Exception as e:
                 print(f"[PRICE] {ticker}: info failed - {e}")
             
-            # 方法4: 降级到日线数据（最后手段）
+            # 方法4: 降级到日线数据（视为 STALE）
             try:
                 hist = t.history(period='5d', interval='1d')
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
                     date = hist.index[-1]
-                    print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {date.strftime('%Y-%m-%d')}) ⚠️ NOT REAL-TIME")
-                    return price
+                    # 计算日线数据的年龄
+                    data_age_minutes = (now_et - date).total_seconds() / 60
+                    print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {date.strftime('%Y-%m-%d')}, {data_age_minutes:.0f}min ago) STALE")
+                    return (price, data_age_minutes, "STALE")
             except Exception as e:
                 print(f"[PRICE] {ticker}: daily history failed - {e}")
                 
         except Exception as e:
             print(f"[ERROR] All price methods failed for {ticker}: {e}")
         
-        return None
+        return (None, 99999, "STALE")
     
     def calculate_momentum(self, ticker, lookback_days=20):
         """计算动量指标"""
@@ -846,7 +868,12 @@ class PaperTradingEngine:
         return adjusted_weights
 
     def execute_rebalance(self, target_weights):
-        """执行再平衡 - 带三大保护器：cooldown / weight_threshold / min_notional"""
+        """执行再平衡 - 带四大保护器：cooldown / weight_threshold / min_notional / stale_price_skip
+        
+        B2) 在交易前检查所有候选 ticker 的价格新鲜度
+        B3) 记录 stale_count / stale_ratio / price_stale_skip
+        B4) 不会用 STALE 价格产生订单
+        """
         
         # ========== 准备交易上下文信息 ==========
         trade_context = self._build_trade_context()
@@ -862,24 +889,71 @@ class PaperTradingEngine:
                 print(f"[COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
                 return []
         
-        # ========== 获取当前价格和持仓价值 ==========
-        current_prices = {}
+        # ========== B2) 获取所有价格并检查新鲜度 ==========
+        stale_price_skip_minutes = execution_config.get('stale_price_skip_minutes', 60)
+        stale_abort_ratio = execution_config.get('stale_abort_ratio', 0.5)
+        
+        price_info = {}  # {ticker: (price, data_age_minutes, market_status)}
+        
+        # 获取当前持仓的价格
+        for ticker in self.positions.keys():
+            price, age, status = self.get_current_price(ticker)
+            if price is not None:
+                price_info[ticker] = (price, age, status)
+        
+        # 获取目标权重中的价格
+        for ticker in target_weights.keys():
+            if ticker == 'CASH' or ticker in price_info:
+                continue
+            price, age, status = self.get_current_price(ticker)
+            if price is not None:
+                price_info[ticker] = (price, age, status)
+        
+        # B2) 统计 STALE 价格比例
+        stale_count = 0
+        total_count = len(price_info)
+        
+        for ticker, (price, age, status) in price_info.items():
+            if status == "STALE" and age > stale_price_skip_minutes:
+                stale_count += 1
+        
+        stale_ratio = stale_count / total_count if total_count > 0 else 0
+        
+        print(f"\n[PRICE CHECK] Total tickers: {total_count}, STALE: {stale_count}, Ratio: {stale_ratio:.1%}")
+        
+        # B2) 如果 STALE 比例过高，本轮不交易
+        if stale_ratio > stale_abort_ratio:
+            print(f"[STALE ABORT] STALE ratio {stale_ratio:.1%} > threshold {stale_abort_ratio:.1%}, skipping rebalance")
+            # B3) 记录到 snapshot
+            self.current_stale_info = {
+                'stale_count': stale_count,
+                'stale_ratio': stale_ratio,
+                'price_stale_skip': True
+            }
+            return []
+        
+        # 记录正常情况
+        self.current_stale_info = {
+            'stale_count': stale_count,
+            'stale_ratio': stale_ratio,
+            'price_stale_skip': False
+        }
+        
+        # ========== 计算当前持仓价值 ==========
         current_values = {}
         positions_value = 0.0
         
         for ticker, qty in self.positions.items():
-            price = self.get_current_price(ticker)
-            if price is None:
-                print(f"[WARN] No price for {ticker}, skipping")
+            if ticker not in price_info:
                 continue
-            current_prices[ticker] = price
+            price, age, status = price_info[ticker]
             value = qty * price
             current_values[ticker] = value
             positions_value += value
         
         total_equity = self.cash + positions_value
         
-        # ========== 计算目标价值（而非目标股数）==========
+        # ========== 计算目标价值 ==========
         target_values = {}
         for ticker, weight in target_weights.items():
             if ticker == 'CASH':
@@ -908,7 +982,7 @@ class PaperTradingEngine:
             
             tickers_to_trade.append(ticker)
         
-        # ========== 保护器 3: Min Notional 过滤 ==========
+        # ========== 保护器 3 & 4: Min Notional + Stale Price 过滤 ==========
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         
         trades = []
@@ -928,15 +1002,18 @@ class PaperTradingEngine:
                 print(f"[SKIP] {ticker} sell notional ${trade_value:.2f} < min ${min_notional}")
                 continue
             
-            # 获取价格
-            price = current_prices.get(ticker)
-            if price is None:
-                price = self.get_current_price(ticker)
-            if price is None or price <= 0:
-                print(f"[WARN] Invalid price for {ticker}")
+            # B2) B4) Stale price 检查 - 必须在产生订单前
+            if ticker not in price_info:
+                print(f"[SKIP] {ticker} no price info")
                 continue
             
-            # 计算卖出股数（基于价值差异）
+            price, age, status = price_info[ticker]
+            
+            if status == "STALE" and age > stale_price_skip_minutes:
+                print(f"[SKIP] {ticker} STALE price (age: {age:.0f}min > {stale_price_skip_minutes}min)")
+                continue
+            
+            # 计算卖出股数
             current_qty = self.positions.get(ticker, 0)
             target_qty = int(target_value / price)
             sell_qty = current_qty - target_qty
@@ -957,8 +1034,13 @@ class PaperTradingEngine:
                 if ticker in self.cost_basis:
                     del self.cost_basis[ticker]
             
-            # 构建决策轨迹
-            decision_trace = ['cooldown_pass', 'weight_threshold_pass', 'min_notional_pass']
+            # B3) 构建决策轨迹（包含价格信息）
+            decision_trace = [
+                'cooldown_pass',
+                'weight_threshold_pass',
+                'min_notional_pass',
+                f'price_{status}_age_{age:.0f}min'
+            ]
             if trade_context['regime_state'] == 'risk_off':
                 decision_trace.append('risk_off_de-risk')
             
@@ -977,10 +1059,12 @@ class PaperTradingEngine:
                 'macro_risk_score': trade_context['macro_risk_score'],
                 'macro_topics': trade_context['macro_topics'],
                 'macro_tilts': trade_context['macro_tilts'],
-                'decision_trace': ' | '.join(decision_trace)
+                'decision_trace': ' | '.join(decision_trace),
+                'price_age_minutes': age,
+                'price_status': status
             })
             
-            print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price:.2f} (notional: ${proceeds:.2f})")
+            print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price:.2f} (notional: ${proceeds:.2f}, {status})")
         
         # 再处理买入
         for ticker in tickers_to_trade:
@@ -997,15 +1081,18 @@ class PaperTradingEngine:
                 print(f"[SKIP] {ticker} buy notional ${trade_value:.2f} < min ${min_notional}")
                 continue
             
-            # 获取价格
-            price = current_prices.get(ticker)
-            if price is None:
-                price = self.get_current_price(ticker)
-            if price is None or price <= 0:
-                print(f"[WARN] Invalid price for {ticker}")
+            # B2) B4) Stale price 检查 - 必须在产生订单前
+            if ticker not in price_info:
+                print(f"[SKIP] {ticker} no price info")
                 continue
             
-            # 计算买入股数（基于价值差异）
+            price, age, status = price_info[ticker]
+            
+            if status == "STALE" and age > stale_price_skip_minutes:
+                print(f"[SKIP] {ticker} STALE price (age: {age:.0f}min > {stale_price_skip_minutes}min)")
+                continue
+            
+            # 计算买入股数
             current_qty = self.positions.get(ticker, 0)
             target_qty = int(target_value / price)
             buy_qty = target_qty - current_qty
@@ -1045,8 +1132,13 @@ class PaperTradingEngine:
             else:
                 self.cost_basis[ticker] = price
             
-            # 构建决策轨迹
-            decision_trace = ['cooldown_pass', 'weight_threshold_pass', 'min_notional_pass']
+            # B3) 构建决策轨迹（包含价格信息）
+            decision_trace = [
+                'cooldown_pass',
+                'weight_threshold_pass',
+                'min_notional_pass',
+                f'price_{status}_age_{age:.0f}min'
+            ]
             if ticker in trade_context.get('macro_tilts_dict', {}):
                 tilt = trade_context['macro_tilts_dict'][ticker]
                 decision_trace.append(f'macro_tilt_{tilt:+.2%}')
@@ -1070,10 +1162,12 @@ class PaperTradingEngine:
                 'macro_risk_score': trade_context['macro_risk_score'],
                 'macro_topics': trade_context['macro_topics'],
                 'macro_tilts': trade_context['macro_tilts'],
-                'decision_trace': ' | '.join(decision_trace)
+                'decision_trace': ' | '.join(decision_trace),
+                'price_age_minutes': age,
+                'price_status': status
             })
             
-            print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f})")
+            print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f}, {status})")
         
         # ========== 更新交易记录和 cooldown 时间 ==========
         if trades:
@@ -1244,7 +1338,11 @@ class PaperTradingEngine:
             # Macro Integration 字段
             'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),
             'confirmed_topics_count': len(self.current_macro.get('confirmed_topics', [])),
-            'macro_tilts': self.current_macro.get('macro_tilts', {})
+            'macro_tilts': self.current_macro.get('macro_tilts', {}),
+            # B3) Price Staleness 字段
+            'stale_count': self.current_stale_info.get('stale_count', 0),
+            'stale_ratio': self.current_stale_info.get('stale_ratio', 0.0),
+            'price_stale_skip': self.current_stale_info.get('price_stale_skip', False)
         }
         
         self.portfolio_snapshots.append(snapshot)

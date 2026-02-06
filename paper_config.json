@@ -121,7 +121,8 @@
     "min_trade_notional_usd": 400,
     "rebalance_cooldown_minutes": 720,
     "max_turnover_pct_per_rebalance": 0.20,
-    "stale_price_skip_minutes": 60
+    "stale_price_skip_minutes": 60,
+    "stale_abort_ratio": 0.5
   },
   "benchmarks": {
     "tickers": ["QQQ", "SPY", "VTI", "DIA"],
