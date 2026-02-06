@@ -436,6 +436,8 @@ class PaperTradingEngine:
         self.current_macro = {}  # 当前宏观信号（Macro Integration）
         self.current_stale_info = {}  # B3) 当前价格新鲜度信息
         self.current_turnover_info = {}  # C4) 当前换手信息
+        self.current_weights_reused = False
+        self.current_macro_reused = False
         
         # E1) 宏观信号平滑
         self.macro_risk_score_history = []  # 保存最近 N 次的 risk_score
@@ -451,6 +453,22 @@ class PaperTradingEngine:
         # 价格缓存（避免重复请求）
         self.price_cache = {}  # {ticker: (price, timestamp)}
         self.price_cache_duration = 60  # 缓存60秒
+
+        # Signal/Macro refresh decoupling state
+        execution_config = self.config.get('execution', {})
+        self.signal_refresh_minutes = execution_config.get('signal_refresh_minutes', 1440)
+        self.macro_refresh_minutes = execution_config.get('macro_refresh_minutes', 60)
+        self.last_signal_time = None
+        self.last_macro_time = None
+        self.cached_target_weights = {}
+        self.cached_macro = {
+            'macro_risk_score_raw': 0.0,
+            'macro_risk_score_smoothed': 0.0,
+            'confirmed_topics': [],
+            'macro_tilts': {},
+            'macro_tilts_ignored': {},
+            'signal_summary': {}
+        }
         
         # 宏观信号适配器
         self.macro_adapter = MacroSignalAdapter(self.config)
@@ -477,6 +495,11 @@ class PaperTradingEngine:
         
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
+
+        # Backward-compatible defaults for decoupled refresh controls
+        execution_config = config.setdefault('execution', {})
+        execution_config.setdefault('signal_refresh_minutes', 1440)
+        execution_config.setdefault('macro_refresh_minutes', 60)
         
         return config
     
@@ -485,6 +508,8 @@ class PaperTradingEngine:
         assert self.config['paper_mode'] == True, "paper_mode must be True"
         assert self.config['safety']['no_real_broker'] == True, "no_real_broker must be True"
         assert self.config['safety']['simulation_only'] == True, "simulation_only must be True"
+        assert self.config.get('execution', {}).get('signal_refresh_minutes', 1440) > 0, "execution.signal_refresh_minutes must be > 0"
+        assert self.config.get('execution', {}).get('macro_refresh_minutes', 60) > 0, "execution.macro_refresh_minutes must be > 0"
         
         print("✅ Safety checks passed: SIMULATION ONLY mode confirmed")
     
@@ -756,13 +781,78 @@ class PaperTradingEngine:
         except:
             return 0.20
     
+    def _sync_current_macro_from_cache(self):
+        """将 cached_macro 投影到 current_macro，供快照和交易日志使用"""
+        macro_risk_score_raw = self.cached_macro.get('macro_risk_score_raw', 0.0)
+        self.current_macro = {
+            'macro_risk_score': macro_risk_score_raw,
+            'macro_risk_score_smoothed': self.cached_macro.get('macro_risk_score_smoothed', macro_risk_score_raw),
+            'confirmed_topics': self.cached_macro.get('confirmed_topics', []),
+            'macro_tilts': self.cached_macro.get('macro_tilts', {}),
+            'macro_tilts_ignored': self.cached_macro.get('macro_tilts_ignored', {}),
+            'signal_summary': self.cached_macro.get('signal_summary', {})
+        }
+
+    def refresh_macro_cache(self, now=None):
+        """按 macro_refresh_minutes 刷新一次宏观信号缓存"""
+        if now is None:
+            now = datetime.now()
+
+        macro_risk_score_raw, confirmed_topics, macro_tilts_raw, signal_summary = self.macro_adapter.analyze_signals()
+
+        # E1) 平滑 macro_risk_score（仅在真正刷新 macro 时更新）
+        self.macro_risk_score_history.append(macro_risk_score_raw)
+        if len(self.macro_risk_score_history) > self.macro_smoothing_window:
+            self.macro_risk_score_history = self.macro_risk_score_history[-self.macro_smoothing_window:]
+
+        if self.macro_smoothing_method == 'median':
+            import statistics
+            macro_risk_score_smoothed = statistics.median(self.macro_risk_score_history)
+        elif self.macro_smoothing_method == 'ewma':
+            if len(self.macro_risk_score_history) == 1:
+                macro_risk_score_smoothed = macro_risk_score_raw
+            else:
+                prev_smoothed = self.cached_macro.get('macro_risk_score_smoothed', macro_risk_score_raw)
+                macro_risk_score_smoothed = (
+                    self.macro_ewma_alpha * macro_risk_score_raw +
+                    (1 - self.macro_ewma_alpha) * prev_smoothed
+                )
+        else:
+            macro_risk_score_smoothed = macro_risk_score_raw
+
+        print(f"[MACRO SMOOTH] Raw: {macro_risk_score_raw:.2f}, Smoothed: {macro_risk_score_smoothed:.2f} "
+              f"(method: {self.macro_smoothing_method}, window: {len(self.macro_risk_score_history)})")
+
+        # E3) 过滤 macro_tilts：只保留 universe 内资产
+        universe_tickers = {asset['ticker'] for asset in self.config['universe']}
+        macro_tilts_filtered = {}
+        macro_tilts_ignored = {}
+
+        for ticker, tilt in macro_tilts_raw.items():
+            if ticker in universe_tickers:
+                macro_tilts_filtered[ticker] = tilt
+            else:
+                macro_tilts_ignored[ticker] = tilt
+
+        if macro_tilts_ignored:
+            print(f"[MACRO TILTS] Ignored (not in universe): {', '.join([f'{t}:{v:+.2%}' for t, v in macro_tilts_ignored.items()])}")
+
+        self.cached_macro = {
+            'macro_risk_score_raw': macro_risk_score_raw,
+            'macro_risk_score_smoothed': macro_risk_score_smoothed,
+            'confirmed_topics': confirmed_topics,
+            'macro_tilts': macro_tilts_filtered,
+            'macro_tilts_ignored': macro_tilts_ignored,
+            'signal_summary': signal_summary
+        }
+        self._sync_current_macro_from_cache()
+        self.last_macro_time = now
+
     def calculate_target_weights(self):
-        """计算目标权重 - 动量 + 波动率调整 + Regime Filter + Macro Signals"""
-        
+        """计算目标权重 - 动量 + 波动率调整 + Regime Filter + Cached Macro Signals"""
+
         # ========== 步骤1: 计算市场状态（Regime Filter）==========
         regime_state, trend_score, regime_details, dynamic_min_cash, dynamic_max_weight = self.compute_regime_state()
-        
-        # 保存 regime 信息供 snapshot 使用
         self.current_regime = {
             'regime_state': regime_state,
             'trend_score': trend_score,
@@ -771,76 +861,25 @@ class PaperTradingEngine:
             'dynamic_max_weight': dynamic_max_weight,
             'risk_caps_applied': regime_state == 'risk_off'
         }
-        
-        # ========== 步骤2: 获取宏观信号（Macro Integration）==========
-        macro_risk_score_raw, confirmed_topics, macro_tilts_raw, signal_summary = self.macro_adapter.analyze_signals()
-        
-        # E1) 平滑 macro_risk_score
-        self.macro_risk_score_history.append(macro_risk_score_raw)
-        
-        # 只保留最近 N 次
-        if len(self.macro_risk_score_history) > self.macro_smoothing_window:
-            self.macro_risk_score_history = self.macro_risk_score_history[-self.macro_smoothing_window:]
-        
-        # 计算平滑值
-        if self.macro_smoothing_method == 'median':
-            import statistics
-            macro_risk_score_smoothed = statistics.median(self.macro_risk_score_history)
-        elif self.macro_smoothing_method == 'ewma':
-            # EWMA: smoothed = alpha * current + (1-alpha) * previous
-            if len(self.macro_risk_score_history) == 1:
-                macro_risk_score_smoothed = macro_risk_score_raw
-            else:
-                prev_smoothed = self.current_macro.get('macro_risk_score_smoothed', macro_risk_score_raw)
-                macro_risk_score_smoothed = (self.macro_ewma_alpha * macro_risk_score_raw + 
-                                            (1 - self.macro_ewma_alpha) * prev_smoothed)
-        else:
-            macro_risk_score_smoothed = macro_risk_score_raw
-        
-        print(f"[MACRO SMOOTH] Raw: {macro_risk_score_raw:.2f}, Smoothed: {macro_risk_score_smoothed:.2f} "
-              f"(method: {self.macro_smoothing_method}, window: {len(self.macro_risk_score_history)})")
-        
-        # E3) 过滤 macro_tilts：只保留 universe 内的资产
-        universe_tickers = {asset['ticker'] for asset in self.config['universe']}
-        macro_tilts_filtered = {}
-        macro_tilts_ignored = {}
-        
-        for ticker, tilt in macro_tilts_raw.items():
-            if ticker in universe_tickers:
-                macro_tilts_filtered[ticker] = tilt
-            else:
-                macro_tilts_ignored[ticker] = tilt
-        
-        if macro_tilts_ignored:
-            print(f"[MACRO TILTS] Ignored (not in universe): {', '.join([f'{t}:{v:+.2%}' for t, v in macro_tilts_ignored.items()])}")
-        
-        # 保存宏观信号信息供 snapshot 使用
-        self.current_macro = {
-            'macro_risk_score': macro_risk_score_raw,  # 原始值
-            'macro_risk_score_smoothed': macro_risk_score_smoothed,  # 平滑值
-            'confirmed_topics': confirmed_topics,
-            'macro_tilts': macro_tilts_filtered,  # 过滤后的 tilts
-            'macro_tilts_ignored': macro_tilts_ignored,  # 被忽略的 tilts
-            'signal_summary': signal_summary
-        }
-        
+
+        # ========== 步骤2: 使用 cached_macro（不在这里直接拉新信号）==========
+        macro_risk_score_raw = self.cached_macro.get('macro_risk_score_raw', 0.0)
+        macro_risk_score_smoothed = self.cached_macro.get('macro_risk_score_smoothed', macro_risk_score_raw)
+        macro_tilts_filtered = self.cached_macro.get('macro_tilts', {})
+        self._sync_current_macro_from_cache()
+
         # E2) 根据平滑后的宏观风险分数调整现金比例（带冷却）
-        macro_cash_add = 0.0
         if macro_risk_score_smoothed > 0:
             macro_cash_slope = self.config.get('macro_integration', {}).get('macro_cash_slope', 0.02)
             macro_cash_add = macro_risk_score_smoothed * macro_cash_slope
-            new_cash_target = min(dynamic_min_cash + macro_cash_add, 0.50)  # 最多 50% 现金
-            
-            # E2) 检查是否需要冷却
+            new_cash_target = min(dynamic_min_cash + macro_cash_add, 0.50)
+
             cash_change = abs(new_cash_target - self.last_macro_cash_target)
-            
             if self.macro_cooldown_remaining > 0:
-                # 冷却期内，保持上次的现金目标（除非触发 circuit breaker）
                 print(f"[MACRO COOLDOWN] Remaining {self.macro_cooldown_remaining} cycles, keeping cash target at {self.last_macro_cash_target:.1%}")
                 dynamic_min_cash = self.last_macro_cash_target
                 self.macro_cooldown_remaining -= 1
-            elif cash_change > 0.05:  # 现金目标变化超过 5%
-                # 应用新的现金目标，并启动冷却
+            elif cash_change > 0.05:
                 print(f"[MACRO] Adjusting min cash: {self.current_regime['dynamic_min_cash']:.1%} → {new_cash_target:.1%} "
                       f"(smoothed risk score: {macro_risk_score_smoothed:.1f})")
                 dynamic_min_cash = new_cash_target
@@ -848,96 +887,79 @@ class PaperTradingEngine:
                 self.macro_cooldown_remaining = self.macro_cooldown_cycles
                 print(f"[MACRO COOLDOWN] Started {self.macro_cooldown_cycles} cycle cooldown")
             else:
-                # 变化不大，直接应用
                 dynamic_min_cash = new_cash_target
                 self.last_macro_cash_target = new_cash_target
-            
-            # 更新 regime 信息
+
             self.current_regime['dynamic_min_cash'] = dynamic_min_cash
-        
+
         # ========== 步骤3: 计算资产评分（动量 + 波动率）==========
         strategy = self.config['strategy']
         lookback = strategy['lookback_days']
         vol_target = strategy['vol_target']
         momentum_weight = strategy['momentum_weight']
         vol_weight = strategy['vol_weight']
-        
+
         asset_scores = {}
-        
+
         print(f"\n📊 Evaluating {len(self.config['universe'])-1} assets...")
         print(f"{'Ticker':<8} {'Momentum':>10} {'Volatility':>12} {'Score':>10} {'Status':<10}")
-        print("-" * 60)
-        
+        print('-' * 60)
+
         for asset in self.config['universe']:
             ticker = asset['ticker']
-            
             if ticker == 'CASH':
                 continue
-            
+
             momentum = self.calculate_momentum(ticker, lookback)
             volatility = self.calculate_volatility(ticker, lookback)
-            
             score = momentum_weight * momentum - vol_weight * (volatility - vol_target)
-            
-            asset_scores[ticker] = {
-                'momentum': momentum,
-                'volatility': volatility,
-                'score': score
-            }
-            
-            # 显示每个资产的评分
-            status = "✅ BUY" if score > 0 else "❌ SKIP"
+
+            asset_scores[ticker] = {'momentum': momentum, 'volatility': volatility, 'score': score}
+            status = '✅ BUY' if score > 0 else '❌ SKIP'
             print(f"{ticker:<8} {momentum:>9.2%} {volatility:>11.2%} {score:>9.4f} {status:<10}")
-        
-        print("-" * 60)
-        
+
+        print('-' * 60)
         positive_assets = {k: v for k, v in asset_scores.items() if v['score'] > 0}
-        
         print(f"Selected {len(positive_assets)} assets with positive scores\n")
-        
+
         if not positive_assets:
             return {'CASH': 1.0}
-        
+
         # ========== 步骤4: 计算原始权重 ==========
         total_score = sum(v['score'] for v in positive_assets.values())
         raw_weights = {k: v['score'] / total_score for k, v in positive_assets.items()}
-        
-        # ========== 步骤5: 应用宏观倾斜（Macro Tilts）- 使用过滤后的 tilts ==========
+
+        # ========== 步骤5: 应用 cached macro tilts ==========
         if macro_tilts_filtered:
             print(f"\n[MACRO] Applying tilts to weights:")
             for ticker, tilt in macro_tilts_filtered.items():
                 if ticker in raw_weights:
                     old_weight = raw_weights[ticker]
-                    raw_weights[ticker] = max(0.0, old_weight + tilt)  # 不能为负
+                    raw_weights[ticker] = max(0.0, old_weight + tilt)
                     print(f"  {ticker}: {old_weight:.2%} → {raw_weights[ticker]:.2%} (tilt: {tilt:+.2%})")
                 elif tilt > 0:
-                    # 如果资产不在组合中但有正倾斜，可以考虑加入
                     raw_weights[ticker] = tilt
                     print(f"  {ticker}: NEW position {tilt:.2%}")
-            
-            # 重新归一化
+
             total_weight = sum(raw_weights.values())
             if total_weight > 0:
                 raw_weights = {k: v / total_weight for k, v in raw_weights.items()}
-        
-        # ========== 步骤6: 应用动态上限（使用 regime-adjusted max_weight）==========
-        adjusted_weights = {}
-        for ticker, weight in raw_weights.items():
-            adjusted_weights[ticker] = min(weight, dynamic_max_weight)
-        
+
+        # ========== 步骤6: 应用动态上限 ==========
+        adjusted_weights = {ticker: min(weight, dynamic_max_weight) for ticker, weight in raw_weights.items()}
         total_weight = sum(adjusted_weights.values())
         if total_weight > 0:
             adjusted_weights = {k: v / total_weight for k, v in adjusted_weights.items()}
-        
-        # ========== 步骤7: 应用动态现金下限（使用 regime + macro adjusted min_cash）==========
+
+        # ========== 步骤7: 应用动态现金下限 ==========
         total_invested = sum(adjusted_weights.values())
         if total_invested > (1 - dynamic_min_cash):
             scale_factor = (1 - dynamic_min_cash) / total_invested
             adjusted_weights = {k: v * scale_factor for k, v in adjusted_weights.items()}
-        
+
         cash_weight = 1.0 - sum(adjusted_weights.values())
         adjusted_weights['CASH'] = cash_weight
-        
+
         return adjusted_weights
 
     def execute_rebalance(self, target_weights):
@@ -1503,6 +1525,10 @@ class PaperTradingEngine:
             'drawdown': drawdown,
             'positions': positions_detail,
             'status': self.status,
+            'weights_reused': self.current_weights_reused,
+            'macro_reused': self.current_macro_reused,
+            'last_signal_time': self.last_signal_time.isoformat() if self.last_signal_time else None,
+            'last_macro_time': self.last_macro_time.isoformat() if self.last_macro_time else None,
             # 基准比较字段
             'bench_returns': bench_returns,
             'bench_avg_return': bench_avg_return,
@@ -1792,35 +1818,70 @@ class PaperTradingEngine:
         print(f"\n{'='*60}")
         print(f"Cycle {self.current_cycle} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
-        
+
+        now = datetime.now()
+
+        # Macro refresh decoupling
+        if self.last_macro_time is None:
+            self.refresh_macro_cache(now=now)
+            self.current_macro_reused = False
+            print(f"[MACRO REFRESH] First refresh completed")
+        else:
+            macro_elapsed = (now - self.last_macro_time).total_seconds() / 60
+            if macro_elapsed >= self.macro_refresh_minutes:
+                self.refresh_macro_cache(now=now)
+                self.current_macro_reused = False
+                print(f"[MACRO REFRESH] Refreshed after {macro_elapsed:.1f} minutes")
+            else:
+                self.current_macro_reused = True
+                self._sync_current_macro_from_cache()
+                print(f"[MACRO REFRESH] Reused cached macro ({macro_elapsed:.1f}m < {self.macro_refresh_minutes}m)")
+
+        # Signal refresh decoupling (target weights)
+        if not self.cached_target_weights or self.last_signal_time is None:
+            target_weights = self.calculate_target_weights()
+            self.cached_target_weights = dict(target_weights)
+            self.last_signal_time = now
+            self.current_weights_reused = False
+            print("[SIGNAL REFRESH] First target weight calculation completed")
+        else:
+            signal_elapsed = (now - self.last_signal_time).total_seconds() / 60
+            if signal_elapsed >= self.signal_refresh_minutes:
+                target_weights = self.calculate_target_weights()
+                self.cached_target_weights = dict(target_weights)
+                self.last_signal_time = now
+                self.current_weights_reused = False
+                print(f"[SIGNAL REFRESH] Recalculated target weights after {signal_elapsed:.1f} minutes")
+            else:
+                target_weights = dict(self.cached_target_weights)
+                self.current_weights_reused = True
+                print(f"[SIGNAL REFRESH] Reusing target weights ({signal_elapsed:.1f}m < {self.signal_refresh_minutes}m)")
+
         snapshot = self.record_snapshot()
-        
+
         print(f"Cash: ${snapshot['cash']:,.2f}")
         print(f"Positions Value: ${snapshot['positions_value']:,.2f}")
         print(f"Total Equity: ${snapshot['total_equity']:,.2f}")
         print(f"Return: {snapshot['total_return']:.2%}")
         print(f"Drawdown: {snapshot['drawdown']:.2%}")
         print(f"Status: {snapshot['status']}")
-        
-        # 显示市场状态（Regime Filter）
+
         if snapshot.get('regime_state'):
             regime_icon = "🟢" if snapshot['regime_state'] == 'risk_on' else "🟡" if snapshot['regime_state'] == 'neutral' else "🔴"
             risk_caps = " ⚠️ RISK CAPS" if snapshot.get('risk_caps_applied') else ""
             print(f"Market Regime: {regime_icon} {snapshot['regime_state'].upper()} (trend: {snapshot['trend_score']:.1%}){risk_caps}")
-        
-        # 显示持仓详情
+
         if snapshot['positions']:
             print(f"\n📊 Current Holdings:")
             print(f"{'Ticker':<8} {'Qty':>6} {'Price':>10} {'Value':>12} {'Weight':>8} {'P&L':>10}")
             print("-" * 60)
-            
+
             for ticker, pos in sorted(snapshot['positions'].items(), key=lambda x: x[1]['value'], reverse=True):
                 qty = pos['quantity']
                 current_price = pos['price']
                 value = pos['value']
                 weight = value / snapshot['total_equity'] * 100
-                
-                # 计算盈亏（如果有历史交易记录）
+
                 cost_basis = self.get_cost_basis(ticker)
                 if cost_basis:
                     pnl = (current_price - cost_basis) / cost_basis * 100
@@ -1829,35 +1890,32 @@ class PaperTradingEngine:
                 else:
                     pnl_str = "N/A"
                     pnl_color = "➡️"
-                
+
                 print(f"{ticker:<8} {qty:>6} ${current_price:>9.2f} ${value:>11,.2f} {weight:>7.1f}% {pnl_color} {pnl_str:>8}")
-            
+
             print("-" * 60)
-        
+
         if self.check_risk_controls():
             print("⚠️ Risk control triggered, skipping rebalance")
             return
-        
-        print("\nCalculating target weights...")
-        target_weights = self.calculate_target_weights()
-        
-        print("Target Weights:")
+
+        print("\nTarget Weights:")
         for ticker, weight in sorted(target_weights.items(), key=lambda x: x[1], reverse=True):
             if weight > 0.01:
                 print(f"  {ticker}: {weight:.2%}")
-        
+
         print("\nExecuting rebalance...")
         trades = self.execute_rebalance(target_weights)
-        
+
         if trades:
             print(f"Executed {len(trades)} trades:")
             for trade in trades:
                 print(f"  {trade['side']} {trade['quantity']} {trade['ticker']} @ ${trade['price']:.2f} (cost: ${trade['cost']:.2f})")
         else:
             print("No trades executed (portfolio already balanced)")
-        
+
         self.current_cycle += 1
-    
+
     def run(self):
         """运行模拟交易"""
         print("\n" + "="*60)

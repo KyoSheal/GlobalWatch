@@ -119,6 +119,8 @@
   "execution": {
     "weight_threshold": 0.025,
     "min_trade_notional_usd": 400,
+    "signal_refresh_minutes": 1440,
+    "macro_refresh_minutes": 60,
     "rebalance_cooldown_minutes": 720,
     "max_turnover_pct_per_rebalance": 0.20,
     "stale_price_skip_minutes": 60,
