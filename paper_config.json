@@ -142,6 +142,7 @@
     "chroma_path": "./memory_db",
     "collection": "trading_signals",
     "confirm_k_of_n": [2, 3],
+    "signal_max_age_hours": 48,
     "decay_lambda_per_hour": 0.15,
     "macro_cash_slope": 0.02,
     "tilt_max_delta": 0.02

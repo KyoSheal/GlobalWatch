@@ -130,10 +130,18 @@ class MacroSignalAdapter:
     def analyze_signals(self):
         """分析宏观信号并输出 macro_risk_score + tilts
         
+        严格的 k-of-n 确认机制：
+        A1) 只保留 signal_max_age_hours 内的信号
+        A2) 每个 theme 取最近 n 条，统计 bullish/bearish 数量，>= k 才确认
+        A3) 时间衰减仅用于强度计算，不用于确认
+        A4) 返回增强的 confirmed_topics 结构
+        A5) macro_risk_score 只由确认主题贡献，risk_off 类加分，risk_on 类可抵消
+        A6) 详细调试日志
+        
         Returns:
             macro_risk_score: 0-10，越大越 risk-off
-            confirmed_topics: 满足 [k/n] 规则的主题列表
-            macro_tilts: {ticker: tilt_delta} 资产倾斜
+            confirmed_topics: List[{theme, direction, strength, confidence_effective, top_sources, newest_timestamp}]
+            macro_tilts: {ticker: tilt_delta}
             signal_summary: 信号统计摘要
         """
         if not self.enabled:
@@ -141,104 +149,229 @@ class MacroSignalAdapter:
         
         print(f"\n[MACRO] Analyzing macro signals from GlobalWatch...")
         
-        # 获取最近信号
-        signals = self.fetch_recent_signals(n=50)
+        # 获取所有信号
+        all_signals = self.fetch_recent_signals(n=200)
         
-        if not signals:
+        if not all_signals:
             print("[MACRO] No signals to analyze")
             return 0.0, [], {}, {}
         
-        # 主题投票统计
-        theme_votes = {}  # {theme: {'bullish': weight_sum, 'bearish': weight_sum, 'count': n}}
-        
-        # 按主题和方向加权投票
-        for signal in signals:
-            metadata = signal['metadata']
-            
-            theme = metadata.get('theme', 'unknown')
-            direction = metadata.get('direction', 'neutral').lower()
-            confidence = metadata.get('confidence', 50.0) / 100.0  # 归一化到 0-1
-            timestamp = metadata.get('timestamp', '')
-            
-            # 计算时间衰减权重
-            weight, age_hours = self.compute_signal_weight(timestamp)
-            
-            # 综合权重 = 时间衰减 * 置信度
-            combined_weight = weight * confidence
-            
-            if theme not in theme_votes:
-                theme_votes[theme] = {'bullish': 0.0, 'bearish': 0.0, 'neutral': 0.0, 'count': 0}
-            
-            if 'bullish' in direction or 'long' in direction:
-                theme_votes[theme]['bullish'] += combined_weight
-            elif 'bearish' in direction or 'short' in direction:
-                theme_votes[theme]['bearish'] += combined_weight
-            else:
-                theme_votes[theme]['neutral'] += combined_weight
-            
-            theme_votes[theme]['count'] += 1
-        
-        # 应用 [k/n] 确认规则
+        # A1) 配置参数
         confirm_k, confirm_n = self.macro_config.get('confirm_k_of_n', [2, 3])
+        signal_max_age_hours = self.macro_config.get('signal_max_age_hours', 48)
+        decay_lambda = self.macro_config.get('decay_lambda_per_hour', 0.15)
+        
+        now = datetime.now()
+        
+        # A1) 过滤：只保留 signal_max_age_hours 内的信号
+        valid_signals = []
+        for signal in all_signals:
+            metadata = signal['metadata']
+            timestamp_str = metadata.get('timestamp', '')
+            
+            try:
+                signal_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                # 统一时区
+                if signal_time.tzinfo:
+                    now_aware = datetime.now(signal_time.tzinfo)
+                else:
+                    now_aware = now
+                    signal_time = signal_time.replace(tzinfo=None)
+                
+                age_hours = (now_aware - signal_time).total_seconds() / 3600
+                
+                if age_hours > signal_max_age_hours:
+                    continue  # 超过窗口，丢弃
+                
+                valid_signals.append({
+                    'metadata': metadata,
+                    'document': signal.get('document', ''),
+                    'timestamp': timestamp_str,
+                    'age_hours': age_hours
+                })
+                
+            except Exception as e:
+                # 无效时间戳，跳过
+                continue
+        
+        print(f"[MACRO] Filtered {len(valid_signals)}/{len(all_signals)} signals within {signal_max_age_hours}h window")
+        
+        if not valid_signals:
+            print("[MACRO] No valid signals after age filtering")
+            return 0.0, [], {}, {}
+        
+        # A2) 按主题分组
+        theme_groups = {}
+        for sig in valid_signals:
+            theme = sig['metadata'].get('theme', 'unknown')
+            if theme not in theme_groups:
+                theme_groups[theme] = []
+            theme_groups[theme].append(sig)
+        
+        # A2) 每个主题：按时间排序，取最近 n 条
+        for theme in theme_groups:
+            theme_groups[theme].sort(key=lambda x: x['timestamp'], reverse=True)
+            theme_groups[theme] = theme_groups[theme][:confirm_n]
+        
+        # A2) 确认机制：统计 bullish/bearish 数量
         confirmed_topics = []
         
-        print(f"\n[MACRO] Theme Analysis (require {confirm_k}/{confirm_n} confirmation):")
-        print(f"{'Theme':<20} {'Bullish':>10} {'Bearish':>10} {'Count':>8} {'Status':<15}")
+        print(f"\n[MACRO] Theme Confirmation (k={confirm_k}, n={confirm_n}, max_age={signal_max_age_hours}h):")
+        print(f"{'Theme':<20} {'Bull':>5} {'Bear':>5} {'Neut':>5} {'Status':<20}")
         print("-" * 70)
         
-        for theme, votes in sorted(theme_votes.items(), key=lambda x: x[1]['count'], reverse=True):
-            bullish_weight = votes['bullish']
-            bearish_weight = votes['bearish']
-            count = votes['count']
+        for theme, signals_list in sorted(theme_groups.items(), key=lambda x: len(x[1]), reverse=True):
+            bullish_count = 0
+            bearish_count = 0
+            neutral_count = 0
             
-            # 判断是否确认（需要至少 k 个信号）
-            if count >= confirm_k:
-                # 判断方向
-                if bullish_weight > bearish_weight * 1.5:  # 明显偏多
-                    confirmed_topics.append({'theme': theme, 'direction': 'bullish', 'strength': bullish_weight})
-                    status = "✅ BULLISH"
-                elif bearish_weight > bullish_weight * 1.5:  # 明显偏空
-                    confirmed_topics.append({'theme': theme, 'direction': 'bearish', 'strength': bearish_weight})
-                    status = "✅ BEARISH"
+            bullish_items = []
+            bearish_items = []
+            
+            for sig in signals_list:
+                metadata = sig['metadata']
+                direction = metadata.get('direction', 'neutral').lower()
+                confidence = metadata.get('confidence', 50.0) / 100.0
+                age_hours = sig['age_hours']
+                
+                if 'bullish' in direction or 'long' in direction:
+                    bullish_count += 1
+                    bullish_items.append({
+                        'confidence': confidence,
+                        'age_hours': age_hours,
+                        'timestamp': sig['timestamp'],
+                        'document': sig['document']
+                    })
+                elif 'bearish' in direction or 'short' in direction:
+                    bearish_count += 1
+                    bearish_items.append({
+                        'confidence': confidence,
+                        'age_hours': age_hours,
+                        'timestamp': sig['timestamp'],
+                        'document': sig['document']
+                    })
                 else:
-                    status = "⚖️ MIXED"
-            else:
-                status = f"⏳ NEED {confirm_k-count} MORE"
+                    neutral_count += 1
             
-            print(f"{theme:<20} {bullish_weight:>10.2f} {bearish_weight:>10.2f} {count:>8} {status:<15}")
+            # A2) 确认逻辑：bullish_count >= k 或 bearish_count >= k
+            confirmed_direction = None
+            confirmed_items = []
+            
+            if bullish_count >= confirm_k and bullish_count > bearish_count:
+                confirmed_direction = 'bullish'
+                confirmed_items = bullish_items
+                status = f"✅ BULLISH ({bullish_count}/{len(signals_list)})"
+            elif bearish_count >= confirm_k and bearish_count > bullish_count:
+                confirmed_direction = 'bearish'
+                confirmed_items = bearish_items
+                status = f"✅ BEARISH ({bearish_count}/{len(signals_list)})"
+            else:
+                # 未确认
+                max_count = max(bullish_count, bearish_count)
+                needed = confirm_k - max_count
+                if needed > 0:
+                    status = f"⏳ NEED {needed} MORE"
+                else:
+                    status = f"⚖️ CONFLICTED ({bullish_count}v{bearish_count})"
+            
+            print(f"{theme:<20} {bullish_count:>5} {bearish_count:>5} {neutral_count:>5} {status:<20}")
+            
+            # A3) 确认后才计算强度（时间衰减）
+            if confirmed_direction:
+                strength = 0.0
+                confidence_sum = 0.0
+                
+                for item in confirmed_items:
+                    time_weight = np.exp(-decay_lambda * item['age_hours'])
+                    strength += item['confidence'] * time_weight
+                    confidence_sum += item['confidence']
+                
+                confidence_effective = confidence_sum / len(confirmed_items) if confirmed_items else 0.0
+                
+                # 提取 top sources（最多3条）
+                top_sources = []
+                for item in confirmed_items[:3]:
+                    doc_preview = item['document'][:100] if item['document'] else 'N/A'
+                    top_sources.append(doc_preview)
+                
+                # 最新时间戳
+                newest_timestamp = confirmed_items[0]['timestamp'] if confirmed_items else ''
+                
+                # A4) 增强的 confirmed_topics 结构
+                confirmed_topics.append({
+                    'theme': theme,
+                    'direction': confirmed_direction,
+                    'strength': strength,
+                    'confidence_effective': confidence_effective,
+                    'top_sources': top_sources,
+                    'newest_timestamp': newest_timestamp,
+                    'count': len(confirmed_items)
+                })
+                
+                # A6) 调试日志
+                print(f"  [DEBUG] {theme}: direction={confirmed_direction}, "
+                      f"count={bullish_count if confirmed_direction=='bullish' else bearish_count}/"
+                      f"{bearish_count if confirmed_direction=='bullish' else bullish_count}, "
+                      f"strength={strength:.3f}, newest={newest_timestamp[:19]}")
         
         print("-" * 70)
         
-        # 计算 macro_risk_score（0-10）
-        # 基于 bearish 主题的强度和数量
+        # A5) macro_risk_score 计算：只由确认主题贡献
+        risk_off_themes = ['risk_off', 'recession', 'rates_up', 'credit_stress', 'inflation_risk', 
+                           'geopolitical_risk', 'market_crash', 'volatility_spike']
+        risk_on_themes = ['risk_on', 'soft_landing', 'growth_acceleration', 'dovish_fed', 
+                          'earnings_beat', 'tech_rally']
+        
         risk_score = 0.0
         
         for topic in confirmed_topics:
-            if topic['direction'] == 'bearish':
-                # 每个 bearish 主题贡献风险分数
-                risk_score += min(topic['strength'] * 2, 3.0)  # 单个主题最多贡献 3 分
+            theme_lower = topic['theme'].lower()
+            strength = topic['strength']
+            direction = topic['direction']
+            
+            # risk_off 类主题
+            is_risk_off = any(keyword in theme_lower for keyword in risk_off_themes)
+            # risk_on 类主题
+            is_risk_on = any(keyword in theme_lower for keyword in risk_on_themes)
+            
+            if is_risk_off:
+                if direction == 'bearish':
+                    # risk_off 主题看跌 → 增加风险分数
+                    risk_score += min(strength * 2.0, 3.0)  # 单主题最多贡献 3 分
+                elif direction == 'bullish':
+                    # risk_off 主题看涨 → 也增加风险（例如"通胀风险看涨"）
+                    risk_score += min(strength * 1.5, 2.5)
+            
+            elif is_risk_on:
+                if direction == 'bullish':
+                    # risk_on 主题看涨 → 抵消风险分数
+                    risk_score -= min(strength * 1.0, 2.0)
+                elif direction == 'bearish':
+                    # risk_on 主题看跌 → 增加风险
+                    risk_score += min(strength * 1.0, 2.0)
         
-        # 限制在 0-10 范围
-        risk_score = min(risk_score, 10.0)
+        # Clip 到 [0, 10]
+        risk_score = max(0.0, min(risk_score, 10.0))
+        
+        print(f"\n[MACRO] Risk Score: {risk_score:.1f}/10.0 (from {len(confirmed_topics)} confirmed topics)")
+        print(f"[MACRO] Confirmed Topics: {len(confirmed_topics)}")
         
         # 生成 macro_tilts（基于 macro_mapping）
         macro_tilts = self._generate_tilts(confirmed_topics)
-        
-        # 信号摘要
-        signal_summary = {
-            'total_signals': len(signals),
-            'confirmed_topics': len(confirmed_topics),
-            'risk_score': risk_score,
-            'theme_votes': theme_votes
-        }
-        
-        print(f"\n[MACRO] Risk Score: {risk_score:.1f}/10.0")
-        print(f"[MACRO] Confirmed Topics: {len(confirmed_topics)}")
         
         if macro_tilts:
             print(f"[MACRO] Asset Tilts:")
             for ticker, tilt in macro_tilts.items():
                 print(f"  {ticker}: {tilt:+.2%}")
+        
+        # 信号摘要
+        signal_summary = {
+            'total_signals_fetched': len(all_signals),
+            'valid_signals_in_window': len(valid_signals),
+            'themes_analyzed': len(theme_groups),
+            'confirmed_topics': len(confirmed_topics),
+            'risk_score': risk_score
+        }
         
         return risk_score, confirmed_topics, macro_tilts, signal_summary
     

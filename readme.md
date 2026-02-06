@@ -51,9 +51,12 @@ By combining **Live RSS Feeds** (Reuters, CNBC, BBC) with **Local Large Language
 
 ### 🌐 Macro Signal Integration
 - **GlobalWatch Connection**: Reads trading signals from ChromaDB
-- **Time-Decay Weighting**: Signals weighted by `exp(-0.15 * age_hours)` × confidence
+- **Signal Age Filter**: Only considers signals within 48 hours (configurable)
+- **Recent Signal Selection**: Takes only the most recent N signals per theme (default: 3)
+- **Direction Counting**: Counts signals by direction (not weighted voting)
+- **Confirmation Rules**: Requires k out of n same-direction signals (default: 2/3)
+- **Time-Decay Weighting**: Applied after confirmation for strength calculation only
 - **Theme Voting**: Aggregates signals by theme (oil_bullish, risk_off, usd_strong, etc.)
-- **Confirmation Rules**: Requires 2/3 signals to confirm a theme
 - **Risk Scoring**: 0-10 scale, higher = more risk-off
 - **Asset Tilts**: Applies macro-driven weight adjustments (±2% max per asset)
 - **Cash Adjustment**: Increases cash allocation based on macro risk score
@@ -567,6 +570,7 @@ python -u paper_trading.py paper_config.json
 - **Real-Time Monitoring**: `REAL_TIME_MONITORING.md` - How to monitor live trading progress
 - **Resume Feature**: `RESUME_FEATURE.md` - Checkpoint and resume functionality
 - **Restart Instructions**: `RESTART_INSTRUCTIONS.md` - Quick restart guide
+- **Macro Confirmation Logic**: `MACRO_CONFIRMATION_LOGIC.md` - How macro signal confirmation works
 
 ### Configuration Files
 - **`paper_config.json`**: 48-hour full simulation with advanced features
