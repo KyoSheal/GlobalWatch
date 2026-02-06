@@ -430,12 +430,14 @@ class PaperTradingEngine:
         self.end_time = None
         self.current_cycle = 0
         self.peak_equity = self.cash
-        self.status = "READY"  # READY/RUNNING/PAUSED/COMPLETED
+        self.status = "READY"  # READY/RUNNING/COMPLETED
         self.last_rebalance_time = None  # 用于 cooldown 检查
         self.current_regime = {}  # 当前市场状态（Regime Filter）
         self.current_macro = {}  # 当前宏观信号（Macro Integration）
         self.current_stale_info = {}  # B3) 当前价格新鲜度信息
         self.current_turnover_info = {}  # C4) 当前换手信息
+        self.forced_until_time = None  # risk_off_forced 结束时间
+        self.forced_regime_reason = ""
         self.current_weights_reused = False
         self.current_macro_reused = False
         
@@ -501,6 +503,7 @@ class PaperTradingEngine:
         execution_config.setdefault('signal_refresh_minutes', 1440)
         execution_config.setdefault('macro_refresh_minutes', 60)
         execution_config.setdefault('max_stale_ratio', 0.3)
+        execution_config.setdefault('circuit_breaker_forced_days', 1)
         stale_policy = execution_config.setdefault('price_stale_policy', {})
         stale_policy.setdefault('allow_buy', ['LIVE', 'RECENT'])
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
@@ -515,6 +518,7 @@ class PaperTradingEngine:
         assert self.config.get('execution', {}).get('signal_refresh_minutes', 1440) > 0, "execution.signal_refresh_minutes must be > 0"
         assert self.config.get('execution', {}).get('macro_refresh_minutes', 60) > 0, "execution.macro_refresh_minutes must be > 0"
         assert self.config.get('execution', {}).get('max_stale_ratio', 0.3) >= 0, "execution.max_stale_ratio must be >= 0"
+        assert self.config.get('execution', {}).get('circuit_breaker_forced_days', 1) > 0, "execution.circuit_breaker_forced_days must be > 0"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         
@@ -866,7 +870,8 @@ class PaperTradingEngine:
             'regime_details': regime_details,
             'dynamic_min_cash': dynamic_min_cash,
             'dynamic_max_weight': dynamic_max_weight,
-            'risk_caps_applied': regime_state == 'risk_off'
+            'risk_caps_applied': regime_state in ('risk_off', 'risk_off_forced'),
+            'forced_until_time': self.forced_until_time.isoformat() if self.forced_until_time else None
         }
 
         # ========== 步骤2: 使用 cached_macro（不在这里直接拉新信号）==========
@@ -1272,7 +1277,7 @@ class PaperTradingEngine:
                 decision_trace.append('sell_allowed_on_stale')
             if turnover_capped:
                 decision_trace.append(f'turnover_cap_scale_{turnover_scale:.2%}')
-            if trade_context['regime_state'] == 'risk_off':
+            if trade_context['regime_state'] in ('risk_off', 'risk_off_forced'):
                 decision_trace.append('risk_off_de-risk')
             
             # 构建完整的交易记录
@@ -1441,58 +1446,251 @@ class PaperTradingEngine:
             'macro_tilts_dict': macro_tilts  # 保留字典格式供内部使用
         }
 
+    def _compute_position_score_for_derisk(self, ticker):
+        """计算持仓去风险优先级分数，越小越优先卖出。"""
+        strategy = self.config.get('strategy', {})
+        lookback = int(strategy.get('lookback_days', 40))
+        vol_target = float(strategy.get('vol_target', 0.15))
+        momentum_weight = float(strategy.get('momentum_weight', 0.65))
+        vol_weight = float(strategy.get('vol_weight', 0.35))
+
+        hist = self.get_market_data(ticker, period='3mo', interval='1d')
+        if hist is not None and not hist.empty:
+            close = hist['Close'].dropna()
+        else:
+            close = pd.Series(dtype=float)
+
+        drawdown = 0.0
+        if len(close) > 1:
+            peak = float(close.cummax().iloc[-1])
+            latest = float(close.iloc[-1])
+            drawdown = ((peak - latest) / peak) if peak > 0 else 0.0
+
+        if len(close) >= lookback + 1:
+            momentum = (float(close.iloc[-1]) - float(close.iloc[-lookback])) / float(close.iloc[-lookback])
+            returns = close.pct_change().dropna()
+            volatility = float(returns.tail(lookback).std() * np.sqrt(252)) if not returns.empty else self.calculate_volatility(ticker, lookback)
+            score = momentum_weight * momentum - vol_weight * (volatility - vol_target)
+            return float(score), float(momentum), float(volatility), float(drawdown), 'momentum_vol'
+
+        volatility = self.calculate_volatility(ticker, lookback)
+        fallback_score = -(volatility + drawdown)
+        return float(fallback_score), None, float(volatility), float(drawdown), 'fallback_vol_drawdown'
+
+    def _run_circuit_breaker_derisk(self, drawdown, max_dd):
+        """触发后进入 risk_off_forced，并按最差评分优先结构化减仓。"""
+        now = datetime.now()
+        execution_config = self.config.get('execution', {})
+        regime_config = self.config.get('regime_filter', {})
+
+        forced_days = float(execution_config.get('circuit_breaker_forced_days', 1))
+        self.forced_until_time = now + timedelta(days=forced_days)
+        self.forced_regime_reason = f"drawdown_{drawdown:.2%}_gt_{max_dd:.2%}"
+
+        risk_off_cash = regime_config.get('cash_risk_off', self.config['objectives']['min_cash_pct'])
+        forced_cash_target = max(self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']), risk_off_cash)
+        forced_max_weight = regime_config.get('max_weight_risk_off', self.config['objectives']['max_weight_per_asset'])
+
+        self.current_regime.update({
+            'regime_state': 'risk_off_forced',
+            'trend_score': self.current_regime.get('trend_score', 0.0),
+            'dynamic_min_cash': forced_cash_target,
+            'dynamic_max_weight': forced_max_weight,
+            'risk_caps_applied': True,
+            'forced_until_time': self.forced_until_time.isoformat(),
+            'forced_reason': self.forced_regime_reason
+        })
+
+        # 计算当前总权益与目标现金
+        holdings = []
+        positions_value = 0.0
+
+        for ticker, qty in list(self.positions.items()):
+            if qty <= 0:
+                continue
+            price, age_min, status = self.get_current_price(ticker)
+            if not price or price <= 0:
+                continue
+
+            value = qty * price
+            score, momentum, volatility, ticker_drawdown, score_source = self._compute_position_score_for_derisk(ticker)
+
+            holdings.append({
+                'ticker': ticker,
+                'qty': qty,
+                'price': price,
+                'age': age_min,
+                'status': status,
+                'value': value,
+                'score': score,
+                'momentum': momentum,
+                'volatility': volatility,
+                'drawdown': ticker_drawdown,
+                'score_source': score_source
+            })
+            positions_value += value
+
+        total_equity = self.cash + positions_value
+        if total_equity <= 0 or not holdings:
+            self.current_turnover_info = {
+                'turnover_notional': 0.0,
+                'turnover_notional_pre': 0.0,
+                'turnover_notional_post': 0.0,
+                'turnover_limit': 0.0,
+                'turnover_scale': 1.0,
+                'turnover_capped': False
+            }
+            return []
+
+        target_cash_value = total_equity * forced_cash_target
+        cash_needed_initial = max(0.0, target_cash_value - self.cash)
+        if cash_needed_initial <= 0:
+            self.current_turnover_info = {
+                'turnover_notional': 0.0,
+                'turnover_notional_pre': 0.0,
+                'turnover_notional_post': 0.0,
+                'turnover_limit': 0.0,
+                'turnover_scale': 1.0,
+                'turnover_capped': False
+            }
+            return []
+
+        # 受 objectives.max_rebalance_pct 与 turnover cap 双重约束
+        max_rebalance_pct = float(self.config.get('objectives', {}).get('max_rebalance_pct', 1.0))
+        max_turnover_pct = float(execution_config.get('max_turnover_pct_per_rebalance', 1.0))
+        cap_pct = min(max_rebalance_pct, max_turnover_pct)
+        turnover_limit = total_equity * cap_pct
+
+        turnover_notional_pre = min(cash_needed_initial, positions_value)
+        turnover_capped = turnover_notional_pre > turnover_limit
+        turnover_scale = (turnover_limit / turnover_notional_pre) if turnover_capped and turnover_notional_pre > 0 else 1.0
+
+        holdings.sort(key=lambda x: x['score'])  # 最差分数优先卖出
+
+        min_notional = execution_config.get('min_trade_notional_usd', 0)
+        tx_cost = self.config['objectives']['transaction_cost_pct']
+        remaining_cash_needed = cash_needed_initial
+        remaining_turnover_budget = turnover_limit
+        turnover_notional_post = 0.0
+
+        trade_context = self._build_trade_context()
+        trades = []
+
+        for h in holdings:
+            if remaining_cash_needed <= 0 or remaining_turnover_budget <= 0:
+                break
+
+            desired_notional = min(h['value'], remaining_cash_needed, remaining_turnover_budget)
+            sell_qty = int(desired_notional / h['price'])
+            sell_qty = min(sell_qty, h['qty'])
+
+            if sell_qty <= 0:
+                continue
+
+            proceeds = sell_qty * h['price']
+            if proceeds < min_notional:
+                continue
+
+            cost = proceeds * tx_cost
+            net_proceeds = proceeds - cost
+
+            old_qty = self.positions.get(h['ticker'], 0)
+            new_qty = old_qty - sell_qty
+            self.cash += net_proceeds
+            turnover_notional_post += proceeds
+            remaining_turnover_budget = max(0.0, remaining_turnover_budget - proceeds)
+            remaining_cash_needed = max(0.0, remaining_cash_needed - net_proceeds)
+
+            if new_qty > 0:
+                self.positions[h['ticker']] = new_qty
+            else:
+                del self.positions[h['ticker']]
+                if h['ticker'] in self.cost_basis:
+                    del self.cost_basis[h['ticker']]
+
+            decision_trace = [
+                'circuit_breaker',
+                f'drawdown_{drawdown:.2%}_gt_{max_dd:.2%}',
+                f'forced_until_{self.forced_until_time.isoformat()}',
+                f'derisk_score_{h["score"]:.4f}',
+                f'score_source_{h["score_source"]}',
+                f'price_{str(h["status"]).upper()}_age_{h["age"]:.0f}min',
+            ]
+            if turnover_capped:
+                decision_trace.append(f'turnover_cap_scale_{turnover_scale:.2%}')
+
+            trades.append({
+                'timestamp': now.isoformat(),
+                'ticker': h['ticker'],
+                'side': 'SELL',
+                'quantity': sell_qty,
+                'price': h['price'],
+                'cost': cost,
+                'reason': 'circuit_breaker',
+                'regime_state': 'risk_off_forced',
+                'trend_score': trade_context['trend_score'],
+                'cash_target': forced_cash_target,
+                'macro_risk_score': trade_context['macro_risk_score'],
+                'macro_topics': trade_context['macro_topics'],
+                'macro_tilts': trade_context['macro_tilts'],
+                'decision_trace': ' | '.join(decision_trace),
+                'price_age_minutes': h['age'],
+                'price_status': str(h['status']).upper(),
+                'turnover_notional_pre': turnover_notional_pre,
+                'turnover_notional_post': 0.0,
+                'turnover_limit': turnover_limit,
+                'turnover_scale': turnover_scale,
+                'turnover_capped': turnover_capped,
+            })
+
+        self.current_turnover_info = {
+            'turnover_notional': turnover_notional_pre,
+            'turnover_notional_pre': turnover_notional_pre,
+            'turnover_notional_post': turnover_notional_post,
+            'turnover_limit': turnover_limit,
+            'turnover_scale': turnover_scale,
+            'turnover_capped': turnover_capped,
+        }
+
+        for t in trades:
+            t['turnover_notional_post'] = turnover_notional_post
+
+        if trades:
+            self.trades_log.extend(trades)
+            self.save_trades_immediately()
+            self.last_rebalance_time = now
+
+        print(f"[CIRCUIT] Forced risk-off active until {self.forced_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[CIRCUIT] Target cash: {forced_cash_target:.1%}, sold notional: ${turnover_notional_post:,.2f}, remaining cash gap: ${remaining_cash_needed:,.2f}")
+
+        return trades
+
     def check_risk_controls(self):
-        """检查风险控制"""
+        """检查风险控制：触发后进入 risk_off_forced 并执行结构化去风险。"""
         positions_value = 0.0
         for ticker, qty in self.positions.items():
             price, age_min, status = self.get_current_price(ticker)  # D2) 解包三元组
             if price:
                 positions_value += qty * price
-        
+
         total_equity = self.cash + positions_value
-        
+
         if total_equity > self.peak_equity:
             self.peak_equity = total_equity
-        
-        drawdown = (self.peak_equity - total_equity) / self.peak_equity
-        
+
+        drawdown = (self.peak_equity - total_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
         max_dd = self.config['objectives']['max_drawdown_pct']
-        
+
         if drawdown > max_dd:
             print(f"⚠️ CIRCUIT BREAKER: Drawdown {drawdown:.2%} exceeds limit {max_dd:.2%}")
-            print(f"   Pausing trading and increasing cash position")
-            
-            self.status = "PAUSED"
-            
-            for ticker in list(self.positions.keys()):
-                qty = self.positions[ticker]
-                sell_qty = qty // 2
-                
-                if sell_qty > 0:
-                    price, age_min, status = self.get_current_price(ticker)  # D2) 解包三元组
-                    if price:
-                        proceeds = sell_qty * price
-                        cost = proceeds * self.config['objectives']['transaction_cost_pct']
-                        self.cash += (proceeds - cost)
-                        self.positions[ticker] -= sell_qty
-                        
-                        if self.positions[ticker] == 0:
-                            del self.positions[ticker]
-                        
-                        self.trades_log.append({
-                            'timestamp': datetime.now().isoformat(),
-                            'ticker': ticker,
-                            'side': 'SELL',
-                            'quantity': sell_qty,
-                            'price': price,
-                            'cost': cost,
-                            'reason': 'circuit_breaker'
-                        })
-            
+            trades = self._run_circuit_breaker_derisk(drawdown, max_dd)
+            if trades:
+                print(f"[CIRCUIT] Executed {len(trades)} structured de-risk trades")
+            else:
+                print("[CIRCUIT] No de-risk trades executed (already at target cash or constrained)")
             return True
-        
+
         return False
-    
     def record_snapshot(self):
         """记录组合快照"""
         print(f"[DEBUG] Recording snapshot at {datetime.now().strftime('%H:%M:%S')}")
@@ -1566,6 +1764,8 @@ class PaperTradingEngine:
             'dynamic_min_cash': self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']),
             'dynamic_max_weight': self.current_regime.get('dynamic_max_weight', self.config['objectives']['max_weight_per_asset']),
             'risk_caps_applied': self.current_regime.get('risk_caps_applied', False),
+            'forced_until_time': self.current_regime.get('forced_until_time', self.forced_until_time.isoformat() if self.forced_until_time else None),
+            'forced_regime_reason': self.current_regime.get('forced_reason', self.forced_regime_reason),
             # Macro Integration 字段
             'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),  # 原始值
             'macro_risk_score_smoothed': self.current_macro.get('macro_risk_score_smoothed', 0.0),  # E1) 平滑值
@@ -1759,10 +1959,29 @@ class PaperTradingEngine:
             dynamic_min_cash: 本轮应使用的最小现金比例
             dynamic_max_weight: 本轮应使用的最大单资产权重
         """
+        regime_config = self.config.get('regime_filter', {})
+
+        # circuit breaker 强制 risk_off 窗口优先
+        if self.forced_until_time is not None:
+            now = datetime.now()
+            if now < self.forced_until_time:
+                dynamic_min_cash = regime_config.get('cash_risk_off', self.config['objectives']['min_cash_pct'])
+                dynamic_max_weight = regime_config.get('max_weight_risk_off', self.config['objectives']['max_weight_per_asset'])
+                regime_details = {
+                    'forced_until_time': self.forced_until_time.isoformat(),
+                    'forced_reason': self.forced_regime_reason
+                }
+                print(f"\n[REGIME] FORCE MODE: RISK_OFF_FORCED until {self.forced_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                return 'risk_off_forced', 0.0, regime_details, dynamic_min_cash, dynamic_max_weight
+            else:
+                print(f"\n[REGIME] FORCE MODE EXPIRED at {self.forced_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                self.forced_until_time = None
+                self.forced_regime_reason = ""
+
         if not self.config.get('regime_filter', {}).get('enabled', False):
             # 如果未启用 regime filter，返回默认值
             return 'neutral', 0.5, {}, self.config['objectives']['min_cash_pct'], self.config['objectives']['max_weight_per_asset']
-        
+
         regime_config = self.config['regime_filter']
         ma_window = regime_config.get('ma_window', 50)
         
@@ -1924,7 +2143,8 @@ class PaperTradingEngine:
             print("-" * 60)
 
         if self.check_risk_controls():
-            print("⚠️ Risk control triggered, skipping rebalance")
+            print("⚠️ Risk control triggered (risk_off_forced active), skipping normal rebalance")
+            self.current_cycle += 1
             return
 
         print("\nTarget Weights:")
@@ -2259,3 +2479,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
