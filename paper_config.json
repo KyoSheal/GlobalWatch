@@ -185,7 +185,8 @@
     "equity_curve_path": "outputs/equity_curve.png",
     "trades_log_path": "outputs/paper_trades.csv",
     "portfolio_snapshots_path": "outputs/portfolio_snapshots.jsonl",
-    "summary_report_path": "outputs/paper_summary.txt"
+    "summary_report_path": "outputs/paper_summary.txt",
+    "scoreboard_path": "outputs/scoreboard.jsonl"
   },
   "safety": {
     "no_real_broker": true,

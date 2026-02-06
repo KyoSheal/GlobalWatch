@@ -607,6 +607,8 @@ class PaperTradingEngine:
         self.current_turnover_info = {}  # C4) 当前换手信息
         self.forced_until_time = None  # risk_off_forced 结束时间
         self.forced_regime_reason = ""
+        self.scoreboard_history = []  # 2w scoreboard records
+        self.last_diagnostic_hint = ""
         self.current_weights_reused = False
         self.current_macro_reused = False
         
@@ -649,6 +651,9 @@ class PaperTradingEngine:
         
         # 创建输出目录
         os.makedirs('outputs', exist_ok=True)
+
+        # 加载 scoreboard 历史（用于连续窗口诊断）
+        self.load_scoreboard_history()
         
         # 设置随机种子（确保可复现）
         np.random.seed(self.config['safety']['random_seed'])
@@ -680,6 +685,8 @@ class PaperTradingEngine:
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
         macro_config = config.setdefault('macro_integration', {})
         macro_config.setdefault('macro_allow_new_positions', ['TLT', 'GLD'])
+        reporting_config = config.setdefault('reporting', {})
+        reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
         
         return config
     
@@ -789,7 +796,106 @@ class PaperTradingEngine:
         except Exception as e:
             print(f"⚠️  Failed to resume from checkpoint: {e}")
             print("   Starting fresh...")
-            self.clear_checkpoint()
+
+    def load_scoreboard_history(self):
+        """加载已有 scoreboard 历史，便于连续窗口诊断。"""
+        scoreboard_path = self.config.get('reporting', {}).get('scoreboard_path', 'outputs/scoreboard.jsonl')
+        self.scoreboard_history = []
+        self.last_diagnostic_hint = ""
+
+        if not os.path.exists(scoreboard_path):
+            return
+
+        try:
+            with open(scoreboard_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        self.scoreboard_history.append(rec)
+                    except Exception:
+                        continue
+
+            if self.scoreboard_history:
+                self.last_diagnostic_hint = str(self.scoreboard_history[-1].get('diagnostic_hint', '') or '')
+        except Exception as e:
+            print(f"[SCOREBOARD] Failed to load history: {e}")
+            self.scoreboard_history = []
+            self.last_diagnostic_hint = ""
+
+    def append_scoreboard_record(self):
+        """在每次 snapshot 后写入一条 2w scoreboard 记录。"""
+        if not self.portfolio_snapshots:
+            return None
+
+        scoreboard_path = self.config.get('reporting', {}).get('scoreboard_path', 'outputs/scoreboard.jsonl')
+        window_n = int(self.config.get('benchmarks', {}).get('evaluation_days', 10))
+        window_n = max(2, window_n)
+        window = self.portfolio_snapshots[-window_n:]
+        latest = window[-1]
+
+        start_equity = float(window[0].get('total_equity', latest.get('total_equity', self.initial_cash)))
+        end_equity = float(latest.get('total_equity', start_equity))
+        strategy_return_2w = ((end_equity - start_equity) / start_equity) if start_equity > 0 else 0.0
+
+        bench_avg_return_2w = float(latest.get('bench_avg_return', 0.0))
+        excess_return_2w = float(strategy_return_2w - bench_avg_return_2w)
+        win_flag_2w = bool(excess_return_2w > 0)
+
+        turnover_sum_2w = float(sum(float(s.get('turnover_notional_post', 0.0) or 0.0) for s in window))
+
+        cash_ratios = []
+        for s in window:
+            equity = float(s.get('total_equity', 0.0) or 0.0)
+            cash = float(s.get('cash', 0.0) or 0.0)
+            cash_ratios.append((cash / equity) if equity > 0 else 1.0)
+        avg_cash_2w = float(np.mean(cash_ratios)) if cash_ratios else 0.0
+
+        macro_active_ratio_2w = float(np.mean([0.0 if s.get('macro_reused', False) else 1.0 for s in window])) if window else 0.0
+        risk_off_ratio_2w = float(np.mean([1.0 if s.get('regime_state') in ('risk_off', 'risk_off_forced') else 0.0 for s in window])) if window else 0.0
+        avg_equity_2w = float(np.mean([float(s.get('total_equity', 0.0) or 0.0) for s in window])) if window else 0.0
+
+        diagnostic_hint = ""
+        temp_rec = {
+            'win_flag_2w': win_flag_2w
+        }
+        tail = (self.scoreboard_history + [temp_rec])[-3:]
+        if len(tail) == 3 and all(not bool(x.get('win_flag_2w', True)) for x in tail):
+            turnover_ratio = (turnover_sum_2w / max(avg_equity_2w, 1.0))
+            if turnover_ratio >= 1.5:
+                diagnostic_hint = "turnover_too_high"
+            elif avg_cash_2w >= 0.40:
+                diagnostic_hint = "too_defensive"
+            elif macro_active_ratio_2w >= 0.60:
+                diagnostic_hint = "macro_too_noisy"
+            elif risk_off_ratio_2w >= 0.60:
+                diagnostic_hint = "regime_filter_too_strict"
+            else:
+                diagnostic_hint = "underperforming_no_clear_driver"
+
+        record = {
+            'timestamp': latest.get('timestamp', datetime.now().isoformat()),
+            'strategy_return_2w': float(strategy_return_2w),
+            'bench_avg_return_2w': float(bench_avg_return_2w),
+            'excess_return_2w': float(excess_return_2w),
+            'win_flag_2w': bool(win_flag_2w),
+            'turnover_sum_2w': float(turnover_sum_2w),
+            'avg_cash_2w': float(avg_cash_2w),
+            'macro_active_ratio_2w': float(macro_active_ratio_2w),
+            'diagnostic_hint': diagnostic_hint
+        }
+
+        try:
+            with open(scoreboard_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+            self.scoreboard_history.append(record)
+            self.last_diagnostic_hint = diagnostic_hint
+        except Exception as e:
+            print(f"[SCOREBOARD] Failed to append record: {e}")
+
+        return record
     
     def rebuild_cost_basis(self):
         """从交易记录重建成本基础"""
@@ -2234,11 +2340,24 @@ class PaperTradingEngine:
             'turnover_notional_post': self.current_turnover_info.get('turnover_notional_post', 0.0),
             'turnover_limit': self.current_turnover_info.get('turnover_limit', 0.0),
             'turnover_scale': self.current_turnover_info.get('turnover_scale', 1.0),
-            'turnover_capped': self.current_turnover_info.get('turnover_capped', False)
+            'turnover_capped': self.current_turnover_info.get('turnover_capped', False),
+            'diagnostic_hint': self.last_diagnostic_hint
         }
         
         self.portfolio_snapshots.append(snapshot)
         self.equity_curve.append((datetime.now(), total_equity, self.cash, positions_value))
+
+        # 每个 snapshot 后写一条 scoreboard
+        scoreboard_record = self.append_scoreboard_record()
+        if scoreboard_record:
+            snapshot['strategy_return_2w'] = scoreboard_record.get('strategy_return_2w', 0.0)
+            snapshot['bench_avg_return_2w'] = scoreboard_record.get('bench_avg_return_2w', 0.0)
+            snapshot['excess_return_2w'] = scoreboard_record.get('excess_return_2w', 0.0)
+            snapshot['win_flag_2w'] = scoreboard_record.get('win_flag_2w', False)
+            snapshot['turnover_sum_2w'] = scoreboard_record.get('turnover_sum_2w', 0.0)
+            snapshot['avg_cash_2w'] = scoreboard_record.get('avg_cash_2w', 0.0)
+            snapshot['macro_active_ratio_2w'] = scoreboard_record.get('macro_active_ratio_2w', 0.0)
+            snapshot['diagnostic_hint'] = scoreboard_record.get('diagnostic_hint', '')
         
         # 每个周期生成实时摘要
         self.generate_live_summary()
