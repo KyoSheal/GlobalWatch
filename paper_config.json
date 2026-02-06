@@ -95,6 +95,181 @@
       "asset_type": "ETF"
     },
     {
+      "ticker": "WMT",
+      "name": "Walmart Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "COST",
+      "name": "Costco Wholesale Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "PEP",
+      "name": "PepsiCo Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MCD",
+      "name": "McDonald's Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "SBUX",
+      "name": "Starbucks Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "HD",
+      "name": "Home Depot Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "LOW",
+      "name": "Lowe's Companies Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MRK",
+      "name": "Merck & Co Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "ABBV",
+      "name": "AbbVie Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "LLY",
+      "name": "Eli Lilly and Co",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "TMO",
+      "name": "Thermo Fisher Scientific Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "BRK.B",
+      "name": "Berkshire Hathaway Inc Class B",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "V",
+      "name": "Visa Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MA",
+      "name": "Mastercard Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "BAC",
+      "name": "Bank of America Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "GS",
+      "name": "Goldman Sachs Group Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "LMT",
+      "name": "Lockheed Martin Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "RTX",
+      "name": "RTX Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "CAT",
+      "name": "Caterpillar Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "DE",
+      "name": "Deere & Co",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "CVX",
+      "name": "Chevron Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "COP",
+      "name": "ConocoPhillips",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "NEE",
+      "name": "NextEra Energy Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "DUK",
+      "name": "Duke Energy Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "ORCL",
+      "name": "Oracle Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "ADBE",
+      "name": "Adobe Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "CRM",
+      "name": "Salesforce Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "INTU",
+      "name": "Intuit Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "XLF",
+      "name": "Financial Select Sector SPDR Fund",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "XLE",
+      "name": "Energy Select Sector SPDR Fund",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "XLV",
+      "name": "Health Care Select Sector SPDR Fund",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "XLP",
+      "name": "Consumer Staples Select Sector SPDR Fund",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "XLI",
+      "name": "Industrial Select Sector SPDR Fund",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "XLK",
+      "name": "Technology Select Sector SPDR Fund",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "VOO",
+      "name": "Vanguard S&P 500 ETF",
+      "asset_type": "ETF"
+    },
+    {
       "ticker": "CASH",
       "name": "Cash Equivalent",
       "asset_type": "CASH"
@@ -130,6 +305,11 @@
     "fill_gap_max": 0.03,
     "fill_gap_max_iters": 2,
     "allow_buy_benchmarks": false,
+    "cross_section_top_n": 10,
+    "correlation_lookback_days": 60,
+    "correlation_threshold": 0.8,
+    "volatility_floor": 0.08,
+    "min_holding_cycles": 4,
     "price_stale_policy": {
       "allow_buy": ["LIVE", "RECENT"],
       "allow_sell": ["LIVE", "RECENT", "STALE"]

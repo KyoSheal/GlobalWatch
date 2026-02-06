@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo GlobalWatch V2.8 Launcher
+echo GlobalWatch V2.9.1 Launcher
 echo ========================================
 echo.
 echo Select mode:
@@ -40,3 +40,4 @@ goto end
 
 :end
 pause
+

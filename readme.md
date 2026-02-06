@@ -1,10 +1,11 @@
-﻿# GlobalWatch Paper Trading (V2.8+)
+﻿# GlobalWatch Paper Trading (V2.9.1)
 
 本项目是一个本地运行的自动化 Paper Trading 引擎（不连接真实券商）。
 你最近新增的功能已经较多，本 README 重点覆盖：
 - 如何运行
 - 如何验收关键行为
 - 关键配置项说明
+- v2.9.1 新增 Alpha 模块（横截面排名/波动缩放/相关性去重/最小持有期）
 
 ## 1. 快速开始
 
@@ -151,6 +152,38 @@ Start_Paper_Trading.bat
   - `regime_filter_too_strict`
 - 最新 `diagnostic_hint` 会同步写入 snapshot
 
+### 2.8 Alpha 升级（v2.9.1）
+目标：
+- 解决“仅看绝对动量”导致的选股弱点
+- 降低高相关与过度换手
+
+行为：
+- A) 横截面排名（Cross-sectional Ranking）
+- 每轮先计算所有候选资产的 `momentum/volatility`
+- 对动量做横截面评分（rank_score）
+- 仅保留 Top N（配置项控制）
+
+- B) 波动缩放（Volatility Scaling）
+- 权重信号近似为：`max(0, rank_score) / volatility`
+- 高波动资产自动降权，低波动资产相对升权
+- 后续仍经过 `cash_target`、`max_weight`、caps/fill 约束
+
+- C) 最小持有期（Holding Period）
+- 新买入后至少持有 `min_holding_cycles` 个 rebalance cycle
+- 触发时阻止 SELL/REDUCE，不绕过 STALE/turnover/cooldown 风控
+- 会在日志输出被阻止资产与剩余周期
+
+- D) 相关性去重（Correlation Control）
+- 在 Top N 内做近 `M` 天收益相关性检查
+- 若相关性 `> threshold`，保留 rank 更高资产，剔除另一只
+- 数据不足或相关性计算失败时安全降级，并打印 debug 提示
+
+新增可解释性日志：
+- `[RANKING]` Top N 表（ticker, momentum, volatility, rank_score, base_score）
+- `[VOL SCALE]` 波动缩放前后权重
+- `[CORR]` 相关性筛选结果与剔除原因
+- `[HOLDING]` 被最小持有期阻止的交易
+
 ---
 
 ## 3. 关键配置速查（paper_config.json）
@@ -168,6 +201,11 @@ Start_Paper_Trading.bat
 - `fill_gap_max: 0.03`
 - `fill_gap_max_iters: 2`
 - `allow_buy_benchmarks: false`
+- `cross_section_top_n: 10`
+- `correlation_lookback_days: 60`
+- `correlation_threshold: 0.80`
+- `volatility_floor: 0.08`
+- `min_holding_cycles: 4`
 
 ### 3.2 macro_integration
 - `macro_cash_slope: 0.02`
@@ -220,6 +258,14 @@ Get-Content outputs\scoreboard.jsonl -Tail 5
 - `scoreboard.jsonl` 出现 `diagnostic_hint`
 - snapshot 同步该字段
 
+7. Alpha 排名与相关性：
+- 日志出现 `[RANKING]`、`[VOL SCALE]`、`[CORR]`
+- `corr_dropped` / `corr_selected` 在 snapshot 可见
+
+8. 最小持有期：
+- 刚买入后若目标要求减仓，日志出现 `[HOLDING] Block SELL/REDUCE ...`
+- snapshot 中 `holding_block_count > 0`
+
 ---
 
 ## 5. 常见问题
@@ -227,6 +273,7 @@ Get-Content outputs\scoreboard.jsonl -Tail 5
 ### Q1: 启动后提示 checkpoint，是否继续？
 - 想续跑历史会话：输入 `y`
 - 想重新开始：输入 `n`
+- 非交互场景可设置环境变量：`GW_CHECKPOINT_ACTION=resume|fresh`
 
 ### Q2: 为什么有些宏观 tilt 没生效？
 - 可能被 `trade_universe` 过滤（benchmark 解耦）
@@ -242,4 +289,5 @@ Get-Content outputs\scoreboard.jsonl -Tail 5
 - 本系统仅用于模拟交易（Paper Trading）
 - 不连接真实券商，不构成投资建议
 - 实盘前请做独立风险评估与充分回测
+
 

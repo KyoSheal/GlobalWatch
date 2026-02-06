@@ -1,8 +1,8 @@
-"""
+﻿"""
 GlobalWatch Paper Trading Module
-全自动无人干预的模拟交易系统
+鍏ㄨ嚜鍔ㄦ棤浜哄共棰勭殑妯℃嫙浜ゆ槗绯荤粺
 
-⚠️ SIMULATION ONLY - NO REAL BROKER CONNECTION
+鈿狅笍 SIMULATION ONLY - NO REAL BROKER CONNECTION
 """
 
 import json
@@ -15,7 +15,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 import matplotlib
-matplotlib.use('Agg')  # 非交互式后端
+matplotlib.use('Agg')  # 闈炰氦浜掑紡鍚庣
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -25,27 +25,27 @@ try:
     CHROMADB_AVAILABLE = True
 except ImportError:
     CHROMADB_AVAILABLE = False
-    print("⚠️ ChromaDB not available - macro integration disabled")
+    print("鈿狅笍 ChromaDB not available - macro integration disabled")
 
-# 设置无缓冲输出，解决 Windows Terminal 延迟问题
+# 璁剧疆鏃犵紦鍐茶緭鍑猴紝瑙ｅ喅 Windows Terminal 寤惰繜闂
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# 安全检查：确保不会连接真实 broker
+# 瀹夊叏妫€鏌ワ細纭繚涓嶄細杩炴帴鐪熷疄 broker
 REAL_BROKER_KEYWORDS = ['alpaca', 'interactive_brokers', 'ib_insync', 'robinhood', 'td_ameritrade']
 for keyword in REAL_BROKER_KEYWORDS:
     try:
         __import__(keyword)
-        raise RuntimeError(f"⚠️ SAFETY VIOLATION: Detected real broker library '{keyword}'. Paper trading is SIMULATION ONLY!")
+        raise RuntimeError(f"鈿狅笍 SAFETY VIOLATION: Detected real broker library '{keyword}'. Paper trading is SIMULATION ONLY!")
     except ImportError:
         pass  # Good, no real broker library
 
 
 class MacroSignalAdapter:
-    """宏观信号适配器 - 连接 GlobalWatch ChromaDB"""
+    """瀹忚淇"彿閫傞厤鍣?- 杩炴帴 GlobalWatch ChromaDB"""
     
     def __init__(self, config):
-        """初始化宏观信号适配器"""
+        """鍒濆鍖栧畯瑙備俊鍙烽€傞厤鍣?"""
         self.config = config
         self.macro_config = config.get('macro_integration', {})
         self.enabled = self.macro_config.get('enabled', False) and CHROMADB_AVAILABLE
@@ -67,13 +67,13 @@ class MacroSignalAdapter:
             self.chroma_client = chromadb.PersistentClient(path=chroma_path)
             self.signals_collection = self.chroma_client.get_collection(name=collection_name)
             
-            print(f"[MACRO] ✅ Connected to ChromaDB: {chroma_path}/{collection_name}")
+            print(f"[MACRO] 鉁?Connected to ChromaDB: {chroma_path}/{collection_name}")
         except Exception as e:
-            print(f"[MACRO] ⚠️ Failed to connect to ChromaDB: {e}")
+            print(f"[MACRO] 鈿狅笍 Failed to connect to ChromaDB: {e}")
             self.enabled = False
 
     def _extract_source_key(self, metadata):
-        """提取信号来源键（source/publisher/channel 等字段）。"""
+        """鎻愬彇淇"彿鏉ユ簮閿紙source/publisher/channel 绛夊瓧娈碉級銆?"""
         source = (
             metadata.get('source')
             or metadata.get('source_name')
@@ -85,7 +85,7 @@ class MacroSignalAdapter:
         return str(source).strip().lower()
 
     def _to_float_optional(self, value):
-        """将可选数值字段安全转换为 float（失败返回 None）。"""
+        """灏嗗彲閫夋暟鍊煎瓧娈靛畨鍏ㄨ浆鎹负 float锛堝け璐ヨ繑鍥?None锛夈€?"""
         if value is None:
             return None
         try:
@@ -94,7 +94,7 @@ class MacroSignalAdapter:
             return None
 
     def _parse_correct_flag(self, value):
-        """解析 correct_* 字段为 [0,1] 区间。"""
+        """瑙ｆ瀽 correct_* 瀛楁涓?[0,1] 鍖洪棿銆?"""
         if value is None:
             return None
 
@@ -118,7 +118,7 @@ class MacroSignalAdapter:
         return None
 
     def _append_rolling_accuracy(self, history_map, key, correct_value):
-        """向 rolling accuracy 序列追加样本并保留固定窗口。"""
+        """鍚?rolling accuracy 搴忓垪杩藉姞鏍锋湰骞朵繚鐣欏浐瀹氱獥鍙ｃ€?"""
         if correct_value is None:
             return
 
@@ -129,7 +129,7 @@ class MacroSignalAdapter:
             del values[:-self.quality_window]
 
     def _update_quality_calibration(self, signals):
-        """读取 VERIFIED/correct_* 回填字段并更新 theme/source 的 accuracy。"""
+        """璇诲彇 VERIFIED/correct_* 鍥炲～瀛楁骞舵洿鏂?theme/source 鐨?accuracy銆?"""
         summary = {
             'verified_count': 0,
             'with_correct_1d': 0,
@@ -174,7 +174,7 @@ class MacroSignalAdapter:
         return summary
 
     def _get_accuracy_factor(self, theme, source):
-        """返回 accuracy_factor 以及采用的 rolling accuracy 信息。"""
+        """杩斿洖 accuracy_factor 浠ュ強閲囩敤鐨?rolling accuracy 淇℃伅銆?"""
         theme_key = str(theme or 'unknown').strip().lower()
         source_key = str(source or 'unknown').strip().lower()
 
@@ -192,12 +192,12 @@ class MacroSignalAdapter:
         return accuracy_factor, acc, scope
     
     def fetch_recent_signals(self, n=50):
-        """获取最近的 N 条信号（仅 PENDING 或 VERIFIED）"""
+        """鑾峰彇鏈€杩戠殑 N 鏉′俊鍙凤紙浠?PENDING 鎴?VERIFIED锛?"""
         if not self.enabled:
             return []
         
         try:
-            # 获取所有信号
+            # 鑾峰彇鎵€鏈変俊鍙?
             results = self.signals_collection.get(
                 include=['metadatas', 'documents']
             )
@@ -206,7 +206,7 @@ class MacroSignalAdapter:
                 print("[MACRO] No signals found in database")
                 return []
             
-            # 过滤状态并按时间排序
+            # 杩囨护鐘舵€佸苟鎸夋椂闂存帓搴?
             signals = []
             for i, metadata in enumerate(results['metadatas']):
                 status = metadata.get('status', 'UNKNOWN')
@@ -218,10 +218,10 @@ class MacroSignalAdapter:
                         'document': results['documents'][i] if i < len(results['documents']) else ''
                     })
             
-            # 按时间戳排序（最新的在前）
+            # 鎸夋椂闂存埑鎺掑簭锛堟渶鏂扮殑鍦ㄥ墠锛?
             signals.sort(key=lambda x: x['metadata'].get('timestamp', ''), reverse=True)
             
-            # 取最近 N 条
+            # 鍙栨渶杩?N 鏉?
             recent_signals = signals[:n]
             
             print(f"[MACRO] Fetched {len(recent_signals)} recent signals (from {len(signals)} valid)")
@@ -233,16 +233,16 @@ class MacroSignalAdapter:
             return []
     
     def compute_signal_weight(self, signal_timestamp):
-        """计算信号权重（基于时间衰减）"""
+        """璁＄畻淇"彿鏉冮噸锛堝熀浜庢椂闂磋“鍑忥級"""
         try:
-            # 解析时间戳
+            # 瑙ｆ瀽鏃堕棿鎴?
             signal_time = datetime.fromisoformat(signal_timestamp.replace('Z', '+00:00'))
             now = datetime.now(signal_time.tzinfo) if signal_time.tzinfo else datetime.now()
             
-            # 计算年龄（小时）
+            # 璁＄畻骞撮緞锛堝皬鏃讹級
             age_hours = (now - signal_time).total_seconds() / 3600
             
-            # 指数衰减：w = exp(-lambda * age_hours)
+            # 鎸囨暟琛板噺锛歸 = exp(-lambda * age_hours)
             decay_lambda = self.macro_config.get('decay_lambda_per_hour', 0.15)
             weight = np.exp(-decay_lambda * age_hours)
             
@@ -253,45 +253,45 @@ class MacroSignalAdapter:
             return 0.0, 0.0
     
     def analyze_signals(self):
-        """分析宏观信号并输出 macro_risk_score + tilts
+        """鍒嗘瀽瀹忚淇"彿骞惰緭鍑?macro_risk_score + tilts
         
-        严格的 k-of-n 确认机制：
-        A1) 只保留 signal_max_age_hours 内的信号
-        A2) 每个 theme 取最近 n 条，统计 bullish/bearish 数量，>= k 才确认
-        A3) 时间衰减仅用于强度计算，不用于确认
-        A4) 返回增强的 confirmed_topics 结构
-        A5) macro_risk_score 只由确认主题贡献，risk_off 类加分，risk_on 类可抵消
-        A6) 详细调试日志
+        涓ユ牸鐨?k-of-n 纭鏈哄埗锛?
+        A1) 鍙繚鐣?signal_max_age_hours 鍐呯殑淇"彿
+        A2) 姣忎釜 theme 鍙栨渶杩?n 鏉★紝缁熻 bullish/bearish 鏁伴噺锛?= k 鎵嶇‘璁?
+        A3) 鏃堕棿琛板噺浠呯敤浜庡己搴﹁绠楋紝涓嶇敤浜庣‘璁?
+        A4) 杩斿洖澧炲己鐨?confirmed_topics 缁撴瀯
+        A5) macro_risk_score 鍙敱纭涓婚璐＄尞锛宺isk_off 绫诲姞鍒嗭紝risk_on 绫诲彲鎶垫秷
+        A6) 璇︾粏璋冭瘯鏃ュ織
         
         Returns:
-            macro_risk_score: 0-10，越大越 risk-off
+            macro_risk_score: 0-10锛岃秺澶ц秺 risk-off
             confirmed_topics: List[{theme, direction, strength, confidence_effective, top_sources, newest_timestamp}]
             macro_tilts: {ticker: tilt_delta}
-            signal_summary: 信号统计摘要
+            signal_summary: 淇"彿缁熻鎽樿
         """
         if not self.enabled:
             return 0.0, [], {}, {}
         
         print(f"\n[MACRO] Analyzing macro signals from GlobalWatch...")
         
-        # 获取所有信号
+        # 鑾峰彇鎵€鏈変俊鍙?
         all_signals = self.fetch_recent_signals(n=200)
         
         if not all_signals:
             print("[MACRO] No signals to analyze")
             return 0.0, [], {}, {}
 
-        # 先更新基于 VERIFIED/correct_* 的质量校准
+        # 鍏堟洿鏂板熀浜?VERIFIED/correct_* 鐨勮川閲忔牎鍑?
         quality_summary = self._update_quality_calibration(all_signals)
         
-        # A1) 配置参数
+        # A1) 閰嶇疆鍙傛暟
         confirm_k, confirm_n = self.macro_config.get('confirm_k_of_n', [2, 3])
         signal_max_age_hours = self.macro_config.get('signal_max_age_hours', 48)
         decay_lambda = self.macro_config.get('decay_lambda_per_hour', 0.15)
         
         now = datetime.now()
         
-        # A1) 过滤：只保留 signal_max_age_hours 内的信号
+        # A1) 杩囨护锛氬彧淇濈暀 signal_max_age_hours 鍐呯殑淇"彿
         valid_signals = []
         for signal in all_signals:
             metadata = signal['metadata']
@@ -299,7 +299,7 @@ class MacroSignalAdapter:
             
             try:
                 signal_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                # 统一时区
+                # 缁熶竴鏃跺尯
                 if signal_time.tzinfo:
                     now_aware = datetime.now(signal_time.tzinfo)
                 else:
@@ -309,7 +309,7 @@ class MacroSignalAdapter:
                 age_hours = (now_aware - signal_time).total_seconds() / 3600
                 
                 if age_hours > signal_max_age_hours:
-                    continue  # 超过窗口，丢弃
+                    continue  # 瓒呰繃绐楀彛锛屼涪寮?
                 
                 valid_signals.append({
                     'metadata': metadata,
@@ -324,7 +324,7 @@ class MacroSignalAdapter:
                 })
                 
             except Exception as e:
-                # 无效时间戳，跳过
+                # 鏃犳晥鏃堕棿鎴筹紝璺宠繃
                 continue
         
         print(f"[MACRO] Filtered {len(valid_signals)}/{len(all_signals)} signals within {signal_max_age_hours}h window")
@@ -333,7 +333,7 @@ class MacroSignalAdapter:
             print("[MACRO] No valid signals after age filtering")
             return 0.0, [], {}, {}
         
-        # A2) 按主题分组
+        # A2) 鎸変富棰樺垎缁?
         theme_groups = {}
         for sig in valid_signals:
             theme = sig['metadata'].get('theme', 'unknown')
@@ -341,12 +341,12 @@ class MacroSignalAdapter:
                 theme_groups[theme] = []
             theme_groups[theme].append(sig)
         
-        # A2) 每个主题：按时间排序，取最近 n 条
+        # A2) 姣忎釜涓婚锛氭寜鏃堕棿鎺掑簭锛屽彇鏈€杩?n 鏉?
         for theme in theme_groups:
             theme_groups[theme].sort(key=lambda x: x['timestamp'], reverse=True)
             theme_groups[theme] = theme_groups[theme][:confirm_n]
         
-        # A2) 确认机制：统计 bullish/bearish 数量
+        # A2) 纭鏈哄埗锛氱粺璁?bullish/bearish 鏁伴噺
         confirmed_topics = []
         
         print(f"\n[MACRO] Theme Confirmation (k={confirm_k}, n={confirm_n}, max_age={signal_max_age_hours}h):")
@@ -406,30 +406,30 @@ class MacroSignalAdapter:
                 else:
                     neutral_count += 1
             
-            # A2) 确认逻辑：bullish_count >= k 或 bearish_count >= k
+            # A2) 纭閫昏緫锛歜ullish_count >= k 鎴?bearish_count >= k
             confirmed_direction = None
             confirmed_items = []
             
             if bullish_count >= confirm_k and bullish_count > bearish_count:
                 confirmed_direction = 'bullish'
                 confirmed_items = bullish_items
-                status = f"✅ BULLISH ({bullish_count}/{len(signals_list)})"
+                status = f"鉁?BULLISH ({bullish_count}/{len(signals_list)})"
             elif bearish_count >= confirm_k and bearish_count > bullish_count:
                 confirmed_direction = 'bearish'
                 confirmed_items = bearish_items
-                status = f"✅ BEARISH ({bearish_count}/{len(signals_list)})"
+                status = f"鉁?BEARISH ({bearish_count}/{len(signals_list)})"
             else:
-                # 未确认
+                # 鏈‘璁?
                 max_count = max(bullish_count, bearish_count)
                 needed = confirm_k - max_count
                 if needed > 0:
-                    status = f"⏳ NEED {needed} MORE"
+                    status = f"鈴?NEED {needed} MORE"
                 else:
-                    status = f"⚖️ CONFLICTED ({bullish_count}v{bearish_count})"
+                    status = f"鈿栵笍 CONFLICTED ({bullish_count}v{bearish_count})"
             
             print(f"{theme:<20} {bullish_count:>5} {bearish_count:>5} {neutral_count:>5} {status:<20}")
             
-            # A3) 确认后才计算强度（时间衰减）
+            # A3) 纭鍚庢墠璁＄畻寮哄害锛堟椂闂磋“鍑忥級
             if confirmed_direction:
                 strength = 0.0
                 confidence_raw_sum = 0.0
@@ -447,16 +447,16 @@ class MacroSignalAdapter:
                 confidence_effective = confidence_effective_sum / len(confirmed_items) if confirmed_items else 0.0
                 accuracy_factor_avg = accuracy_factor_sum / len(confirmed_items) if confirmed_items else 1.0
                 
-                # 提取 top sources（最多3条）
+                # 鎻愬彇 top sources锛堟渶澶?鏉★級
                 top_sources = []
                 for item in confirmed_items[:3]:
                     doc_preview = item['document'][:100] if item['document'] else 'N/A'
                     top_sources.append(doc_preview)
                 
-                # 最新时间戳
+                # 鏈€鏂版椂闂存埑
                 newest_timestamp = confirmed_items[0]['timestamp'] if confirmed_items else ''
                 
-                # A4) 增强的 confirmed_topics 结构
+                # A4) 澧炲己鐨?confirmed_topics 缁撴瀯
                 confirmed_topics.append({
                     'theme': theme,
                     'direction': confirmed_direction,
@@ -469,7 +469,7 @@ class MacroSignalAdapter:
                     'count': len(confirmed_items)
                 })
                 
-                # A6) 调试日志
+                # A6) 璋冭瘯鏃ュ織
                 print(f"  [DEBUG] {theme}: direction={confirmed_direction}, "
                       f"count={bullish_count if confirmed_direction=='bullish' else bearish_count}/"
                       f"{bearish_count if confirmed_direction=='bullish' else bullish_count}, "
@@ -479,7 +479,7 @@ class MacroSignalAdapter:
         
         print("-" * 70)
         
-        # A5) macro_risk_score 计算：只由确认主题贡献
+        # A5) macro_risk_score 璁＄畻锛氬彧鐢辩‘璁や富棰樿础鐚?
         risk_off_themes = ['risk_off', 'recession', 'rates_up', 'credit_stress', 'inflation_risk', 
                            'geopolitical_risk', 'market_crash', 'volatility_spike']
         risk_on_themes = ['risk_on', 'soft_landing', 'growth_acceleration', 'dovish_fed', 
@@ -492,34 +492,34 @@ class MacroSignalAdapter:
             strength = topic['strength']
             direction = topic['direction']
             
-            # risk_off 类主题
+            # risk_off 绫讳富棰?
             is_risk_off = any(keyword in theme_lower for keyword in risk_off_themes)
-            # risk_on 类主题
+            # risk_on 绫讳富棰?
             is_risk_on = any(keyword in theme_lower for keyword in risk_on_themes)
             
             if is_risk_off:
                 if direction == 'bearish':
-                    # risk_off 主题看跌 → 增加风险分数
-                    risk_score += min(strength * 2.0, 3.0)  # 单主题最多贡献 3 分
+                    # risk_off 涓婚鐪嬭穼 鈫?澧炲姞椋庨櫓鍒嗘暟
+                    risk_score += min(strength * 2.0, 3.0)  # 鍗曚富棰樻渶澶氳础鐚?3 鍒?
                 elif direction == 'bullish':
-                    # risk_off 主题看涨 → 也增加风险（例如"通胀风险看涨"）
+                    # risk_off 涓婚鐪嬫定 鈫?涔熷鍔犻闄╋紙渚嬪"閫氳儉椋庨櫓鐪嬫定"锛?
                     risk_score += min(strength * 1.5, 2.5)
             
             elif is_risk_on:
                 if direction == 'bullish':
-                    # risk_on 主题看涨 → 抵消风险分数
+                    # risk_on 涓婚鐪嬫定 鈫?鎶垫秷椋庨櫓鍒嗘暟
                     risk_score -= min(strength * 1.0, 2.0)
                 elif direction == 'bearish':
-                    # risk_on 主题看跌 → 增加风险
+                    # risk_on 涓婚鐪嬭穼 鈫?澧炲姞椋庨櫓
                     risk_score += min(strength * 1.0, 2.0)
         
-        # Clip 到 [0, 10]
+        # Clip 鍒?[0, 10]
         risk_score = max(0.0, min(risk_score, 10.0))
         
         print(f"\n[MACRO] Risk Score: {risk_score:.1f}/10.0 (from {len(confirmed_topics)} confirmed topics)")
         print(f"[MACRO] Confirmed Topics: {len(confirmed_topics)}")
         
-        # 生成 macro_tilts（基于 macro_mapping）
+        # 鐢熸垚 macro_tilts锛堝熀浜?macro_mapping锛?
         macro_tilts = self._generate_tilts(confirmed_topics)
         
         if macro_tilts:
@@ -527,7 +527,7 @@ class MacroSignalAdapter:
             for ticker, tilt in macro_tilts.items():
                 print(f"  {ticker}: {tilt:+.2%}")
         
-        # 信号摘要
+        # 淇"彿鎽樿
         signal_summary = {
             'total_signals_fetched': len(all_signals),
             'valid_signals_in_window': len(valid_signals),
@@ -545,7 +545,7 @@ class MacroSignalAdapter:
         return risk_score, confirmed_topics, macro_tilts, signal_summary
     
     def _generate_tilts(self, confirmed_topics):
-        """根据确认的主题生成资产倾斜"""
+        """鏍规嵁纭鐨勪富棰樼敓鎴愯祫浜у€炬枩"""
         macro_mapping = self.config.get('macro_mapping', {})
         tilt_max_delta = self.macro_config.get('tilt_max_delta', 0.02)
         
@@ -555,82 +555,85 @@ class MacroSignalAdapter:
             theme = topic['theme'].lower()
             direction = topic['direction']
             
-            # 查找匹配的映射规则
+            # 鏌ユ壘鍖归厤鐨勬槧灏勮鍒?
             for rule_name, rule_config in macro_mapping.items():
-                # 简单匹配：主题名包含规则名
+                # 绠€鍗曞尮閰嶏細涓婚鍚嶅寘鍚鍒欏悕
                 if rule_name.lower() in theme or theme in rule_name.lower():
                     
-                    # 应用倾斜规则
+                    # 搴旂敤鍊炬枩瑙勫垯
                     if 'tilt' in rule_config:
                         for ticker, tilt_value in rule_config['tilt'].items():
-                            # 根据方向调整倾斜
+                            # 鏍规嵁鏂瑰悜璋冩暣鍊炬枩
                             if direction == 'bearish':
-                                tilt_value = -abs(tilt_value)  # 反向倾斜
+                                tilt_value = -abs(tilt_value)  # 鍙嶅悜鍊炬枩
                             
-                            # 累加倾斜（但不超过上限）
+                            # 绱姞鍊炬枩锛堜絾涓嶈秴杩囦笂闄愶級
                             current_tilt = tilts.get(ticker, 0.0)
                             new_tilt = current_tilt + tilt_value
                             
-                            # 限制在 [-tilt_max_delta, +tilt_max_delta]
+                            # 闄愬埗鍦?[-tilt_max_delta, +tilt_max_delta]
                             tilts[ticker] = max(-tilt_max_delta, min(new_tilt, tilt_max_delta))
         
         return tilts
 
 
 class PaperTradingEngine:
-    """模拟交易引擎"""
+    """妯℃嫙浜ゆ槗寮曟搸"""
     
     def __init__(self, config_path='paper_config.json'):
-        """初始化"""
+        """鍒濆鍖?"""
         self.config = self.load_config(config_path)
         self.validate_config()
         
-        # 初始化状态
+        # 鍒濆鍖栫姸鎬?
         self.cash = self.config['initial_cash_usd']
         self.initial_cash = self.cash
         self.positions = {}  # {ticker: quantity}
-        self.cost_basis = {}  # {ticker: average_cost} 追踪成本基础
+        self.cost_basis = {}  # {ticker: average_cost} 杩借釜鎴愭湰鍩虹
         self.equity_curve = []  # [(timestamp, equity, cash, positions_value)]
-        self.trades_log = []  # 交易记录
-        self.portfolio_snapshots = []  # 组合快照
+        self.trades_log = []  # 浜ゆ槗璁板綍
+        self.portfolio_snapshots = []  # 缁勫悎蹇収
         
-        # 运行状态
+        # 杩愯鐘舵€?
         self.start_time = None
         self.end_time = None
         self.current_cycle = 0
         self.peak_equity = self.cash
         self.status = "READY"  # READY/RUNNING/COMPLETED
-        self.last_rebalance_time = None  # 用于 cooldown 检查
-        self.current_regime = {}  # 当前市场状态（Regime Filter）
-        self.current_macro = {}  # 当前宏观信号（Macro Integration）
-        self.current_stale_info = {}  # B3) 当前价格新鲜度信息
-        self.current_turnover_info = {}  # C4) 当前换手信息
-        self.forced_until_time = None  # risk_off_forced 结束时间
+        self.last_rebalance_time = None  # for cooldown checks
+        self.current_regime = {}
+        self.current_macro = {}
+        self.current_stale_info = {}
+        self.current_turnover_info = {}
+        self.current_holding_blocks = []
+        self.forced_until_time = None  # risk_off_forced 缁撴潫鏃堕棿
         self.forced_regime_reason = ""
         self.scoreboard_history = []  # 2w scoreboard records
         self.last_diagnostic_hint = ""
         self.current_weights_reused = False
         self.current_macro_reused = False
         
-        # E1) 宏观信号平滑
-        self.macro_risk_score_history = []  # 保存最近 N 次的 risk_score
+        # E1) 瀹忚淇"彿骞虫粦
+        self.macro_risk_score_history = []  # 淇濆瓨鏈€杩?N 娆＄殑 risk_score
         self.macro_smoothing_window = self.config.get('macro_integration', {}).get('smoothing_window', 3)
         self.macro_smoothing_method = self.config.get('macro_integration', {}).get('smoothing_method', 'median')  # 'median' or 'ewma'
         self.macro_ewma_alpha = self.config.get('macro_integration', {}).get('ewma_alpha', 0.4)
         
-        # E2) 宏观动作冷却
-        self.last_macro_cash_target = self.config['objectives']['min_cash_pct']  # 上次的现金目标
+        # E2) 瀹忚鍔ㄤ綔鍐峰嵈
+        self.last_macro_cash_target = self.config['objectives']['min_cash_pct']  # 涓婃鐨勭幇閲戠洰鏍?
         self.macro_cooldown_cycles = self.config.get('macro_integration', {}).get('cooldown_cycles', 2)
-        self.macro_cooldown_remaining = 0  # 剩余冷却周期数
+        self.macro_cooldown_remaining = 0  # 鍓╀綑鍐峰嵈鍛ㄦ湡鏁?
         
-        # 价格缓存（避免重复请求）
+        # 浠锋牸缂撳瓨锛堥伩鍏嶉噸澶嶈姹傦級
         self.price_cache = {}  # {ticker: (price, timestamp)}
-        self.price_cache_duration = 60  # 缓存60秒
+        self.price_cache_duration = 60  # 缂撳瓨60绉?
 
         # Signal/Macro refresh decoupling state
         execution_config = self.config.get('execution', {})
         self.signal_refresh_minutes = execution_config.get('signal_refresh_minutes', 1440)
         self.macro_refresh_minutes = execution_config.get('macro_refresh_minutes', 60)
+        self.min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
+        self.position_entry_cycle = {}
         self.last_signal_time = None
         self.last_macro_time = None
         self.cached_target_weights = {}
@@ -643,29 +646,30 @@ class PaperTradingEngine:
             'signal_summary': {}
         }
         
-        # 宏观信号适配器
+        # 瀹忚淇"彿閫傞厤鍣?
         self.macro_adapter = MacroSignalAdapter(self.config)
         
-        # 尝试恢复之前的状态
+        # 灏濊瘯鎭㈠涔嬪墠鐨勭姸鎬?
         self.resume_from_checkpoint()
+        self.rebuild_position_entry_cycles()
         
-        # 创建输出目录
+        # 鍒涘缓杈撳嚭鐩綍
         os.makedirs('outputs', exist_ok=True)
 
-        # 加载 scoreboard 历史（用于连续窗口诊断）
+        # 鍔犺浇 scoreboard 鍘嗗彶锛堢敤浜庤繛缁獥鍙ｈ瘖鏂級
         self.load_scoreboard_history()
         
-        # 设置随机种子（确保可复现）
+        # 璁剧疆闅忔満绉嶅瓙锛堢‘淇濆彲澶嶇幇锛?
         np.random.seed(self.config['safety']['random_seed'])
         
-        print("✅ Paper Trading Engine initialized")
+        print("鉁?Paper Trading Engine initialized")
         print(f"   Initial Cash: ${self.cash:,.2f}")
         print(f"   Duration: {self.config['duration_hours']} hours")
         print(f"   Rebalance Interval: {self.config['rebalance_minutes']} minutes")
         print(f"   Universe: {len(self.config['universe'])} assets")
     
     def load_config(self, config_path):
-        """加载配置文件"""
+        """鍔犺浇閰嶇疆鏂囦欢"""
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
         
@@ -681,6 +685,11 @@ class PaperTradingEngine:
         execution_config.setdefault('fill_gap_max', 0.03)
         execution_config.setdefault('fill_gap_max_iters', 2)
         execution_config.setdefault('allow_buy_benchmarks', False)
+        execution_config.setdefault('cross_section_top_n', 10)
+        execution_config.setdefault('correlation_lookback_days', 60)
+        execution_config.setdefault('correlation_threshold', 0.80)
+        execution_config.setdefault('volatility_floor', 0.08)
+        execution_config.setdefault('min_holding_cycles', 4)
         stale_policy = execution_config.setdefault('price_stale_policy', {})
         stale_policy.setdefault('allow_buy', ['LIVE', 'RECENT'])
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
@@ -692,7 +701,7 @@ class PaperTradingEngine:
         return config
     
     def validate_config(self):
-        """验证配置"""
+        """楠岃瘉閰嶇疆"""
         assert self.config['paper_mode'] == True, "paper_mode must be True"
         assert self.config['safety']['no_real_broker'] == True, "no_real_broker must be True"
         assert self.config['safety']['simulation_only'] == True, "simulation_only must be True"
@@ -703,51 +712,57 @@ class PaperTradingEngine:
         assert self.config.get('execution', {}).get('fill_gap_max', 0.03) >= 0, "execution.fill_gap_max must be >= 0"
         assert int(self.config.get('execution', {}).get('fill_gap_max_iters', 2)) >= 1, "execution.fill_gap_max_iters must be >= 1"
         assert isinstance(self.config.get('execution', {}).get('allow_buy_benchmarks', False), bool), "execution.allow_buy_benchmarks must be bool"
+        assert int(self.config.get('execution', {}).get('cross_section_top_n', 10)) >= 1, "execution.cross_section_top_n must be >= 1"
+        assert int(self.config.get('execution', {}).get('correlation_lookback_days', 60)) >= 20, "execution.correlation_lookback_days must be >= 20"
+        corr_threshold = float(self.config.get('execution', {}).get('correlation_threshold', 0.80))
+        assert 0.0 <= corr_threshold <= 1.0, "execution.correlation_threshold must be in [0,1]"
+        assert float(self.config.get('execution', {}).get('volatility_floor', 0.08)) > 0, "execution.volatility_floor must be > 0"
+        assert int(self.config.get('execution', {}).get('min_holding_cycles', 4)) >= 0, "execution.min_holding_cycles must be >= 0"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         
-        print("✅ Safety checks passed: SIMULATION ONLY mode confirmed")
+        print("鉁?Safety checks passed: SIMULATION ONLY mode confirmed")
     
     def resume_from_checkpoint(self):
-        """从检查点恢复之前的运行状态"""
+        """浠庢鏌ョ偣鎭㈠涔嬪墠鐨勮繍琛岀姸鎬?"""
         snapshots_path = self.config['reporting']['portfolio_snapshots_path']
         trades_path = self.config['reporting']['trades_log_path']
         
-        # 检查是否存在检查点文件
+        # 妫€鏌ユ槸鍚﹀瓨鍦ㄦ鏌ョ偣鏂囦欢
         if not os.path.exists(snapshots_path):
-            print("ℹ️  No checkpoint found - starting fresh")
+            print("鈩癸笍  No checkpoint found - starting fresh")
             return
         
         try:
             print("\n" + "="*60)
-            print("🔄 CHECKPOINT DETECTED - Attempting to resume")
+            print("馃攧 CHECKPOINT DETECTED - Attempting to resume")
             print("="*60)
             
-            # 1. 读取快照文件
+            # 1. 璇诲彇蹇収鏂囦欢
             with open(snapshots_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
                 if not lines:
-                    print("⚠️  Checkpoint file is empty - starting fresh")
+                    print("鈿狅笍  Checkpoint file is empty - starting fresh")
                     return
                 
-                # 加载所有快照
+                # 鍔犺浇鎵€鏈夊揩鐓?
                 for line in lines:
                     snapshot = json.loads(line.strip())
                     self.portfolio_snapshots.append(snapshot)
             
-            # 2. 恢复最后的状态
+            # 2. 鎭㈠鏈€鍚庣殑鐘舵€?
             last_snapshot = self.portfolio_snapshots[-1]
             
             self.cash = last_snapshot['cash']
-            self.current_cycle = last_snapshot['cycle'] + 1  # 继续下一个周期
+            self.current_cycle = last_snapshot['cycle'] + 1  # 缁х画涓嬩竴涓懆鏈?
             self.status = "RESUMED"
             
-            # 恢复持仓
+            # 鎭㈠鎸佷粨
             self.positions = {}
             for ticker, pos in last_snapshot['positions'].items():
                 self.positions[ticker] = pos['quantity']
             
-            # 恢复权益曲线
+            # 鎭㈠鏉冪泭鏇茬嚎
             for snapshot in self.portfolio_snapshots:
                 timestamp = datetime.fromisoformat(snapshot['timestamp'])
                 self.equity_curve.append((
@@ -757,19 +772,19 @@ class PaperTradingEngine:
                     snapshot['positions_value']
                 ))
             
-            # 更新峰值权益
+            # 鏇存柊宄板€兼潈鐩?
             self.peak_equity = max(s['total_equity'] for s in self.portfolio_snapshots)
             
-            # 3. 读取交易记录
+            # 3. 璇诲彇浜ゆ槗璁板綍
             if os.path.exists(trades_path):
                 trades_df = pd.read_csv(trades_path)
                 self.trades_log = trades_df.to_dict('records')
                 
-                # 从交易记录重建成本基础
+                # 浠庝氦鏄撹褰曢噸寤烘垚鏈熀纭€
                 self.rebuild_cost_basis()
             
-            # 4. 显示恢复信息
-            print(f"✅ Successfully resumed from checkpoint")
+            # 4. 鏄剧ず鎭㈠淇℃伅
+            print(f"鉁?Successfully resumed from checkpoint")
             print(f"   Last cycle: {last_snapshot['cycle']}")
             print(f"   Last update: {last_snapshot['timestamp']}")
             print(f"   Cash: ${self.cash:,.2f}")
@@ -779,7 +794,7 @@ class PaperTradingEngine:
             print(f"   Historical snapshots: {len(self.portfolio_snapshots)}")
             print(f"   Historical trades: {len(self.trades_log)}")
             
-            # 显示当前持仓
+            # 鏄剧ず褰撳墠鎸佷粨
             if self.positions:
                 print(f"\n   Current Holdings:")
                 for ticker, qty in sorted(self.positions.items()):
@@ -788,7 +803,7 @@ class PaperTradingEngine:
             
             print("="*60 + "\n")
             
-            # 询问用户是否继续
+            # 璇㈤棶鐢ㄦ埛鏄惁缁х画
             response = self.prompt_checkpoint_choice()
             if response == 'n':
                 print("Starting fresh as requested...")
@@ -797,14 +812,14 @@ class PaperTradingEngine:
             print("Resuming from checkpoint as requested...")
             
         except RuntimeError:
-            # 非交互环境或用户未明确选择，直接中止，避免静默地从头开始
+            # 闈炰氦浜掔幆澧冩垨鐢ㄦ埛鏈槑纭€夋嫨锛岀洿鎺ヤ腑姝紝閬垮厤闈欓粯鍦颁粠澶村紑濮?
             raise
         except Exception as e:
-            print(f"⚠️  Failed to resume from checkpoint: {e}")
+            print(f"鈿狅笍  Failed to resume from checkpoint: {e}")
             print("   Starting fresh...")
 
     def prompt_checkpoint_choice(self):
-        """必须得到明确的 y/n 输入，避免误触从头开始。"""
+        """蹇呴』寰楀埌鏄庣‘鐨?y/n 杈撳叆锛岄伩鍏嶈瑙︿粠澶村紑濮嬨€?"""
         env_choice = os.environ.get('GW_CHECKPOINT_ACTION', '').strip().lower()
         if env_choice in ('y', 'yes', 'resume', 'continue'):
             return 'y'
@@ -829,7 +844,7 @@ class PaperTradingEngine:
             print("Please type 'y' to resume or 'n' to start fresh.")
 
     def load_scoreboard_history(self):
-        """加载已有 scoreboard 历史，便于连续窗口诊断。"""
+        """鍔犺浇宸叉湁 scoreboard 鍘嗗彶锛屼究浜庤繛缁獥鍙ｈ瘖鏂€?"""
         scoreboard_path = self.config.get('reporting', {}).get('scoreboard_path', 'outputs/scoreboard.jsonl')
         self.scoreboard_history = []
         self.last_diagnostic_hint = ""
@@ -857,7 +872,7 @@ class PaperTradingEngine:
             self.last_diagnostic_hint = ""
 
     def append_scoreboard_record(self):
-        """在每次 snapshot 后写入一条 2w scoreboard 记录。"""
+        """鍦ㄦ瘡娆?snapshot 鍚庡啓鍏ヤ竴鏉?2w scoreboard 璁板綍銆?"""
         if not self.portfolio_snapshots:
             return None
 
@@ -929,7 +944,7 @@ class PaperTradingEngine:
         return record
     
     def rebuild_cost_basis(self):
-        """从交易记录重建成本基础"""
+        """浠庝氦鏄撹褰曢噸寤烘垚鏈熀纭€"""
         self.cost_basis = {}
         position_qty = {}
         
@@ -943,7 +958,7 @@ class PaperTradingEngine:
                 old_qty = position_qty.get(ticker, 0)
                 old_cost = self.cost_basis.get(ticker, 0)
                 
-                # 加权平均成本
+                # 鍔犳潈骞冲潎鎴愭湰
                 if old_qty > 0:
                     total_cost = (old_qty * old_cost) + (qty * price)
                     position_qty[ticker] = old_qty + qty
@@ -958,8 +973,50 @@ class PaperTradingEngine:
                     position_qty[ticker] = 0
                     self.cost_basis[ticker] = 0
     
+    def rebuild_position_entry_cycles(self):
+        """Rebuild last BUY cycle per open position for holding-period checks."""
+        self.position_entry_cycle = {}
+        position_qty = {}
+
+        for trade in self.trades_log:
+            ticker = str(trade.get('ticker', '')).upper()
+            if not ticker:
+                continue
+
+            side = str(trade.get('side', '')).upper()
+            try:
+                qty = int(float(trade.get('quantity', 0)))
+            except (TypeError, ValueError):
+                qty = 0
+            if qty <= 0:
+                continue
+
+            raw_cycle = trade.get('cycle', None)
+            if raw_cycle is None or raw_cycle == '':
+                trade_cycle = 0
+            else:
+                try:
+                    trade_cycle = int(raw_cycle)
+                except (TypeError, ValueError):
+                    trade_cycle = 0
+
+            if side == 'BUY':
+                position_qty[ticker] = position_qty.get(ticker, 0) + qty
+                self.position_entry_cycle[ticker] = trade_cycle
+            elif side == 'SELL':
+                remaining = position_qty.get(ticker, 0) - qty
+                if remaining <= 0:
+                    position_qty.pop(ticker, None)
+                    self.position_entry_cycle.pop(ticker, None)
+                else:
+                    position_qty[ticker] = remaining
+
+        mature_cycle = max(0, int(self.current_cycle) - int(self.min_holding_cycles))
+        for ticker in self.positions.keys():
+            self.position_entry_cycle.setdefault(str(ticker).upper(), mature_cycle)
+
     def clear_checkpoint(self):
-        """清除检查点，重新开始"""
+        """Clear checkpoint state and restart from fresh paper account."""
         self.cash = self.config['initial_cash_usd']
         self.positions = {}
         self.cost_basis = {}
@@ -969,9 +1026,11 @@ class PaperTradingEngine:
         self.current_cycle = 0
         self.peak_equity = self.cash
         self.status = "READY"
-    
+        self.position_entry_cycle = {}
+        self.current_holding_blocks = []
+
     def get_market_data(self, ticker, period='1mo', interval='1d'):
-        """获取市场数据"""
+        """鑾峰彇甯傚満鏁版嵁"""
         try:
             if ticker == 'CASH':
                 return None
@@ -980,21 +1039,21 @@ class PaperTradingEngine:
             hist = t.history(period=period, interval=interval)
             
             if hist.empty:
-                print(f"⚠️ No data for {ticker}, skipping")
+                print(f"鈿狅笍 No data for {ticker}, skipping")
                 return None
             
             return hist
         except Exception as e:
-            print(f"⚠️ Error fetching data for {ticker}: {e}")
+            print(f"鈿狅笍 Error fetching data for {ticker}: {e}")
             return None
 
     def get_current_price(self, ticker):
-        """获取当前价格（实时或最新）
+        """鑾峰彇褰撳墠浠锋牸锛堝疄鏃舵垨鏈€鏂帮級
         
-        B1) 返回三元组：(price, data_age_minutes, market_status)
-        - market_status ∈ {"LIVE", "RECENT", "STALE"}
-        - data_age_minutes: 数据时间戳与 now 的分钟差
-        - 若无法获取时间戳，market_status = "STALE", data_age_minutes = 99999
+        B1) 杩斿洖涓夊厓缁勶細(price, data_age_minutes, market_status)
+        - market_status 鈭?{"LIVE", "RECENT", "STALE"}
+        - data_age_minutes: 鏁版嵁鏃堕棿鎴充笌 now 鐨勫垎閽熷樊
+        - 鑻ユ棤娉曡幏鍙栨椂闂存埑锛宮arket_status = "STALE", data_age_minutes = 99999
         
         Returns:
             (price, data_age_minutes, market_status) or (None, 99999, "STALE")
@@ -1006,10 +1065,10 @@ class PaperTradingEngine:
             import pytz
             now_et = datetime.now(pytz.timezone('US/Eastern'))
             
-            # 创建新的 Ticker 对象，避免缓存
+            # 鍒涘缓鏂扮殑 Ticker 瀵硅薄锛岄伩鍏嶇紦瀛?
             t = yf.Ticker(ticker)
             
-            # 方法1: 尝试获取最新的分钟级数据（5m 间隔）
+            # 鏂规硶1: 灏濊瘯鑾峰彇鏈€鏂扮殑鍒嗛挓绾ф暟鎹紙5m 闂撮殧锛?
             try:
                 hist = t.history(period='1d', interval='5m')
                 if not hist.empty:
@@ -1029,7 +1088,7 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[PRICE] {ticker}: 5m history failed - {e}")
             
-            # 方法2: 尝试 1m 间隔
+            # 鏂规硶2: 灏濊瘯 1m 闂撮殧
             try:
                 hist = t.history(period='1d', interval='1m')
                 if not hist.empty:
@@ -1049,7 +1108,7 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[PRICE] {ticker}: 1m history failed - {e}")
             
-            # 方法3: 尝试 info（无时间戳，视为 STALE）
+            # 鏂规硶3: 灏濊瘯 info锛堟棤鏃堕棿鎴筹紝瑙嗕负 STALE锛?
             try:
                 info = t.info
                 for price_field in ['currentPrice', 'regularMarketPrice', 'ask', 'bid']:
@@ -1061,13 +1120,13 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[PRICE] {ticker}: info failed - {e}")
             
-            # 方法4: 降级到日线数据（视为 STALE）
+            # 鏂规硶4: 闄嶇骇鍒版棩绾挎暟鎹紙瑙嗕负 STALE锛?
             try:
                 hist = t.history(period='5d', interval='1d')
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
                     date = hist.index[-1]
-                    # 计算日线数据的年龄
+                    # 璁＄畻鏃ョ嚎鏁版嵁鐨勫勾榫?
                     data_age_minutes = (now_et - date).total_seconds() / 60
                     print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {date.strftime('%Y-%m-%d')}, {data_age_minutes:.0f}min ago) STALE")
                     return (price, data_age_minutes, "STALE")
@@ -1080,7 +1139,7 @@ class PaperTradingEngine:
         return (None, 99999, "STALE")
     
     def calculate_momentum(self, ticker, lookback_days=20):
-        """计算动量指标"""
+        """璁＄畻鍔ㄩ噺鎸囨爣"""
         try:
             hist = self.get_market_data(ticker, period='3mo', interval='1d')
             if hist is None or len(hist) < lookback_days:
@@ -1092,7 +1151,7 @@ class PaperTradingEngine:
             return 0.0
     
     def calculate_volatility(self, ticker, lookback_days=20):
-        """计算波动率"""
+        """璁＄畻娉㈠姩鐜?"""
         try:
             hist = self.get_market_data(ticker, period='3mo', interval='1d')
             if hist is None or len(hist) < lookback_days:
@@ -1105,7 +1164,7 @@ class PaperTradingEngine:
             return 0.20
     
     def _sync_current_macro_from_cache(self):
-        """将 cached_macro 投影到 current_macro，供快照和交易日志使用"""
+        """灏?cached_macro 鎶曞奖鍒?current_macro锛屼緵蹇収鍜屼氦鏄撴棩蹇椾娇鐢?"""
         macro_risk_score_raw = self.cached_macro.get('macro_risk_score_raw', 0.0)
         self.current_macro = {
             'macro_risk_score': macro_risk_score_raw,
@@ -1128,13 +1187,13 @@ class PaperTradingEngine:
         }
 
     def refresh_macro_cache(self, now=None):
-        """按 macro_refresh_minutes 刷新一次宏观信号缓存"""
+        """鎸?macro_refresh_minutes 鍒锋柊涓€娆"畯瑙備俊鍙风紦瀛?"""
         if now is None:
             now = datetime.now()
 
         macro_risk_score_raw, confirmed_topics, macro_tilts_raw, signal_summary = self.macro_adapter.analyze_signals()
 
-        # E1) 平滑 macro_risk_score（仅在真正刷新 macro 时更新）
+        # E1) 骞虫粦 macro_risk_score锛堜粎鍦ㄧ湡姝ｅ埛鏂?macro 鏃舵洿鏂帮級
         self.macro_risk_score_history.append(macro_risk_score_raw)
         if len(self.macro_risk_score_history) > self.macro_smoothing_window:
             self.macro_risk_score_history = self.macro_risk_score_history[-self.macro_smoothing_window:]
@@ -1157,7 +1216,7 @@ class PaperTradingEngine:
         print(f"[MACRO SMOOTH] Raw: {macro_risk_score_raw:.2f}, Smoothed: {macro_risk_score_smoothed:.2f} "
               f"(method: {self.macro_smoothing_method}, window: {len(self.macro_risk_score_history)})")
 
-        # E3) 过滤 macro_tilts：只保留 universe 内资产
+        # E3) 杩囨护 macro_tilts锛氬彧淇濈暀 universe 鍐呰祫浜?
         universe_tickers = {asset['ticker'] for asset in self.config['universe']}
         macro_tilts_filtered = {}
         macro_tilts_ignored = {}
@@ -1182,11 +1241,115 @@ class PaperTradingEngine:
         self._sync_current_macro_from_cache()
         self.last_macro_time = now
 
+
+    def _compute_cross_sectional_metrics(self, trade_universe_assets, lookback_days, vol_target, momentum_weight, vol_weight, top_n):
+        """Compute momentum/vol metrics and cross-sectional rank score."""
+        metrics = {}
+        for asset in trade_universe_assets:
+            ticker = str(asset.get('ticker', ''))
+            if not ticker or ticker.upper() == 'CASH':
+                continue
+
+            momentum = self.calculate_momentum(ticker, lookback_days)
+            volatility = self.calculate_volatility(ticker, lookback_days)
+            base_score = momentum_weight * momentum - vol_weight * (volatility - vol_target)
+            metrics[ticker] = {
+                'momentum': float(momentum),
+                'volatility': float(max(volatility, 1e-6)),
+                'base_score': float(base_score),
+                'rank_score': 0.0,
+                'momentum_rank_pct': 0.0
+            }
+
+        if not metrics:
+            return {}, []
+
+        momentums = np.array([v['momentum'] for v in metrics.values()], dtype=float)
+        mu = float(np.mean(momentums))
+        sigma = float(np.std(momentums))
+        ranked_by_momentum = sorted(metrics.items(), key=lambda x: x[1]['momentum'], reverse=True)
+        n = len(ranked_by_momentum)
+
+        for rank_idx, (ticker, data) in enumerate(ranked_by_momentum, start=1):
+            z_score = (data['momentum'] - mu) / sigma if sigma > 1e-12 else 0.0
+            data['rank_score'] = float(z_score)
+            data['momentum_rank_pct'] = float((n - rank_idx + 1) / n)
+
+        ranked_tickers = sorted(
+            metrics.keys(),
+            key=lambda t: (metrics[t]['rank_score'], metrics[t]['base_score'], metrics[t]['momentum']),
+            reverse=True
+        )
+        top_n = max(1, min(int(top_n), len(ranked_tickers)))
+        return metrics, ranked_tickers[:top_n]
+
+    def _get_returns_for_correlation(self, ticker, lookback_days):
+        """Fetch trailing daily return series for correlation checks."""
+        hist = self.get_market_data(ticker, period='6mo', interval='1d')
+        if hist is None or hist.empty or 'Close' not in hist:
+            return None
+        returns = hist['Close'].pct_change().dropna()
+        if returns.empty:
+            return None
+        return returns.tail(int(max(20, lookback_days)))
+
+    def _apply_correlation_filter(self, ranked_tickers, lookback_days, threshold):
+        """Drop lower-ranked assets when pairwise corr exceeds threshold."""
+        try:
+            if not ranked_tickers:
+                return [], [], []
+
+            returns_map = {}
+            degraded_reasons = []
+            min_overlap = max(20, int(lookback_days // 2))
+
+            for ticker in ranked_tickers:
+                series = self._get_returns_for_correlation(ticker, lookback_days)
+                if series is None or len(series) < min_overlap:
+                    degraded_reasons.append(f"{ticker}:insufficient_history")
+                    continue
+                returns_map[ticker] = series
+
+            kept = []
+            decisions = []
+            for ticker in ranked_tickers:
+                dropped = False
+                for kept_ticker in kept:
+                    a = returns_map.get(ticker)
+                    b = returns_map.get(kept_ticker)
+                    if a is None or b is None:
+                        continue
+
+                    aligned = pd.concat([a.rename('a'), b.rename('b')], axis=1, join='inner').dropna()
+                    if len(aligned) < min_overlap:
+                        continue
+
+                    corr = float(aligned['a'].corr(aligned['b']))
+                    if np.isnan(corr):
+                        continue
+                    if corr > threshold:
+                        decisions.append({
+                            'dropped': ticker,
+                            'kept': kept_ticker,
+                            'corr': corr,
+                            'reason': f'corr>{threshold:.2f}'
+                        })
+                        dropped = True
+                        break
+
+                if not dropped:
+                    kept.append(ticker)
+
+            return kept, decisions, degraded_reasons
+        except Exception as e:
+            print(f"[CORR] Degraded: correlation filter failed ({e}), fallback to ranked list")
+            return list(ranked_tickers), [], [f"error:{e}"]
+
     def calculate_target_weights(self):
-        """计算目标权重：风险雷达（现金）+ 趋势放大器（tilt/上限）"""
+        """璁＄畻鐩爣鏉冮噸锛氶闄╅浄杈撅紙鐜伴噾锛? 瓒嬪娍鏀惧ぇ鍣紙tilt/涓婇檺锛?"""
 
         def _apply_caps_and_normalize(weights_map, cap_map, invested_budget, fill_gap_max, fill_gap_max_iters, score_map):
-            """先裁剪、仅超预算下调；小缺口时可在 headroom 内软补足。"""
+            """鍏堣鍓€佷粎瓒呴绠椾笅璋冿紱灏忕己鍙ｆ椂鍙湪 headroom 鍐呰蒋琛ヨ冻銆?"""
             weights = {k: max(0.0, float(v)) for k, v in weights_map.items() if float(v) > 0}
             capped = set()
             diagnostics = {
@@ -1254,7 +1417,7 @@ class PaperTradingEngine:
                         fill_reason = 'no_headroom'
                         break
 
-                    # 优先按当前权重比例补足；若当前权重全为0则按 score 比例；再退化为均匀分配
+                    # 浼樺厛鎸夊綋鍓嶆潈閲嶆瘮渚嬭ˉ瓒筹紱鑻ュ綋鍓嶆潈閲嶅叏涓?鍒欐寜 score 姣斾緥锛涘啀閫€鍖栦负鍧囧寑鍒嗛厤
                     base_sum = sum(weights.get(k, 0.0) for k in headroom.keys())
                     if base_sum > 1e-12:
                         ratios = {k: weights.get(k, 0.0) / base_sum for k in headroom.keys()}
@@ -1302,7 +1465,7 @@ class PaperTradingEngine:
 
             return {k: v for k, v in weights.items() if v > 1e-10}, diagnostics
 
-        # ========== 步骤1: Regime 基线 ==========
+        # ========== 姝ラ1: Regime 鍩虹嚎 ==========
         regime_state, trend_score, regime_details, base_cash_from_regime, base_max_weight = self.compute_regime_state()
         self.current_regime = {
             'regime_state': regime_state,
@@ -1314,7 +1477,7 @@ class PaperTradingEngine:
             'forced_until_time': self.forced_until_time.isoformat() if self.forced_until_time else None
         }
 
-        # ========== 步骤2: 读取 cached macro ==========
+        # ========== 姝ラ2: 璇诲彇 cached macro ==========
         macro_cfg = self.config.get('macro_integration', {})
         execution_cfg = self.config.get('execution', {})
         macro_mapping = self.config.get('macro_mapping', {})
@@ -1326,7 +1489,7 @@ class PaperTradingEngine:
         confirmed_topics = self.cached_macro.get('confirmed_topics', [])
         self._sync_current_macro_from_cache()
 
-        # ========== 通路1: 风险雷达（现金目标） ==========
+        # ========== 閫氳矾1: 椋庨櫓闆疯揪锛堢幇閲戠洰鏍囷級 ==========
         macro_cash_slope = float(macro_cfg.get('macro_cash_slope', 0.02))
         macro_cash_from_risk = macro_cash_slope * macro_risk_score_smoothed
         macro_cash_from_topics = 0.0
@@ -1356,12 +1519,12 @@ class PaperTradingEngine:
         if macro_cash_topic_details:
             print(f"[MACRO PATH1] topic cash_add details: {', '.join(macro_cash_topic_details)}")
 
-        # ========== 通路2: 趋势放大器（tilt + 单资产上限） ==========
+        # ========== 閫氳矾2: 瓒嬪娍鏀惧ぇ鍣紙tilt + 鍗曡祫浜т笂闄愶級 ==========
         macro_allow_new_positions = {str(x).upper() for x in macro_cfg.get('macro_allow_new_positions', ['TLT', 'GLD'])}
         defensive_tilt_assets = set(macro_allow_new_positions) | {'CASH', 'TLT', 'GLD'}
         risk_off_mode = regime_state in ('risk_off', 'risk_off_forced')
 
-        # 构造 trade_universe：benchmarks 仅用于 regime/benchmark 计算，不自动进入交易池
+        # 鏋勯€?trade_universe锛歜enchmarks 浠呯敤浜?regime/benchmark 璁＄畻锛屼笉鑷姩杩涘叆浜ゆ槗姹?
         benchmark_tickers = {str(t).upper() for t in self.config.get('benchmarks', {}).get('tickers', [])}
         trade_universe_assets = []
         excluded_benchmark_assets = []
@@ -1426,49 +1589,95 @@ class PaperTradingEngine:
             'macro_cash_from_topics': macro_cash_from_topics
         }
 
-        # ========== 步骤3: 计算原始评分权重 ==========
+        # ========== 姝ラ3: Cross-sectional Ranking + Volatility Scaling ==========
         strategy = self.config['strategy']
-        lookback = strategy['lookback_days']
-        vol_target = strategy['vol_target']
-        momentum_weight = strategy['momentum_weight']
-        vol_weight = strategy['vol_weight']
+        lookback = int(strategy['lookback_days'])
+        vol_target = float(strategy['vol_target'])
+        momentum_weight = float(strategy['momentum_weight'])
+        vol_weight = float(strategy['vol_weight'])
         fill_gap_max = float(execution_cfg.get('fill_gap_max', 0.03))
         fill_gap_max_iters = int(execution_cfg.get('fill_gap_max_iters', 2))
+        top_n = int(execution_cfg.get('cross_section_top_n', 10))
+        corr_lookback_days = int(execution_cfg.get('correlation_lookback_days', 60))
+        corr_threshold = float(execution_cfg.get('correlation_threshold', 0.80))
+        vol_floor = max(1e-4, float(execution_cfg.get('volatility_floor', 0.08)))
 
-        asset_scores = {}
+        asset_metrics, top_ranked = self._compute_cross_sectional_metrics(
+            trade_universe_assets,
+            lookback,
+            vol_target,
+            momentum_weight,
+            vol_weight,
+            top_n
+        )
 
-        print(f"\n📊 Evaluating {len(trade_universe_assets)} assets...")
-        print(f"{'Ticker':<8} {'Momentum':>10} {'Volatility':>12} {'Score':>10} {'Status':<10}")
-        print('-' * 60)
+        print(f"\n[RANKING] Top {len(top_ranked)} assets (cross-sectional):")
+        print(f"{'Ticker':<8} {'Momentum':>10} {'Volatility':>12} {'RankScore':>11} {'BaseScore':>11}")
+        print('-' * 68)
+        for ticker in top_ranked:
+            m = asset_metrics[ticker]
+            print(f"{ticker:<8} {m['momentum']:>9.2%} {m['volatility']:>11.2%} {m['rank_score']:>10.4f} {m['base_score']:>10.4f}")
+        print('-' * 68)
 
-        for asset in trade_universe_assets:
-            ticker = asset['ticker']
-            if ticker == 'CASH':
-                continue
+        corr_selected, corr_decisions, corr_degraded = self._apply_correlation_filter(
+            top_ranked,
+            corr_lookback_days,
+            corr_threshold
+        )
+        selected_assets = corr_selected
+        print(f"[CORR] Selected {len(selected_assets)}/{len(top_ranked)} after correlation filter (threshold={corr_threshold:.2f})")
+        if corr_decisions:
+            for d in corr_decisions:
+                print(f"[CORR DROP] {d['dropped']} -> keep {d['kept']} (corr={d['corr']:.2f}, {d['reason']})")
+        if corr_degraded:
+            print(f"[CORR DEGRADED] insufficient data for: {', '.join(corr_degraded[:8])}{' ...' if len(corr_degraded) > 8 else ''}")
 
-            momentum = self.calculate_momentum(ticker, lookback)
-            volatility = self.calculate_volatility(ticker, lookback)
-            score = momentum_weight * momentum - vol_weight * (volatility - vol_target)
+        rank_signal_map = {t: max(0.0, float(asset_metrics.get(t, {}).get('rank_score', 0.0))) for t in selected_assets}
+        if sum(rank_signal_map.values()) <= 1e-12:
+            rank_signal_map = {
+                t: max(0.0, float(asset_metrics.get(t, {}).get('momentum_rank_pct', 0.0)) - 0.5)
+                for t in selected_assets
+            }
+        if sum(rank_signal_map.values()) <= 1e-12:
+            rank_signal_map = {
+                t: max(0.0, float(asset_metrics.get(t, {}).get('base_score', 0.0)))
+                for t in selected_assets
+            }
 
-            asset_scores[ticker] = {'momentum': momentum, 'volatility': volatility, 'score': score}
-            status = '✅ BUY' if score > 0 else '❌ SKIP'
-            print(f"{ticker:<8} {momentum:>9.2%} {volatility:>11.2%} {score:>9.4f} {status:<10}")
+        if sum(rank_signal_map.values()) > 1e-12:
+            rank_only_weights = {
+                t: rank_signal_map[t] / sum(rank_signal_map.values())
+                for t in selected_assets
+                if rank_signal_map.get(t, 0.0) > 0
+            }
+        else:
+            rank_only_weights = {}
 
-        print('-' * 60)
-        positive_assets = {k: v for k, v in asset_scores.items() if v['score'] > 0}
-        print(f"Selected {len(positive_assets)} assets with positive scores\n")
+        vol_scaled_signal = {}
+        for ticker, base_sig in rank_only_weights.items():
+            vol = float(asset_metrics.get(ticker, {}).get('volatility', vol_floor))
+            vol_scaled_signal[ticker] = base_sig / max(vol, vol_floor)
 
-        total_score = sum(v['score'] for v in positive_assets.values())
-        if total_score > 0:
-            raw_weights = {k: v['score'] / total_score for k, v in positive_assets.items()}
+        signal_sum = sum(vol_scaled_signal.values())
+        if signal_sum > 1e-12:
+            raw_weights = {t: v / signal_sum for t, v in vol_scaled_signal.items() if v > 0}
         else:
             raw_weights = {}
 
-        # 先应用 cash_target 缩放
+        print(f"[VOL SCALE] rank->vol adjusted weights:")
+        print(f"{'Ticker':<8} {'RankW':>10} {'Vol':>10} {'ScaledW':>10}")
+        print('-' * 44)
+        for ticker in sorted(raw_weights.keys(), key=lambda x: raw_weights[x], reverse=True):
+            rank_w = rank_only_weights.get(ticker, 0.0)
+            vol = float(asset_metrics.get(ticker, {}).get('volatility', vol_floor))
+            print(f"{ticker:<8} {rank_w:>9.2%} {vol:>9.2%} {raw_weights[ticker]:>9.2%}")
+        print('-' * 44)
+
+        # 鍏堝簲鐢?cash_target 缂╂斁
         invested_budget = max(0.0, 1.0 - cash_target)
         scaled_weights = {k: v * invested_budget for k, v in raw_weights.items()}
 
-        # 应用 tilts（趋势放大器，不直接强买）
+        # 搴旂敤 tilts锛堣秼鍔挎斁澶у櫒锛屼笉鐩存帴寮轰拱锛?
         universe_tickers = {str(asset['ticker']).upper() for asset in trade_universe_assets}
         if applied_tilts:
             print(f"[MACRO PATH2] Applying tilts:")
@@ -1490,7 +1699,7 @@ class PaperTradingEngine:
                 scaled_weights[ticker] = tilt_delta
                 print(f"  {ticker}: NEW position {tilt_delta:.2%}")
 
-        # 生成单资产有效上限（base_max_weight + tilt_delta，delta clip 到 ±tilt_max_delta）
+        # 鐢熸垚鍗曡祫浜ф湁鏁堜笂闄愶紙base_max_weight + tilt_delta锛宒elta clip 鍒?卤tilt_max_delta锛?
         max_weight_effective = {}
         for asset in trade_universe_assets:
             ticker = asset['ticker']
@@ -1499,8 +1708,8 @@ class PaperTradingEngine:
             tilt_delta = float(np.clip(applied_tilts.get(ticker, 0.0), -tilt_max_delta, tilt_max_delta))
             max_weight_effective[ticker] = float(np.clip(base_max_weight + tilt_delta, 0.0, 1.0))
 
-        # 再应用“上限裁剪 + 下调 + 小缺口软补足”
-        score_map = {k: max(0.0, float(v['score'])) for k, v in positive_assets.items()}
+        # 鍐嶅簲鐢ㄢ€滀笂闄愯鍓?+ 涓嬭皟 + 灏忕己鍙ｈ蒋琛ヨ冻鈥?
+        score_map = {k: max(0.0, float(rank_signal_map.get(k, 0.0))) for k in scaled_weights.keys()}
         adjusted_weights, alloc_diag = _apply_caps_and_normalize(
             scaled_weights,
             max_weight_effective,
@@ -1509,12 +1718,17 @@ class PaperTradingEngine:
             fill_gap_max_iters,
             score_map
         )
+        alloc_diag['cross_section_top_n'] = int(top_n)
+        alloc_diag['ranked_candidates'] = list(top_ranked)
+        alloc_diag['corr_selected'] = list(selected_assets)
+        alloc_diag['corr_dropped'] = [d['dropped'] for d in corr_decisions]
+        alloc_diag['corr_threshold'] = float(corr_threshold)
         capped_assets = alloc_diag.get('capped_assets', [])
 
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))
         adjusted_weights['CASH'] = cash_weight
 
-        # 记录本轮 macro 应用结果，供 snapshot/trade context 使用
+        # 璁板綍鏈疆 macro 搴旂敤缁撴灉锛屼緵 snapshot/trade context 浣跨敤
         self.current_macro['applied_tilts'] = dict(applied_tilts)
         self.current_macro['blocked_tilts'] = dict(blocked_tilts)
         self.current_macro['blocked_tilts_not_trade_universe'] = dict(blocked_tilts_not_trade_universe)
@@ -1538,23 +1752,23 @@ class PaperTradingEngine:
         return adjusted_weights
 
     def execute_rebalance(self, target_weights):
-        """执行再平衡 - 带五大保护器：cooldown / weight_threshold / min_notional / stale_price_skip / turnover_cap
+        """鎵ц鍐嶅钩琛?- 甯︿簲澶т繚鎶ゅ櫒锛歝ooldown / weight_threshold / min_notional / stale_price_skip / turnover_cap
         
-        C1) 计算计划交易名义金额
-        C2) 检查是否超过 turnover_limit
-        C3) 如果超过，按比例缩放所有交易
-        C4) 记录 turnover_notional / turnover_limit / turnover_scale / turnover_capped
-        C5) 不破坏现有三大保护器
-        D1-D5) 修复 get_current_price() 接口不一致问题
+        C1) 璁＄畻璁"垝浜ゆ槗鍚嶄箟閲戦
+        C2) 妫€鏌ユ槸鍚﹁秴杩?turnover_limit
+        C3) 濡傛灉瓒呰繃锛屾寜姣斾緥缂╂斁鎵€鏈変氦鏄?
+        C4) 璁板綍 turnover_notional / turnover_limit / turnover_scale / turnover_capped
+        C5) 涓嶇牬鍧忕幇鏈変笁澶т繚鎶ゅ櫒
+        D1-D5) 淇 get_current_price() 鎺ュ彛涓嶄竴鑷撮棶棰?
         """
         
-        # D5) 自检：测试 get_current_price() 返回三元组
+        # D5) 鑷锛氭祴璇?get_current_price() 杩斿洖涓夊厓缁?
         if self.positions:
             test_ticker = list(self.positions.keys())[0]
             test_price, test_age, test_status = self.get_current_price(test_ticker)
             print(f"[SELF-CHECK] get_current_price('{test_ticker}') = (price={test_price}, age={test_age}min, status={test_status})")
         
-        # ========== 准备交易上下文信息 ==========
+        # ========== 鍑嗗浜ゆ槗涓婁笅鏂囦俊鎭?==========
         trade_context = self._build_trade_context()
         alloc_trace = [
             f"alloc_budget_{trade_context.get('invested_budget', 0.0):.2%}",
@@ -1570,9 +1784,11 @@ class PaperTradingEngine:
             f"alloc_capped_{','.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else 'none'}"
         ]
         
-        # ========== 保护器 1: Cooldown 检查 ==========
+        # ========== 淇濇姢鍣?1: Cooldown 妫€鏌?==========
         execution_config = self.config.get('execution', {})
         cooldown_minutes = execution_config.get('rebalance_cooldown_minutes', 0)
+        min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
+        self.current_holding_blocks = []
         
         if cooldown_minutes > 0 and self.last_rebalance_time is not None:
             time_since_last = (datetime.now() - self.last_rebalance_time).total_seconds() / 60
@@ -1581,7 +1797,7 @@ class PaperTradingEngine:
                 print(f"[COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
                 return []
         
-        # ========== B2) 获取所有价格并检查新鲜度 ==========
+        # ========== B2) 鑾峰彇鎵€鏈変环鏍煎苟妫€鏌ユ柊椴滃害 ==========
         stale_price_skip_minutes = execution_config.get('stale_price_skip_minutes', 60)
         max_stale_ratio = execution_config.get('max_stale_ratio', 0.3)
         stale_policy_cfg = execution_config.get('price_stale_policy', {})
@@ -1590,13 +1806,13 @@ class PaperTradingEngine:
         
         price_info = {}  # {ticker: (price, data_age_minutes, market_status)}
         
-        # 获取当前持仓的价格
+        # 鑾峰彇褰撳墠鎸佷粨鐨勪环鏍?
         for ticker in self.positions.keys():
             price, age, status = self.get_current_price(ticker)
             if price is not None:
                 price_info[ticker] = (price, age, status)
         
-        # 获取目标权重中的价格
+        # 鑾峰彇鐩爣鏉冮噸涓殑浠锋牸
         for ticker in target_weights.keys():
             if ticker == 'CASH' or ticker in price_info:
                 continue
@@ -1604,7 +1820,7 @@ class PaperTradingEngine:
             if price is not None:
                 price_info[ticker] = (price, age, status)
         
-        # B2) 统计全量价格 STALE 概况（用于快照展示）
+        # B2) 缁熻鍏ㄩ噺浠锋牸 STALE 姒傚喌锛堢敤浜庡揩鐓у睍绀猴級
         stale_count = 0
         total_count = len(price_info)
         
@@ -1617,7 +1833,7 @@ class PaperTradingEngine:
         print(f"\n[PRICE CHECK] Total tickers: {total_count}, STALE: {stale_count}, Ratio: {stale_ratio:.1%} | "
               f"Policy BUY={sorted(allow_buy_status)} SELL={sorted(allow_sell_status)}")
         
-        # 记录正常情况
+        # 璁板綍姝ｅ父鎯呭喌
         self.current_stale_info = {
             'stale_count': stale_count,
             'stale_ratio': stale_ratio,
@@ -1626,7 +1842,7 @@ class PaperTradingEngine:
             'decision_trace': ''
         }
         
-        # ========== 计算当前持仓价值 ==========
+        # ========== 璁＄畻褰撳墠鎸佷粨浠峰€?==========
         current_values = {}
         positions_value = 0.0
         
@@ -1640,14 +1856,14 @@ class PaperTradingEngine:
         
         total_equity = self.cash + positions_value
         
-        # ========== 计算目标价值 ==========
+        # ========== 璁＄畻鐩爣浠峰€?==========
         target_values = {}
         for ticker, weight in target_weights.items():
             if ticker == 'CASH':
                 continue
             target_values[ticker] = total_equity * weight
         
-        # ========== 保护器 2: Weight Threshold 过滤 ==========
+        # ========== 淇濇姢鍣?2: Weight Threshold 杩囨护 ==========
         weight_threshold = execution_config.get('weight_threshold', 0.0)
         
         tickers_to_trade = []
@@ -1669,40 +1885,53 @@ class PaperTradingEngine:
             
             tickers_to_trade.append(ticker)
         
-        # ========== C1) 计算计划交易（通过所有过滤器的）==========
+        # ========== C1) 璁＄畻璁"垝浜ゆ槗锛堥€氳繃鎵€鏈夎繃婊ゅ櫒鐨勶級==========
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         
         planned_trades = []  # [{ticker, side, current_value, target_value, desired_trade_value, price, age, status}]
-        stale_candidate_count = 0  # 候选交易中 STALE 数量
-        policy_skip_count = 0  # 因 price_stale_policy 被跳过的候选数量
+        stale_candidate_count = 0  # 鍊欓€変氦鏄撲腑 STALE 鏁伴噺
+        policy_skip_count = 0  # 鍥?price_stale_policy 琚烦杩囩殑鍊欓€夋暟閲?
         candidate_count = 0
         
         for ticker in tickers_to_trade:
             current_value = current_values.get(ticker, 0.0)
             target_value = target_values.get(ticker, 0.0)
+            side = 'BUY' if target_value > current_value else 'SELL'
+
+            if side == 'SELL' and min_holding_cycles > 0:
+                entry_cycle = self.position_entry_cycle.get(str(ticker).upper())
+                if entry_cycle is not None:
+                    held_cycles = int(self.current_cycle) - int(entry_cycle)
+                    remaining_cycles = int(min_holding_cycles) - int(held_cycles)
+                    if remaining_cycles > 0:
+                        self.current_holding_blocks.append({
+                            'ticker': ticker,
+                            'remaining_cycles': int(remaining_cycles),
+                            'held_cycles': int(max(0, held_cycles))
+                        })
+                        print(f"[HOLDING] Block SELL/REDUCE {ticker}: remaining_cycles={remaining_cycles} (held={max(0, held_cycles)})")
+                        continue
+
             desired_trade_value = abs(target_value - current_value)
             
-            # Min notional 检查
+            # Min notional 妫€鏌?
             if desired_trade_value < min_notional:
                 print(f"[SKIP] {ticker} trade notional ${desired_trade_value:.2f} < min ${min_notional}")
                 continue
             
-            # 获取价格信息
+            # 鑾峰彇浠锋牸淇℃伅
             if ticker not in price_info:
                 print(f"[SKIP] {ticker} no price info")
                 continue
             
             price, age, status = price_info[ticker]
             
-            # 确定交易方向
-            side = 'BUY' if target_value > current_value else 'SELL'
-            
             status = str(status).upper()
             candidate_count += 1
             if status == "STALE" and age > stale_price_skip_minutes:
                 stale_candidate_count += 1
 
-            # 统一执行 price_stale_policy
+            # 缁熶竴鎵ц price_stale_policy
             if side == 'BUY' and status not in allow_buy_status:
                 policy_skip_count += 1
                 print(f"[SKIP] {ticker} BUY status={status} not in allow_buy={sorted(allow_buy_status)}")
@@ -1725,8 +1954,12 @@ class PaperTradingEngine:
                 'age': age,
                 'status': status
             })
+
+        if self.current_holding_blocks:
+            blocked_str = ", ".join([f"{x['ticker']}({x['remaining_cycles']})" for x in self.current_holding_blocks])
+            print(f"[HOLDING] Blocked by minimum holding period: {blocked_str}")
         
-        # 2) 全局数据异常保护：检查候选交易 STALE 比例
+        # 2) 鍏ㄥ眬鏁版嵁寮傚父淇濇姢锛氭鏌ュ€欓€変氦鏄?STALE 姣斾緥
         stale_ratio_candidates = stale_candidate_count / candidate_count if candidate_count > 0 else 0
         
         print(f"\n[STALE CHECK] Candidate tickers: {candidate_count}, STALE: {stale_candidate_count}, Ratio: {stale_ratio_candidates:.1%}")
@@ -1734,13 +1967,12 @@ class PaperTradingEngine:
         if stale_ratio_candidates > max_stale_ratio:
             print(f"[STALE ABORT] STALE ratio {stale_ratio_candidates:.1%} > threshold {max_stale_ratio:.1%}, aborting rebalance")
             abort_trace = f"stale_abort_ratio_{stale_ratio_candidates:.1%}_gt_{max_stale_ratio:.1%}"
-            # 3) 记录到 snapshot
+            # 3) 璁板綍鍒?snapshot
             self.current_stale_info = {
                 'stale_count': stale_count,
                 'stale_ratio': stale_ratio,
                 'price_stale_skip': policy_skip_count > 0,
-                'price_stale_abort': True,  # 新增：因 STALE 比例过高而中止
-                'stale_candidate_count': stale_candidate_count,
+                'price_stale_abort': True,  # 鏂板锛氬洜 STALE 姣斾緥杩囬珮鑰屼腑姝?                'stale_candidate_count': stale_candidate_count,
                 'stale_ratio_candidates': stale_ratio_candidates,
                 'decision_trace': abort_trace
             }
@@ -1755,17 +1987,17 @@ class PaperTradingEngine:
             print(f"[DECISION] {abort_trace}")
             return []
         
-        # 更新 stale_info（正常情况）
+        # 鏇存柊 stale_info锛堟甯告儏鍐碉級
         self.current_stale_info['price_stale_skip'] = policy_skip_count > 0
         self.current_stale_info['price_stale_abort'] = False
         self.current_stale_info['stale_candidate_count'] = stale_candidate_count
         self.current_stale_info['stale_ratio_candidates'] = stale_ratio_candidates
         self.current_stale_info['decision_trace'] = f"stale_ok_{stale_ratio_candidates:.1%}_le_{max_stale_ratio:.1%}"
         
-        # C1) 计算总换手
+        # C1) 璁＄畻鎬绘崲鎵?
         turnover_notional_pre = sum(abs(t['desired_trade_value']) for t in planned_trades)
         
-        # C2) 检查换手上限
+        # C2) 妫€鏌ユ崲鎵嬩笂闄?
         max_turnover_pct = execution_config.get('max_turnover_pct_per_rebalance', 0.20)
         turnover_limit = total_equity * max_turnover_pct
         
@@ -1774,18 +2006,18 @@ class PaperTradingEngine:
         
         print(f"\n[TURNOVER] Planned(pre): ${turnover_notional_pre:,.2f}, Limit: ${turnover_limit:,.2f} ({max_turnover_pct:.1%})")
         
-        # C3) 如果超过上限，按比例缩放
+        # C3) 濡傛灉瓒呰繃涓婇檺锛屾寜姣斾緥缂╂斁
         if turnover_notional_pre > turnover_limit:
             turnover_scale = turnover_limit / turnover_notional_pre
             turnover_capped = True
             print(f"[TURNOVER CAP] Scaling all trades by {turnover_scale:.2%}")
             
-            # 缩放所有计划交易
+            # 缂╂斁鎵€鏈夎鍒掍氦鏄?
             scaled_trades = []
             for trade in planned_trades:
                 scaled_trade_value = trade['desired_trade_value'] * turnover_scale
                 
-                # 缩放后仍需满足 min_notional
+                # 缂╂斁鍚庝粛闇€婊¤冻 min_notional
                 if scaled_trade_value < min_notional:
                     print(f"[SKIP] {trade['ticker']} scaled notional ${scaled_trade_value:.2f} < min ${min_notional}")
                     continue
@@ -1795,11 +2027,11 @@ class PaperTradingEngine:
             
             planned_trades = scaled_trades
             
-            # 缩放后的目标换手（仍为期望名义）
+            # 缂╂斁鍚庣殑鐩爣鎹㈡墜锛堜粛涓烘湡鏈涘悕涔夛級
             actual_turnover_scaled = sum(abs(t['desired_trade_value']) for t in planned_trades)
             print(f"[TURNOVER CAP] Planned(after scaling): ${actual_turnover_scaled:,.2f}")
         
-        # C4) 先记录 pre，post 在最终成交后更新
+        # C4) 鍏堣褰?pre锛宲ost 鍦ㄦ渶缁堟垚浜ゅ悗鏇存柊
         self.current_turnover_info = {
             'turnover_notional': turnover_notional_pre,  # backward compatibility
             'turnover_notional_pre': turnover_notional_pre,
@@ -1809,17 +2041,17 @@ class PaperTradingEngine:
             'turnover_capped': turnover_capped
         }
         
-        # ========== 执行交易 ==========
+        # ========== 鎵ц浜ゆ槗 ==========
         trades = []
         turnover_notional_post = 0.0
         
-        # 先处理卖出
+        # 鍏堝鐞嗗崠鍑?
         for trade in [t for t in planned_trades if t['side'] == 'SELL']:
             ticker = trade['ticker']
             price = trade['price']
             desired_notional = abs(trade['desired_trade_value'])
             
-            # 缩放后再按整股换算，确保最终成交不超过缩放目标
+            # 缂╂斁鍚庡啀鎸夋暣鑲℃崲绠楋紝纭繚鏈€缁堟垚浜や笉瓒呰繃缂╂斁鐩爣
             current_qty = self.positions.get(ticker, 0)
             sell_qty = int(desired_notional / price)
             sell_qty = min(sell_qty, current_qty)
@@ -1827,7 +2059,7 @@ class PaperTradingEngine:
             if sell_qty <= 0:
                 continue
             
-            # 执行卖出
+            # 鎵ц鍗栧嚭
             proceeds = sell_qty * price
             cost = proceeds * self.config['objectives']['transaction_cost_pct']
             net_proceeds = proceeds - cost
@@ -1840,15 +2072,16 @@ class PaperTradingEngine:
                 del self.positions[ticker]
                 if ticker in self.cost_basis:
                     del self.cost_basis[ticker]
+                self.position_entry_cycle.pop(str(ticker).upper(), None)
             
-            # 构建决策轨迹
+            # 鏋勫缓鍐崇瓥杞ㄨ抗
             decision_trace = [
                 'cooldown_pass',
                 'weight_threshold_pass',
                 'min_notional_pass',
                 f'price_{trade["status"]}_age_{trade["age"]:.0f}min'
             ]
-            # 1) STALE SELL 标注
+            # 1) STALE SELL 鏍囨敞
             if trade['status'] == 'STALE':
                 decision_trace.append('sell_allowed_on_stale')
             if turnover_capped:
@@ -1857,9 +2090,10 @@ class PaperTradingEngine:
                 decision_trace.append('risk_off_de-risk')
             decision_trace.extend(alloc_trace)
             
-            # 构建完整的交易记录
+            # 鏋勫缓瀹屾暣鐨勪氦鏄撹褰?
             trades.append({
                 'timestamp': datetime.now().isoformat(),
+                'cycle': self.current_cycle,
                 'ticker': ticker,
                 'side': 'SELL',
                 'quantity': sell_qty,
@@ -1879,26 +2113,26 @@ class PaperTradingEngine:
             
             print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price:.2f} (notional: ${proceeds:.2f}, {trade['status']})")
         
-        # 再处理买入
+        # 鍐嶅鐞嗕拱鍏?
         for trade in [t for t in planned_trades if t['side'] == 'BUY']:
             ticker = trade['ticker']
             price = trade['price']
             desired_notional = abs(trade['desired_trade_value'])
             
-            # 缩放后再按整股换算，确保最终成交不超过缩放目标
+            # 缂╂斁鍚庡啀鎸夋暣鑲℃崲绠楋紝纭繚鏈€缁堟垚浜や笉瓒呰繃缂╂斁鐩爣
             buy_qty = int(desired_notional / price)
             
             if buy_qty <= 0:
                 continue
             
-            # 检查现金是否足够
+            # 妫€鏌ョ幇閲戞槸鍚﹁冻澶?
             cash_before_trade = self.cash
             required_cash = buy_qty * price
             cost = required_cash * self.config['objectives']['transaction_cost_pct']
             total_required = required_cash + cost
             
             if total_required > self.cash:
-                # 调整买入数量
+                # 璋冩暣涔板叆鏁伴噺
                 buy_qty = int((self.cash * 0.99) / (price * (1 + self.config['objectives']['transaction_cost_pct'])))
                 
                 if buy_qty <= 0:
@@ -1909,23 +2143,24 @@ class PaperTradingEngine:
                 cost = required_cash * self.config['objectives']['transaction_cost_pct']
                 total_required = required_cash + cost
             
-            # 执行买入
+            # 鎵ц涔板叆
             self.cash -= total_required
             turnover_notional_post += required_cash
             old_qty = self.positions.get(ticker, 0)
             old_cost = self.cost_basis.get(ticker, 0)
             
-            # 更新持仓
+            # 鏇存柊鎸佷粨
             self.positions[ticker] = old_qty + buy_qty
+            self.position_entry_cycle[str(ticker).upper()] = int(self.current_cycle)
             
-            # 更新成本基础（加权平均）
+            # 鏇存柊鎴愭湰鍩虹锛堝姞鏉冨钩鍧囷級
             if old_qty > 0:
                 total_cost = (old_qty * old_cost) + (buy_qty * price)
                 self.cost_basis[ticker] = total_cost / (old_qty + buy_qty)
             else:
                 self.cost_basis[ticker] = price
             
-            # 构建决策轨迹
+            # 鏋勫缓鍐崇瓥杞ㄨ抗
             decision_trace = [
                 'cooldown_pass',
                 'weight_threshold_pass',
@@ -1943,9 +2178,10 @@ class PaperTradingEngine:
                 decision_trace.append('cash_limited')
             decision_trace.extend(alloc_trace)
             
-            # 构建完整的交易记录
+            # 鏋勫缓瀹屾暣鐨勪氦鏄撹褰?
             trades.append({
                 'timestamp': datetime.now().isoformat(),
+                'cycle': self.current_cycle,
                 'ticker': ticker,
                 'side': 'BUY',
                 'quantity': buy_qty,
@@ -1965,7 +2201,7 @@ class PaperTradingEngine:
             
             print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f}, {trade['status']})")
 
-        # 最终成交级别 turnover 回填（用于 snapshot / trades 验收）
+        # 鏈€缁堟垚浜ょ骇鍒?turnover 鍥炲～锛堢敤浜?snapshot / trades 楠屾敹锛?
         self.current_turnover_info['turnover_notional_post'] = turnover_notional_post
         if turnover_capped and turnover_notional_post > turnover_limit + 1e-6:
             print(f"[WARN] turnover_notional_post ${turnover_notional_post:,.2f} > limit ${turnover_limit:,.2f}")
@@ -1989,11 +2225,11 @@ class PaperTradingEngine:
             trade['fill_remaining_end'] = trade_context.get('fill_remaining_end', trade_context.get('remaining_gap', 0.0))
             trade['capped_assets'] = ';'.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else ''
         
-        # ========== 更新交易记录和 cooldown 时间 ==========
+        # ========== 鏇存柊浜ゆ槗璁板綍鍜?cooldown 鏃堕棿 ==========
         if trades:
             self.trades_log.extend(trades)
             self.save_trades_immediately()
-            self.last_rebalance_time = datetime.now()  # 只有实际成交才更新
+            self.last_rebalance_time = datetime.now()  # 鍙湁瀹為檯鎴愪氦鎵嶆洿鏂?
             print(f"[COOLDOWN] Next rebalance allowed after {cooldown_minutes} minutes")
         else:
             print(f"[INFO] No trades executed (all filtered by protections)")
@@ -2001,26 +2237,26 @@ class PaperTradingEngine:
         return trades
     
     def _build_trade_context(self):
-        """构建交易上下文信息（用于记录交易理由）"""
-        # Regime 信息
+        """鏋勫缓浜ゆ槗涓婁笅鏂囦俊鎭紙鐢ㄤ簬璁板綍浜ゆ槗鐞嗙敱锛?"""
+        # Regime 淇℃伅
         regime_state = self.current_regime.get('regime_state', 'neutral')
         trend_score = self.current_regime.get('trend_score', 0.5)
         cash_target = self.current_regime.get('cash_target', self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']))
         
-        # Macro 信息 - E1) 使用平滑后的 risk_score
+        # Macro 淇℃伅 - E1) 浣跨敤骞虫粦鍚庣殑 risk_score
         macro_risk_score_raw = self.current_macro.get('macro_risk_score', 0.0)
         macro_risk_score_smoothed = self.current_macro.get('macro_risk_score_smoothed', 0.0)
         confirmed_topics = self.current_macro.get('confirmed_topics', [])
         macro_tilts = self.current_macro.get('applied_tilts', self.current_macro.get('macro_tilts', {}))
         alloc_diag = self.current_regime.get('allocation_diagnostics', self.current_macro.get('allocation_diagnostics', {}))
         
-        # 格式化 macro_topics 为字符串
+        # 鏍煎紡鍖?macro_topics 涓哄瓧绗︿覆
         if confirmed_topics:
             topics_str = '; '.join([f"{t['theme']}:{t['direction']}" for t in confirmed_topics[:3]])
         else:
             topics_str = 'none'
         
-        # 格式化 macro_tilts 为字符串
+        # 鏍煎紡鍖?macro_tilts 涓哄瓧绗︿覆
         if macro_tilts:
             tilts_str = '; '.join([f"{k}:{v:+.2%}" for k, v in macro_tilts.items()])
         else:
@@ -2030,12 +2266,11 @@ class PaperTradingEngine:
             'regime_state': regime_state,
             'trend_score': trend_score,
             'cash_target': cash_target,
-            'macro_risk_score': macro_risk_score_smoothed,  # E1) 使用平滑值
-            'macro_risk_score_raw': macro_risk_score_raw,  # 保留原始值
+            'macro_risk_score': macro_risk_score_smoothed,  # E1) 浣跨敤骞虫粦鍊?
+            'macro_risk_score_raw': macro_risk_score_raw,  # 淇濈暀鍘熷鍊?
             'macro_topics': topics_str,
             'macro_tilts': tilts_str,
-            'macro_tilts_dict': macro_tilts,  # 保留字典格式供内部使用
-            'invested_budget': alloc_diag.get('invested_budget', 0.0),
+            'macro_tilts_dict': macro_tilts,  # 淇濈暀瀛楀吀鏍煎紡渚涘唴閮ㄤ娇鐢?            'invested_budget': alloc_diag.get('invested_budget', 0.0),
             'total_before_caps': alloc_diag.get('total_before_caps', 0.0),
             'total_after_caps': alloc_diag.get('total_after_caps', 0.0),
             'downscaled': alloc_diag.get('downscaled', False),
@@ -2050,7 +2285,7 @@ class PaperTradingEngine:
         }
 
     def _compute_position_score_for_derisk(self, ticker):
-        """计算持仓去风险优先级分数，越小越优先卖出。"""
+        """璁＄畻鎸佷粨鍘婚闄╀紭鍏堢骇鍒嗘暟锛岃秺灏忚秺浼樺厛鍗栧嚭銆?"""
         strategy = self.config.get('strategy', {})
         lookback = int(strategy.get('lookback_days', 40))
         vol_target = float(strategy.get('vol_target', 0.15))
@@ -2081,7 +2316,7 @@ class PaperTradingEngine:
         return float(fallback_score), None, float(volatility), float(drawdown), 'fallback_vol_drawdown'
 
     def _run_circuit_breaker_derisk(self, drawdown, max_dd):
-        """触发后进入 risk_off_forced，并按最差评分优先结构化减仓。"""
+        """瑙﹀彂鍚庤繘鍏?risk_off_forced锛屽苟鎸夋渶宸瘎鍒嗕紭鍏堢粨鏋勫寲鍑忎粨銆?"""
         now = datetime.now()
         execution_config = self.config.get('execution', {})
         regime_config = self.config.get('regime_filter', {})
@@ -2104,7 +2339,7 @@ class PaperTradingEngine:
             'forced_reason': self.forced_regime_reason
         })
 
-        # 计算当前总权益与目标现金
+        # 璁＄畻褰撳墠鎬绘潈鐩婁笌鐩爣鐜伴噾
         holdings = []
         positions_value = 0.0
 
@@ -2158,7 +2393,7 @@ class PaperTradingEngine:
             }
             return []
 
-        # 受 objectives.max_rebalance_pct 与 turnover cap 双重约束
+        # 鍙?objectives.max_rebalance_pct 涓?turnover cap 鍙岄噸绾︽潫
         max_rebalance_pct = float(self.config.get('objectives', {}).get('max_rebalance_pct', 1.0))
         max_turnover_pct = float(execution_config.get('max_turnover_pct_per_rebalance', 1.0))
         cap_pct = min(max_rebalance_pct, max_turnover_pct)
@@ -2168,8 +2403,7 @@ class PaperTradingEngine:
         turnover_capped = turnover_notional_pre > turnover_limit
         turnover_scale = (turnover_limit / turnover_notional_pre) if turnover_capped and turnover_notional_pre > 0 else 1.0
 
-        holdings.sort(key=lambda x: x['score'])  # 最差分数优先卖出
-
+        holdings.sort(key=lambda x: x['score'])  # 鏈€宸垎鏁颁紭鍏堝崠鍑?
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         tx_cost = self.config['objectives']['transaction_cost_pct']
         remaining_cash_needed = cash_needed_initial
@@ -2269,10 +2503,10 @@ class PaperTradingEngine:
         return trades
 
     def check_risk_controls(self):
-        """检查风险控制：触发后进入 risk_off_forced 并执行结构化去风险。"""
+        """妫€鏌ラ闄╂帶鍒讹細瑙﹀彂鍚庤繘鍏?risk_off_forced 骞舵墽琛岀粨鏋勫寲鍘婚闄┿€?"""
         positions_value = 0.0
         for ticker, qty in self.positions.items():
-            price, age_min, status = self.get_current_price(ticker)  # D2) 解包三元组
+            price, age_min, status = self.get_current_price(ticker)  # D2) 瑙ｅ寘涓夊厓缁?
             if price:
                 positions_value += qty * price
 
@@ -2285,7 +2519,7 @@ class PaperTradingEngine:
         max_dd = self.config['objectives']['max_drawdown_pct']
 
         if drawdown > max_dd:
-            print(f"⚠️ CIRCUIT BREAKER: Drawdown {drawdown:.2%} exceeds limit {max_dd:.2%}")
+            print(f"鈿狅笍 CIRCUIT BREAKER: Drawdown {drawdown:.2%} exceeds limit {max_dd:.2%}")
             trades = self._run_circuit_breaker_derisk(drawdown, max_dd)
             if trades:
                 print(f"[CIRCUIT] Executed {len(trades)} structured de-risk trades")
@@ -2295,7 +2529,7 @@ class PaperTradingEngine:
 
         return False
     def record_snapshot(self):
-        """记录组合快照"""
+        """璁板綍缁勫悎蹇収"""
         print(f"[DEBUG] Recording snapshot at {datetime.now().strftime('%H:%M:%S')}")
         import sys; sys.stdout.flush()
         
@@ -2303,7 +2537,7 @@ class PaperTradingEngine:
         positions_detail = {}
         
         for ticker, qty in self.positions.items():
-            price, age_min, status = self.get_current_price(ticker)  # D2) 解包三元组
+            price, age_min, status = self.get_current_price(ticker)  # D2) 瑙ｅ寘涓夊厓缁?
             if price:
                 value = qty * price
                 positions_value += value
@@ -2321,7 +2555,7 @@ class PaperTradingEngine:
         total_return = (total_equity - self.initial_cash) / self.initial_cash
         drawdown = (self.peak_equity - total_equity) / self.peak_equity if self.peak_equity > 0 else 0
         
-        # 计算基准收益率（如果配置了）
+        # 璁＄畻鍩哄噯鏀剁泭鐜囷紙濡傛灉閰嶇疆浜嗭級
         bench_returns = {}
         bench_avg_return = 0.0
         bench_dispersion = 0.0
@@ -2337,7 +2571,7 @@ class PaperTradingEngine:
                     bench_tickers, evaluation_days
                 )
                 
-                # 计算超额收益（策略收益 - 基准平均收益）
+                # 璁＄畻瓒呴鏀剁泭锛堢瓥鐣ユ敹鐩?- 鍩哄噯骞冲潎鏀剁泭锛?
                 excess_return = total_return - bench_avg_return
                 win_flag = excess_return > 0
         
@@ -2355,13 +2589,13 @@ class PaperTradingEngine:
             'macro_reused': self.current_macro_reused,
             'last_signal_time': self.last_signal_time.isoformat() if self.last_signal_time else None,
             'last_macro_time': self.last_macro_time.isoformat() if self.last_macro_time else None,
-            # 基准比较字段
+            # 鍩哄噯姣旇緝瀛楁
             'bench_returns': bench_returns,
             'bench_avg_return': bench_avg_return,
             'bench_dispersion': bench_dispersion,
             'excess_return': excess_return,
             'win_flag': win_flag,
-            # Regime Filter 字段
+            # Regime Filter 瀛楁
             'regime_state': self.current_regime.get('regime_state', 'neutral'),
             'trend_score': self.current_regime.get('trend_score', 0.5),
             'dynamic_min_cash': self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']),
@@ -2370,11 +2604,9 @@ class PaperTradingEngine:
             'risk_caps_applied': self.current_regime.get('risk_caps_applied', False),
             'forced_until_time': self.current_regime.get('forced_until_time', self.forced_until_time.isoformat() if self.forced_until_time else None),
             'forced_regime_reason': self.current_regime.get('forced_reason', self.forced_regime_reason),
-            # Macro Integration 字段
+            # Macro Integration 瀛楁
             'macro_risk_score_raw': self.current_macro.get('macro_risk_score', 0.0),
-            'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),  # 原始值
-            'macro_risk_score_smoothed': self.current_macro.get('macro_risk_score_smoothed', 0.0),  # E1) 平滑值
-            'confirmed_topics_count': len(self.current_macro.get('confirmed_topics', [])),
+            'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),  # 鍘熷鍊?            'macro_risk_score_smoothed': self.current_macro.get('macro_risk_score_smoothed', 0.0),  # E1) 骞虫粦鍊?            'confirmed_topics_count': len(self.current_macro.get('confirmed_topics', [])),
             'macro_tilts': self.current_macro.get('macro_tilts', {}),
             'applied_tilts': self.current_macro.get('applied_tilts', {}),
             'capped_assets': self.current_macro.get('capped_assets', []),
@@ -2389,17 +2621,23 @@ class PaperTradingEngine:
             'fill_amount': self.current_regime.get('allocation_diagnostics', {}).get('fill_amount', 0.0),
             'fill_reason': self.current_regime.get('allocation_diagnostics', {}).get('fill_reason', ''),
             'fill_remaining_end': self.current_regime.get('allocation_diagnostics', {}).get('fill_remaining_end', 0.0),
-            'macro_tilts_ignored': self.current_macro.get('macro_tilts_ignored', {}),  # E3) 被忽略的 tilts
-            'macro_cooldown_remaining': self.macro_cooldown_remaining,  # E2) 冷却剩余周期
-            # B3) Price Staleness 字段
+            'macro_tilts_ignored': self.current_macro.get('macro_tilts_ignored', {}),  # E3) 琚拷鐣ョ殑 tilts
+            'macro_cooldown_remaining': self.macro_cooldown_remaining,  # E2) 鍐峰嵈鍓╀綑鍛ㄦ湡
+            # B3) Price Staleness 瀛楁
             'stale_count': self.current_stale_info.get('stale_count', 0),
             'stale_ratio': self.current_stale_info.get('stale_ratio', 0.0),
             'price_stale_skip': self.current_stale_info.get('price_stale_skip', False),
-            'price_stale_abort': self.current_stale_info.get('price_stale_abort', False),  # 新增
-            'stale_candidate_count': self.current_stale_info.get('stale_candidate_count', 0),  # 新增
-            'stale_ratio_candidates': self.current_stale_info.get('stale_ratio_candidates', 0.0),  # 新增
+            'price_stale_abort': self.current_stale_info.get('price_stale_abort', False),  # 鏂板
+            'stale_candidate_count': self.current_stale_info.get('stale_candidate_count', 0),  # 鏂板
+            'stale_ratio_candidates': self.current_stale_info.get('stale_ratio_candidates', 0.0),  # 鏂板
             'stale_decision_trace': self.current_stale_info.get('decision_trace', ''),
-            # C4) Turnover Cap 字段
+            'holding_block_count': len(self.current_holding_blocks),
+            'holding_blocks': list(self.current_holding_blocks),
+            'cross_section_top_n': self.current_regime.get('allocation_diagnostics', {}).get('cross_section_top_n', self.config.get('execution', {}).get('cross_section_top_n', 10)),
+            'ranked_candidates': self.current_regime.get('allocation_diagnostics', {}).get('ranked_candidates', []),
+            'corr_selected': self.current_regime.get('allocation_diagnostics', {}).get('corr_selected', []),
+            'corr_dropped': self.current_regime.get('allocation_diagnostics', {}).get('corr_dropped', []),
+            # C4) Turnover Cap 瀛楁
             'turnover_notional': self.current_turnover_info.get('turnover_notional', 0.0),
             'turnover_notional_pre': self.current_turnover_info.get('turnover_notional_pre', self.current_turnover_info.get('turnover_notional', 0.0)),
             'turnover_notional_post': self.current_turnover_info.get('turnover_notional_post', 0.0),
@@ -2412,7 +2650,7 @@ class PaperTradingEngine:
         self.portfolio_snapshots.append(snapshot)
         self.equity_curve.append((datetime.now(), total_equity, self.cash, positions_value))
 
-        # 每个 snapshot 后写一条 scoreboard
+        # 姣忎釜 snapshot 鍚庡啓涓€鏉?scoreboard
         scoreboard_record = self.append_scoreboard_record()
         if scoreboard_record:
             snapshot['strategy_return_2w'] = scoreboard_record.get('strategy_return_2w', 0.0)
@@ -2424,22 +2662,22 @@ class PaperTradingEngine:
             snapshot['macro_active_ratio_2w'] = scoreboard_record.get('macro_active_ratio_2w', 0.0)
             snapshot['diagnostic_hint'] = scoreboard_record.get('diagnostic_hint', '')
         
-        # 每个周期生成实时摘要
+        # 姣忎釜鍛ㄦ湡鐢熸垚瀹炴椂鎽樿
         self.generate_live_summary()
         
         return snapshot
 
     def save_trades_immediately(self):
-        """实时保存交易记录"""
+        """瀹炴椂淇濆瓨浜ゆ槗璁板綍"""
         trades_path = self.config['reporting']['trades_log_path']
         if self.trades_log:
             trades_df = pd.DataFrame(self.trades_log)
             trades_df.to_csv(trades_path, index=False)
-        print(f"💾 Trades updated: {trades_path}")
-        import sys; sys.stdout.flush()  # 强制刷新输出
+        print(f"馃捑 Trades updated: {trades_path}")
+        import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
 
     def generate_live_summary(self):
-        """生成实时摘要（不等程序结束）"""
+        """鐢熸垚瀹炴椂鎽樿锛堜笉绛夌▼搴忕粨鏉燂級"""
         if not self.portfolio_snapshots:
             return
         
@@ -2462,13 +2700,13 @@ class PaperTradingEngine:
             f.write(f"  Current Return: {final_snapshot['total_return']:.2%}\n")
             f.write(f"  Current Drawdown: {final_snapshot['drawdown']:.2%}\n\n")
             
-            # Regime Filter 面板
+            # Regime Filter 闈㈡澘
             if final_snapshot.get('regime_state'):
                 f.write(f"Market Regime:\n")
                 f.write(f"  State: {final_snapshot['regime_state'].upper()}")
                 
                 if final_snapshot.get('risk_caps_applied'):
-                    f.write(" ⚠️ RISK CAPS ACTIVE\n")
+                    f.write(" 鈿狅笍 RISK CAPS ACTIVE\n")
                 else:
                     f.write("\n")
                 
@@ -2476,7 +2714,7 @@ class PaperTradingEngine:
                 f.write(f"  Dynamic Min Cash: {final_snapshot['dynamic_min_cash']:.1%}\n")
                 f.write(f"  Dynamic Max Weight: {final_snapshot['dynamic_max_weight']:.1%}\n\n")
             
-            # Macro Integration 面板
+            # Macro Integration 闈㈡澘
             if final_snapshot.get('macro_risk_score', 0) > 0:
                 f.write(f"Macro Signals (GlobalWatch):\n")
                 f.write(f"  Risk Score: {final_snapshot['macro_risk_score']:.1f}/10.0\n")
@@ -2488,7 +2726,7 @@ class PaperTradingEngine:
                         f.write(f"    {ticker}: {tilt:+.2%}\n")
                 f.write("\n")
             
-            # 基准比较面板
+            # 鍩哄噯姣旇緝闈㈡澘
             if final_snapshot.get('bench_returns'):
                 f.write(f"Benchmark Comparison:\n")
                 f.write(f"  Strategy Return: {final_snapshot['total_return']:.2%}\n")
@@ -2496,9 +2734,9 @@ class PaperTradingEngine:
                 f.write(f"  Excess Return: {final_snapshot['excess_return']:.2%}")
                 
                 if final_snapshot['win_flag']:
-                    f.write(" ✅ OUTPERFORM\n")
+                    f.write(" 鉁?OUTPERFORM\n")
                 else:
-                    f.write(" ❌ UNDERPERFORM\n")
+                    f.write(" 鉂?UNDERPERFORM\n")
                 
                 f.write(f"  Benchmark Dispersion: {final_snapshot['bench_dispersion']:.2%}\n\n")
                 
@@ -2520,41 +2758,41 @@ class PaperTradingEngine:
             f.write(f"\nTotal Trades So Far: {len(self.trades_log)}\n")
             
             f.write("\n" + "="*60 + "\n")
-            f.write("⚠️  LIVE DATA - Updates every cycle\n")
-            f.write("⚠️  SIMULATION ONLY - NO REAL MONEY\n")
+            f.write("鈿狅笍  LIVE DATA - Updates every cycle\n")
+            f.write("鈿狅笍  SIMULATION ONLY - NO REAL MONEY\n")
             f.write("="*60 + "\n")
         
-        print(f"📊 Live summary updated: {summary_path}")
-        import sys; sys.stdout.flush()  # 强制刷新输出
+        print(f"馃搳 Live summary updated: {summary_path}")
+        import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
 
     def get_cost_basis(self, ticker):
-        """获取股票的成本基础（平均买入价）"""
+        """鑾峰彇鑲＄エ鐨勬垚鏈熀纭€锛堝钩鍧囦拱鍏ヤ环锛?"""
         return self.cost_basis.get(ticker, None)
     
     def compute_benchmark_returns(self, tickers, evaluation_days=10):
-        """计算基准指数收益率
+        """璁＄畻鍩哄噯鎸囨暟鏀剁泭鐜?
         
         Args:
-            tickers: 基准指数列表，如 ['QQQ', 'SPY', 'VTI', 'DIA']
-            evaluation_days: 评估周期（交易日），默认10天约等于2周
+            tickers: 鍩哄噯鎸囨暟鍒楄〃锛屽 ['QQQ', 'SPY', 'VTI', 'DIA']
+            evaluation_days: 璇勪及鍛ㄦ湡锛堜氦鏄撴棩锛夛紝榛樿10澶╃害绛変簬2鍛?
         
         Returns:
             bench_returns: {ticker: return_pct}
-            bench_avg_return: 平均收益率
-            bench_dispersion: 收益率标准差（离散度）
+            bench_avg_return: 骞冲潎鏀剁泭鐜?
+            bench_dispersion: 鏀剁泭鐜囨爣鍑嗗樊锛堢鏁ｅ害锛?
         """
         bench_returns = {}
         
         for ticker in tickers:
             try:
-                # 获取 evaluation_days+1 天的收盘价（需要多一天计算收益）
+                # 鑾峰彇 evaluation_days+1 澶╃殑鏀剁洏浠凤紙闇€瑕佸涓€澶╄绠楁敹鐩婏級
                 hist = self.get_market_data(ticker, period='1mo', interval='1d')
                 
                 if hist is None or len(hist) < evaluation_days + 1:
                     print(f"[BENCHMARK] {ticker}: insufficient data (need {evaluation_days+1} days)")
                     continue
                 
-                # 计算收益率：(最新价 - N天前价) / N天前价
+                # 璁＄畻鏀剁泭鐜囷細(鏈€鏂颁环 - N澶╁墠浠? / N澶╁墠浠?
                 latest_close = hist['Close'].iloc[-1]
                 past_close = hist['Close'].iloc[-(evaluation_days + 1)]
                 
@@ -2571,7 +2809,7 @@ class PaperTradingEngine:
             print("[BENCHMARK] No valid benchmark data")
             return {}, 0.0, 0.0
         
-        # 计算平均收益和离散度
+        # 璁＄畻骞冲潎鏀剁泭鍜岀鏁ｅ害
         returns_list = list(bench_returns.values())
         bench_avg_return = float(np.mean(returns_list))
         bench_dispersion = float(np.std(returns_list))
@@ -2581,18 +2819,16 @@ class PaperTradingEngine:
         return bench_returns, bench_avg_return, bench_dispersion
     
     def compute_regime_state(self):
-        """计算市场状态（基于四大指数 MA50 趋势）
-        
+        """璁＄畻甯傚満鐘舵€侊紙鍩轰簬鍥涘ぇ鎸囨暟 MA50 瓒嬪娍锛?        
         Returns:
             regime_state: 'risk_on' / 'neutral' / 'risk_off'
-            trend_score: 0.0 - 1.0 (满足 close > MA50 的指数比例)
+            trend_score: 0.0 - 1.0 (婊¤冻 close > MA50 鐨勬寚鏁版瘮渚?
             regime_details: {ticker: {'close': float, 'ma50': float, 'above_ma': bool}}
-            dynamic_min_cash: 本轮应使用的最小现金比例
-            dynamic_max_weight: 本轮应使用的最大单资产权重
+            dynamic_min_cash: 鏈疆搴斾娇鐢ㄧ殑鏈€灏忕幇閲戞瘮渚?            dynamic_max_weight: 鏈疆搴斾娇鐢ㄧ殑鏈€澶у崟璧勪骇鏉冮噸
         """
         regime_config = self.config.get('regime_filter', {})
 
-        # circuit breaker 强制 risk_off 窗口优先
+        # circuit breaker 寮哄埗 risk_off 绐楀彛浼樺厛
         if self.forced_until_time is not None:
             now = datetime.now()
             if now < self.forced_until_time:
@@ -2610,13 +2846,13 @@ class PaperTradingEngine:
                 self.forced_regime_reason = ""
 
         if not self.config.get('regime_filter', {}).get('enabled', False):
-            # 如果未启用 regime filter，返回默认值
+            # 濡傛灉鏈惎鐢?regime filter锛岃繑鍥為粯璁ゅ€?
             return 'neutral', 0.5, {}, self.config['objectives']['min_cash_pct'], self.config['objectives']['max_weight_per_asset']
 
         regime_config = self.config['regime_filter']
         ma_window = regime_config.get('ma_window', 50)
         
-        # 获取基准指数列表
+        # 鑾峰彇鍩哄噯鎸囨暟鍒楄〃
         bench_tickers = self.config.get('benchmarks', {}).get('tickers', ['QQQ', 'SPY', 'VTI', 'DIA'])
         
         print(f"\n[REGIME] Computing market regime using MA{ma_window}...")
@@ -2627,14 +2863,14 @@ class PaperTradingEngine:
         
         for ticker in bench_tickers:
             try:
-                # 获取足够的历史数据计算 MA50
+                # 鑾峰彇瓒冲鐨勫巻鍙叉暟鎹绠?MA50
                 hist = self.get_market_data(ticker, period='3mo', interval='1d')
                 
                 if hist is None or len(hist) < ma_window:
                     print(f"[REGIME] {ticker}: insufficient data for MA{ma_window}")
                     continue
                 
-                # 计算 MA50
+                # 璁＄畻 MA50
                 ma50 = hist['Close'].rolling(window=ma_window).mean()
                 latest_close = float(hist['Close'].iloc[-1])
                 latest_ma50 = float(ma50.iloc[-1])
@@ -2651,7 +2887,7 @@ class PaperTradingEngine:
                 if above_ma:
                     above_ma_count += 1
                 
-                status = "✅ ABOVE" if above_ma else "❌ BELOW"
+                status = "鉁?ABOVE" if above_ma else "鉂?BELOW"
                 print(f"[REGIME] {ticker}: ${latest_close:.2f} vs MA50 ${latest_ma50:.2f} {status}")
                 
             except Exception as e:
@@ -2662,10 +2898,10 @@ class PaperTradingEngine:
             print("[REGIME] No valid data, defaulting to neutral")
             return 'neutral', 0.5, {}, self.config['objectives']['min_cash_pct'], self.config['objectives']['max_weight_per_asset']
         
-        # 计算 trend_score = 满足条件的数量 / 总数
+        # 璁＄畻 trend_score = 婊¤冻鏉′欢鐨勬暟閲?/ 鎬绘暟
         trend_score = above_ma_count / valid_count
         
-        # 根据阈值判断市场状态
+        # 鏍规嵁闃堝€煎垽鏂競鍦虹姸鎬?
         risk_on_threshold = regime_config.get('trend_score_risk_on', 0.75)
         risk_off_threshold = regime_config.get('trend_score_risk_off', 0.50)
         
@@ -2676,7 +2912,7 @@ class PaperTradingEngine:
         else:
             regime_state = 'neutral'
         
-        # 动态调整现金和权重上限
+        # 鍔ㄦ€佽皟鏁寸幇閲戝拰鏉冮噸涓婇檺
         dynamic_min_cash = regime_config.get(f'cash_{regime_state}', self.config['objectives']['min_cash_pct'])
         
         if regime_state == 'risk_off':
@@ -2692,7 +2928,7 @@ class PaperTradingEngine:
         return regime_state, trend_score, regime_details, dynamic_min_cash, dynamic_max_weight
 
     def run_cycle(self):
-        """运行一个周期"""
+        """杩愯涓€涓懆鏈?"""
         print(f"\n{'='*60}")
         print(f"Cycle {self.current_cycle} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
@@ -2745,12 +2981,12 @@ class PaperTradingEngine:
         print(f"Status: {snapshot['status']}")
 
         if snapshot.get('regime_state'):
-            regime_icon = "🟢" if snapshot['regime_state'] == 'risk_on' else "🟡" if snapshot['regime_state'] == 'neutral' else "🔴"
-            risk_caps = " ⚠️ RISK CAPS" if snapshot.get('risk_caps_applied') else ""
+            regime_icon = "馃煝" if snapshot['regime_state'] == 'risk_on' else "馃煛" if snapshot['regime_state'] == 'neutral' else "馃敶"
+            risk_caps = " 鈿狅笍 RISK CAPS" if snapshot.get('risk_caps_applied') else ""
             print(f"Market Regime: {regime_icon} {snapshot['regime_state'].upper()} (trend: {snapshot['trend_score']:.1%}){risk_caps}")
 
         if snapshot['positions']:
-            print(f"\n📊 Current Holdings:")
+            print(f"\n馃搳 Current Holdings:")
             print(f"{'Ticker':<8} {'Qty':>6} {'Price':>10} {'Value':>12} {'Weight':>8} {'P&L':>10}")
             print("-" * 60)
 
@@ -2764,17 +3000,17 @@ class PaperTradingEngine:
                 if cost_basis:
                     pnl = (current_price - cost_basis) / cost_basis * 100
                     pnl_str = f"{pnl:+.2f}%"
-                    pnl_color = "📈" if pnl > 0 else "📉" if pnl < 0 else "➡️"
+                    pnl_color = "馃搱" if pnl > 0 else "馃搲" if pnl < 0 else "鉃★笍"
                 else:
                     pnl_str = "N/A"
-                    pnl_color = "➡️"
+                    pnl_color = "鉃★笍"
 
                 print(f"{ticker:<8} {qty:>6} ${current_price:>9.2f} ${value:>11,.2f} {weight:>7.1f}% {pnl_color} {pnl_str:>8}")
 
             print("-" * 60)
 
         if self.check_risk_controls():
-            print("⚠️ Risk control triggered (risk_off_forced active), skipping normal rebalance")
+            print("鈿狅笍 Risk control triggered (risk_off_forced active), skipping normal rebalance")
             self.current_cycle += 1
             return
 
@@ -2796,32 +3032,32 @@ class PaperTradingEngine:
         self.current_cycle += 1
 
     def run(self):
-        """运行模拟交易"""
+        """杩愯妯℃嫙浜ゆ槗"""
         print("\n" + "="*60)
-        print("🚀 Starting Paper Trading Simulation")
+        print("馃殌 Starting Paper Trading Simulation")
         print("="*60)
-        print(f"⚠️  SIMULATION ONLY - NO REAL MONEY")
-        print(f"⚠️  NO BROKER CONNECTION")
+        print(f"鈿狅笍  SIMULATION ONLY - NO REAL MONEY")
+        print(f"鈿狅笍  NO BROKER CONNECTION")
         print("="*60 + "\n")
         
-        # F4) 版本指纹自检
+        # F4) 鐗堟湰鎸囩汗鑷
         print("="*60)
-        print("📋 ENGINE VERSION FINGERPRINT")
+        print("馃搵 ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v2.8-2026-02-06")
+        print(f"ENGINE_VERSION: v2.9.1-2026-02-06")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
-        # 测试 get_current_price 返回三元组
+        # 娴嬭瘯 get_current_price 杩斿洖涓夊厓缁?
         try:
             test_result = self.get_current_price("QQQ")
             is_tuple = isinstance(test_result, tuple) and len(test_result) == 3
             print(f"PRICE_API_RETURNS_TUPLE: {is_tuple}")
             if is_tuple:
-                print(f"  └─ Sample: get_current_price('QQQ') = (price={test_result[0]}, age={test_result[1]}, status='{test_result[2]}')")
+                print(f"  鈹斺攢 Sample: get_current_price('QQQ') = (price={test_result[0]}, age={test_result[1]}, status='{test_result[2]}')")
         except Exception as e:
             print(f"PRICE_API_RETURNS_TUPLE: False (Error: {e})")
         
-        # 检查关键功能
+        # 妫€鏌ュ叧閿姛鑳?
         print(f"HAS_STALE_PRICE_SKIP: {hasattr(self, 'current_stale_info')}")
         print(f"HAS_TURNOVER_CAP: {hasattr(self, 'current_turnover_info')}")
         print(f"HAS_MACRO_COOLDOWN: {hasattr(self, 'macro_cooldown_remaining')}")
@@ -2845,31 +3081,31 @@ class PaperTradingEngine:
                 sleep_seconds = self.config['rebalance_minutes'] * 60
                 
                 if datetime.now() + timedelta(seconds=sleep_seconds) >= self.end_time:
-                    print(f"\n⏰ Approaching end time, running final cycle...")
+                    print(f"\n鈴?Approaching end time, running final cycle...")
                     break
                 
-                print(f"\n💤 Sleeping for {self.config['rebalance_minutes']} minutes...")
+                print(f"\n馃挙 Sleeping for {self.config['rebalance_minutes']} minutes...")
                 print(f"   Next cycle at: {(datetime.now() + timedelta(seconds=sleep_seconds)).strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 print(f"[DEBUG] About to sleep at {datetime.now().strftime('%H:%M:%S')}")
                 print(f"[DEBUG] Sleep duration: {sleep_seconds} seconds")
-                import sys; sys.stdout.flush()  # 强制刷新输出
+                import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
                 time.sleep(sleep_seconds)
                 print(f"[DEBUG] Woke up at {datetime.now().strftime('%H:%M:%S')}")
-                import sys; sys.stdout.flush()  # 强制刷新输出
+                import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
             
             print(f"\n{'='*60}")
-            print("📊 Final Snapshot")
+            print("馃搳 Final Snapshot")
             print(f"{'='*60}")
             self.run_cycle()
             
             self.status = "COMPLETED"
             
         except KeyboardInterrupt:
-            print("\n⚠️ Interrupted by user")
+            print("\n鈿狅笍 Interrupted by user")
             self.status = "INTERRUPTED"
         except Exception as e:
-            print(f"\n❌ Error: {e}")
+            print(f"\n鉂?Error: {e}")
             import traceback
             traceback.print_exc()
             self.status = "ERROR"
@@ -2877,37 +3113,37 @@ class PaperTradingEngine:
             self.save_results()
 
     def save_results(self):
-        """保存结果"""
+        """淇濆瓨缁撴灉"""
         print(f"\n{'='*60}")
-        print("💾 Saving Results")
+        print("馃捑 Saving Results")
         print(f"{'='*60}")
         
-        # 保存交易日志
+        # 淇濆瓨浜ゆ槗鏃ュ織
         trades_path = self.config['reporting']['trades_log_path']
         if self.trades_log:
             trades_df = pd.DataFrame(self.trades_log)
             trades_df.to_csv(trades_path, index=False)
-            print(f"✅ Trades log saved: {trades_path}")
+            print(f"鉁?Trades log saved: {trades_path}")
         else:
-            # 即使没有交易也创建空文件
+            # 鍗充娇娌℃湁浜ゆ槗涔熷垱寤虹┖鏂囦欢
             pd.DataFrame(columns=['timestamp', 'ticker', 'side', 'quantity', 'price', 'cost', 'reason']).to_csv(trades_path, index=False)
-            print(f"✅ Trades log saved (empty): {trades_path}")
+            print(f"鉁?Trades log saved (empty): {trades_path}")
         
-        # 保存组合快照
+        # 淇濆瓨缁勫悎蹇収
         snapshots_path = self.config['reporting']['portfolio_snapshots_path']
         with open(snapshots_path, 'w', encoding='utf-8') as f:
             for snapshot in self.portfolio_snapshots:
                 f.write(json.dumps(snapshot) + '\n')
-        print(f"✅ Portfolio snapshots saved: {snapshots_path}")
+        print(f"鉁?Portfolio snapshots saved: {snapshots_path}")
         
-        # 生成图表和报告
+        # 鐢熸垚鍥捐〃鍜屾姤鍛?
         self.generate_equity_curve()
         self.generate_summary_report()
     
     def generate_equity_curve(self):
-        """生成资金曲线图"""
+        """鐢熸垚璧勯噾鏇茬嚎鍥?"""
         if not self.equity_curve:
-            print("⚠️ No equity curve data to plot")
+            print("鈿狅笍 No equity curve data to plot")
             return
         
         timestamps = [ec[0] for ec in self.equity_curve]
@@ -2949,14 +3185,14 @@ class PaperTradingEngine:
         
         curve_path = self.config['reporting']['equity_curve_path']
         plt.savefig(curve_path, dpi=150, bbox_inches='tight')
-        print(f"✅ Equity curve saved: {curve_path}")
+        print(f"鉁?Equity curve saved: {curve_path}")
         
         plt.close()
     
     def generate_summary_report(self):
-        """生成摘要报告"""
+        """鐢熸垚鎽樿鎶ュ憡"""
         if not self.portfolio_snapshots:
-            print("⚠️ No snapshots to generate report")
+            print("鈿狅笍 No snapshots to generate report")
             return
         
         final_snapshot = self.portfolio_snapshots[-1]
@@ -2999,13 +3235,13 @@ class PaperTradingEngine:
             f.write(f"  Max Drawdown: {max_drawdown:.2%}\n")
             f.write(f"  Sharpe Ratio: {sharpe:.2f}\n\n")
             
-            # Regime Filter 面板
+            # Regime Filter 闈㈡澘
             if final_snapshot.get('regime_state'):
                 f.write(f"Final Market Regime:\n")
                 f.write(f"  State: {final_snapshot['regime_state'].upper()}")
                 
                 if final_snapshot.get('risk_caps_applied'):
-                    f.write(" ⚠️ RISK CAPS ACTIVE\n")
+                    f.write(" 鈿狅笍 RISK CAPS ACTIVE\n")
                 else:
                     f.write("\n")
                 
@@ -3013,7 +3249,7 @@ class PaperTradingEngine:
                 f.write(f"  Dynamic Min Cash: {final_snapshot['dynamic_min_cash']:.1%}\n")
                 f.write(f"  Dynamic Max Weight: {final_snapshot['dynamic_max_weight']:.1%}\n\n")
             
-            # Macro Integration 面板
+            # Macro Integration 闈㈡澘
             if final_snapshot.get('macro_risk_score', 0) > 0:
                 f.write(f"Final Macro Signals (GlobalWatch):\n")
                 f.write(f"  Risk Score: {final_snapshot['macro_risk_score']:.1f}/10.0\n")
@@ -3025,7 +3261,7 @@ class PaperTradingEngine:
                         f.write(f"    {ticker}: {tilt:+.2%}\n")
                 f.write("\n")
             
-            # 基准比较面板
+            # 鍩哄噯姣旇緝闈㈡澘
             if final_snapshot.get('bench_returns'):
                 f.write(f"Benchmark Comparison:\n")
                 f.write(f"  Strategy Return: {total_return:.2%}\n")
@@ -3033,9 +3269,9 @@ class PaperTradingEngine:
                 f.write(f"  Excess Return: {final_snapshot['excess_return']:.2%}")
                 
                 if final_snapshot['win_flag']:
-                    f.write(" ✅ OUTPERFORM\n")
+                    f.write(" 鉁?OUTPERFORM\n")
                 else:
-                    f.write(" ❌ UNDERPERFORM\n")
+                    f.write(" 鉂?UNDERPERFORM\n")
                 
                 f.write(f"  Benchmark Dispersion: {final_snapshot['bench_dispersion']:.2%}\n\n")
                 
@@ -3062,14 +3298,14 @@ class PaperTradingEngine:
                 f.write(f"  Total Transaction Costs: ${total_cost:,.2f}\n")
             
             f.write("\n" + "="*60 + "\n")
-            f.write("⚠️  SIMULATION ONLY - NO REAL MONEY\n")
-            f.write("⚠️  Past performance does not guarantee future results\n")
+            f.write("鈿狅笍  SIMULATION ONLY - NO REAL MONEY\n")
+            f.write("鈿狅笍  Past performance does not guarantee future results\n")
             f.write("="*60 + "\n")
         
-        print(f"✅ Summary report saved: {report_path}")
+        print(f"鉁?Summary report saved: {report_path}")
         
         print(f"\n{'='*60}")
-        print("📊 FINAL RESULTS")
+        print("馃搳 FINAL RESULTS")
         print(f"{'='*60}")
         print(f"Initial Cash: ${self.initial_cash:,.2f}")
         print(f"Final Equity: ${final_snapshot['total_equity']:,.2f}")
@@ -3077,16 +3313,16 @@ class PaperTradingEngine:
         print(f"Max Drawdown: {max_drawdown:.2%}")
         print(f"Sharpe Ratio: {sharpe:.2f}")
         
-        # 显示基准比较
+        # 鏄剧ず鍩哄噯姣旇緝
         if final_snapshot.get('bench_returns'):
             print(f"\nBenchmark Comparison:")
             print(f"  Strategy: {total_return:.2%}")
             print(f"  Benchmark Avg: {final_snapshot['bench_avg_return']:.2%}")
             print(f"  Excess Return: {final_snapshot['excess_return']:.2%}", end="")
             if final_snapshot['win_flag']:
-                print(" ✅ OUTPERFORM")
+                print(" 鉁?OUTPERFORM")
             else:
-                print(" ❌ UNDERPERFORM")
+                print(" 鉂?UNDERPERFORM")
         
         print(f"\nTotal Trades: {len(self.trades_log)}")
         print(f"Status: {self.status}")
@@ -3094,7 +3330,7 @@ class PaperTradingEngine:
 
 
 def main():
-    """主函数"""
+    """涓诲嚱鏁?"""
     import sys
     
     config_path = 'paper_config.json'
@@ -3110,4 +3346,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
 
