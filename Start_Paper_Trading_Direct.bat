@@ -1,17 +1,22 @@
 @echo off
 REM ============================================================
-REM 无缓冲启动纸上交易 - 解决 Windows Terminal 延迟问题
+REM 直接启动纸上交易 - 避免 PowerShell 复杂性
 REM ============================================================
 
+title Paper Trading - Running
+
 echo ============================================================
-echo Starting Paper Trading (Unbuffered Output)
+echo Starting Paper Trading (Direct Mode)
 echo ============================================================
-echo This version forces immediate output display
-echo to prevent delays in Windows Terminal
+echo.
+echo This version runs directly without PowerShell
+echo to avoid any input waiting issues
+echo.
+echo Press Ctrl+C to stop the trading session
 echo ============================================================
 echo.
 
-REM 使用 -u 参数强制无缓冲输出
+REM 直接启动 Python 程序（无缓冲模式）
 python -u paper_trading.py paper_config.json
 
 echo.

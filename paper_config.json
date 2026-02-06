@@ -2,7 +2,7 @@
   "paper_mode": true,
   "initial_cash_usd": 30000,
   "duration_hours": 48,
-  "rebalance_minutes": 15,
+  "rebalance_minutes": 10,
   "universe": [
     {
       "ticker": "SPY",
@@ -111,10 +111,10 @@
   },
   "strategy": {
     "type": "momentum_vol_targeting",
-    "lookback_days": 20,
-    "vol_target": 0.10,
-    "momentum_weight": 0.6,
-    "vol_weight": 0.4
+    "lookback_days": 40,
+    "vol_target": 0.15,
+    "momentum_weight": 0.65,
+    "vol_weight": 0.35
   },
   "reporting": {
     "equity_curve_path": "outputs/equity_curve.png",

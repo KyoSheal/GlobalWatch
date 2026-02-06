@@ -56,6 +56,10 @@ class PaperTradingEngine:
         self.peak_equity = self.cash
         self.status = "READY"  # READY/RUNNING/PAUSED/COMPLETED
         
+        # 价格缓存（避免重复请求）
+        self.price_cache = {}  # {ticker: (price, timestamp)}
+        self.price_cache_duration = 60  # 缓存60秒
+        
         # 尝试恢复之前的状态
         self.resume_from_checkpoint()
         
@@ -346,6 +350,10 @@ class PaperTradingEngine:
         
         asset_scores = {}
         
+        print(f"\n📊 Evaluating {len(self.config['universe'])-1} assets...")
+        print(f"{'Ticker':<8} {'Momentum':>10} {'Volatility':>12} {'Score':>10} {'Status':<10}")
+        print("-" * 60)
+        
         for asset in self.config['universe']:
             ticker = asset['ticker']
             
@@ -362,10 +370,19 @@ class PaperTradingEngine:
                 'volatility': volatility,
                 'score': score
             }
+            
+            # 显示每个资产的评分
+            status = "✅ BUY" if score > 0 else "❌ SKIP"
+            print(f"{ticker:<8} {momentum:>9.2%} {volatility:>11.2%} {score:>9.4f} {status:<10}")
+        
+        print("-" * 60)
         
         positive_assets = {k: v for k, v in asset_scores.items() if v['score'] > 0}
         
+        print(f"Selected {len(positive_assets)} assets with positive scores\n")
+        
         if not positive_assets:
+            return {'CASH': 1.0}
             return {'CASH': 1.0}
         
         total_score = sum(v['score'] for v in positive_assets.values())
@@ -422,12 +439,21 @@ class PaperTradingEngine:
         
         trades = []
         
+        # 最小交易阈值（避免1-2股的微调）
+        min_trade_qty = 5  # 最少交易5股
+        
         # 卖出
         for ticker, current_qty in list(self.positions.items()):
             target_qty = target_positions.get(ticker, 0)
             
             if target_qty < current_qty:
                 sell_qty = current_qty - target_qty
+                
+                # 检查是否达到最小交易阈值
+                if sell_qty < min_trade_qty:
+                    print(f"[SKIP] {ticker} sell {sell_qty} shares (below minimum {min_trade_qty})")
+                    continue
+                
                 price = current_prices.get(ticker, self.get_current_price(ticker))
                 
                 if price is None:
@@ -459,6 +485,12 @@ class PaperTradingEngine:
             
             if target_qty > current_qty:
                 buy_qty = target_qty - current_qty
+                
+                # 检查是否达到最小交易阈值
+                if buy_qty < min_trade_qty:
+                    print(f"[SKIP] {ticker} buy {buy_qty} shares (below minimum {min_trade_qty})")
+                    continue
+                
                 price = self.get_current_price(ticker)
                 
                 if price is None:
@@ -564,6 +596,9 @@ class PaperTradingEngine:
     
     def record_snapshot(self):
         """记录组合快照"""
+        print(f"[DEBUG] Recording snapshot at {datetime.now().strftime('%H:%M:%S')}")
+        import sys; sys.stdout.flush()
+        
         positions_value = 0.0
         positions_detail = {}
         
@@ -577,6 +612,9 @@ class PaperTradingEngine:
                     'price': price,
                     'value': value
                 }
+        
+        print(f"[DEBUG] Snapshot complete at {datetime.now().strftime('%H:%M:%S')}")
+        import sys; sys.stdout.flush()
         
         total_equity = self.cash + positions_value
         
