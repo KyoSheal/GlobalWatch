@@ -25,7 +25,7 @@ try:
     CHROMADB_AVAILABLE = True
 except ImportError:
     CHROMADB_AVAILABLE = False
-    print("鈿狅笍 ChromaDB not available - macro integration disabled")
+    print("[WARN] ChromaDB not available - macro integration disabled")
 
 # 璁剧疆鏃犵紦鍐茶緭鍑猴紝瑙ｅ喅 Windows Terminal 寤惰繜闂
 sys.stdout.reconfigure(line_buffering=True)
@@ -67,9 +67,9 @@ class MacroSignalAdapter:
             self.chroma_client = chromadb.PersistentClient(path=chroma_path)
             self.signals_collection = self.chroma_client.get_collection(name=collection_name)
             
-            print(f"[MACRO] 鉁?Connected to ChromaDB: {chroma_path}/{collection_name}")
+            print(f"[MACRO] Connected to ChromaDB: {chroma_path}/{collection_name}")
         except Exception as e:
-            print(f"[MACRO] 鈿狅笍 Failed to connect to ChromaDB: {e}")
+            print(f"[MACRO] Failed to connect to ChromaDB: {e}")
             self.enabled = False
 
     def _extract_source_key(self, metadata):
@@ -662,7 +662,7 @@ class PaperTradingEngine:
         # 璁剧疆闅忔満绉嶅瓙锛堢‘淇濆彲澶嶇幇锛?
         np.random.seed(self.config['safety']['random_seed'])
         
-        print("鉁?Paper Trading Engine initialized")
+        print("[OK] Paper Trading Engine initialized")
         print(f"   Initial Cash: ${self.cash:,.2f}")
         print(f"   Duration: {self.config['duration_hours']} hours")
         print(f"   Rebalance Interval: {self.config['rebalance_minutes']} minutes")
@@ -721,7 +721,7 @@ class PaperTradingEngine:
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         
-        print("鉁?Safety checks passed: SIMULATION ONLY mode confirmed")
+        print("[OK] Safety checks passed: SIMULATION ONLY mode confirmed")
     
     def resume_from_checkpoint(self):
         """浠庢鏌ョ偣鎭㈠涔嬪墠鐨勮繍琛岀姸鎬?"""
@@ -730,19 +730,19 @@ class PaperTradingEngine:
         
         # 妫€鏌ユ槸鍚﹀瓨鍦ㄦ鏌ョ偣鏂囦欢
         if not os.path.exists(snapshots_path):
-            print("鈩癸笍  No checkpoint found - starting fresh")
+            print("[INFO] No checkpoint found - starting fresh")
             return
         
         try:
             print("\n" + "="*60)
-            print("馃攧 CHECKPOINT DETECTED - Attempting to resume")
+            print("[CHECKPOINT] Detected - attempting to resume")
             print("="*60)
             
             # 1. 璇诲彇蹇収鏂囦欢
             with open(snapshots_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
                 if not lines:
-                    print("鈿狅笍  Checkpoint file is empty - starting fresh")
+                    print("[WARN] Checkpoint file is empty - starting fresh")
                     return
                 
                 # 鍔犺浇鎵€鏈夊揩鐓?
@@ -784,7 +784,7 @@ class PaperTradingEngine:
                 self.rebuild_cost_basis()
             
             # 4. 鏄剧ず鎭㈠淇℃伅
-            print(f"鉁?Successfully resumed from checkpoint")
+            print(f"[OK] Successfully resumed from checkpoint")
             print(f"   Last cycle: {last_snapshot['cycle']}")
             print(f"   Last update: {last_snapshot['timestamp']}")
             print(f"   Cash: ${self.cash:,.2f}")
@@ -815,7 +815,7 @@ class PaperTradingEngine:
             # 闈炰氦浜掔幆澧冩垨鐢ㄦ埛鏈槑纭€夋嫨锛岀洿鎺ヤ腑姝紝閬垮厤闈欓粯鍦颁粠澶村紑濮?
             raise
         except Exception as e:
-            print(f"鈿狅笍  Failed to resume from checkpoint: {e}")
+            print(f"[WARN] Failed to resume from checkpoint: {e}")
             print("   Starting fresh...")
 
     def prompt_checkpoint_choice(self):
@@ -1029,22 +1029,41 @@ class PaperTradingEngine:
         self.position_entry_cycle = {}
         self.current_holding_blocks = []
 
+    def _normalize_market_ticker(self, ticker):
+        """Normalize ticker symbol for market-data providers like Yahoo."""
+        if ticker is None:
+            return ticker
+        t = str(ticker).strip()
+        if not t:
+            return t
+        upper = t.upper()
+        explicit_map = {
+            'BRK.B': 'BRK-B',
+            'BRK/A': 'BRK-A',
+        }
+        if upper in explicit_map:
+            return explicit_map[upper]
+        if '.' in upper and upper.count('.') == 1 and upper.split('.')[0].isalpha():
+            return upper.replace('.', '-')
+        return t
+
     def get_market_data(self, ticker, period='1mo', interval='1d'):
         """鑾峰彇甯傚満鏁版嵁"""
         try:
             if ticker == 'CASH':
                 return None
-            
-            t = yf.Ticker(ticker)
+
+            market_ticker = self._normalize_market_ticker(ticker)
+            t = yf.Ticker(market_ticker)
             hist = t.history(period=period, interval=interval)
             
             if hist.empty:
-                print(f"鈿狅笍 No data for {ticker}, skipping")
+                print(f"[WARN] No data for {ticker} (provider symbol: {market_ticker}), skipping")
                 return None
             
             return hist
         except Exception as e:
-            print(f"鈿狅笍 Error fetching data for {ticker}: {e}")
+            print(f"[WARN] Error fetching data for {ticker}: {e}")
             return None
 
     def get_current_price(self, ticker):
@@ -1066,7 +1085,8 @@ class PaperTradingEngine:
             now_et = datetime.now(pytz.timezone('US/Eastern'))
             
             # 鍒涘缓鏂扮殑 Ticker 瀵硅薄锛岄伩鍏嶇紦瀛?
-            t = yf.Ticker(ticker)
+            market_ticker = self._normalize_market_ticker(ticker)
+            t = yf.Ticker(market_ticker)
             
             # 鏂规硶1: 灏濊瘯鑾峰彇鏈€鏂扮殑鍒嗛挓绾ф暟鎹紙5m 闂撮殧锛?
             try:
@@ -1832,6 +1852,9 @@ class PaperTradingEngine:
         
         print(f"\n[PRICE CHECK] Total tickers: {total_count}, STALE: {stale_count}, Ratio: {stale_ratio:.1%} | "
               f"Policy BUY={sorted(allow_buy_status)} SELL={sorted(allow_sell_status)}")
+        if total_count > 0 and stale_count == total_count and 'STALE' not in allow_buy_status:
+            print("[INFO] All candidate prices are STALE and BUY policy blocks STALE quotes. "
+                  "Likely outside market hours; rebalance may be skipped.")
         
         # 璁板綍姝ｅ父鎯呭喌
         self.current_stale_info = {
@@ -1966,6 +1989,9 @@ class PaperTradingEngine:
         
         if stale_ratio_candidates > max_stale_ratio:
             print(f"[STALE ABORT] STALE ratio {stale_ratio_candidates:.1%} > threshold {max_stale_ratio:.1%}, aborting rebalance")
+            if candidate_count > 0 and stale_candidate_count == candidate_count:
+                print("[INFO] All candidate trades depend on STALE prices. "
+                      "This typically happens when market is closed or data is delayed.")
             abort_trace = f"stale_abort_ratio_{stale_ratio_candidates:.1%}_gt_{max_stale_ratio:.1%}"
             # 3) 璁板綍鍒?snapshot
             self.current_stale_info = {
@@ -2519,7 +2545,7 @@ class PaperTradingEngine:
         max_dd = self.config['objectives']['max_drawdown_pct']
 
         if drawdown > max_dd:
-            print(f"鈿狅笍 CIRCUIT BREAKER: Drawdown {drawdown:.2%} exceeds limit {max_dd:.2%}")
+            print(f"[WARN] CIRCUIT BREAKER: Drawdown {drawdown:.2%} exceeds limit {max_dd:.2%}")
             trades = self._run_circuit_breaker_derisk(drawdown, max_dd)
             if trades:
                 print(f"[CIRCUIT] Executed {len(trades)} structured de-risk trades")
@@ -2673,7 +2699,7 @@ class PaperTradingEngine:
         if self.trades_log:
             trades_df = pd.DataFrame(self.trades_log)
             trades_df.to_csv(trades_path, index=False)
-        print(f"馃捑 Trades updated: {trades_path}")
+        print(f"[OK] Trades updated: {trades_path}")
         import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
 
     def generate_live_summary(self):
@@ -2762,7 +2788,7 @@ class PaperTradingEngine:
             f.write("鈿狅笍  SIMULATION ONLY - NO REAL MONEY\n")
             f.write("="*60 + "\n")
         
-        print(f"馃搳 Live summary updated: {summary_path}")
+        print(f"[OK] Live summary updated: {summary_path}")
         import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
 
     def get_cost_basis(self, ticker):
@@ -2986,7 +3012,7 @@ class PaperTradingEngine:
             print(f"Market Regime: {regime_icon} {snapshot['regime_state'].upper()} (trend: {snapshot['trend_score']:.1%}){risk_caps}")
 
         if snapshot['positions']:
-            print(f"\n馃搳 Current Holdings:")
+            print(f"\nCurrent Holdings:")
             print(f"{'Ticker':<8} {'Qty':>6} {'Price':>10} {'Value':>12} {'Weight':>8} {'P&L':>10}")
             print("-" * 60)
 
@@ -3010,7 +3036,7 @@ class PaperTradingEngine:
             print("-" * 60)
 
         if self.check_risk_controls():
-            print("鈿狅笍 Risk control triggered (risk_off_forced active), skipping normal rebalance")
+            print("[WARN] Risk control triggered (risk_off_forced active), skipping normal rebalance")
             self.current_cycle += 1
             return
 
@@ -3034,15 +3060,15 @@ class PaperTradingEngine:
     def run(self):
         """杩愯妯℃嫙浜ゆ槗"""
         print("\n" + "="*60)
-        print("馃殌 Starting Paper Trading Simulation")
+        print("Starting Paper Trading Simulation")
         print("="*60)
-        print(f"鈿狅笍  SIMULATION ONLY - NO REAL MONEY")
-        print(f"鈿狅笍  NO BROKER CONNECTION")
+        print("WARNING: SIMULATION ONLY - NO REAL MONEY")
+        print("WARNING: NO BROKER CONNECTION")
         print("="*60 + "\n")
         
         # F4) 鐗堟湰鎸囩汗鑷
         print("="*60)
-        print("馃搵 ENGINE VERSION FINGERPRINT")
+        print("ENGINE VERSION FINGERPRINT")
         print("="*60)
         print(f"ENGINE_VERSION: v2.9.1-2026-02-06")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
@@ -3053,7 +3079,7 @@ class PaperTradingEngine:
             is_tuple = isinstance(test_result, tuple) and len(test_result) == 3
             print(f"PRICE_API_RETURNS_TUPLE: {is_tuple}")
             if is_tuple:
-                print(f"  鈹斺攢 Sample: get_current_price('QQQ') = (price={test_result[0]}, age={test_result[1]}, status='{test_result[2]}')")
+                print(f"  Sample: get_current_price('QQQ') = (price={test_result[0]}, age={test_result[1]}, status='{test_result[2]}')")
         except Exception as e:
             print(f"PRICE_API_RETURNS_TUPLE: False (Error: {e})")
         
@@ -3081,10 +3107,10 @@ class PaperTradingEngine:
                 sleep_seconds = self.config['rebalance_minutes'] * 60
                 
                 if datetime.now() + timedelta(seconds=sleep_seconds) >= self.end_time:
-                    print(f"\n鈴?Approaching end time, running final cycle...")
+                    print(f"\n[INFO] Approaching end time, running final cycle...")
                     break
                 
-                print(f"\n馃挙 Sleeping for {self.config['rebalance_minutes']} minutes...")
+                print(f"\nSleeping for {self.config['rebalance_minutes']} minutes...")
                 print(f"   Next cycle at: {(datetime.now() + timedelta(seconds=sleep_seconds)).strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 print(f"[DEBUG] About to sleep at {datetime.now().strftime('%H:%M:%S')}")
@@ -3095,17 +3121,17 @@ class PaperTradingEngine:
                 import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
             
             print(f"\n{'='*60}")
-            print("馃搳 Final Snapshot")
+            print("Final Snapshot")
             print(f"{'='*60}")
             self.run_cycle()
             
             self.status = "COMPLETED"
             
         except KeyboardInterrupt:
-            print("\n鈿狅笍 Interrupted by user")
+            print("\n[WARN] Interrupted by user")
             self.status = "INTERRUPTED"
         except Exception as e:
-            print(f"\n鉂?Error: {e}")
+            print(f"\n[ERROR] {e}")
             import traceback
             traceback.print_exc()
             self.status = "ERROR"
@@ -3115,7 +3141,7 @@ class PaperTradingEngine:
     def save_results(self):
         """淇濆瓨缁撴灉"""
         print(f"\n{'='*60}")
-        print("馃捑 Saving Results")
+        print("Saving Results")
         print(f"{'='*60}")
         
         # 淇濆瓨浜ゆ槗鏃ュ織
@@ -3123,18 +3149,18 @@ class PaperTradingEngine:
         if self.trades_log:
             trades_df = pd.DataFrame(self.trades_log)
             trades_df.to_csv(trades_path, index=False)
-            print(f"鉁?Trades log saved: {trades_path}")
+            print(f"[OK] Trades log saved: {trades_path}")
         else:
             # 鍗充娇娌℃湁浜ゆ槗涔熷垱寤虹┖鏂囦欢
             pd.DataFrame(columns=['timestamp', 'ticker', 'side', 'quantity', 'price', 'cost', 'reason']).to_csv(trades_path, index=False)
-            print(f"鉁?Trades log saved (empty): {trades_path}")
+            print(f"[OK] Trades log saved (empty): {trades_path}")
         
         # 淇濆瓨缁勫悎蹇収
         snapshots_path = self.config['reporting']['portfolio_snapshots_path']
         with open(snapshots_path, 'w', encoding='utf-8') as f:
             for snapshot in self.portfolio_snapshots:
                 f.write(json.dumps(snapshot) + '\n')
-        print(f"鉁?Portfolio snapshots saved: {snapshots_path}")
+        print(f"[OK] Portfolio snapshots saved: {snapshots_path}")
         
         # 鐢熸垚鍥捐〃鍜屾姤鍛?
         self.generate_equity_curve()
@@ -3143,7 +3169,7 @@ class PaperTradingEngine:
     def generate_equity_curve(self):
         """鐢熸垚璧勯噾鏇茬嚎鍥?"""
         if not self.equity_curve:
-            print("鈿狅笍 No equity curve data to plot")
+            print("[WARN] No equity curve data to plot")
             return
         
         timestamps = [ec[0] for ec in self.equity_curve]
@@ -3185,14 +3211,14 @@ class PaperTradingEngine:
         
         curve_path = self.config['reporting']['equity_curve_path']
         plt.savefig(curve_path, dpi=150, bbox_inches='tight')
-        print(f"鉁?Equity curve saved: {curve_path}")
+        print(f"[OK] Equity curve saved: {curve_path}")
         
         plt.close()
     
     def generate_summary_report(self):
         """鐢熸垚鎽樿鎶ュ憡"""
         if not self.portfolio_snapshots:
-            print("鈿狅笍 No snapshots to generate report")
+            print("[WARN] No snapshots to generate report")
             return
         
         final_snapshot = self.portfolio_snapshots[-1]
@@ -3302,10 +3328,10 @@ class PaperTradingEngine:
             f.write("鈿狅笍  Past performance does not guarantee future results\n")
             f.write("="*60 + "\n")
         
-        print(f"鉁?Summary report saved: {report_path}")
+        print(f"[OK] Summary report saved: {report_path}")
         
         print(f"\n{'='*60}")
-        print("馃搳 FINAL RESULTS")
+        print("FINAL RESULTS")
         print(f"{'='*60}")
         print(f"Initial Cash: ${self.initial_cash:,.2f}")
         print(f"Final Equity: ${final_snapshot['total_equity']:,.2f}")
@@ -3320,9 +3346,9 @@ class PaperTradingEngine:
             print(f"  Benchmark Avg: {final_snapshot['bench_avg_return']:.2%}")
             print(f"  Excess Return: {final_snapshot['excess_return']:.2%}", end="")
             if final_snapshot['win_flag']:
-                print(" 鉁?OUTPERFORM")
+                print(" [OK] OUTPERFORM")
             else:
-                print(" 鉂?UNDERPERFORM")
+                print(" [WARN] UNDERPERFORM")
         
         print(f"\nTotal Trades: {len(self.trades_log)}")
         print(f"Status: {self.status}")

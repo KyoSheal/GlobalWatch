@@ -35,8 +35,8 @@ Start_Paper_Trading.bat
 ## 2. 当前引擎核心行为（已实现）
 
 ### 2.1 信号刷新解耦
-- `execution.signal_refresh_minutes`（默认 `1440`）
-- `execution.macro_refresh_minutes`（默认 `60`）
+- `execution.signal_refresh_minutes`
+- `execution.macro_refresh_minutes`
 
 行为：
 - 每个 cycle 都会 `record_snapshot()`
@@ -50,9 +50,9 @@ Start_Paper_Trading.bat
 
 ### 2.2 STALE 强风控
 相关配置：
-- `execution.max_stale_ratio`（默认 `0.3`）
-- `execution.price_stale_policy.allow_buy`（默认 `LIVE/RECENT`）
-- `execution.price_stale_policy.allow_sell`（默认 `LIVE/RECENT/STALE`）
+- `execution.max_stale_ratio`
+- `execution.price_stale_policy.allow_buy`
+- `execution.price_stale_policy.allow_sell`
 
 行为：
 - BUY 不允许 STALE（按 allow_buy）
@@ -75,35 +75,34 @@ Start_Paper_Trading.bat
 
 ### 2.4 Circuit Breaker 与 Regime 统一
 相关配置：
-- `execution.circuit_breaker_forced_days`（默认 `1`）
+- `execution.circuit_breaker_forced_days`
 
 行为：
 - 不再使用永久 `PAUSED`
 - 改为 `risk_off_forced`，并设置 `forced_until_time`
-- 强制风险状态下进行结构化减仓（按最差评分优先）
+- 强制风险状态下进行结构化减仓
 - Circuit breaker 交易同样写入完整上下文字段（含 `decision_trace` 中 `circuit_breaker`）
 
 ### 2.5 宏观双通路（5.12）
 
 #### 通路1：风险雷达（影响现金）
-- `cash_target = base_cash_from_regime + macro_cash_slope * macro_risk_score_smoothed + topic cash_add`
-- clip 到 `[min_cash_from_regime, 0.60]`
+- 现金目标由多源风险信号联合驱动
+- 现金目标始终受到风险边界约束
 
 #### 通路2：趋势放大器（影响权重上限/倾斜）
 - 生成 `max_weight_per_asset_effective`
 - `risk_off/risk_off_forced` 时，仅允许防守类倾斜（TLT/GLD/CASH）
-- `macro_allow_new_positions` 控制风险状态下可新开仓资产（默认 `TLT/GLD`）
+- `macro_allow_new_positions` 控制风险状态下可新开仓资产
 
-#### 小缺口补足（B 方案）
+#### 缺口补足（B 方案）
 相关配置：
-- `execution.fill_gap_max`（默认 `0.03`）
-- `execution.fill_gap_max_iters`（默认 `2`）
+- `execution.fill_gap_max`
+- `execution.fill_gap_max_iters`
 
 行为：
-- 先 cap
-- 仅 overweight 时 downscale
-- 若剩余缺口 `<= fill_gap_max`，在 headroom 内温和补足
-- 若缺口更大，留现金，不强行买满
+- 先执行上限约束与预算约束
+- 在小缺口场景进行有限补足
+- 在大缺口场景保留现金，不强行买满
 
 新增快照/trace指标：
 - `invested_budget`
@@ -120,22 +119,22 @@ Start_Paper_Trading.bat
 
 ### 2.6 Universe 与 Benchmarks 解耦
 相关配置：
-- `execution.allow_buy_benchmarks`（默认 `false`）
+- `execution.allow_buy_benchmarks`
 
 行为：
 - `benchmarks.tickers` 只用于：
   - `compute_regime_state()`
   - `compute_benchmark_returns()`
-- 在 `allow_buy_benchmarks=false` 下，打分/选权重会排除 benchmark ticker
+- 可配置是否允许基准资产参与交易池
 - macro_tilt 也只对最终 trade_universe 生效；被过滤的 tilt 会记录日志
 
-### 2.7 Scoreboard（新）
+### 2.7 Scoreboard
 相关配置：
-- `reporting.scoreboard_path`（默认 `outputs/scoreboard.jsonl`）
+- `reporting.scoreboard_path`
 
 每次 `record_snapshot()` 后追加一行：
 - `timestamp`
-- `strategy_return_2w`（10交易日窗口）
+- `strategy_return_2w`
 - `bench_avg_return_2w`
 - `excess_return_2w`
 - `win_flag_2w`
@@ -145,7 +144,7 @@ Start_Paper_Trading.bat
 - `diagnostic_hint`
 
 自动诊断：
-- 连续3个窗口 `win_flag_2w=false` 时触发提示，例如：
+- 连续落后时触发提示，例如：
   - `turnover_too_high`
   - `too_defensive`
   - `macro_too_noisy`
@@ -153,64 +152,38 @@ Start_Paper_Trading.bat
 - 最新 `diagnostic_hint` 会同步写入 snapshot
 
 ### 2.8 Alpha 升级（v2.9.1）
-目标：
-- 解决“仅看绝对动量”导致的选股弱点
-- 降低高相关与过度换手
-
-行为：
-- A) 横截面排名（Cross-sectional Ranking）
-- 每轮先计算所有候选资产的 `momentum/volatility`
-- 对动量做横截面评分（rank_score）
-- 仅保留 Top N（配置项控制）
-
-- B) 波动缩放（Volatility Scaling）
-- 权重信号近似为：`max(0, rank_score) / volatility`
-- 高波动资产自动降权，低波动资产相对升权
-- 后续仍经过 `cash_target`、`max_weight`、caps/fill 约束
-
-- C) 最小持有期（Holding Period）
-- 新买入后至少持有 `min_holding_cycles` 个 rebalance cycle
-- 触发时阻止 SELL/REDUCE，不绕过 STALE/turnover/cooldown 风控
-- 会在日志输出被阻止资产与剩余周期
-
-- D) 相关性去重（Correlation Control）
-- 在 Top N 内做近 `M` 天收益相关性检查
-- 若相关性 `> threshold`，保留 rank 更高资产，剔除另一只
-- 数据不足或相关性计算失败时安全降级，并打印 debug 提示
-
-新增可解释性日志：
-- `[RANKING]` Top N 表（ticker, momentum, volatility, rank_score, base_score）
-- `[VOL SCALE]` 波动缩放前后权重
-- `[CORR]` 相关性筛选结果与剔除原因
-- `[HOLDING]` 被最小持有期阻止的交易
+说明：
+- 已启用新版选股与权重引擎，包含多层信号筛选、风险约束与交易稳定机制
+- 算法实现细节、内部阈值与参数取值不在公开文档披露
+- 日志中保留必要的运行状态标签用于调试，不披露核心策略细节
 
 ---
 
 ## 3. 关键配置速查（paper_config.json）
 
 ### 3.1 execution
-- `signal_refresh_minutes: 1440`
-- `macro_refresh_minutes: 60`
-- `weight_threshold: 0.025`
-- `min_trade_notional_usd: 400`
-- `max_turnover_pct_per_rebalance: 0.20`
-- `max_stale_ratio: 0.3`
-- `price_stale_policy.allow_buy: ["LIVE","RECENT"]`
-- `price_stale_policy.allow_sell: ["LIVE","RECENT","STALE"]`
-- `circuit_breaker_forced_days: 1`
-- `fill_gap_max: 0.03`
-- `fill_gap_max_iters: 2`
-- `allow_buy_benchmarks: false`
-- `cross_section_top_n: 10`
-- `correlation_lookback_days: 60`
-- `correlation_threshold: 0.80`
-- `volatility_floor: 0.08`
-- `min_holding_cycles: 4`
+- `signal_refresh_minutes`
+- `macro_refresh_minutes`
+- `weight_threshold`
+- `min_trade_notional_usd`
+- `max_turnover_pct_per_rebalance`
+- `max_stale_ratio`
+- `price_stale_policy.allow_buy`
+- `price_stale_policy.allow_sell`
+- `circuit_breaker_forced_days`
+- `fill_gap_max`
+- `fill_gap_max_iters`
+- `allow_buy_benchmarks`
+- `cross_section_top_n`
+- `correlation_lookback_days`
+- `correlation_threshold`
+- `volatility_floor`
+- `min_holding_cycles`
 
 ### 3.2 macro_integration
-- `macro_cash_slope: 0.02`
-- `tilt_max_delta: 0.02`
-- `macro_allow_new_positions: ["TLT", "GLD"]`
+- `macro_cash_slope`
+- `tilt_max_delta`
+- `macro_allow_new_positions`
 
 ### 3.3 reporting
 - `trades_log_path`
@@ -236,35 +209,31 @@ Get-Content outputs\scoreboard.jsonl -Tail 5
 ```
 
 ### 4.3 重点验收项
-1. 连续两轮间隔小于 `signal_refresh_minutes`：
-- `weights_reused=true`
-- `target_weights` 不变
+1. 信号缓存与复用：
+- 快照可看到权重/宏观复用状态
+- 复用场景下目标权重保持稳定
 
 2. 强制 STALE 场景：
-- 出现 `price_stale_abort=true` 或大量 `stale_price_skip`
+- 出现 STALE 防护相关日志与快照标记
 
 3. 超换手场景：
-- `turnover_notional_post <= turnover_limit`
+- 出现换手限制生效的相关日志与快照标记
 
 4. 触发回撤熔断：
 - 不进入 `PAUSED`
 - 进入 `risk_off_forced`
 - 有结构化减仓交易与日志
 
-5. `allow_buy_benchmarks=false`：
-- `target_weights` 不应自动出现 `QQQ/SPY/VTI/DIA`
+5. Universe / Benchmark 解耦：
+- 基准资产是否交易应与配置保持一致
 
 6. 连续落后窗口：
 - `scoreboard.jsonl` 出现 `diagnostic_hint`
 - snapshot 同步该字段
 
-7. Alpha 排名与相关性：
-- 日志出现 `[RANKING]`、`[VOL SCALE]`、`[CORR]`
-- `corr_dropped` / `corr_selected` 在 snapshot 可见
-
-8. 最小持有期：
-- 刚买入后若目标要求减仓，日志出现 `[HOLDING] Block SELL/REDUCE ...`
-- snapshot 中 `holding_block_count > 0`
+7. Alpha 模块状态：
+- 新版 Alpha 相关日志标签可见
+- 快照中可看到对应状态字段
 
 ---
 
@@ -280,7 +249,7 @@ Get-Content outputs\scoreboard.jsonl -Tail 5
 - 可能在 `risk_off` 下被判定为进攻型 tilt 而阻断
 
 ### Q3: 为什么资金没有完全投满？
-- 这是设计行为：大缺口（>`fill_gap_max`）保留现金，避免强行买满导致过度冒险
+- 这可能是风控与资金管理机制的设计行为，公开文档不披露内部判定细节
 
 ---
 

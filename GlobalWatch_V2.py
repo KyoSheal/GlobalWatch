@@ -2298,7 +2298,7 @@ with tab_scoreboard:
                 })
             
             df = pd.DataFrame(signal_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.info("No signals recorded yet. Run some analyses to start tracking!")
     
@@ -2562,7 +2562,7 @@ with tab_warning:
                 height=400
             )
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             
             st.divider()
             
