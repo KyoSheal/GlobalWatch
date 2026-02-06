@@ -789,15 +789,44 @@ class PaperTradingEngine:
             print("="*60 + "\n")
             
             # 询问用户是否继续
-            response = input("Continue from checkpoint? (y/n): ").strip().lower()
-            if response != 'y':
+            response = self.prompt_checkpoint_choice()
+            if response == 'n':
                 print("Starting fresh as requested...")
                 self.clear_checkpoint()
                 return
+            print("Resuming from checkpoint as requested...")
             
+        except RuntimeError:
+            # 非交互环境或用户未明确选择，直接中止，避免静默地从头开始
+            raise
         except Exception as e:
             print(f"⚠️  Failed to resume from checkpoint: {e}")
             print("   Starting fresh...")
+
+    def prompt_checkpoint_choice(self):
+        """必须得到明确的 y/n 输入，避免误触从头开始。"""
+        env_choice = os.environ.get('GW_CHECKPOINT_ACTION', '').strip().lower()
+        if env_choice in ('y', 'yes', 'resume', 'continue'):
+            return 'y'
+        if env_choice in ('n', 'no', 'fresh', 'restart'):
+            return 'n'
+
+        while True:
+            try:
+                response = input("Continue from checkpoint? (y/n): ").strip().lower()
+            except EOFError as e:
+                raise RuntimeError(
+                    "Checkpoint choice required. Run in interactive terminal and input y/n, "
+                    "or set env GW_CHECKPOINT_ACTION=resume|fresh."
+                ) from e
+            except KeyboardInterrupt as e:
+                raise RuntimeError("Checkpoint choice cancelled by user.") from e
+
+            if response in ('y', 'yes'):
+                return 'y'
+            if response in ('n', 'no'):
+                return 'n'
+            print("Please type 'y' to resume or 'n' to start fresh.")
 
     def load_scoreboard_history(self):
         """加载已有 scoreboard 历史，便于连续窗口诊断。"""
@@ -2779,7 +2808,7 @@ class PaperTradingEngine:
         print("="*60)
         print("📋 ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v2.5-ABCDEF-2026-02-05")
+        print(f"ENGINE_VERSION: v2.8-2026-02-06")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
         # 测试 get_current_price 返回三元组

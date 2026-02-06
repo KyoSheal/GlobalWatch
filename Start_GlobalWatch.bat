@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo GlobalWatch V2.5 Launcher
+echo GlobalWatch V2.8 Launcher
 echo ========================================
 echo.
 echo Select mode:
@@ -35,7 +35,7 @@ echo Starting both modes in separate windows...
 cd /d "%~dp0"
 start "GlobalWatch Main" cmd /k "python -m streamlit run GlobalWatch_V2.py"
 timeout /t 2 /nobreak >nul
-start "GlobalWatch Paper Trading" cmd /k "python paper_trading.py"
+start "GlobalWatch Paper Trading" cmd /k "python -u paper_trading.py paper_config.json"
 goto end
 
 :end

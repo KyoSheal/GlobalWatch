@@ -2,7 +2,7 @@
   "paper_mode": true,
   "initial_cash_usd": 30000,
   "duration_hours": 48,
-  "rebalance_minutes": 360,
+  "rebalance_minutes": 20,
   "universe": [
     {
       "ticker": "SPY",

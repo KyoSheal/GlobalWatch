@@ -1,4 +1,4 @@
-﻿# GlobalWatch Paper Trading (V2.5+)
+﻿# GlobalWatch Paper Trading (V2.8+)
 
 本项目是一个本地运行的自动化 Paper Trading 引擎（不连接真实券商）。
 你最近新增的功能已经较多，本 README 重点覆盖：
@@ -242,3 +242,4 @@ Get-Content outputs\scoreboard.jsonl -Tail 5
 - 本系统仅用于模拟交易（Paper Trading）
 - 不连接真实券商，不构成投资建议
 - 实盘前请做独立风险评估与充分回测
+
