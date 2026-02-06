@@ -1091,7 +1091,7 @@ class PaperTradingEngine:
         # ========== C1) 计算计划交易（通过所有过滤器的）==========
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         
-        planned_trades = []  # [{ticker, side, current_value, target_value, trade_value, price, age, status}]
+        planned_trades = []  # [{ticker, side, current_value, target_value, desired_trade_value, price, age, status}]
         stale_candidate_count = 0  # 候选交易中 STALE 数量
         policy_skip_count = 0  # 因 price_stale_policy 被跳过的候选数量
         candidate_count = 0
@@ -1099,11 +1099,11 @@ class PaperTradingEngine:
         for ticker in tickers_to_trade:
             current_value = current_values.get(ticker, 0.0)
             target_value = target_values.get(ticker, 0.0)
-            trade_value = abs(target_value - current_value)
+            desired_trade_value = abs(target_value - current_value)
             
             # Min notional 检查
-            if trade_value < min_notional:
-                print(f"[SKIP] {ticker} trade notional ${trade_value:.2f} < min ${min_notional}")
+            if desired_trade_value < min_notional:
+                print(f"[SKIP] {ticker} trade notional ${desired_trade_value:.2f} < min ${min_notional}")
                 continue
             
             # 获取价格信息
@@ -1139,7 +1139,7 @@ class PaperTradingEngine:
                 'side': side,
                 'current_value': current_value,
                 'target_value': target_value,
-                'trade_value': trade_value,
+                'desired_trade_value': desired_trade_value,
                 'price': price,
                 'age': age,
                 'status': status
@@ -1163,6 +1163,14 @@ class PaperTradingEngine:
                 'stale_ratio_candidates': stale_ratio_candidates,
                 'decision_trace': abort_trace
             }
+            self.current_turnover_info = {
+                'turnover_notional': 0.0,
+                'turnover_notional_pre': 0.0,
+                'turnover_notional_post': 0.0,
+                'turnover_limit': total_equity * execution_config.get('max_turnover_pct_per_rebalance', 0.20),
+                'turnover_scale': 1.0,
+                'turnover_capped': False
+            }
             print(f"[DECISION] {abort_trace}")
             return []
         
@@ -1174,7 +1182,7 @@ class PaperTradingEngine:
         self.current_stale_info['decision_trace'] = f"stale_ok_{stale_ratio_candidates:.1%}_le_{max_stale_ratio:.1%}"
         
         # C1) 计算总换手
-        turnover_notional = sum(t['trade_value'] for t in planned_trades)
+        turnover_notional_pre = sum(abs(t['desired_trade_value']) for t in planned_trades)
         
         # C2) 检查换手上限
         max_turnover_pct = execution_config.get('max_turnover_pct_per_rebalance', 0.20)
@@ -1183,43 +1191,38 @@ class PaperTradingEngine:
         turnover_scale = 1.0
         turnover_capped = False
         
-        print(f"\n[TURNOVER] Planned: ${turnover_notional:,.2f}, Limit: ${turnover_limit:,.2f} ({max_turnover_pct:.1%})")
+        print(f"\n[TURNOVER] Planned(pre): ${turnover_notional_pre:,.2f}, Limit: ${turnover_limit:,.2f} ({max_turnover_pct:.1%})")
         
         # C3) 如果超过上限，按比例缩放
-        if turnover_notional > turnover_limit:
-            turnover_scale = turnover_limit / turnover_notional
+        if turnover_notional_pre > turnover_limit:
+            turnover_scale = turnover_limit / turnover_notional_pre
             turnover_capped = True
             print(f"[TURNOVER CAP] Scaling all trades by {turnover_scale:.2%}")
             
             # 缩放所有计划交易
             scaled_trades = []
             for trade in planned_trades:
-                scaled_trade_value = trade['trade_value'] * turnover_scale
+                scaled_trade_value = trade['desired_trade_value'] * turnover_scale
                 
                 # 缩放后仍需满足 min_notional
                 if scaled_trade_value < min_notional:
                     print(f"[SKIP] {trade['ticker']} scaled notional ${scaled_trade_value:.2f} < min ${min_notional}")
                     continue
                 
-                # 更新 target_value（缩放后）
-                if trade['side'] == 'BUY':
-                    scaled_target_value = trade['current_value'] + scaled_trade_value
-                else:  # SELL
-                    scaled_target_value = trade['current_value'] - scaled_trade_value
-                
-                trade['target_value'] = scaled_target_value
-                trade['trade_value'] = scaled_trade_value
+                trade['desired_trade_value'] = scaled_trade_value
                 scaled_trades.append(trade)
             
             planned_trades = scaled_trades
             
-            # 重新计算实际换手
-            actual_turnover = sum(t['trade_value'] for t in planned_trades)
-            print(f"[TURNOVER CAP] Actual after scaling: ${actual_turnover:,.2f}")
+            # 缩放后的目标换手（仍为期望名义）
+            actual_turnover_scaled = sum(abs(t['desired_trade_value']) for t in planned_trades)
+            print(f"[TURNOVER CAP] Planned(after scaling): ${actual_turnover_scaled:,.2f}")
         
-        # C4) 记录 turnover 信息
+        # C4) 先记录 pre，post 在最终成交后更新
         self.current_turnover_info = {
-            'turnover_notional': turnover_notional,
+            'turnover_notional': turnover_notional_pre,  # backward compatibility
+            'turnover_notional_pre': turnover_notional_pre,
+            'turnover_notional_post': 0.0,
             'turnover_limit': turnover_limit,
             'turnover_scale': turnover_scale,
             'turnover_capped': turnover_capped
@@ -1227,17 +1230,18 @@ class PaperTradingEngine:
         
         # ========== 执行交易 ==========
         trades = []
+        turnover_notional_post = 0.0
         
         # 先处理卖出
         for trade in [t for t in planned_trades if t['side'] == 'SELL']:
             ticker = trade['ticker']
             price = trade['price']
-            target_value = trade['target_value']
+            desired_notional = abs(trade['desired_trade_value'])
             
-            # 计算卖出股数
+            # 缩放后再按整股换算，确保最终成交不超过缩放目标
             current_qty = self.positions.get(ticker, 0)
-            target_qty = int(target_value / price)
-            sell_qty = current_qty - target_qty
+            sell_qty = int(desired_notional / price)
+            sell_qty = min(sell_qty, current_qty)
             
             if sell_qty <= 0:
                 continue
@@ -1246,11 +1250,12 @@ class PaperTradingEngine:
             proceeds = sell_qty * price
             cost = proceeds * self.config['objectives']['transaction_cost_pct']
             net_proceeds = proceeds - cost
+            turnover_notional_post += proceeds
             
             self.cash += net_proceeds
-            self.positions[ticker] = target_qty
+            self.positions[ticker] = current_qty - sell_qty
             
-            if target_qty == 0:
+            if self.positions[ticker] == 0:
                 del self.positions[ticker]
                 if ticker in self.cost_basis:
                     del self.cost_basis[ticker]
@@ -1296,17 +1301,16 @@ class PaperTradingEngine:
         for trade in [t for t in planned_trades if t['side'] == 'BUY']:
             ticker = trade['ticker']
             price = trade['price']
-            target_value = trade['target_value']
+            desired_notional = abs(trade['desired_trade_value'])
             
-            # 计算买入股数
-            current_qty = self.positions.get(ticker, 0)
-            target_qty = int(target_value / price)
-            buy_qty = target_qty - current_qty
+            # 缩放后再按整股换算，确保最终成交不超过缩放目标
+            buy_qty = int(desired_notional / price)
             
             if buy_qty <= 0:
                 continue
             
             # 检查现金是否足够
+            cash_before_trade = self.cash
             required_cash = buy_qty * price
             cost = required_cash * self.config['objectives']['transaction_cost_pct']
             total_required = required_cash + cost
@@ -1325,6 +1329,7 @@ class PaperTradingEngine:
             
             # 执行买入
             self.cash -= total_required
+            turnover_notional_post += required_cash
             old_qty = self.positions.get(ticker, 0)
             old_cost = self.cost_basis.get(ticker, 0)
             
@@ -1352,7 +1357,7 @@ class PaperTradingEngine:
                 decision_trace.append(f'macro_tilt_{tilt:+.2%}')
             if trade_context['regime_state'] == 'risk_on':
                 decision_trace.append('risk_on_add-risk')
-            if total_required >= self.cash * 0.99:
+            if total_required >= cash_before_trade * 0.99:
                 decision_trace.append('cash_limited')
             
             # 构建完整的交易记录
@@ -1376,6 +1381,18 @@ class PaperTradingEngine:
             })
             
             print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f}, {trade['status']})")
+
+        # 最终成交级别 turnover 回填（用于 snapshot / trades 验收）
+        self.current_turnover_info['turnover_notional_post'] = turnover_notional_post
+        if turnover_capped and turnover_notional_post > turnover_limit + 1e-6:
+            print(f"[WARN] turnover_notional_post ${turnover_notional_post:,.2f} > limit ${turnover_limit:,.2f}")
+
+        for trade in trades:
+            trade['turnover_notional_pre'] = turnover_notional_pre
+            trade['turnover_notional_post'] = turnover_notional_post
+            trade['turnover_limit'] = turnover_limit
+            trade['turnover_scale'] = turnover_scale
+            trade['turnover_capped'] = turnover_capped
         
         # ========== 更新交易记录和 cooldown 时间 ==========
         if trades:
@@ -1566,6 +1583,8 @@ class PaperTradingEngine:
             'stale_decision_trace': self.current_stale_info.get('decision_trace', ''),
             # C4) Turnover Cap 字段
             'turnover_notional': self.current_turnover_info.get('turnover_notional', 0.0),
+            'turnover_notional_pre': self.current_turnover_info.get('turnover_notional_pre', self.current_turnover_info.get('turnover_notional', 0.0)),
+            'turnover_notional_post': self.current_turnover_info.get('turnover_notional_post', 0.0),
             'turnover_limit': self.current_turnover_info.get('turnover_limit', 0.0),
             'turnover_scale': self.current_turnover_info.get('turnover_scale', 1.0),
             'turnover_capped': self.current_turnover_info.get('turnover_capped', False)
