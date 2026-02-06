@@ -680,6 +680,7 @@ class PaperTradingEngine:
         execution_config.setdefault('circuit_breaker_forced_days', 1)
         execution_config.setdefault('fill_gap_max', 0.03)
         execution_config.setdefault('fill_gap_max_iters', 2)
+        execution_config.setdefault('allow_buy_benchmarks', False)
         stale_policy = execution_config.setdefault('price_stale_policy', {})
         stale_policy.setdefault('allow_buy', ['LIVE', 'RECENT'])
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
@@ -701,6 +702,7 @@ class PaperTradingEngine:
         assert self.config.get('execution', {}).get('circuit_breaker_forced_days', 1) > 0, "execution.circuit_breaker_forced_days must be > 0"
         assert self.config.get('execution', {}).get('fill_gap_max', 0.03) >= 0, "execution.fill_gap_max must be >= 0"
         assert int(self.config.get('execution', {}).get('fill_gap_max_iters', 2)) >= 1, "execution.fill_gap_max_iters must be >= 1"
+        assert isinstance(self.config.get('execution', {}).get('allow_buy_benchmarks', False), bool), "execution.allow_buy_benchmarks must be bool"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         
@@ -1285,8 +1287,10 @@ class PaperTradingEngine:
 
         # ========== 步骤2: 读取 cached macro ==========
         macro_cfg = self.config.get('macro_integration', {})
+        execution_cfg = self.config.get('execution', {})
         macro_mapping = self.config.get('macro_mapping', {})
         tilt_max_delta = float(macro_cfg.get('tilt_max_delta', 0.02))
+        allow_buy_benchmarks = bool(execution_cfg.get('allow_buy_benchmarks', False))
         macro_risk_score_raw = float(self.cached_macro.get('macro_risk_score_raw', 0.0))
         macro_risk_score_smoothed = float(self.cached_macro.get('macro_risk_score_smoothed', macro_risk_score_raw))
         macro_tilts_filtered = dict(self.cached_macro.get('macro_tilts', {}))
@@ -1325,26 +1329,57 @@ class PaperTradingEngine:
 
         # ========== 通路2: 趋势放大器（tilt + 单资产上限） ==========
         macro_allow_new_positions = {str(x).upper() for x in macro_cfg.get('macro_allow_new_positions', ['TLT', 'GLD'])}
-        defensive_tilt_assets = set(macro_allow_new_positions) | {'CASH'}
+        defensive_tilt_assets = set(macro_allow_new_positions) | {'CASH', 'TLT', 'GLD'}
         risk_off_mode = regime_state in ('risk_off', 'risk_off_forced')
+
+        # 构造 trade_universe：benchmarks 仅用于 regime/benchmark 计算，不自动进入交易池
+        benchmark_tickers = {str(t).upper() for t in self.config.get('benchmarks', {}).get('tickers', [])}
+        trade_universe_assets = []
+        excluded_benchmark_assets = []
+        for asset in self.config.get('universe', []):
+            ticker = str(asset.get('ticker', ''))
+            if not ticker or ticker.upper() == 'CASH':
+                continue
+            ticker_u = ticker.upper()
+            if allow_buy_benchmarks or (ticker_u not in benchmark_tickers) or (ticker_u in defensive_tilt_assets):
+                trade_universe_assets.append(asset)
+            else:
+                excluded_benchmark_assets.append(ticker)
+
+        trade_ticker_by_upper = {str(a.get('ticker', '')).upper(): str(a.get('ticker', '')) for a in trade_universe_assets}
+        trade_universe_tickers = set(trade_ticker_by_upper.keys())
+        if excluded_benchmark_assets and not allow_buy_benchmarks:
+            print(f"[UNIVERSE] Excluding benchmark tickers from trading: {', '.join(sorted(excluded_benchmark_assets))}")
 
         applied_tilts = {}
         blocked_tilts = {}
+        blocked_tilts_not_trade_universe = {}
         for ticker, tilt in macro_tilts_filtered.items():
+            ticker_u = str(ticker).upper()
+            if ticker_u != 'CASH' and ticker_u not in trade_universe_tickers:
+                try:
+                    blocked_tilts_not_trade_universe[ticker] = float(tilt)
+                except (TypeError, ValueError):
+                    blocked_tilts_not_trade_universe[ticker] = tilt
+                continue
             try:
                 tilt_delta = float(tilt)
             except (TypeError, ValueError):
                 continue
             tilt_delta = float(np.clip(tilt_delta, -tilt_max_delta, tilt_max_delta))
+            canonical_ticker = trade_ticker_by_upper.get(ticker_u, str(ticker))
 
-            if risk_off_mode and ticker.upper() not in defensive_tilt_assets:
-                blocked_tilts[ticker] = tilt_delta
+            if risk_off_mode and ticker_u not in defensive_tilt_assets:
+                blocked_tilts[canonical_ticker] = tilt_delta
                 continue
-            applied_tilts[ticker] = tilt_delta
+            applied_tilts[canonical_ticker] = tilt_delta
 
         if blocked_tilts:
             print(f"[MACRO PATH2] blocked offensive tilts in {regime_state}: "
                   f"{', '.join([f'{k}:{v:+.2%}' for k, v in blocked_tilts.items()])}")
+        if blocked_tilts_not_trade_universe:
+            print(f"[MACRO PATH2] blocked tilts not in trade_universe: "
+                  f"{', '.join([f'{k}:{v}' for k, v in blocked_tilts_not_trade_universe.items()])}")
 
         cash_tilt = applied_tilts.get('CASH', 0.0)
         if abs(cash_tilt) > 1e-12:
@@ -1368,17 +1403,16 @@ class PaperTradingEngine:
         vol_target = strategy['vol_target']
         momentum_weight = strategy['momentum_weight']
         vol_weight = strategy['vol_weight']
-        execution_cfg = self.config.get('execution', {})
         fill_gap_max = float(execution_cfg.get('fill_gap_max', 0.03))
         fill_gap_max_iters = int(execution_cfg.get('fill_gap_max_iters', 2))
 
         asset_scores = {}
 
-        print(f"\n📊 Evaluating {len(self.config['universe'])-1} assets...")
+        print(f"\n📊 Evaluating {len(trade_universe_assets)} assets...")
         print(f"{'Ticker':<8} {'Momentum':>10} {'Volatility':>12} {'Score':>10} {'Status':<10}")
         print('-' * 60)
 
-        for asset in self.config['universe']:
+        for asset in trade_universe_assets:
             ticker = asset['ticker']
             if ticker == 'CASH':
                 continue
@@ -1406,13 +1440,14 @@ class PaperTradingEngine:
         scaled_weights = {k: v * invested_budget for k, v in raw_weights.items()}
 
         # 应用 tilts（趋势放大器，不直接强买）
-        universe_tickers = {asset['ticker'] for asset in self.config['universe']}
+        universe_tickers = {str(asset['ticker']).upper() for asset in trade_universe_assets}
         if applied_tilts:
             print(f"[MACRO PATH2] Applying tilts:")
         for ticker, tilt_delta in applied_tilts.items():
-            if ticker == 'CASH':
+            ticker_u = str(ticker).upper()
+            if ticker_u == 'CASH':
                 continue
-            if ticker not in universe_tickers:
+            if ticker_u not in universe_tickers:
                 continue
 
             if ticker in scaled_weights:
@@ -1428,7 +1463,7 @@ class PaperTradingEngine:
 
         # 生成单资产有效上限（base_max_weight + tilt_delta，delta clip 到 ±tilt_max_delta）
         max_weight_effective = {}
-        for asset in self.config['universe']:
+        for asset in trade_universe_assets:
             ticker = asset['ticker']
             if ticker == 'CASH':
                 continue
@@ -1453,6 +1488,7 @@ class PaperTradingEngine:
         # 记录本轮 macro 应用结果，供 snapshot/trade context 使用
         self.current_macro['applied_tilts'] = dict(applied_tilts)
         self.current_macro['blocked_tilts'] = dict(blocked_tilts)
+        self.current_macro['blocked_tilts_not_trade_universe'] = dict(blocked_tilts_not_trade_universe)
         self.current_macro['capped_assets'] = list(capped_assets)
         self.current_macro['max_weight_per_asset_effective'] = dict(max_weight_effective)
         self.current_macro['cash_target'] = cash_target

@@ -129,6 +129,7 @@
     "max_stale_ratio": 0.3,
     "fill_gap_max": 0.03,
     "fill_gap_max_iters": 2,
+    "allow_buy_benchmarks": false,
     "price_stale_policy": {
       "allow_buy": ["LIVE", "RECENT"],
       "allow_sell": ["LIVE", "RECENT", "STALE"]
