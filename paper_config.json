@@ -125,7 +125,11 @@
     "max_turnover_pct_per_rebalance": 0.20,
     "stale_price_skip_minutes": 60,
     "stale_abort_ratio": 0.5,
-    "max_stale_ratio": 0.3
+    "max_stale_ratio": 0.3,
+    "price_stale_policy": {
+      "allow_buy": ["LIVE", "RECENT"],
+      "allow_sell": ["LIVE", "RECENT", "STALE"]
+    }
   },
   "benchmarks": {
     "tickers": ["QQQ", "SPY", "VTI", "DIA"],
