@@ -1867,6 +1867,31 @@ class PaperTradingEngine:
         print(f"⚠️  NO BROKER CONNECTION")
         print("="*60 + "\n")
         
+        # F4) 版本指纹自检
+        print("="*60)
+        print("📋 ENGINE VERSION FINGERPRINT")
+        print("="*60)
+        print(f"ENGINE_VERSION: v2.5-ABCDEF-2026-02-05")
+        print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
+        
+        # 测试 get_current_price 返回三元组
+        try:
+            test_result = self.get_current_price("QQQ")
+            is_tuple = isinstance(test_result, tuple) and len(test_result) == 3
+            print(f"PRICE_API_RETURNS_TUPLE: {is_tuple}")
+            if is_tuple:
+                print(f"  └─ Sample: get_current_price('QQQ') = (price={test_result[0]}, age={test_result[1]}, status='{test_result[2]}')")
+        except Exception as e:
+            print(f"PRICE_API_RETURNS_TUPLE: False (Error: {e})")
+        
+        # 检查关键功能
+        print(f"HAS_STALE_PRICE_SKIP: {hasattr(self, 'current_stale_info')}")
+        print(f"HAS_TURNOVER_CAP: {hasattr(self, 'current_turnover_info')}")
+        print(f"HAS_MACRO_COOLDOWN: {hasattr(self, 'macro_cooldown_remaining')}")
+        print(f"HAS_REGIME_FILTER: {'regime_filter' in self.config}")
+        print(f"HAS_MACRO_INTEGRATION: {self.macro_adapter.enabled if hasattr(self, 'macro_adapter') else False}")
+        print("="*60 + "\n")
+        
         self.start_time = datetime.now()
         self.end_time = self.start_time + timedelta(hours=self.config['duration_hours'])
         self.status = "RUNNING"
