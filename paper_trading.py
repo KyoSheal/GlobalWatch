@@ -876,7 +876,14 @@ class PaperTradingEngine:
         C3) 如果超过，按比例缩放所有交易
         C4) 记录 turnover_notional / turnover_limit / turnover_scale / turnover_capped
         C5) 不破坏现有三大保护器
+        D1-D5) 修复 get_current_price() 接口不一致问题
         """
+        
+        # D5) 自检：测试 get_current_price() 返回三元组
+        if self.positions:
+            test_ticker = list(self.positions.keys())[0]
+            test_price, test_age, test_status = self.get_current_price(test_ticker)
+            print(f"[SELF-CHECK] get_current_price('{test_ticker}') = (price={test_price}, age={test_age}min, status={test_status})")
         
         # ========== 准备交易上下文信息 ==========
         trade_context = self._build_trade_context()
@@ -988,6 +995,7 @@ class PaperTradingEngine:
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         
         planned_trades = []  # [{ticker, side, current_value, target_value, trade_value, price, age, status}]
+        stale_candidate_count = 0  # 统计 STALE 候选交易数量
         
         for ticker in tickers_to_trade:
             current_value = current_values.get(ticker, 0.0)
@@ -999,19 +1007,33 @@ class PaperTradingEngine:
                 print(f"[SKIP] {ticker} trade notional ${trade_value:.2f} < min ${min_notional}")
                 continue
             
-            # Stale price 检查
+            # 获取价格信息
             if ticker not in price_info:
                 print(f"[SKIP] {ticker} no price info")
                 continue
             
             price, age, status = price_info[ticker]
             
-            if status == "STALE" and age > stale_price_skip_minutes:
-                print(f"[SKIP] {ticker} STALE price (age: {age:.0f}min > {stale_price_skip_minutes}min)")
-                continue
-            
             # 确定交易方向
             side = 'BUY' if target_value > current_value else 'SELL'
+            
+            # 1) STALE 交易策略：BUY 一律禁止，SELL 允许但标注
+            if status == "STALE":
+                stale_candidate_count += 1
+                
+                if side == 'BUY':
+                    # BUY: 一律禁止（即使 age 未超阈值）
+                    print(f"[SKIP] {ticker} BUY on STALE price (age: {age:.0f}min) - BUY prohibited")
+                    continue
+                else:
+                    # SELL: 允许（用于去风险），但会在 decision_trace 标注
+                    print(f"[ALLOW] {ticker} SELL on STALE price (age: {age:.0f}min) - de-risk allowed")
+            
+            # 原有的 age 阈值检查（仅对非 STALE 或已通过上面检查的 SELL）
+            if status == "STALE" and age > stale_price_skip_minutes and side == 'BUY':
+                # 这个条件实际上已经被上面的 BUY 禁止覆盖了，但保留以防万一
+                print(f"[SKIP] {ticker} STALE price (age: {age:.0f}min > {stale_price_skip_minutes}min)")
+                continue
             
             planned_trades.append({
                 'ticker': ticker,
@@ -1023,6 +1045,31 @@ class PaperTradingEngine:
                 'age': age,
                 'status': status
             })
+        
+        # 2) 全局数据异常保护：检查 STALE 比例
+        candidate_count = len(tickers_to_trade)
+        stale_ratio_candidates = stale_candidate_count / candidate_count if candidate_count > 0 else 0
+        max_stale_ratio = execution_config.get('max_stale_ratio', 0.3)
+        
+        print(f"\n[STALE CHECK] Candidate tickers: {candidate_count}, STALE: {stale_candidate_count}, Ratio: {stale_ratio_candidates:.1%}")
+        
+        if stale_ratio_candidates > max_stale_ratio:
+            print(f"[STALE ABORT] STALE ratio {stale_ratio_candidates:.1%} > threshold {max_stale_ratio:.1%}, aborting rebalance")
+            # 3) 记录到 snapshot
+            self.current_stale_info = {
+                'stale_count': stale_count,
+                'stale_ratio': stale_ratio,
+                'price_stale_skip': False,
+                'price_stale_abort': True,  # 新增：因 STALE 比例过高而中止
+                'stale_candidate_count': stale_candidate_count,
+                'stale_ratio_candidates': stale_ratio_candidates
+            }
+            return []
+        
+        # 更新 stale_info（正常情况）
+        self.current_stale_info['price_stale_abort'] = False
+        self.current_stale_info['stale_candidate_count'] = stale_candidate_count
+        self.current_stale_info['stale_ratio_candidates'] = stale_ratio_candidates
         
         # C1) 计算总换手
         turnover_notional = sum(t['trade_value'] for t in planned_trades)
@@ -1113,6 +1160,9 @@ class PaperTradingEngine:
                 'min_notional_pass',
                 f'price_{trade["status"]}_age_{trade["age"]:.0f}min'
             ]
+            # 1) STALE SELL 标注
+            if trade['status'] == 'STALE':
+                decision_trace.append('sell_allowed_on_stale')
             if turnover_capped:
                 decision_trace.append(f'turnover_cap_scale_{turnover_scale:.2%}')
             if trade_context['regime_state'] == 'risk_off':
@@ -1274,7 +1324,7 @@ class PaperTradingEngine:
         """检查风险控制"""
         positions_value = 0.0
         for ticker, qty in self.positions.items():
-            price = self.get_current_price(ticker)
+            price, age_min, status = self.get_current_price(ticker)  # D2) 解包三元组
             if price:
                 positions_value += qty * price
         
@@ -1298,7 +1348,7 @@ class PaperTradingEngine:
                 sell_qty = qty // 2
                 
                 if sell_qty > 0:
-                    price = self.get_current_price(ticker)
+                    price, age_min, status = self.get_current_price(ticker)  # D2) 解包三元组
                     if price:
                         proceeds = sell_qty * price
                         cost = proceeds * self.config['objectives']['transaction_cost_pct']
@@ -1331,7 +1381,7 @@ class PaperTradingEngine:
         positions_detail = {}
         
         for ticker, qty in self.positions.items():
-            price = self.get_current_price(ticker)
+            price, age_min, status = self.get_current_price(ticker)  # D2) 解包三元组
             if price:
                 value = qty * price
                 positions_value += value
@@ -1399,6 +1449,9 @@ class PaperTradingEngine:
             'stale_count': self.current_stale_info.get('stale_count', 0),
             'stale_ratio': self.current_stale_info.get('stale_ratio', 0.0),
             'price_stale_skip': self.current_stale_info.get('price_stale_skip', False),
+            'price_stale_abort': self.current_stale_info.get('price_stale_abort', False),  # 新增
+            'stale_candidate_count': self.current_stale_info.get('stale_candidate_count', 0),  # 新增
+            'stale_ratio_candidates': self.current_stale_info.get('stale_ratio_candidates', 0.0),  # 新增
             # C4) Turnover Cap 字段
             'turnover_notional': self.current_turnover_info.get('turnover_notional', 0.0),
             'turnover_limit': self.current_turnover_info.get('turnover_limit', 0.0),

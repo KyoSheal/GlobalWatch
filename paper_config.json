@@ -122,7 +122,8 @@
     "rebalance_cooldown_minutes": 720,
     "max_turnover_pct_per_rebalance": 0.20,
     "stale_price_skip_minutes": 60,
-    "stale_abort_ratio": 0.5
+    "stale_abort_ratio": 0.5,
+    "max_stale_ratio": 0.3
   },
   "benchmarks": {
     "tickers": ["QQQ", "SPY", "VTI", "DIA"],
