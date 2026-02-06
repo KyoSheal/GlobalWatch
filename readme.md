@@ -19,14 +19,54 @@ By combining **Live RSS Feeds** (Reuters, CNBC, BBC) with **Local Large Language
 
 ## 🚀 What's New in V2.5
 
-### 📈 Paper Trading System
+### 📈 Advanced Paper Trading System
 - **48-Hour Simulation**: Automated paper trading with real-time price updates
-- **Momentum + Volatility Strategy**: Dynamic portfolio rebalancing every 15 minutes
+- **Multi-Layer Strategy Engine**:
+  - **Momentum + Volatility Scoring**: Dynamic asset evaluation
+  - **Regime Filter**: MA50-based market state detection (risk_on/neutral/risk_off)
+  - **Macro Integration**: Connects to GlobalWatch ChromaDB for macro signals
+  - **Dynamic Risk Adjustment**: Auto-adjusts cash and position limits based on market conditions
 - **Real-Time Monitoring**: Live summary updates, trade logs, and P&L tracking
 - **Resume from Checkpoint**: Interrupt and resume trading sessions seamlessly
 - **19-Asset Universe**: ETFs (SPY, QQQ, DIA, IWM, GLD, TLT) + Tech stocks (AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA) + Defensive stocks (JPM, XOM, JNJ, PG, KO)
-- **Risk Controls**: Max drawdown limits, position sizing, transaction costs
-- **Comprehensive Reporting**: Equity curves, trade logs, performance metrics
+- **Advanced Risk Controls**: 
+  - Cooldown protection (12-hour minimum between rebalances)
+  - Weight threshold filtering (2.5% minimum change)
+  - Minimum notional filtering ($400 minimum trade size)
+  - Max drawdown limits, position sizing, transaction costs
+- **Comprehensive Reporting**: 
+  - Benchmark comparison (vs QQQ, SPY, VTI, DIA)
+  - Regime state tracking
+  - Macro signal integration
+  - Detailed trade reasoning logs
+  - Equity curves, performance metrics
+
+### 🎯 Regime Filter System
+- **MA50 Trend Analysis**: Monitors 4 benchmark indices (QQQ, SPY, VTI, DIA)
+- **Dynamic State Detection**: 
+  - 🟢 **Risk_On**: ≥75% indices above MA50 → Min cash 10%, Max weight 25%
+  - 🟡 **Neutral**: 50-75% above MA50 → Min cash 20%, Max weight 25%
+  - 🔴 **Risk_Off**: ≤50% above MA50 → Min cash 35%, Max weight 20%
+- **Automatic Risk Adjustment**: Portfolio constraints adapt to market conditions
+
+### 🌐 Macro Signal Integration
+- **GlobalWatch Connection**: Reads trading signals from ChromaDB
+- **Time-Decay Weighting**: Signals weighted by `exp(-0.15 * age_hours)` × confidence
+- **Theme Voting**: Aggregates signals by theme (oil_bullish, risk_off, usd_strong, etc.)
+- **Confirmation Rules**: Requires 2/3 signals to confirm a theme
+- **Risk Scoring**: 0-10 scale, higher = more risk-off
+- **Asset Tilts**: Applies macro-driven weight adjustments (±2% max per asset)
+- **Cash Adjustment**: Increases cash allocation based on macro risk score
+
+### 📝 Trade Reasoning Logs
+Every trade now includes complete context:
+- **Regime State**: Market condition at trade time
+- **Trend Score**: % of indices above MA50
+- **Cash Target**: Dynamic minimum cash requirement
+- **Macro Risk Score**: GlobalWatch risk assessment (0-10)
+- **Macro Topics**: Confirmed themes (e.g., "oil_bullish:bullish; risk_off:bearish")
+- **Macro Tilts**: Active asset tilts (e.g., "XOM:+2.00%; TLT:+2.00%")
+- **Decision Trace**: Execution path (e.g., "cooldown_pass | weight_threshold_pass | min_notional_pass | macro_tilt_+2.00% | risk_on_add-risk")
 
 ### 🚨 Early-Warning Risk Scoring System
 - **Universal Risk Monitor**: Tracks risk levels for any asset (Gold, Oil, CNY, CAD, etc.)
@@ -250,14 +290,54 @@ The application opens with four main tabs:
 
 ## 🚀 V2.5 版本新功能
 
-### 📈 纸上交易系统
+### 📈 高级纸上交易系统
 - **48小时模拟**: 自动化纸上交易，实时价格更新
-- **动量+波动率策略**: 每15分钟动态组合再平衡
+- **多层策略引擎**:
+  - **动量+波动率评分**: 动态资产评估
+  - **Regime Filter**: 基于MA50的市场状态检测（risk_on/neutral/risk_off）
+  - **宏观整合**: 连接GlobalWatch ChromaDB获取宏观信号
+  - **动态风险调整**: 根据市场条件自动调整现金和仓位限制
 - **实时监控**: 实时摘要更新、交易日志、盈亏追踪
 - **断点续传**: 无缝中断和恢复交易会话
 - **19资产池**: ETF（SPY, QQQ, DIA, IWM, GLD, TLT）+ 科技股（AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA）+ 防御性股票（JPM, XOM, JNJ, PG, KO）
-- **风险控制**: 最大回撤限制、仓位管理、交易成本
-- **全面报告**: 资金曲线、交易日志、表现指标
+- **高级风险控制**: 
+  - 冷却保护（再平衡间隔最少12小时）
+  - 权重阈值过滤（最小变化2.5%）
+  - 最小名义金额过滤（最小交易$400）
+  - 最大回撤限制、仓位管理、交易成本
+- **全面报告**: 
+  - 基准比较（vs QQQ, SPY, VTI, DIA）
+  - Regime状态追踪
+  - 宏观信号整合
+  - 详细交易理由日志
+  - 资金曲线、表现指标
+
+### 🎯 Regime Filter 系统
+- **MA50趋势分析**: 监控4个基准指数（QQQ, SPY, VTI, DIA）
+- **动态状态检测**: 
+  - 🟢 **Risk_On**: ≥75%指数在MA50之上 → 最小现金10%，最大权重25%
+  - 🟡 **Neutral**: 50-75%在MA50之上 → 最小现金20%，最大权重25%
+  - 🔴 **Risk_Off**: ≤50%在MA50之上 → 最小现金35%，最大权重20%
+- **自动风险调整**: 组合约束根据市场条件自适应
+
+### 🌐 宏观信号整合
+- **GlobalWatch连接**: 从ChromaDB读取交易信号
+- **时间衰减加权**: 信号按`exp(-0.15 * age_hours)` × 置信度加权
+- **主题投票**: 按主题聚合信号（oil_bullish, risk_off, usd_strong等）
+- **确认规则**: 需要2/3信号确认一个主题
+- **风险评分**: 0-10刻度，越高越risk-off
+- **资产倾斜**: 应用宏观驱动的权重调整（每资产最多±2%）
+- **现金调整**: 根据宏观风险分数增加现金配置
+
+### 📝 交易理由日志
+每笔交易现在包含完整上下文：
+- **Regime State**: 交易时的市场状态
+- **Trend Score**: 指数在MA50之上的百分比
+- **Cash Target**: 动态最小现金要求
+- **Macro Risk Score**: GlobalWatch风险评估（0-10）
+- **Macro Topics**: 确认的主题（如"oil_bullish:bullish; risk_off:bearish"）
+- **Macro Tilts**: 活跃的资产倾斜（如"XOM:+2.00%; TLT:+2.00%"）
+- **Decision Trace**: 执行路径（如"cooldown_pass | weight_threshold_pass | min_notional_pass | macro_tilt_+2.00% | risk_on_add-risk"）
 
 ### 🚨 Early-Warning 风险评分系统
 - **通用风险监控**: 追踪任何资产的风险水平（黄金、原油、人民币、加元等）
@@ -489,8 +569,34 @@ python -u paper_trading.py paper_config.json
 - **Restart Instructions**: `RESTART_INSTRUCTIONS.md` - Quick restart guide
 
 ### Configuration Files
-- **`paper_config.json`**: 48-hour full simulation (19 assets, $30,000 initial capital)
+- **`paper_config.json`**: 48-hour full simulation with advanced features
+  - 19 assets, $30,000 initial capital
+  - 6-hour rebalance interval (360 minutes)
+  - Regime Filter enabled (MA50 trend analysis)
+  - Macro Integration enabled (GlobalWatch ChromaDB)
+  - Benchmark comparison (QQQ, SPY, VTI, DIA)
+  - Advanced execution controls (cooldown, thresholds, notional limits)
 - **`paper_config_quick_test.json`**: 1-hour quick test (6 assets, $20,000 initial capital)
+
+### Paper Trading Output Files
+- **`outputs/paper_summary_live.txt`**: Real-time summary (updates every cycle)
+  - Current performance metrics
+  - Market regime state
+  - Macro signals from GlobalWatch
+  - Benchmark comparison
+  - Current holdings
+- **`outputs/paper_summary.txt`**: Final report after completion
+- **`outputs/paper_trades.csv`**: Complete trade log with reasoning
+  - Columns: timestamp, ticker, side, quantity, price, cost, reason
+  - **New columns**: regime_state, trend_score, cash_target, macro_risk_score, macro_topics, macro_tilts, decision_trace
+- **`outputs/portfolio_snapshots.jsonl`**: Detailed snapshots (one per cycle)
+- **`outputs/equity_curve.png`**: Visual performance chart
+
+### Example Trade Log Entry
+```csv
+timestamp,ticker,side,quantity,price,cost,reason,regime_state,trend_score,cash_target,macro_risk_score,macro_topics,macro_tilts,decision_trace
+2026-02-05T10:30:00,XOM,BUY,15,146.50,1.10,rebalance,risk_on,0.75,0.10,3.2,oil_bullish:bullish,XOM:+2.00%; TLT:+2.00%,cooldown_pass | weight_threshold_pass | min_notional_pass | macro_tilt_+2.00% | risk_on_add-risk
+```
 
 ## 🤝 Contributing
 

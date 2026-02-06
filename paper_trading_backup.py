@@ -49,6 +49,7 @@ class PaperTradingEngine:
         self.current_cycle = 0
         self.peak_equity = self.cash
         self.status = "READY"  # READY/RUNNING/PAUSED/COMPLETED
+        self.last_rebalance_time = None  # 用于 cooldown 检查
         
         # 创建输出目录
         os.makedirs('outputs', exist_ok=True)
@@ -194,105 +195,195 @@ class PaperTradingEngine:
         return adjusted_weights
 
     def execute_rebalance(self, target_weights):
-        """执行再平衡"""
+        """执行再平衡 - 带三大保护器：cooldown / weight_threshold / min_notional"""
+        
+        # ========== 保护器 1: Cooldown 检查 ==========
+        execution_config = self.config.get('execution', {})
+        cooldown_minutes = execution_config.get('rebalance_cooldown_minutes', 0)
+        
+        if cooldown_minutes > 0 and self.last_rebalance_time is not None:
+            time_since_last = (datetime.now() - self.last_rebalance_time).total_seconds() / 60
+            if time_since_last < cooldown_minutes:
+                remaining = cooldown_minutes - time_since_last
+                print(f"[COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
+                return []
+        
+        # ========== 获取当前价格和持仓价值 ==========
         current_prices = {}
+        current_values = {}
         positions_value = 0.0
         
         for ticker, qty in self.positions.items():
             price = self.get_current_price(ticker)
             if price is None:
-                price = 100.0
+                print(f"[WARN] No price for {ticker}, skipping")
+                continue
             current_prices[ticker] = price
-            positions_value += qty * price
+            value = qty * price
+            current_values[ticker] = value
+            positions_value += value
         
         total_equity = self.cash + positions_value
         
-        target_positions = {}
+        # ========== 计算目标价值（而非目标股数）==========
+        target_values = {}
         for ticker, weight in target_weights.items():
             if ticker == 'CASH':
                 continue
-            
-            target_value = total_equity * weight
-            price = self.get_current_price(ticker)
-            
-            if price is None or price <= 0:
+            target_values[ticker] = total_equity * weight
+        
+        # ========== 保护器 2: Weight Threshold 过滤 ==========
+        weight_threshold = execution_config.get('weight_threshold', 0.0)
+        
+        tickers_to_trade = []
+        for ticker in set(list(self.positions.keys()) + list(target_values.keys())):
+            if ticker == 'CASH':
                 continue
             
-            target_qty = int(target_value / price)
-            target_positions[ticker] = target_qty
+            current_value = current_values.get(ticker, 0.0)
+            target_value = target_values.get(ticker, 0.0)
+            
+            current_weight = current_value / total_equity if total_equity > 0 else 0
+            target_weight = target_value / total_equity if total_equity > 0 else 0
+            
+            weight_diff = abs(target_weight - current_weight)
+            
+            if weight_diff < weight_threshold:
+                print(f"[SKIP] {ticker} weight diff {weight_diff:.4f} < threshold {weight_threshold:.4f}")
+                continue
+            
+            tickers_to_trade.append(ticker)
+        
+        # ========== 保护器 3: Min Notional 过滤 ==========
+        min_notional = execution_config.get('min_trade_notional_usd', 0)
         
         trades = []
         
-        # 卖出
-        for ticker, current_qty in list(self.positions.items()):
-            target_qty = target_positions.get(ticker, 0)
+        # 先处理卖出
+        for ticker in tickers_to_trade:
+            current_value = current_values.get(ticker, 0.0)
+            target_value = target_values.get(ticker, 0.0)
             
-            if target_qty < current_qty:
-                sell_qty = current_qty - target_qty
-                price = current_prices.get(ticker, self.get_current_price(ticker))
-                
-                if price is None:
-                    continue
-                
-                proceeds = sell_qty * price
-                cost = proceeds * self.config['objectives']['transaction_cost_pct']
-                net_proceeds = proceeds - cost
-                
-                self.cash += net_proceeds
-                self.positions[ticker] = target_qty
-                
-                if target_qty == 0:
-                    del self.positions[ticker]
-                
-                trades.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'ticker': ticker,
-                    'side': 'SELL',
-                    'quantity': sell_qty,
-                    'price': price,
-                    'cost': cost,
-                    'reason': 'rebalance'
-                })
-        
-        # 买入
-        for ticker, target_qty in target_positions.items():
-            current_qty = self.positions.get(ticker, 0)
+            if target_value >= current_value:
+                continue  # 不是卖出
             
-            if target_qty > current_qty:
-                buy_qty = target_qty - current_qty
+            trade_value = current_value - target_value
+            
+            # Min notional 检查
+            if trade_value < min_notional:
+                print(f"[SKIP] {ticker} sell notional ${trade_value:.2f} < min ${min_notional}")
+                continue
+            
+            # 获取价格
+            price = current_prices.get(ticker)
+            if price is None:
                 price = self.get_current_price(ticker)
+            if price is None or price <= 0:
+                print(f"[WARN] Invalid price for {ticker}")
+                continue
+            
+            # 计算卖出股数（基于价值差异）
+            current_qty = self.positions.get(ticker, 0)
+            target_qty = int(target_value / price)
+            sell_qty = current_qty - target_qty
+            
+            if sell_qty <= 0:
+                continue
+            
+            # 执行卖出
+            proceeds = sell_qty * price
+            cost = proceeds * self.config['objectives']['transaction_cost_pct']
+            net_proceeds = proceeds - cost
+            
+            self.cash += net_proceeds
+            self.positions[ticker] = target_qty
+            
+            if target_qty == 0:
+                del self.positions[ticker]
+            
+            trades.append({
+                'timestamp': datetime.now().isoformat(),
+                'ticker': ticker,
+                'side': 'SELL',
+                'quantity': sell_qty,
+                'price': price,
+                'cost': cost,
+                'reason': 'rebalance'
+            })
+            
+            print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price:.2f} (notional: ${proceeds:.2f})")
+        
+        # 再处理买入
+        for ticker in tickers_to_trade:
+            current_value = current_values.get(ticker, 0.0)
+            target_value = target_values.get(ticker, 0.0)
+            
+            if target_value <= current_value:
+                continue  # 不是买入
+            
+            trade_value = target_value - current_value
+            
+            # Min notional 检查
+            if trade_value < min_notional:
+                print(f"[SKIP] {ticker} buy notional ${trade_value:.2f} < min ${min_notional}")
+                continue
+            
+            # 获取价格
+            price = current_prices.get(ticker)
+            if price is None:
+                price = self.get_current_price(ticker)
+            if price is None or price <= 0:
+                print(f"[WARN] Invalid price for {ticker}")
+                continue
+            
+            # 计算买入股数（基于价值差异）
+            current_qty = self.positions.get(ticker, 0)
+            target_qty = int(target_value / price)
+            buy_qty = target_qty - current_qty
+            
+            if buy_qty <= 0:
+                continue
+            
+            # 检查现金是否足够
+            required_cash = buy_qty * price
+            cost = required_cash * self.config['objectives']['transaction_cost_pct']
+            total_required = required_cash + cost
+            
+            if total_required > self.cash:
+                # 调整买入数量
+                buy_qty = int((self.cash * 0.99) / (price * (1 + self.config['objectives']['transaction_cost_pct'])))
                 
-                if price is None:
+                if buy_qty <= 0:
+                    print(f"[SKIP] {ticker} insufficient cash")
                     continue
                 
                 required_cash = buy_qty * price
                 cost = required_cash * self.config['objectives']['transaction_cost_pct']
                 total_required = required_cash + cost
-                
-                if total_required > self.cash:
-                    buy_qty = int((self.cash * 0.99) / (price * (1 + self.config['objectives']['transaction_cost_pct'])))
-                    
-                    if buy_qty <= 0:
-                        continue
-                    
-                    required_cash = buy_qty * price
-                    cost = required_cash * self.config['objectives']['transaction_cost_pct']
-                    total_required = required_cash + cost
-                
-                self.cash -= total_required
-                self.positions[ticker] = self.positions.get(ticker, 0) + buy_qty
-                
-                trades.append({
-                    'timestamp': datetime.now().isoformat(),
-                    'ticker': ticker,
-                    'side': 'BUY',
-                    'quantity': buy_qty,
-                    'price': price,
-                    'cost': cost,
-                    'reason': 'rebalance'
-                })
+            
+            # 执行买入
+            self.cash -= total_required
+            self.positions[ticker] = self.positions.get(ticker, 0) + buy_qty
+            
+            trades.append({
+                'timestamp': datetime.now().isoformat(),
+                'ticker': ticker,
+                'side': 'BUY',
+                'quantity': buy_qty,
+                'price': price,
+                'cost': cost,
+                'reason': 'rebalance'
+            })
+            
+            print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f})")
         
-        self.trades_log.extend(trades)
+        # ========== 更新交易记录和 cooldown 时间 ==========
+        if trades:
+            self.trades_log.extend(trades)
+            self.last_rebalance_time = datetime.now()  # 只有实际成交才更新
+            print(f"[COOLDOWN] Next rebalance allowed after {cooldown_minutes} minutes")
+        else:
+            print(f"[INFO] No trades executed (all filtered by protections)")
         
         return trades
 
