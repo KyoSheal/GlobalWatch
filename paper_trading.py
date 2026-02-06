@@ -676,6 +676,8 @@ class PaperTradingEngine:
         stale_policy = execution_config.setdefault('price_stale_policy', {})
         stale_policy.setdefault('allow_buy', ['LIVE', 'RECENT'])
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
+        macro_config = config.setdefault('macro_integration', {})
+        macro_config.setdefault('macro_allow_new_positions', ['TLT', 'GLD'])
         
         return config
     
@@ -970,7 +972,14 @@ class PaperTradingEngine:
             'confirmed_topics': self.cached_macro.get('confirmed_topics', []),
             'macro_tilts': self.cached_macro.get('macro_tilts', {}),
             'macro_tilts_ignored': self.cached_macro.get('macro_tilts_ignored', {}),
-            'signal_summary': self.cached_macro.get('signal_summary', {})
+            'signal_summary': self.cached_macro.get('signal_summary', {}),
+            'applied_tilts': self.cached_macro.get('applied_tilts', self.current_macro.get('applied_tilts', {}) if isinstance(self.current_macro, dict) else {}),
+            'blocked_tilts': self.cached_macro.get('blocked_tilts', self.current_macro.get('blocked_tilts', {}) if isinstance(self.current_macro, dict) else {}),
+            'capped_assets': self.cached_macro.get('capped_assets', self.current_macro.get('capped_assets', []) if isinstance(self.current_macro, dict) else []),
+            'max_weight_per_asset_effective': self.cached_macro.get(
+                'max_weight_per_asset_effective',
+                self.current_macro.get('max_weight_per_asset_effective', {}) if isinstance(self.current_macro, dict) else {}
+            )
         }
 
     def refresh_macro_cache(self, now=None):
@@ -1029,51 +1038,123 @@ class PaperTradingEngine:
         self.last_macro_time = now
 
     def calculate_target_weights(self):
-        """计算目标权重 - 动量 + 波动率调整 + Regime Filter + Cached Macro Signals"""
+        """计算目标权重：风险雷达（现金）+ 趋势放大器（tilt/上限）"""
 
-        # ========== 步骤1: 计算市场状态（Regime Filter）==========
-        regime_state, trend_score, regime_details, dynamic_min_cash, dynamic_max_weight = self.compute_regime_state()
+        def _apply_caps_and_normalize(weights_map, cap_map, invested_budget):
+            """先裁剪到上限；仅当超出 invested_budget 时做归一化下调。"""
+            weights = {k: max(0.0, float(v)) for k, v in weights_map.items() if float(v) > 0}
+            capped = set()
+
+            for ticker in list(weights.keys()):
+                cap = float(cap_map.get(ticker, 1.0))
+                if weights[ticker] > cap:
+                    weights[ticker] = cap
+                    capped.add(ticker)
+
+            total = sum(weights.values())
+            if total <= 0 or invested_budget <= 0:
+                return {}, sorted(capped)
+
+            if total > invested_budget:
+                scale = invested_budget / total
+                for ticker in list(weights.keys()):
+                    weights[ticker] *= scale
+                return {k: v for k, v in weights.items() if v > 1e-10}, sorted(capped)
+
+            return {k: v for k, v in weights.items() if v > 1e-10}, sorted(capped)
+
+        # ========== 步骤1: Regime 基线 ==========
+        regime_state, trend_score, regime_details, base_cash_from_regime, base_max_weight = self.compute_regime_state()
         self.current_regime = {
             'regime_state': regime_state,
             'trend_score': trend_score,
             'regime_details': regime_details,
-            'dynamic_min_cash': dynamic_min_cash,
-            'dynamic_max_weight': dynamic_max_weight,
+            'dynamic_min_cash': base_cash_from_regime,
+            'dynamic_max_weight': base_max_weight,
             'risk_caps_applied': regime_state in ('risk_off', 'risk_off_forced'),
             'forced_until_time': self.forced_until_time.isoformat() if self.forced_until_time else None
         }
 
-        # ========== 步骤2: 使用 cached_macro（不在这里直接拉新信号）==========
-        macro_risk_score_raw = self.cached_macro.get('macro_risk_score_raw', 0.0)
-        macro_risk_score_smoothed = self.cached_macro.get('macro_risk_score_smoothed', macro_risk_score_raw)
-        macro_tilts_filtered = self.cached_macro.get('macro_tilts', {})
+        # ========== 步骤2: 读取 cached macro ==========
+        macro_cfg = self.config.get('macro_integration', {})
+        macro_mapping = self.config.get('macro_mapping', {})
+        tilt_max_delta = float(macro_cfg.get('tilt_max_delta', 0.02))
+        macro_risk_score_raw = float(self.cached_macro.get('macro_risk_score_raw', 0.0))
+        macro_risk_score_smoothed = float(self.cached_macro.get('macro_risk_score_smoothed', macro_risk_score_raw))
+        macro_tilts_filtered = dict(self.cached_macro.get('macro_tilts', {}))
+        confirmed_topics = self.cached_macro.get('confirmed_topics', [])
         self._sync_current_macro_from_cache()
 
-        # E2) 根据平滑后的宏观风险分数调整现金比例（带冷却）
-        if macro_risk_score_smoothed > 0:
-            macro_cash_slope = self.config.get('macro_integration', {}).get('macro_cash_slope', 0.02)
-            macro_cash_add = macro_risk_score_smoothed * macro_cash_slope
-            new_cash_target = min(dynamic_min_cash + macro_cash_add, 0.50)
+        # ========== 通路1: 风险雷达（现金目标） ==========
+        macro_cash_slope = float(macro_cfg.get('macro_cash_slope', 0.02))
+        macro_cash_from_risk = macro_cash_slope * macro_risk_score_smoothed
+        macro_cash_from_topics = 0.0
+        macro_cash_topic_details = []
 
-            cash_change = abs(new_cash_target - self.last_macro_cash_target)
-            if self.macro_cooldown_remaining > 0:
-                print(f"[MACRO COOLDOWN] Remaining {self.macro_cooldown_remaining} cycles, keeping cash target at {self.last_macro_cash_target:.1%}")
-                dynamic_min_cash = self.last_macro_cash_target
-                self.macro_cooldown_remaining -= 1
-            elif cash_change > 0.05:
-                print(f"[MACRO] Adjusting min cash: {self.current_regime['dynamic_min_cash']:.1%} → {new_cash_target:.1%} "
-                      f"(smoothed risk score: {macro_risk_score_smoothed:.1f})")
-                dynamic_min_cash = new_cash_target
-                self.last_macro_cash_target = new_cash_target
-                self.macro_cooldown_remaining = self.macro_cooldown_cycles
-                print(f"[MACRO COOLDOWN] Started {self.macro_cooldown_cycles} cycle cooldown")
-            else:
-                dynamic_min_cash = new_cash_target
-                self.last_macro_cash_target = new_cash_target
+        for topic in confirmed_topics:
+            theme = str(topic.get('theme', 'unknown')).lower()
+            for rule_name, rule_config in macro_mapping.items():
+                if rule_name.lower() in theme or theme in rule_name.lower():
+                    cash_add = rule_config.get('cash_add')
+                    if cash_add is None:
+                        continue
+                    try:
+                        cash_add = float(cash_add)
+                    except (TypeError, ValueError):
+                        continue
+                    macro_cash_from_topics += cash_add
+                    macro_cash_topic_details.append(f"{rule_name}:{cash_add:+.2%}")
 
-            self.current_regime['dynamic_min_cash'] = dynamic_min_cash
+        cash_target_unclipped = base_cash_from_regime + macro_cash_from_risk + macro_cash_from_topics
+        cash_target = float(np.clip(cash_target_unclipped, base_cash_from_regime, 0.60))
+        self.last_macro_cash_target = cash_target
 
-        # ========== 步骤3: 计算资产评分（动量 + 波动率）==========
+        print(f"\n[MACRO PATH1] cash_target = base({base_cash_from_regime:.2%}) + "
+              f"slope*risk({macro_cash_from_risk:+.2%}) + topic_cash_add({macro_cash_from_topics:+.2%}) -> "
+              f"clip[{base_cash_from_regime:.2%},60.00%] = {cash_target:.2%}")
+        if macro_cash_topic_details:
+            print(f"[MACRO PATH1] topic cash_add details: {', '.join(macro_cash_topic_details)}")
+
+        # ========== 通路2: 趋势放大器（tilt + 单资产上限） ==========
+        macro_allow_new_positions = {str(x).upper() for x in macro_cfg.get('macro_allow_new_positions', ['TLT', 'GLD'])}
+        defensive_tilt_assets = set(macro_allow_new_positions) | {'CASH'}
+        risk_off_mode = regime_state in ('risk_off', 'risk_off_forced')
+
+        applied_tilts = {}
+        blocked_tilts = {}
+        for ticker, tilt in macro_tilts_filtered.items():
+            try:
+                tilt_delta = float(tilt)
+            except (TypeError, ValueError):
+                continue
+            tilt_delta = float(np.clip(tilt_delta, -tilt_max_delta, tilt_max_delta))
+
+            if risk_off_mode and ticker.upper() not in defensive_tilt_assets:
+                blocked_tilts[ticker] = tilt_delta
+                continue
+            applied_tilts[ticker] = tilt_delta
+
+        if blocked_tilts:
+            print(f"[MACRO PATH2] blocked offensive tilts in {regime_state}: "
+                  f"{', '.join([f'{k}:{v:+.2%}' for k, v in blocked_tilts.items()])}")
+
+        cash_tilt = applied_tilts.get('CASH', 0.0)
+        if abs(cash_tilt) > 1e-12:
+            cash_target_before_cash_tilt = cash_target
+            cash_target = float(np.clip(cash_target + cash_tilt, base_cash_from_regime, 0.60))
+            print(f"[MACRO PATH2] CASH tilt {cash_tilt:+.2%} -> cash_target {cash_target_before_cash_tilt:.2%} -> {cash_target:.2%}")
+
+        self.current_regime['dynamic_min_cash'] = cash_target
+        self.current_regime['cash_target'] = cash_target
+        self.current_regime['cash_target_components'] = {
+            'base_cash_from_regime': base_cash_from_regime,
+            'macro_cash_slope': macro_cash_slope,
+            'macro_risk_score_smoothed': macro_risk_score_smoothed,
+            'macro_cash_from_risk': macro_cash_from_risk,
+            'macro_cash_from_topics': macro_cash_from_topics
+        }
+
+        # ========== 步骤3: 计算原始评分权重 ==========
         strategy = self.config['strategy']
         lookback = strategy['lookback_days']
         vol_target = strategy['vol_target']
@@ -1103,43 +1184,63 @@ class PaperTradingEngine:
         positive_assets = {k: v for k, v in asset_scores.items() if v['score'] > 0}
         print(f"Selected {len(positive_assets)} assets with positive scores\n")
 
-        if not positive_assets:
-            return {'CASH': 1.0}
-
-        # ========== 步骤4: 计算原始权重 ==========
         total_score = sum(v['score'] for v in positive_assets.values())
-        raw_weights = {k: v['score'] / total_score for k, v in positive_assets.items()}
+        if total_score > 0:
+            raw_weights = {k: v['score'] / total_score for k, v in positive_assets.items()}
+        else:
+            raw_weights = {}
 
-        # ========== 步骤5: 应用 cached macro tilts ==========
-        if macro_tilts_filtered:
-            print(f"\n[MACRO] Applying tilts to weights:")
-            for ticker, tilt in macro_tilts_filtered.items():
-                if ticker in raw_weights:
-                    old_weight = raw_weights[ticker]
-                    raw_weights[ticker] = max(0.0, old_weight + tilt)
-                    print(f"  {ticker}: {old_weight:.2%} → {raw_weights[ticker]:.2%} (tilt: {tilt:+.2%})")
-                elif tilt > 0:
-                    raw_weights[ticker] = tilt
-                    print(f"  {ticker}: NEW position {tilt:.2%}")
+        # 先应用 cash_target 缩放
+        invested_budget = max(0.0, 1.0 - cash_target)
+        scaled_weights = {k: v * invested_budget for k, v in raw_weights.items()}
 
-            total_weight = sum(raw_weights.values())
-            if total_weight > 0:
-                raw_weights = {k: v / total_weight for k, v in raw_weights.items()}
+        # 应用 tilts（趋势放大器，不直接强买）
+        universe_tickers = {asset['ticker'] for asset in self.config['universe']}
+        if applied_tilts:
+            print(f"[MACRO PATH2] Applying tilts:")
+        for ticker, tilt_delta in applied_tilts.items():
+            if ticker == 'CASH':
+                continue
+            if ticker not in universe_tickers:
+                continue
 
-        # ========== 步骤6: 应用动态上限 ==========
-        adjusted_weights = {ticker: min(weight, dynamic_max_weight) for ticker, weight in raw_weights.items()}
-        total_weight = sum(adjusted_weights.values())
-        if total_weight > 0:
-            adjusted_weights = {k: v / total_weight for k, v in adjusted_weights.items()}
+            if ticker in scaled_weights:
+                old_weight = scaled_weights[ticker]
+                scaled_weights[ticker] = max(0.0, old_weight + tilt_delta)
+                print(f"  {ticker}: {old_weight:.2%} -> {scaled_weights[ticker]:.2%} (tilt {tilt_delta:+.2%})")
+            elif tilt_delta > 0:
+                if risk_off_mode and ticker.upper() not in macro_allow_new_positions:
+                    blocked_tilts[ticker] = tilt_delta
+                    continue
+                scaled_weights[ticker] = tilt_delta
+                print(f"  {ticker}: NEW position {tilt_delta:.2%}")
 
-        # ========== 步骤7: 应用动态现金下限 ==========
-        total_invested = sum(adjusted_weights.values())
-        if total_invested > (1 - dynamic_min_cash):
-            scale_factor = (1 - dynamic_min_cash) / total_invested
-            adjusted_weights = {k: v * scale_factor for k, v in adjusted_weights.items()}
+        # 生成单资产有效上限（base_max_weight + tilt_delta，delta clip 到 ±tilt_max_delta）
+        max_weight_effective = {}
+        for asset in self.config['universe']:
+            ticker = asset['ticker']
+            if ticker == 'CASH':
+                continue
+            tilt_delta = float(np.clip(applied_tilts.get(ticker, 0.0), -tilt_max_delta, tilt_max_delta))
+            max_weight_effective[ticker] = float(np.clip(base_max_weight + tilt_delta, 0.0, 1.0))
 
-        cash_weight = 1.0 - sum(adjusted_weights.values())
+        # 再应用“上限裁剪 + 归一化”
+        adjusted_weights, capped_assets = _apply_caps_and_normalize(scaled_weights, max_weight_effective, invested_budget)
+
+        cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))
         adjusted_weights['CASH'] = cash_weight
+
+        # 记录本轮 macro 应用结果，供 snapshot/trade context 使用
+        self.current_macro['applied_tilts'] = dict(applied_tilts)
+        self.current_macro['blocked_tilts'] = dict(blocked_tilts)
+        self.current_macro['capped_assets'] = list(capped_assets)
+        self.current_macro['max_weight_per_asset_effective'] = dict(max_weight_effective)
+        self.current_macro['cash_target'] = cash_target
+
+        self.current_regime['dynamic_max_weight'] = base_max_weight
+        self.current_regime['cash_target'] = cash_target
+        self.current_regime['max_weight_per_asset_effective'] = dict(max_weight_effective)
+        self.current_regime['capped_assets'] = list(capped_assets)
 
         return adjusted_weights
 
@@ -1584,13 +1685,13 @@ class PaperTradingEngine:
         # Regime 信息
         regime_state = self.current_regime.get('regime_state', 'neutral')
         trend_score = self.current_regime.get('trend_score', 0.5)
-        cash_target = self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct'])
+        cash_target = self.current_regime.get('cash_target', self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']))
         
         # Macro 信息 - E1) 使用平滑后的 risk_score
         macro_risk_score_raw = self.current_macro.get('macro_risk_score', 0.0)
         macro_risk_score_smoothed = self.current_macro.get('macro_risk_score_smoothed', 0.0)
         confirmed_topics = self.current_macro.get('confirmed_topics', [])
-        macro_tilts = self.current_macro.get('macro_tilts', {})
+        macro_tilts = self.current_macro.get('applied_tilts', self.current_macro.get('macro_tilts', {}))
         
         # 格式化 macro_topics 为字符串
         if confirmed_topics:
@@ -1932,14 +2033,18 @@ class PaperTradingEngine:
             'trend_score': self.current_regime.get('trend_score', 0.5),
             'dynamic_min_cash': self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']),
             'dynamic_max_weight': self.current_regime.get('dynamic_max_weight', self.config['objectives']['max_weight_per_asset']),
+            'cash_target': self.current_regime.get('cash_target', self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct'])),
             'risk_caps_applied': self.current_regime.get('risk_caps_applied', False),
             'forced_until_time': self.current_regime.get('forced_until_time', self.forced_until_time.isoformat() if self.forced_until_time else None),
             'forced_regime_reason': self.current_regime.get('forced_reason', self.forced_regime_reason),
             # Macro Integration 字段
+            'macro_risk_score_raw': self.current_macro.get('macro_risk_score', 0.0),
             'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),  # 原始值
             'macro_risk_score_smoothed': self.current_macro.get('macro_risk_score_smoothed', 0.0),  # E1) 平滑值
             'confirmed_topics_count': len(self.current_macro.get('confirmed_topics', [])),
             'macro_tilts': self.current_macro.get('macro_tilts', {}),
+            'applied_tilts': self.current_macro.get('applied_tilts', {}),
+            'capped_assets': self.current_macro.get('capped_assets', []),
             'macro_tilts_ignored': self.current_macro.get('macro_tilts_ignored', {}),  # E3) 被忽略的 tilts
             'macro_cooldown_remaining': self.macro_cooldown_remaining,  # E2) 冷却剩余周期
             # B3) Price Staleness 字段
