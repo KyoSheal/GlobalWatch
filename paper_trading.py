@@ -437,6 +437,17 @@ class PaperTradingEngine:
         self.current_stale_info = {}  # B3) 当前价格新鲜度信息
         self.current_turnover_info = {}  # C4) 当前换手信息
         
+        # E1) 宏观信号平滑
+        self.macro_risk_score_history = []  # 保存最近 N 次的 risk_score
+        self.macro_smoothing_window = self.config.get('macro_integration', {}).get('smoothing_window', 3)
+        self.macro_smoothing_method = self.config.get('macro_integration', {}).get('smoothing_method', 'median')  # 'median' or 'ewma'
+        self.macro_ewma_alpha = self.config.get('macro_integration', {}).get('ewma_alpha', 0.4)
+        
+        # E2) 宏观动作冷却
+        self.last_macro_cash_target = self.config['objectives']['min_cash_pct']  # 上次的现金目标
+        self.macro_cooldown_cycles = self.config.get('macro_integration', {}).get('cooldown_cycles', 2)
+        self.macro_cooldown_remaining = 0  # 剩余冷却周期数
+        
         # 价格缓存（避免重复请求）
         self.price_cache = {}  # {ticker: (price, timestamp)}
         self.price_cache_duration = 60  # 缓存60秒
@@ -762,23 +773,84 @@ class PaperTradingEngine:
         }
         
         # ========== 步骤2: 获取宏观信号（Macro Integration）==========
-        macro_risk_score, confirmed_topics, macro_tilts, signal_summary = self.macro_adapter.analyze_signals()
+        macro_risk_score_raw, confirmed_topics, macro_tilts_raw, signal_summary = self.macro_adapter.analyze_signals()
+        
+        # E1) 平滑 macro_risk_score
+        self.macro_risk_score_history.append(macro_risk_score_raw)
+        
+        # 只保留最近 N 次
+        if len(self.macro_risk_score_history) > self.macro_smoothing_window:
+            self.macro_risk_score_history = self.macro_risk_score_history[-self.macro_smoothing_window:]
+        
+        # 计算平滑值
+        if self.macro_smoothing_method == 'median':
+            import statistics
+            macro_risk_score_smoothed = statistics.median(self.macro_risk_score_history)
+        elif self.macro_smoothing_method == 'ewma':
+            # EWMA: smoothed = alpha * current + (1-alpha) * previous
+            if len(self.macro_risk_score_history) == 1:
+                macro_risk_score_smoothed = macro_risk_score_raw
+            else:
+                prev_smoothed = self.current_macro.get('macro_risk_score_smoothed', macro_risk_score_raw)
+                macro_risk_score_smoothed = (self.macro_ewma_alpha * macro_risk_score_raw + 
+                                            (1 - self.macro_ewma_alpha) * prev_smoothed)
+        else:
+            macro_risk_score_smoothed = macro_risk_score_raw
+        
+        print(f"[MACRO SMOOTH] Raw: {macro_risk_score_raw:.2f}, Smoothed: {macro_risk_score_smoothed:.2f} "
+              f"(method: {self.macro_smoothing_method}, window: {len(self.macro_risk_score_history)})")
+        
+        # E3) 过滤 macro_tilts：只保留 universe 内的资产
+        universe_tickers = {asset['ticker'] for asset in self.config['universe']}
+        macro_tilts_filtered = {}
+        macro_tilts_ignored = {}
+        
+        for ticker, tilt in macro_tilts_raw.items():
+            if ticker in universe_tickers:
+                macro_tilts_filtered[ticker] = tilt
+            else:
+                macro_tilts_ignored[ticker] = tilt
+        
+        if macro_tilts_ignored:
+            print(f"[MACRO TILTS] Ignored (not in universe): {', '.join([f'{t}:{v:+.2%}' for t, v in macro_tilts_ignored.items()])}")
         
         # 保存宏观信号信息供 snapshot 使用
         self.current_macro = {
-            'macro_risk_score': macro_risk_score,
+            'macro_risk_score': macro_risk_score_raw,  # 原始值
+            'macro_risk_score_smoothed': macro_risk_score_smoothed,  # 平滑值
             'confirmed_topics': confirmed_topics,
-            'macro_tilts': macro_tilts,
+            'macro_tilts': macro_tilts_filtered,  # 过滤后的 tilts
+            'macro_tilts_ignored': macro_tilts_ignored,  # 被忽略的 tilts
             'signal_summary': signal_summary
         }
         
-        # 根据宏观风险分数调整现金比例
-        if macro_risk_score > 0:
+        # E2) 根据平滑后的宏观风险分数调整现金比例（带冷却）
+        macro_cash_add = 0.0
+        if macro_risk_score_smoothed > 0:
             macro_cash_slope = self.config.get('macro_integration', {}).get('macro_cash_slope', 0.02)
-            macro_cash_add = macro_risk_score * macro_cash_slope
-            dynamic_min_cash = min(dynamic_min_cash + macro_cash_add, 0.50)  # 最多 50% 现金
+            macro_cash_add = macro_risk_score_smoothed * macro_cash_slope
+            new_cash_target = min(dynamic_min_cash + macro_cash_add, 0.50)  # 最多 50% 现金
             
-            print(f"[MACRO] Adjusting min cash: {self.current_regime['dynamic_min_cash']:.1%} → {dynamic_min_cash:.1%} (risk score: {macro_risk_score:.1f})")
+            # E2) 检查是否需要冷却
+            cash_change = abs(new_cash_target - self.last_macro_cash_target)
+            
+            if self.macro_cooldown_remaining > 0:
+                # 冷却期内，保持上次的现金目标（除非触发 circuit breaker）
+                print(f"[MACRO COOLDOWN] Remaining {self.macro_cooldown_remaining} cycles, keeping cash target at {self.last_macro_cash_target:.1%}")
+                dynamic_min_cash = self.last_macro_cash_target
+                self.macro_cooldown_remaining -= 1
+            elif cash_change > 0.05:  # 现金目标变化超过 5%
+                # 应用新的现金目标，并启动冷却
+                print(f"[MACRO] Adjusting min cash: {self.current_regime['dynamic_min_cash']:.1%} → {new_cash_target:.1%} "
+                      f"(smoothed risk score: {macro_risk_score_smoothed:.1f})")
+                dynamic_min_cash = new_cash_target
+                self.last_macro_cash_target = new_cash_target
+                self.macro_cooldown_remaining = self.macro_cooldown_cycles
+                print(f"[MACRO COOLDOWN] Started {self.macro_cooldown_cycles} cycle cooldown")
+            else:
+                # 变化不大，直接应用
+                dynamic_min_cash = new_cash_target
+                self.last_macro_cash_target = new_cash_target
             
             # 更新 regime 信息
             self.current_regime['dynamic_min_cash'] = dynamic_min_cash
@@ -830,10 +902,10 @@ class PaperTradingEngine:
         total_score = sum(v['score'] for v in positive_assets.values())
         raw_weights = {k: v['score'] / total_score for k, v in positive_assets.items()}
         
-        # ========== 步骤5: 应用宏观倾斜（Macro Tilts）==========
-        if macro_tilts:
+        # ========== 步骤5: 应用宏观倾斜（Macro Tilts）- 使用过滤后的 tilts ==========
+        if macro_tilts_filtered:
             print(f"\n[MACRO] Applying tilts to weights:")
-            for ticker, tilt in macro_tilts.items():
+            for ticker, tilt in macro_tilts_filtered.items():
                 if ticker in raw_weights:
                     old_weight = raw_weights[ticker]
                     raw_weights[ticker] = max(0.0, old_weight + tilt)  # 不能为负
@@ -1293,8 +1365,9 @@ class PaperTradingEngine:
         trend_score = self.current_regime.get('trend_score', 0.5)
         cash_target = self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct'])
         
-        # Macro 信息
-        macro_risk_score = self.current_macro.get('macro_risk_score', 0.0)
+        # Macro 信息 - E1) 使用平滑后的 risk_score
+        macro_risk_score_raw = self.current_macro.get('macro_risk_score', 0.0)
+        macro_risk_score_smoothed = self.current_macro.get('macro_risk_score_smoothed', 0.0)
         confirmed_topics = self.current_macro.get('confirmed_topics', [])
         macro_tilts = self.current_macro.get('macro_tilts', {})
         
@@ -1314,7 +1387,8 @@ class PaperTradingEngine:
             'regime_state': regime_state,
             'trend_score': trend_score,
             'cash_target': cash_target,
-            'macro_risk_score': macro_risk_score,
+            'macro_risk_score': macro_risk_score_smoothed,  # E1) 使用平滑值
+            'macro_risk_score_raw': macro_risk_score_raw,  # 保留原始值
             'macro_topics': topics_str,
             'macro_tilts': tilts_str,
             'macro_tilts_dict': macro_tilts  # 保留字典格式供内部使用
@@ -1442,9 +1516,12 @@ class PaperTradingEngine:
             'dynamic_max_weight': self.current_regime.get('dynamic_max_weight', self.config['objectives']['max_weight_per_asset']),
             'risk_caps_applied': self.current_regime.get('risk_caps_applied', False),
             # Macro Integration 字段
-            'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),
+            'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),  # 原始值
+            'macro_risk_score_smoothed': self.current_macro.get('macro_risk_score_smoothed', 0.0),  # E1) 平滑值
             'confirmed_topics_count': len(self.current_macro.get('confirmed_topics', [])),
             'macro_tilts': self.current_macro.get('macro_tilts', {}),
+            'macro_tilts_ignored': self.current_macro.get('macro_tilts_ignored', {}),  # E3) 被忽略的 tilts
+            'macro_cooldown_remaining': self.macro_cooldown_remaining,  # E2) 冷却剩余周期
             # B3) Price Staleness 字段
             'stale_count': self.current_stale_info.get('stale_count', 0),
             'stale_ratio': self.current_stale_info.get('stale_ratio', 0.0),
