@@ -324,6 +324,12 @@
     "exit_signal_volume_spike_ratio": 2.0,
     "exit_signal_consecutive_down_days": 3,
     "exit_signal_long_upper_shadow_ratio": 2.0,
+    "enable_score_smoothing": true,
+    "score_smoothing_window": 3,
+    "max_portfolio_volatility": 0.25,
+    "enable_diversity_check": true,
+    "max_herfindahl_index": 0.35,
+    "portfolio_vol_min_coverage": 0.70,
     "momentum_weights": {
       "short": 0.4,
       "medium": 0.6

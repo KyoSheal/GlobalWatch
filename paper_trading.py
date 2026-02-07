@@ -696,6 +696,7 @@ class PaperTradingEngine:
         self.current_stale_info = {}
         self.current_turnover_info = {}
         self.current_exit_info = {}
+        self.current_risk_check_info = {}
         self.current_holding_blocks = []
         self.forced_until_time = None  # NOTE: comment omitted (was garbled/non-ASCII).
         self.forced_regime_reason = ""
@@ -703,6 +704,7 @@ class PaperTradingEngine:
         self.last_diagnostic_hint = ""
         self.current_weights_reused = False
         self.current_macro_reused = False
+        self.score_history_by_ticker = {}
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_risk_score_history = []  # NOTE: comment omitted (was garbled/non-ASCII).
@@ -800,6 +802,12 @@ class PaperTradingEngine:
         execution_config.setdefault('exit_signal_volume_spike_ratio', 2.0)
         execution_config.setdefault('exit_signal_consecutive_down_days', 3)
         execution_config.setdefault('exit_signal_long_upper_shadow_ratio', 2.0)
+        execution_config.setdefault('enable_score_smoothing', True)
+        execution_config.setdefault('score_smoothing_window', 3)
+        execution_config.setdefault('max_portfolio_volatility', 0.25)
+        execution_config.setdefault('enable_diversity_check', True)
+        execution_config.setdefault('max_herfindahl_index', 0.35)
+        execution_config.setdefault('portfolio_vol_min_coverage', 0.70)
         momentum_weights_cfg = execution_config.setdefault('momentum_weights', {})
         momentum_weights_cfg.setdefault('short', 0.4)
         momentum_weights_cfg.setdefault('medium', 0.6)
@@ -869,6 +877,12 @@ class PaperTradingEngine:
         assert float(self.config.get('execution', {}).get('exit_signal_volume_spike_ratio', 2.0)) >= 1.0, "execution.exit_signal_volume_spike_ratio must be >= 1"
         assert int(self.config.get('execution', {}).get('exit_signal_consecutive_down_days', 3)) >= 2, "execution.exit_signal_consecutive_down_days must be >= 2"
         assert float(self.config.get('execution', {}).get('exit_signal_long_upper_shadow_ratio', 2.0)) >= 1.0, "execution.exit_signal_long_upper_shadow_ratio must be >= 1"
+        assert isinstance(self.config.get('execution', {}).get('enable_score_smoothing', True), bool), "execution.enable_score_smoothing must be bool"
+        assert int(self.config.get('execution', {}).get('score_smoothing_window', 3)) >= 1, "execution.score_smoothing_window must be >= 1"
+        assert float(self.config.get('execution', {}).get('max_portfolio_volatility', 0.25)) > 0, "execution.max_portfolio_volatility must be > 0"
+        assert isinstance(self.config.get('execution', {}).get('enable_diversity_check', True), bool), "execution.enable_diversity_check must be bool"
+        assert 0.0 < float(self.config.get('execution', {}).get('max_herfindahl_index', 0.35)) <= 1.0, "execution.max_herfindahl_index must be in (0,1]"
+        assert 0.0 <= float(self.config.get('execution', {}).get('portfolio_vol_min_coverage', 0.70)) <= 1.0, "execution.portfolio_vol_min_coverage must be in [0,1]"
         momentum_weights_cfg = self.config.get('execution', {}).get('momentum_weights', {})
         assert isinstance(momentum_weights_cfg, dict), "execution.momentum_weights must be an object"
         short_w = float(momentum_weights_cfg.get('short', 0.4))
@@ -1481,6 +1495,7 @@ class PaperTradingEngine:
             if enable_short_term_momentum:
                 print(f"[MOMENTUM] {ticker}: short={short_z:+.2f}, med={medium_z:+.2f}, blended={blended_z:+.2f}")
 
+        metrics = self._apply_score_stability_controls(metrics)
         ranked_for_pct = sorted(metrics.items(), key=lambda x: x[1]['rank_score'], reverse=True)
         n = len(ranked_for_pct)
         for rank_idx, (ticker, data) in enumerate(ranked_for_pct, start=1):
@@ -1555,6 +1570,124 @@ class PaperTradingEngine:
         except Exception as e:
             print(f"[CORR] Degraded: correlation filter failed ({e}), fallback to ranked list")
             return list(ranked_tickers), [], [f"error:{e}"]
+
+    def _apply_score_stability_controls(self, metrics):
+        """Apply optional smoothing, normalization and clipping to rank scores."""
+        if not metrics:
+            return metrics
+
+        execution_cfg = self.config.get('execution', {})
+        enable_smoothing = bool(execution_cfg.get('enable_score_smoothing', True))
+        window = max(1, int(execution_cfg.get('score_smoothing_window', 3)))
+
+        raw_scores = {ticker: float(data.get('rank_score', 0.0)) for ticker, data in metrics.items()}
+        smoothed_scores = {}
+        for ticker, raw_score in raw_scores.items():
+            if enable_smoothing:
+                history = self.score_history_by_ticker.setdefault(ticker, [])
+                history.append(raw_score)
+                if len(history) > window:
+                    del history[:-window]
+                smoothed_scores[ticker] = float(np.mean(history))
+            else:
+                smoothed_scores[ticker] = raw_score
+
+        active_tickers = set(metrics.keys())
+        for ticker in list(self.score_history_by_ticker.keys()):
+            if ticker not in active_tickers and len(self.score_history_by_ticker.get(ticker, [])) == 0:
+                self.score_history_by_ticker.pop(ticker, None)
+
+        smoothed_values = np.array(list(smoothed_scores.values()), dtype=float)
+        mu = float(np.mean(smoothed_values)) if len(smoothed_values) > 0 else 0.0
+        sigma = float(np.std(smoothed_values)) if len(smoothed_values) > 0 else 0.0
+
+        clipped_count = 0
+        for ticker, data in metrics.items():
+            raw_score = raw_scores.get(ticker, 0.0)
+            smooth_score = smoothed_scores.get(ticker, raw_score)
+            normalized_score = (smooth_score - mu) / sigma if sigma > 1e-12 else 0.0
+            capped_score = float(np.clip(normalized_score, -3.0, 3.0))
+            if abs(capped_score - normalized_score) > 1e-12:
+                clipped_count += 1
+            data['raw_rank_score'] = float(raw_score)
+            data['smoothed_rank_score'] = float(smooth_score)
+            data['normalized_rank_score'] = float(normalized_score)
+            data['rank_score'] = capped_score
+
+        print(f"[SCORE STABILITY] smoothing={enable_smoothing} window={window} mu={mu:+.3f} sigma={sigma:.3f} clipped={clipped_count}")
+        return metrics
+
+    def _get_asset_volatility_optional(self, ticker, lookback_days):
+        """Return annualized volatility or None if data is insufficient."""
+        try:
+            hist = self.get_market_data(ticker, period='3mo', interval='1d')
+            if hist is None or hist.empty or len(hist) < int(max(5, lookback_days)):
+                return None
+            returns = hist['Close'].pct_change().dropna()
+            if len(returns) < int(max(5, lookback_days // 2)):
+                return None
+            return float(returns.tail(int(lookback_days)).std() * np.sqrt(252))
+        except Exception:
+            return None
+
+    def _evaluate_portfolio_risk_gate(self, target_weights):
+        """Check portfolio-level volatility/diversification before execution."""
+        execution_cfg = self.config.get('execution', {})
+        strategy_cfg = self.config.get('strategy', {})
+        lookback_days = int(strategy_cfg.get('lookback_days', 40))
+        max_portfolio_volatility = float(execution_cfg.get('max_portfolio_volatility', 0.25))
+        min_coverage = float(execution_cfg.get('portfolio_vol_min_coverage', 0.70))
+        enable_diversity_check = bool(execution_cfg.get('enable_diversity_check', True))
+        max_hhi = float(execution_cfg.get('max_herfindahl_index', 0.35))
+
+        invested_weights = {
+            str(t).upper(): max(0.0, float(w))
+            for t, w in (target_weights or {}).items()
+            if str(t).upper() != 'CASH' and float(w) > 1e-12
+        }
+
+        known_weight = 0.0
+        weighted_volatility = 0.0
+        vol_map = {}
+        for ticker, weight in invested_weights.items():
+            vol = self._get_asset_volatility_optional(ticker, lookback_days)
+            if vol is None:
+                continue
+            vol_map[ticker] = float(vol)
+            known_weight += weight
+            weighted_volatility += weight * vol
+
+        invested_budget = float(sum(invested_weights.values()))
+        hhi = 0.0
+        if invested_budget > 1e-12:
+            normalized = [w / invested_budget for w in invested_weights.values()]
+            hhi = float(sum(w * w for w in normalized))
+
+        abort_reason = ""
+        abort_flag = False
+        volatility_confident = known_weight >= min_coverage
+        if volatility_confident and weighted_volatility > max_portfolio_volatility:
+            abort_flag = True
+            abort_reason = "portfolio_volatility"
+
+        if (not abort_flag) and enable_diversity_check and invested_budget > 1e-12 and hhi > max_hhi:
+            abort_flag = True
+            abort_reason = "diversity_hhi"
+
+        return {
+            'abort': bool(abort_flag),
+            'abort_reason': abort_reason,
+            'weighted_volatility': float(weighted_volatility),
+            'max_portfolio_volatility': float(max_portfolio_volatility),
+            'volatility_known_weight': float(known_weight),
+            'volatility_confident': bool(volatility_confident),
+            'min_coverage': float(min_coverage),
+            'enable_diversity_check': bool(enable_diversity_check),
+            'herfindahl_index': float(hhi),
+            'max_herfindahl_index': float(max_hhi),
+            'invested_budget': float(invested_budget),
+            'asset_volatility_map': vol_map
+        }
 
     def _estimate_current_cash_ratio(self):
         """Estimate current portfolio cash ratio for high-conviction checks."""
@@ -2287,6 +2420,10 @@ class PaperTradingEngine:
             'signals': [],
             'triggered_count': 0
         }
+        self.current_risk_check_info = {
+            'checked': False,
+            'abort': False
+        }
         
         if cooldown_minutes > 0 and self.last_rebalance_time is not None:
             time_since_last = (datetime.now() - self.last_rebalance_time).total_seconds() / 60
@@ -2548,6 +2685,40 @@ class PaperTradingEngine:
         self.current_stale_info['stale_candidate_count'] = stale_candidate_count
         self.current_stale_info['stale_ratio_candidates'] = stale_ratio_candidates
         self.current_stale_info['decision_trace'] = f"stale_ok_{stale_ratio_candidates:.1%}_le_{max_stale_ratio:.1%}"
+
+        risk_gate = self._evaluate_portfolio_risk_gate(target_weights)
+        risk_gate['checked'] = True
+        self.current_risk_check_info = dict(risk_gate)
+
+        if risk_gate.get('volatility_confident', False):
+            print(f"[RISK CHECK] Portfolio volatility = {risk_gate['weighted_volatility']:.2f} "
+                  f"(limit {risk_gate['max_portfolio_volatility']:.2f}, known_weight={risk_gate['volatility_known_weight']:.1%})")
+        else:
+            print(f"[RISK CHECK] Portfolio volatility unknown coverage {risk_gate['volatility_known_weight']:.1%} "
+                  f"< required {risk_gate['min_coverage']:.1%}; skip volatility gate")
+        if risk_gate.get('enable_diversity_check', False):
+            print(f"[RISK CHECK] Herfindahl Index = {risk_gate['herfindahl_index']:.3f} "
+                  f"(limit {risk_gate['max_herfindahl_index']:.3f})")
+
+        if risk_gate.get('abort', False):
+            reason = str(risk_gate.get('abort_reason', 'risk_gate'))
+            if reason == 'portfolio_volatility':
+                print(f"[RISK CHECK] Portfolio volatility = {risk_gate['weighted_volatility']:.2f} -> aborting rebalance")
+            elif reason == 'diversity_hhi':
+                print(f"[RISK CHECK] Herfindahl Index = {risk_gate['herfindahl_index']:.3f} -> aborting rebalance")
+            else:
+                print(f"[RISK CHECK] aborting rebalance: {reason}")
+
+            self.current_turnover_info = {
+                'turnover_notional': 0.0,
+                'turnover_notional_pre': 0.0,
+                'turnover_notional_post': 0.0,
+                'turnover_limit': total_equity * execution_config.get('max_turnover_pct_per_rebalance', 0.20),
+                'turnover_scale': 1.0,
+                'turnover_capped': False
+            }
+            self.current_stale_info['decision_trace'] = f"{self.current_stale_info.get('decision_trace', '')}|risk_gate_abort_{reason}"
+            return []
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         turnover_notional_pre = sum(abs(t['desired_trade_value']) for t in planned_trades)
@@ -3204,6 +3375,17 @@ class PaperTradingEngine:
             'turnover_limit': self.current_turnover_info.get('turnover_limit', 0.0),
             'turnover_scale': self.current_turnover_info.get('turnover_scale', 1.0),
             'turnover_capped': self.current_turnover_info.get('turnover_capped', False),
+            'risk_check_checked': self.current_risk_check_info.get('checked', False),
+            'risk_check_abort': self.current_risk_check_info.get('abort', False),
+            'risk_check_reason': self.current_risk_check_info.get('abort_reason', ''),
+            'portfolio_weighted_volatility': self.current_risk_check_info.get('weighted_volatility', 0.0),
+            'portfolio_volatility_limit': self.current_risk_check_info.get('max_portfolio_volatility', self.config.get('execution', {}).get('max_portfolio_volatility', 0.25)),
+            'portfolio_volatility_known_weight': self.current_risk_check_info.get('volatility_known_weight', 0.0),
+            'portfolio_volatility_confident': self.current_risk_check_info.get('volatility_confident', False),
+            'portfolio_vol_min_coverage': self.current_risk_check_info.get('min_coverage', self.config.get('execution', {}).get('portfolio_vol_min_coverage', 0.70)),
+            'diversity_check_enabled': self.current_risk_check_info.get('enable_diversity_check', self.config.get('execution', {}).get('enable_diversity_check', True)),
+            'herfindahl_index': self.current_risk_check_info.get('herfindahl_index', 0.0),
+            'herfindahl_limit': self.current_risk_check_info.get('max_herfindahl_index', self.config.get('execution', {}).get('max_herfindahl_index', 0.35)),
             'diagnostic_hint': self.last_diagnostic_hint
         }
         
@@ -3589,7 +3771,7 @@ class PaperTradingEngine:
         print("="*60)
         print("ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v2.9.1-2026-02-06")
+        print(f"ENGINE_VERSION: v2.10.1-2026-02-07")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
