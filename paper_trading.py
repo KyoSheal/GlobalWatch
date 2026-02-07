@@ -585,6 +585,7 @@ class PaperTradingEngine:
         self.current_macro = {}
         self.current_stale_info = {}
         self.current_turnover_info = {}
+        self.current_exit_info = {}
         self.current_holding_blocks = []
         self.forced_until_time = None  # NOTE: comment omitted (was garbled/non-ASCII).
         self.forced_regime_reason = ""
@@ -680,6 +681,15 @@ class PaperTradingEngine:
         execution_config.setdefault('high_conviction_weight_ratio_threshold', 2.0)
         execution_config.setdefault('enable_short_term_momentum', True)
         execution_config.setdefault('short_momentum_lookback_days', 10)
+        execution_config.setdefault('enable_exit_signals', True)
+        execution_config.setdefault('exit_signal_lookback_days', 20)
+        execution_config.setdefault('exit_signal_action', 'reduce')
+        execution_config.setdefault('exit_signal_reduce_factor', 0.5)
+        execution_config.setdefault('exit_signal_min_trigger_count', 1)
+        execution_config.setdefault('exit_signal_gap_down_pct', 0.03)
+        execution_config.setdefault('exit_signal_volume_spike_ratio', 2.0)
+        execution_config.setdefault('exit_signal_consecutive_down_days', 3)
+        execution_config.setdefault('exit_signal_long_upper_shadow_ratio', 2.0)
         momentum_weights_cfg = execution_config.setdefault('momentum_weights', {})
         momentum_weights_cfg.setdefault('short', 0.4)
         momentum_weights_cfg.setdefault('medium', 0.6)
@@ -726,6 +736,16 @@ class PaperTradingEngine:
         assert float(self.config.get('execution', {}).get('high_conviction_weight_ratio_threshold', 2.0)) >= 1.0, "execution.high_conviction_weight_ratio_threshold must be >= 1"
         assert isinstance(self.config.get('execution', {}).get('enable_short_term_momentum', True), bool), "execution.enable_short_term_momentum must be bool"
         assert int(self.config.get('execution', {}).get('short_momentum_lookback_days', 10)) >= 2, "execution.short_momentum_lookback_days must be >= 2"
+        assert isinstance(self.config.get('execution', {}).get('enable_exit_signals', True), bool), "execution.enable_exit_signals must be bool"
+        assert int(self.config.get('execution', {}).get('exit_signal_lookback_days', 20)) >= 5, "execution.exit_signal_lookback_days must be >= 5"
+        assert str(self.config.get('execution', {}).get('exit_signal_action', 'reduce')).lower() in ('reduce', 'exit'), "execution.exit_signal_action must be reduce|exit"
+        reduce_factor = float(self.config.get('execution', {}).get('exit_signal_reduce_factor', 0.5))
+        assert 0.0 <= reduce_factor <= 1.0, "execution.exit_signal_reduce_factor must be in [0,1]"
+        assert int(self.config.get('execution', {}).get('exit_signal_min_trigger_count', 1)) >= 1, "execution.exit_signal_min_trigger_count must be >= 1"
+        assert float(self.config.get('execution', {}).get('exit_signal_gap_down_pct', 0.03)) > 0, "execution.exit_signal_gap_down_pct must be > 0"
+        assert float(self.config.get('execution', {}).get('exit_signal_volume_spike_ratio', 2.0)) >= 1.0, "execution.exit_signal_volume_spike_ratio must be >= 1"
+        assert int(self.config.get('execution', {}).get('exit_signal_consecutive_down_days', 3)) >= 2, "execution.exit_signal_consecutive_down_days must be >= 2"
+        assert float(self.config.get('execution', {}).get('exit_signal_long_upper_shadow_ratio', 2.0)) >= 1.0, "execution.exit_signal_long_upper_shadow_ratio must be >= 1"
         momentum_weights_cfg = self.config.get('execution', {}).get('momentum_weights', {})
         assert isinstance(momentum_weights_cfg, dict), "execution.momentum_weights must be an object"
         short_w = float(momentum_weights_cfg.get('short', 0.4))
@@ -1578,6 +1598,77 @@ class PaperTradingEngine:
         info['reason'] = 'signal_not_strong_enough'
         return None, info
 
+    def detect_exit_signals(self, ticker, price_series):
+        """Detect simple technical breakdown signals for existing holdings."""
+        execution_cfg = self.config.get('execution', {})
+        lookback_days = int(execution_cfg.get('exit_signal_lookback_days', 20))
+        min_trigger_count = int(execution_cfg.get('exit_signal_min_trigger_count', 1))
+        gap_down_threshold = abs(float(execution_cfg.get('exit_signal_gap_down_pct', 0.03)))
+        volume_spike_ratio = float(execution_cfg.get('exit_signal_volume_spike_ratio', 2.0))
+        consecutive_down_days = int(execution_cfg.get('exit_signal_consecutive_down_days', 3))
+        long_upper_shadow_ratio = float(execution_cfg.get('exit_signal_long_upper_shadow_ratio', 2.0))
+
+        if price_series is None or price_series.empty:
+            return False, "insufficient_data"
+
+        required_cols = {'Open', 'High', 'Low', 'Close'}
+        if not required_cols.issubset(set(price_series.columns)):
+            return False, "missing_ohlc"
+
+        window_size = max(lookback_days, consecutive_down_days + 2, 8)
+        window = price_series.tail(window_size).copy()
+        window = window.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        if len(window) < max(6, consecutive_down_days + 1):
+            return False, "insufficient_window"
+
+        latest = window.iloc[-1]
+        prev = window.iloc[-2]
+        triggers = []
+
+        prev_close = float(prev['Close'])
+        latest_open = float(latest['Open'])
+        if prev_close > 0:
+            gap_return = (latest_open - prev_close) / prev_close
+            if gap_return <= -gap_down_threshold:
+                triggers.append(f"gap-down {gap_return:.1%}")
+
+        prev_open = float(prev['Open'])
+        latest_close = float(latest['Close'])
+        bullish_prev = prev_close > prev_open
+        bearish_now = latest_close < latest_open
+        bearish_engulf = bullish_prev and bearish_now and (latest_open >= prev_close) and (latest_close <= prev_open)
+        if bearish_engulf:
+            triggers.append("bearish engulf")
+
+        latest_high = float(latest['High'])
+        latest_low = float(latest['Low'])
+        body_size = max(abs(latest_close - latest_open), 1e-6)
+        upper_shadow = max(0.0, latest_high - max(latest_open, latest_close))
+        candle_range = max(latest_high - latest_low, 1e-6)
+        close_location = (latest_close - latest_low) / candle_range
+        if (upper_shadow / body_size) >= long_upper_shadow_ratio and close_location <= 0.35:
+            triggers.append("long upper shadow")
+
+        closes = window['Close'].tail(consecutive_down_days + 1).astype(float).tolist()
+        if len(closes) >= consecutive_down_days + 1:
+            down_seq = all(closes[i] < closes[i - 1] for i in range(1, len(closes)))
+            if down_seq:
+                triggers.append(f"{consecutive_down_days}-day decline")
+
+        if 'Volume' in window.columns:
+            vol_series = window['Volume'].dropna().astype(float)
+            if len(vol_series) >= 6:
+                latest_vol = float(vol_series.iloc[-1])
+                base_vol = float(vol_series.iloc[-6:-1].mean())
+                if base_vol > 0 and latest_vol >= base_vol * volume_spike_ratio:
+                    triggers.append(f"vol spike x{latest_vol / base_vol:.1f}")
+
+        if len(triggers) >= max(1, min_trigger_count):
+            reason = " + ".join(triggers[:3])
+            return True, reason
+
+        return False, ""
+
     def calculate_target_weights(self):
         """def calculate_target_weights: docstring omitted (was garbled/non-ASCII)."""
 
@@ -2056,7 +2147,17 @@ class PaperTradingEngine:
         execution_config = self.config.get('execution', {})
         cooldown_minutes = execution_config.get('rebalance_cooldown_minutes', 0)
         min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
+        enable_exit_signals = bool(execution_config.get('enable_exit_signals', True))
+        exit_signal_action = str(execution_config.get('exit_signal_action', 'reduce')).lower()
+        if exit_signal_action not in ('reduce', 'exit'):
+            exit_signal_action = 'reduce'
+        exit_signal_reduce_factor = float(np.clip(execution_config.get('exit_signal_reduce_factor', 0.5), 0.0, 1.0))
         self.current_holding_blocks = []
+        self.current_exit_info = {
+            'enabled': enable_exit_signals,
+            'signals': [],
+            'triggered_count': 0
+        }
         
         if cooldown_minutes > 0 and self.last_rebalance_time is not None:
             time_since_last = (datetime.now() - self.last_rebalance_time).total_seconds() / 60
@@ -2126,6 +2227,51 @@ class PaperTradingEngine:
             positions_value += value
         
         total_equity = self.cash + positions_value
+
+        # Evaluate exit signals for existing holdings and override target weights if triggered.
+        if enable_exit_signals and total_equity > 0 and self.positions:
+            adjusted_target_weights = dict(target_weights)
+            regime_state_now = str(self.current_regime.get('regime_state', 'neutral'))
+            for ticker, qty in self.positions.items():
+                if qty <= 0:
+                    continue
+                if ticker not in current_values:
+                    continue
+
+                hist = self.get_market_data(ticker, period='3mo', interval='1d')
+                exit_flag, exit_reason = self.detect_exit_signals(ticker, hist)
+                if not exit_flag:
+                    continue
+
+                current_weight = current_values.get(ticker, 0.0) / total_equity if total_equity > 0 else 0.0
+                if current_weight <= 1e-12:
+                    continue
+
+                old_target_weight = float(adjusted_target_weights.get(ticker, 0.0))
+                action = exit_signal_action
+                if regime_state_now in ('risk_off', 'risk_off_forced'):
+                    action = 'exit'
+
+                if action == 'exit':
+                    new_target_weight = 0.0
+                else:
+                    new_target_weight = min(old_target_weight, current_weight * exit_signal_reduce_factor)
+
+                adjusted_target_weights[ticker] = max(0.0, float(new_target_weight))
+                self.current_exit_info['signals'].append({
+                    'ticker': ticker,
+                    'reason': exit_reason,
+                    'action': action,
+                    'current_weight': float(current_weight),
+                    'old_target_weight': float(old_target_weight),
+                    'new_target_weight': float(new_target_weight)
+                })
+
+                print(f"[EXIT SIGNAL] {ticker}: {exit_reason} | action={action.upper()} "
+                      f"target {old_target_weight:.2%}->{new_target_weight:.2%}")
+
+            self.current_exit_info['triggered_count'] = len(self.current_exit_info.get('signals', []))
+            target_weights = adjusted_target_weights
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         target_values = {}
@@ -2133,6 +2279,12 @@ class PaperTradingEngine:
             if ticker == 'CASH':
                 continue
             target_values[ticker] = total_equity * weight
+
+        exit_signal_actions = {
+            str(x.get('ticker')): str(x.get('action', 'reduce')).lower()
+            for x in self.current_exit_info.get('signals', [])
+            if x.get('ticker')
+        }
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         weight_threshold = execution_config.get('weight_threshold', 0.0)
@@ -2358,6 +2510,8 @@ class PaperTradingEngine:
             # NOTE: comment omitted (was garbled/non-ASCII).
             if trade['status'] == 'STALE':
                 decision_trace.append('sell_allowed_on_stale')
+            if ticker in exit_signal_actions:
+                decision_trace.append(f'exit_signal_{exit_signal_actions[ticker]}')
             if turnover_capped:
                 decision_trace.append(f'turnover_cap_scale_{turnover_scale:.2%}')
             if trade_context['regime_state'] in ('risk_off', 'risk_off_forced'):
@@ -2905,6 +3059,9 @@ class PaperTradingEngine:
             'stale_candidate_count': self.current_stale_info.get('stale_candidate_count', 0),  # NOTE: comment omitted (was garbled/non-ASCII).
             'stale_ratio_candidates': self.current_stale_info.get('stale_ratio_candidates', 0.0),  # NOTE: comment omitted (was garbled/non-ASCII).
             'stale_decision_trace': self.current_stale_info.get('decision_trace', ''),
+            'exit_signals_enabled': self.current_exit_info.get('enabled', False),
+            'exit_signals_triggered': self.current_exit_info.get('triggered_count', 0),
+            'exit_signal_tickers': [x.get('ticker') for x in self.current_exit_info.get('signals', []) if x.get('ticker')],
             'holding_block_count': len(self.current_holding_blocks),
             'holding_blocks': list(self.current_holding_blocks),
             'cross_section_top_n': self.current_regime.get('allocation_diagnostics', {}).get('cross_section_top_n', self.config.get('execution', {}).get('cross_section_top_n', 10)),

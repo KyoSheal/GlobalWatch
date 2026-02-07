@@ -315,6 +315,15 @@
     "max_high_conviction_weight": 0.4,
     "enable_short_term_momentum": true,
     "short_momentum_lookback_days": 10,
+    "enable_exit_signals": true,
+    "exit_signal_lookback_days": 20,
+    "exit_signal_action": "reduce",
+    "exit_signal_reduce_factor": 0.5,
+    "exit_signal_min_trigger_count": 1,
+    "exit_signal_gap_down_pct": 0.03,
+    "exit_signal_volume_spike_ratio": 2.0,
+    "exit_signal_consecutive_down_days": 3,
+    "exit_signal_long_upper_shadow_ratio": 2.0,
     "momentum_weights": {
       "short": 0.4,
       "medium": 0.6
