@@ -674,6 +674,10 @@ class PaperTradingEngine:
         execution_config.setdefault('high_conviction_zscore_threshold', 2.5)
         execution_config.setdefault('high_conviction_lead_threshold', 0.20)
         execution_config.setdefault('high_conviction_cash_surplus_buffer', 0.05)
+        execution_config.setdefault('enable_high_conviction_weighting', True)
+        execution_config.setdefault('max_high_conviction_weight', 0.40)
+        execution_config.setdefault('high_conviction_weight_zscore_threshold', 2.5)
+        execution_config.setdefault('high_conviction_weight_ratio_threshold', 2.0)
         execution_config.setdefault('enable_short_term_momentum', True)
         execution_config.setdefault('short_momentum_lookback_days', 10)
         momentum_weights_cfg = execution_config.setdefault('momentum_weights', {})
@@ -715,6 +719,11 @@ class PaperTradingEngine:
         assert float(self.config.get('execution', {}).get('high_conviction_zscore_threshold', 2.5)) > 0, "execution.high_conviction_zscore_threshold must be > 0"
         assert float(self.config.get('execution', {}).get('high_conviction_lead_threshold', 0.20)) >= 0, "execution.high_conviction_lead_threshold must be >= 0"
         assert float(self.config.get('execution', {}).get('high_conviction_cash_surplus_buffer', 0.05)) >= 0, "execution.high_conviction_cash_surplus_buffer must be >= 0"
+        assert isinstance(self.config.get('execution', {}).get('enable_high_conviction_weighting', True), bool), "execution.enable_high_conviction_weighting must be bool"
+        max_hc_weight = float(self.config.get('execution', {}).get('max_high_conviction_weight', 0.40))
+        assert 0 < max_hc_weight <= 1.0, "execution.max_high_conviction_weight must be in (0,1]"
+        assert float(self.config.get('execution', {}).get('high_conviction_weight_zscore_threshold', 2.5)) > 0, "execution.high_conviction_weight_zscore_threshold must be > 0"
+        assert float(self.config.get('execution', {}).get('high_conviction_weight_ratio_threshold', 2.0)) >= 1.0, "execution.high_conviction_weight_ratio_threshold must be >= 1"
         assert isinstance(self.config.get('execution', {}).get('enable_short_term_momentum', True), bool), "execution.enable_short_term_momentum must be bool"
         assert int(self.config.get('execution', {}).get('short_momentum_lookback_days', 10)) >= 2, "execution.short_momentum_lookback_days must be >= 2"
         momentum_weights_cfg = self.config.get('execution', {}).get('momentum_weights', {})
@@ -1505,6 +1514,70 @@ class PaperTradingEngine:
 
         return float(cash_target), info
 
+    def _select_high_conviction_weight_boost(self, selected_assets, asset_metrics, regime_state):
+        """Select at most one exceptional asset for temporary position-cap boost."""
+        execution_cfg = self.config.get('execution', {})
+        enabled = bool(execution_cfg.get('enable_high_conviction_weighting', True))
+        max_weight = float(execution_cfg.get('max_high_conviction_weight', 0.40))
+        zscore_threshold = float(execution_cfg.get('high_conviction_weight_zscore_threshold', 2.5))
+        ratio_threshold = float(execution_cfg.get('high_conviction_weight_ratio_threshold', 2.0))
+
+        info = {
+            'enabled': enabled,
+            'applied': False,
+            'boosted_ticker': None,
+            'max_weight': max_weight,
+            'top_score': 0.0,
+            'second_score': 0.0,
+            'score_ratio': 0.0,
+            'reason': 'not_triggered'
+        }
+
+        if not enabled:
+            info['reason'] = 'disabled_by_config'
+            return None, info
+        if regime_state == 'risk_off_forced':
+            info['reason'] = 'risk_off_forced_active'
+            return None, info
+        if not selected_assets:
+            info['reason'] = 'no_selected_assets'
+            return None, info
+
+        ranked = sorted(
+            selected_assets,
+            key=lambda t: float(asset_metrics.get(t, {}).get('rank_score', 0.0)),
+            reverse=True
+        )
+        top_ticker = ranked[0]
+        top_score = float(asset_metrics.get(top_ticker, {}).get('rank_score', 0.0))
+        second_score = float(asset_metrics.get(ranked[1], {}).get('rank_score', 0.0)) if len(ranked) > 1 else 0.0
+
+        if top_score <= 0:
+            info.update({'top_score': top_score, 'second_score': second_score, 'reason': 'top_score_not_positive'})
+            return None, info
+
+        strong_zscore = top_score > zscore_threshold
+        score_ratio = 0.0
+        strong_ratio = False
+        if second_score > 1e-12:
+            score_ratio = top_score / second_score
+            strong_ratio = score_ratio >= ratio_threshold
+
+        info.update({
+            'boosted_ticker': top_ticker,
+            'top_score': top_score,
+            'second_score': second_score,
+            'score_ratio': score_ratio
+        })
+
+        if strong_zscore or strong_ratio:
+            info['applied'] = True
+            info['reason'] = 'high_conviction'
+            return top_ticker, info
+
+        info['reason'] = 'signal_not_strong_enough'
+        return None, info
+
     def calculate_target_weights(self):
         """def calculate_target_weights: docstring omitted (was garbled/non-ASCII)."""
 
@@ -1810,6 +1883,12 @@ class PaperTradingEngine:
             regime_state=regime_state
         )
         self.current_regime['high_conviction_override'] = dict(high_conviction_info)
+        boosted_ticker, weight_boost_info = self._select_high_conviction_weight_boost(
+            selected_assets=selected_assets,
+            asset_metrics=asset_metrics,
+            regime_state=regime_state
+        )
+        self.current_regime['high_conviction_weighting'] = dict(weight_boost_info)
 
         rank_signal_map = {t: max(0.0, float(asset_metrics.get(t, {}).get('rank_score', 0.0))) for t in selected_assets}
         if sum(rank_signal_map.values()) <= 1e-12:
@@ -1887,6 +1966,15 @@ class PaperTradingEngine:
             tilt_delta = float(np.clip(applied_tilts.get(ticker, 0.0), -tilt_max_delta, tilt_max_delta))
             max_weight_effective[ticker] = float(np.clip(base_max_weight + tilt_delta, 0.0, 1.0))
 
+        if boosted_ticker and boosted_ticker in max_weight_effective:
+            max_hc_weight = float(self.config.get('execution', {}).get('max_high_conviction_weight', 0.40))
+            old_cap = float(max_weight_effective.get(boosted_ticker, base_max_weight))
+            new_cap = float(np.clip(max(old_cap, max_hc_weight), 0.0, 1.0))
+            max_weight_effective[boosted_ticker] = new_cap
+            top_score = float(weight_boost_info.get('top_score', 0.0))
+            second_score = float(weight_boost_info.get('second_score', 0.0))
+            print(f"[WEIGHT BOOST] {boosted_ticker}: score={top_score:.2f} >> 2nd best={second_score:.2f} -> allowed {new_cap:.0%} weight")
+
         # NOTE: comment omitted (was garbled/non-ASCII).
         score_map = {k: max(0.0, float(rank_signal_map.get(k, 0.0))) for k in scaled_weights.keys()}
         adjusted_weights, alloc_diag = _apply_caps_and_normalize(
@@ -1908,6 +1996,8 @@ class PaperTradingEngine:
             'short': float(momentum_short_weight),
             'medium': float(momentum_medium_weight)
         }
+        alloc_diag['high_conviction_weight_boost'] = dict(weight_boost_info)
+        alloc_diag['boosted_ticker'] = boosted_ticker
         capped_assets = alloc_diag.get('capped_assets', [])
 
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))

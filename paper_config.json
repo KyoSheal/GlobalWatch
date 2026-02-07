@@ -311,6 +311,8 @@
     "volatility_floor": 0.08,
     "min_holding_cycles": 4,
     "allow_high_conviction_override": true,
+    "enable_high_conviction_weighting": true,
+    "max_high_conviction_weight": 0.4,
     "enable_short_term_momentum": true,
     "short_momentum_lookback_days": 10,
     "momentum_weights": {
