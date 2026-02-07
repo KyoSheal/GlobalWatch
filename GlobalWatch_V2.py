@@ -132,6 +132,44 @@ REFRESH_OPTIONS = {"手动": 0, "5 分钟": 300, "10 分钟": 600, "30 分钟": 
 
 # ================= 1. 深度解析函数 (V3.0 新增) =================
 
+def load_paper_runtime_settings():
+    """Load optional runtime settings from paper_config.json."""
+    defaults = {
+        "enable_llm_topic_signals": True,
+        "llm_topic_confidence_threshold": 0.6,
+        "llm_topic_score_threshold": 0.5,
+        "llm_topic_model": LOCAL_MODEL
+    }
+    config_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
+    if not os.path.exists(config_path):
+        return defaults
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        macro_cfg = cfg.get("macro_integration", {})
+        defaults["enable_llm_topic_signals"] = bool(macro_cfg.get("enable_llm_topic_signals", defaults["enable_llm_topic_signals"]))
+        defaults["llm_topic_confidence_threshold"] = float(macro_cfg.get("llm_topic_confidence_threshold", defaults["llm_topic_confidence_threshold"]))
+        defaults["llm_topic_score_threshold"] = float(macro_cfg.get("llm_topic_score_threshold", defaults["llm_topic_score_threshold"]))
+        defaults["llm_topic_model"] = str(macro_cfg.get("llm_topic_model", defaults["llm_topic_model"]))
+    except Exception as e:
+        log_error(f"load_paper_runtime_settings error: {str(e)}")
+    return defaults
+
+
+RUNTIME_SETTINGS = load_paper_runtime_settings()
+
+
+def query_ollama(model, prompt, num_ctx=8192, temperature=None):
+    """Thin wrapper for ollama.chat to keep calls consistent."""
+    if temperature is None:
+        temperature = TEMPERATURE
+    response = ollama.chat(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        options={"num_ctx": int(num_ctx), "temperature": float(temperature)}
+    )
+    return response.get("message", {}).get("content", "")
+
 def parse_deepseek_output(text):
     """
     专门解析 DeepSeek-R1 的输出
@@ -428,6 +466,190 @@ def record_signal(asset, direction, confidence, predictions_dict, news_sources):
     except Exception as e:
         print(f"Error recording signal: {e}")
         return None
+
+
+def extract_llm_topic_sentiment(news, macro_data, lang_mode):
+    """Extract structured sector/topic sentiment from headlines using LLM."""
+    if not news:
+        return None
+    if not RUNTIME_SETTINGS.get("enable_llm_topic_signals", True):
+        return None
+
+    model_name = str(RUNTIME_SETTINGS.get("llm_topic_model", LOCAL_MODEL))
+    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "中文" else "OUTPUT LANGUAGE: ENGLISH"
+    headlines = "\n".join([f"- [{item.get('source', 'Unknown')}] {item.get('title', '')}" for item in news[:20]])
+
+    prompt = f"""
+You are a macro-news signal parser. {lang_instruction}
+Read the headlines and infer sector/theme momentum.
+
+Headlines:
+{headlines}
+
+Macro context:
+{json.dumps(macro_data)}
+
+Return ONLY JSON in this exact schema:
+{{
+  "timestamp": "ISO8601 string",
+  "source": "llm+news",
+  "confidence": 0.0,
+  "summary": "1-2 sentence summary",
+  "sector_mentions": [{{"sector": "semiconductors", "count": 2}}],
+  "entities": [{{"entity": "NVIDIA", "sector": "semiconductors", "polarity": 0.8}}],
+  "topic_recurrence": [{{"topic": "AI chip demand", "frequency": 3}}],
+  "signals": {{"semiconductors": 0.7, "utilities": -0.5}}
+}}
+
+Rules:
+- signal values must be in [-1.0, 1.0]
+- confidence must be in [0.0, 1.0]
+- include only sectors/themes with clear directional evidence
+"""
+    try:
+        raw_content = query_ollama(model_name, prompt, num_ctx=8192)
+        thought, json_text = parse_deepseek_output(raw_content)
+        parsed = robust_json_parse(json_text, model_name, max_retries=1)
+        if parsed.get("_parse_error"):
+            return None
+
+        raw_signals = parsed.get("signals", {})
+        if not isinstance(raw_signals, dict):
+            return None
+
+        normalized_signals = {}
+        for sector, value in raw_signals.items():
+            if sector is None:
+                continue
+            sector_key = str(sector).strip().lower()
+            if not sector_key:
+                continue
+            try:
+                score = float(value)
+            except Exception:
+                continue
+            normalized_signals[sector_key] = max(-1.0, min(1.0, score))
+
+        confidence = parsed.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        payload = {
+            "timestamp": datetime.now().isoformat(),
+            "source": "llm+news",
+            "confidence": confidence,
+            "summary": str(parsed.get("summary", "")),
+            "sector_mentions": parsed.get("sector_mentions", []),
+            "entities": parsed.get("entities", []),
+            "topic_recurrence": parsed.get("topic_recurrence", []),
+            "signals": normalized_signals,
+            "thought_process": thought
+        }
+        return payload
+    except Exception as e:
+        log_error(f"extract_llm_topic_sentiment error: {str(e)}")
+        return None
+
+
+def record_llm_topic_signals(payload, news_sources):
+    """Store structured LLM topic signals into trading_signals collection."""
+    if not payload:
+        return 0
+    signals = payload.get("signals", {})
+    if not isinstance(signals, dict) or not signals:
+        return 0
+
+    confidence_threshold = float(RUNTIME_SETTINGS.get("llm_topic_confidence_threshold", 0.6))
+    score_threshold = float(RUNTIME_SETTINGS.get("llm_topic_score_threshold", 0.5))
+    payload_conf = float(payload.get("confidence", 0.0))
+    if payload_conf < confidence_threshold:
+        return 0
+
+    count = 0
+    source_str = ",".join(list(set([s for s in news_sources if s]))[:3])
+    topic_recurrence = payload.get("topic_recurrence", [])
+    recurrence_map = {}
+    if isinstance(topic_recurrence, list):
+        for item in topic_recurrence:
+            if isinstance(item, dict):
+                topic_name = str(item.get("topic", "")).strip().lower()
+                if not topic_name:
+                    continue
+                try:
+                    recurrence_map[topic_name] = float(item.get("frequency", 1.0))
+                except Exception:
+                    recurrence_map[topic_name] = 1.0
+
+    for sector, raw_score in signals.items():
+        try:
+            score = float(raw_score)
+        except Exception:
+            continue
+        if abs(score) < score_threshold:
+            continue
+
+        direction = "Bullish" if score > 0 else "Bearish" if score < 0 else "Neutral"
+        sector_key = str(sector).strip().lower()
+        signal_id = str(uuid.uuid4())
+        topic_recur = recurrence_map.get(sector_key, 1.0)
+        metadata = {
+            "signal_id": signal_id,
+            "timestamp": payload.get("timestamp", datetime.now().isoformat()),
+            "asset": sector_key,
+            "ticker": "UNKNOWN",
+            "direction": direction,
+            "confidence": float(payload_conf * 100.0),
+            "theme": f"sector_{sector_key}",
+            "initial_price": 0.0,
+            "sources": source_str,
+            "status": "PENDING",
+            "signal_type": "topic_sentiment",
+            "topic_sector": sector_key,
+            "topic_score": float(score),
+            "topic_confidence": float(payload_conf),
+            "topic_recurrence": float(topic_recur),
+            "summary": str(payload.get("summary", "")),
+            "source_tag": "llm+news",
+            "price_1h": 0.0,
+            "price_4h": 0.0,
+            "price_1d": 0.0,
+            "price_1w": 0.0,
+            "correct_1h": "",
+            "correct_4h": "",
+            "correct_1d": "",
+            "correct_1w": "",
+            "return_1h": 0.0,
+            "return_4h": 0.0,
+            "return_1d": 0.0,
+            "return_1w": 0.0
+        }
+
+        try:
+            signals_collection.add(
+                documents=[json.dumps(payload)],
+                metadatas=[metadata],
+                ids=[signal_id]
+            )
+            if score > 0:
+                print(f"[GLOBALWATCH] Overweight {sector_key} due to LLM {score:+.2f}")
+            else:
+                print(f"[GLOBALWATCH] Underweight {sector_key} due to LLM {score:+.2f}")
+            count += 1
+        except Exception as e:
+            log_error(f"record_llm_topic_signals add error: {str(e)}")
+            continue
+
+    if count > 0:
+        os.makedirs("outputs", exist_ok=True)
+        try:
+            with open("outputs/llm_topic_signals.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log_error(f"record_llm_topic_signals file write error: {str(e)}")
+    return count
 
 def backfill_signal_results():
     """
@@ -1738,12 +1960,22 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
             res['_evidence_warning'] = True
             original_advice = res.get('advice', '')
             res['advice'] = f"{original_advice}\n\n⚠️ WARNING: No valid evidence found. Predictions may be unreliable. Please verify independently."
+
+        # Optional LLM topic sentiment extraction and storage
+        news_sources = [item.get('source') for item in news]
+        if RUNTIME_SETTINGS.get("enable_llm_topic_signals", True):
+            topic_payload = extract_llm_topic_sentiment(news, macro_data, lang_mode)
+            if topic_payload and topic_payload.get("signals"):
+                recorded_topic_count = record_llm_topic_signals(topic_payload, news_sources)
+                res['topic_signals'] = topic_payload
+                res['_topic_signals_recorded'] = recorded_topic_count
+            else:
+                res['_topic_signals_recorded'] = 0
         
         # 【新增】记录交易信号
         if res.get("status") == "alert" and res.get("predictions"):
             predictions = res.get("predictions", {})
             impact_score = res.get("impact_score", 0)
-            news_sources = [item.get('source') for item in news]
             
             # 为每个预测记录信号
             for asset, prediction_text in predictions.items():

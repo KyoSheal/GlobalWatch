@@ -501,6 +501,11 @@ class MacroSignalAdapter:
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         macro_tilts = self._generate_tilts(confirmed_topics)
+        topic_tilts, applied_sector_topics = self._generate_topic_tilts_from_signals(valid_signals)
+        if topic_tilts:
+            tilt_max_delta = float(self.macro_config.get('tilt_max_delta', 0.02))
+            for ticker, tilt in topic_tilts.items():
+                macro_tilts[ticker] = float(np.clip(macro_tilts.get(ticker, 0.0) + tilt, -tilt_max_delta, tilt_max_delta))
         
         if macro_tilts:
             print(f"[MACRO] Asset Tilts:")
@@ -513,6 +518,8 @@ class MacroSignalAdapter:
             'valid_signals_in_window': len(valid_signals),
             'themes_analyzed': len(theme_groups),
             'confirmed_topics': len(confirmed_topics),
+            'llm_topic_signals_applied': len(applied_sector_topics),
+            'llm_topic_sectors': [x.get('sector') for x in applied_sector_topics],
             'risk_score': risk_score,
             'quality_verified_count': quality_summary.get('verified_count', 0),
             'quality_with_correct_1d': quality_summary.get('with_correct_1d', 0),
@@ -555,6 +562,109 @@ class MacroSignalAdapter:
                             tilts[ticker] = max(-tilt_max_delta, min(new_tilt, tilt_max_delta))
         
         return tilts
+
+    def _generate_topic_tilts_from_signals(self, valid_signals):
+        """Convert optional LLM topic sentiment signals into ticker tilts."""
+        if not bool(self.macro_config.get('enable_llm_topic_signals', True)):
+            return {}, []
+
+        topic_map_cfg = self.macro_config.get('topic_sector_ticker_map', {})
+        if not isinstance(topic_map_cfg, dict) or not topic_map_cfg:
+            return {}, []
+        normalized_topic_map = {}
+        for key, tickers in topic_map_cfg.items():
+            key_norm = str(key).strip().lower()
+            if not key_norm:
+                continue
+            if isinstance(tickers, list):
+                normalized_topic_map[key_norm] = [str(t).upper() for t in tickers if str(t).strip()]
+        if not normalized_topic_map:
+            return {}, []
+
+        confidence_threshold = float(self.macro_config.get('llm_topic_confidence_threshold', 0.6))
+        score_threshold = float(self.macro_config.get('llm_topic_score_threshold', 0.5))
+        tilt_scale = float(self.macro_config.get('llm_topic_tilt_scale', 0.02))
+        tilt_max_delta = float(self.macro_config.get('tilt_max_delta', 0.02))
+
+        sector_scores = {}
+        sector_weights = {}
+        sector_details = {}
+
+        for sig in valid_signals:
+            metadata = sig.get('metadata', {}) or {}
+            signal_type = str(metadata.get('signal_type', '')).strip().lower()
+            if signal_type != 'topic_sentiment':
+                continue
+
+            sector = str(metadata.get('topic_sector') or metadata.get('sector') or '').strip().lower()
+            if not sector:
+                continue
+            if sector not in normalized_topic_map:
+                continue
+
+            try:
+                topic_score = float(metadata.get('topic_score', metadata.get('topic_score_raw', 0.0)))
+            except (TypeError, ValueError):
+                continue
+
+            confidence_raw = metadata.get('topic_confidence', metadata.get('confidence', 0.0))
+            try:
+                confidence = float(confidence_raw)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence > 1.0:
+                confidence = confidence / 100.0
+
+            if abs(topic_score) < score_threshold or confidence < confidence_threshold:
+                continue
+
+            recurrence_raw = metadata.get('topic_recurrence', metadata.get('recurrence', 1.0))
+            try:
+                recurrence = max(1.0, float(recurrence_raw))
+            except (TypeError, ValueError):
+                recurrence = 1.0
+
+            weight = confidence * min(1.0, recurrence / 3.0)
+            sector_scores[sector] = sector_scores.get(sector, 0.0) + topic_score * weight
+            sector_weights[sector] = sector_weights.get(sector, 0.0) + weight
+            sector_details[sector] = {
+                'score': topic_score,
+                'confidence': confidence,
+                'recurrence': recurrence
+            }
+
+        sector_avg_scores = {}
+        for sector, weighted_sum in sector_scores.items():
+            denom = max(1e-9, sector_weights.get(sector, 0.0))
+            sector_avg_scores[sector] = float(weighted_sum / denom)
+
+        topic_tilts = {}
+        applied_sector_topics = []
+        for sector, avg_score in sorted(sector_avg_scores.items(), key=lambda x: abs(x[1]), reverse=True):
+            mapped_tickers = normalized_topic_map.get(sector, [])
+            if not mapped_tickers:
+                continue
+
+            direction = "Overweight" if avg_score > 0 else "Underweight"
+            signed_tilt = float(np.clip(avg_score * tilt_scale, -tilt_max_delta, tilt_max_delta))
+            if abs(signed_tilt) <= 1e-12:
+                continue
+
+            print(f"[GLOBALWATCH] {direction} {sector} due to LLM {avg_score:+.2f}")
+            applied_sector_topics.append({
+                'sector': sector,
+                'score': float(avg_score),
+                'tilt': signed_tilt,
+                'tickers': list(mapped_tickers)
+            })
+
+            for ticker in mapped_tickers:
+                if not ticker:
+                    continue
+                ticker_u = str(ticker).upper()
+                topic_tilts[ticker_u] = float(np.clip(topic_tilts.get(ticker_u, 0.0) + signed_tilt, -tilt_max_delta, tilt_max_delta))
+
+        return topic_tilts, applied_sector_topics
 
 
 class PaperTradingEngine:
@@ -702,6 +812,19 @@ class PaperTradingEngine:
         regime_config.setdefault('cash_risk_off', 0.25)
         macro_config = config.setdefault('macro_integration', {})
         macro_config.setdefault('macro_allow_new_positions', ['TLT', 'GLD'])
+        macro_config.setdefault('enable_llm_topic_signals', True)
+        macro_config.setdefault('llm_topic_confidence_threshold', 0.6)
+        macro_config.setdefault('llm_topic_score_threshold', 0.5)
+        macro_config.setdefault('llm_topic_tilt_scale', 0.02)
+        macro_config.setdefault('topic_sector_ticker_map', {
+            'semiconductors': ['NVDA', 'SOXX', 'XLK'],
+            'technology': ['XLK', 'MSFT', 'AAPL'],
+            'utilities': ['NEE', 'DUK'],
+            'energy': ['XOM', 'CVX', 'XLE'],
+            'defense': ['LMT', 'RTX'],
+            'healthcare': ['XLV', 'JNJ', 'MRK'],
+            'financials': ['XLF', 'JPM', 'V']
+        })
         reporting_config = config.setdefault('reporting', {})
         reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
         
@@ -754,6 +877,12 @@ class PaperTradingEngine:
         assert (short_w + medium_w) > 0, "execution.momentum_weights short+medium must be > 0"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
+        macro_cfg = self.config.get('macro_integration', {})
+        assert isinstance(macro_cfg.get('enable_llm_topic_signals', True), bool), "macro_integration.enable_llm_topic_signals must be bool"
+        assert 0.0 <= float(macro_cfg.get('llm_topic_confidence_threshold', 0.6)) <= 1.0, "macro_integration.llm_topic_confidence_threshold must be in [0,1]"
+        assert float(macro_cfg.get('llm_topic_score_threshold', 0.5)) >= 0.0, "macro_integration.llm_topic_score_threshold must be >= 0"
+        assert float(macro_cfg.get('llm_topic_tilt_scale', 0.02)) >= 0.0, "macro_integration.llm_topic_tilt_scale must be >= 0"
+        assert isinstance(macro_cfg.get('topic_sector_ticker_map', {}), dict), "macro_integration.topic_sector_ticker_map must be an object"
         
         print("[OK] Safety checks passed: SIMULATION ONLY mode confirmed")
     
