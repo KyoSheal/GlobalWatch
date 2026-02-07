@@ -674,6 +674,11 @@ class PaperTradingEngine:
         execution_config.setdefault('high_conviction_zscore_threshold', 2.5)
         execution_config.setdefault('high_conviction_lead_threshold', 0.20)
         execution_config.setdefault('high_conviction_cash_surplus_buffer', 0.05)
+        execution_config.setdefault('enable_short_term_momentum', True)
+        execution_config.setdefault('short_momentum_lookback_days', 10)
+        momentum_weights_cfg = execution_config.setdefault('momentum_weights', {})
+        momentum_weights_cfg.setdefault('short', 0.4)
+        momentum_weights_cfg.setdefault('medium', 0.6)
         stale_policy = execution_config.setdefault('price_stale_policy', {})
         stale_policy.setdefault('allow_buy', ['LIVE', 'RECENT'])
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
@@ -710,6 +715,14 @@ class PaperTradingEngine:
         assert float(self.config.get('execution', {}).get('high_conviction_zscore_threshold', 2.5)) > 0, "execution.high_conviction_zscore_threshold must be > 0"
         assert float(self.config.get('execution', {}).get('high_conviction_lead_threshold', 0.20)) >= 0, "execution.high_conviction_lead_threshold must be >= 0"
         assert float(self.config.get('execution', {}).get('high_conviction_cash_surplus_buffer', 0.05)) >= 0, "execution.high_conviction_cash_surplus_buffer must be >= 0"
+        assert isinstance(self.config.get('execution', {}).get('enable_short_term_momentum', True), bool), "execution.enable_short_term_momentum must be bool"
+        assert int(self.config.get('execution', {}).get('short_momentum_lookback_days', 10)) >= 2, "execution.short_momentum_lookback_days must be >= 2"
+        momentum_weights_cfg = self.config.get('execution', {}).get('momentum_weights', {})
+        assert isinstance(momentum_weights_cfg, dict), "execution.momentum_weights must be an object"
+        short_w = float(momentum_weights_cfg.get('short', 0.4))
+        medium_w = float(momentum_weights_cfg.get('medium', 0.6))
+        assert short_w >= 0 and medium_w >= 0, "execution.momentum_weights.short/medium must be >= 0"
+        assert (short_w + medium_w) > 0, "execution.momentum_weights short+medium must be > 0"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         
@@ -1245,37 +1258,74 @@ class PaperTradingEngine:
         self.last_macro_time = now
 
 
-    def _compute_cross_sectional_metrics(self, trade_universe_assets, lookback_days, vol_target, momentum_weight, vol_weight, top_n):
+    def _compute_cross_sectional_metrics(
+        self,
+        trade_universe_assets,
+        lookback_days,
+        vol_target,
+        momentum_weight,
+        vol_weight,
+        top_n,
+        enable_short_term_momentum=False,
+        short_lookback_days=10,
+        momentum_short_weight=0.4,
+        momentum_medium_weight=0.6
+    ):
         """Compute momentum/vol metrics and cross-sectional rank score."""
+        blend_weight_sum = max(1e-12, float(momentum_short_weight) + float(momentum_medium_weight))
+        short_w = float(momentum_short_weight) / blend_weight_sum
+        medium_w = float(momentum_medium_weight) / blend_weight_sum
         metrics = {}
         for asset in trade_universe_assets:
             ticker = str(asset.get('ticker', ''))
             if not ticker or ticker.upper() == 'CASH':
                 continue
 
-            momentum = self.calculate_momentum(ticker, lookback_days)
+            medium_momentum = self.calculate_momentum(ticker, lookback_days)
+            short_momentum = self.calculate_momentum(ticker, short_lookback_days) if enable_short_term_momentum else medium_momentum
+            blended_momentum = (medium_w * medium_momentum) + (short_w * short_momentum)
             volatility = self.calculate_volatility(ticker, lookback_days)
-            base_score = momentum_weight * momentum - vol_weight * (volatility - vol_target)
+            base_score = momentum_weight * blended_momentum - vol_weight * (volatility - vol_target)
             metrics[ticker] = {
-                'momentum': float(momentum),
+                'momentum': float(blended_momentum),
+                'medium_momentum': float(medium_momentum),
+                'short_momentum': float(short_momentum),
                 'volatility': float(max(volatility, 1e-6)),
                 'base_score': float(base_score),
                 'rank_score': 0.0,
-                'momentum_rank_pct': 0.0
+                'momentum_rank_pct': 0.0,
+                'medium_term_z': 0.0,
+                'short_term_z': 0.0,
+                'blended_momentum_z': 0.0
             }
 
         if not metrics:
             return {}, []
 
-        momentums = np.array([v['momentum'] for v in metrics.values()], dtype=float)
-        mu = float(np.mean(momentums))
-        sigma = float(np.std(momentums))
-        ranked_by_momentum = sorted(metrics.items(), key=lambda x: x[1]['momentum'], reverse=True)
-        n = len(ranked_by_momentum)
+        medium_values = np.array([v['medium_momentum'] for v in metrics.values()], dtype=float)
+        short_values = np.array([v['short_momentum'] for v in metrics.values()], dtype=float)
+        med_mu = float(np.mean(medium_values))
+        med_sigma = float(np.std(medium_values))
+        short_mu = float(np.mean(short_values))
+        short_sigma = float(np.std(short_values))
 
-        for rank_idx, (ticker, data) in enumerate(ranked_by_momentum, start=1):
-            z_score = (data['momentum'] - mu) / sigma if sigma > 1e-12 else 0.0
-            data['rank_score'] = float(z_score)
+        for ticker, data in metrics.items():
+            medium_z = (data['medium_momentum'] - med_mu) / med_sigma if med_sigma > 1e-12 else 0.0
+            short_z = (data['short_momentum'] - short_mu) / short_sigma if short_sigma > 1e-12 else 0.0
+            blended_z = (medium_w * medium_z) + (short_w * short_z)
+            if not enable_short_term_momentum:
+                short_z = medium_z
+                blended_z = medium_z
+            data['medium_term_z'] = float(medium_z)
+            data['short_term_z'] = float(short_z)
+            data['blended_momentum_z'] = float(blended_z)
+            data['rank_score'] = float(blended_z)
+            if enable_short_term_momentum:
+                print(f"[MOMENTUM] {ticker}: short={short_z:+.2f}, med={medium_z:+.2f}, blended={blended_z:+.2f}")
+
+        ranked_for_pct = sorted(metrics.items(), key=lambda x: x[1]['rank_score'], reverse=True)
+        n = len(ranked_for_pct)
+        for rank_idx, (ticker, data) in enumerate(ranked_for_pct, start=1):
             data['momentum_rank_pct'] = float((n - rank_idx + 1) / n)
 
         ranked_tickers = sorted(
@@ -1713,6 +1763,11 @@ class PaperTradingEngine:
         corr_lookback_days = int(execution_cfg.get('correlation_lookback_days', 60))
         corr_threshold = float(execution_cfg.get('correlation_threshold', 0.80))
         vol_floor = max(1e-4, float(execution_cfg.get('volatility_floor', 0.08)))
+        enable_short_term_momentum = bool(execution_cfg.get('enable_short_term_momentum', True))
+        short_momentum_lookback_days = int(execution_cfg.get('short_momentum_lookback_days', 10))
+        momentum_weights_cfg = execution_cfg.get('momentum_weights', {}) if isinstance(execution_cfg.get('momentum_weights', {}), dict) else {}
+        momentum_short_weight = float(momentum_weights_cfg.get('short', 0.4))
+        momentum_medium_weight = float(momentum_weights_cfg.get('medium', 0.6))
 
         asset_metrics, top_ranked = self._compute_cross_sectional_metrics(
             trade_universe_assets,
@@ -1720,16 +1775,20 @@ class PaperTradingEngine:
             vol_target,
             momentum_weight,
             vol_weight,
-            top_n
+            top_n,
+            enable_short_term_momentum=enable_short_term_momentum,
+            short_lookback_days=short_momentum_lookback_days,
+            momentum_short_weight=momentum_short_weight,
+            momentum_medium_weight=momentum_medium_weight
         )
 
         print(f"\n[RANKING] Top {len(top_ranked)} assets (cross-sectional):")
-        print(f"{'Ticker':<8} {'Momentum':>10} {'Volatility':>12} {'RankScore':>11} {'BaseScore':>11}")
-        print('-' * 68)
+        print(f"{'Ticker':<8} {'ShortMom':>10} {'MedMom':>10} {'Volatility':>12} {'RankScore':>11} {'BaseScore':>11}")
+        print('-' * 80)
         for ticker in top_ranked:
             m = asset_metrics[ticker]
-            print(f"{ticker:<8} {m['momentum']:>9.2%} {m['volatility']:>11.2%} {m['rank_score']:>10.4f} {m['base_score']:>10.4f}")
-        print('-' * 68)
+            print(f"{ticker:<8} {m['short_momentum']:>9.2%} {m['medium_momentum']:>9.2%} {m['volatility']:>11.2%} {m['rank_score']:>10.4f} {m['base_score']:>10.4f}")
+        print('-' * 80)
 
         corr_selected, corr_decisions, corr_degraded = self._apply_correlation_filter(
             top_ranked,
@@ -1843,6 +1902,12 @@ class PaperTradingEngine:
         alloc_diag['corr_selected'] = list(selected_assets)
         alloc_diag['corr_dropped'] = [d['dropped'] for d in corr_decisions]
         alloc_diag['corr_threshold'] = float(corr_threshold)
+        alloc_diag['enable_short_term_momentum'] = bool(enable_short_term_momentum)
+        alloc_diag['short_momentum_lookback_days'] = int(short_momentum_lookback_days)
+        alloc_diag['momentum_weights'] = {
+            'short': float(momentum_short_weight),
+            'medium': float(momentum_medium_weight)
+        }
         capped_assets = alloc_diag.get('capped_assets', [])
 
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))

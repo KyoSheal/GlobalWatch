@@ -311,6 +311,12 @@
     "volatility_floor": 0.08,
     "min_holding_cycles": 4,
     "allow_high_conviction_override": true,
+    "enable_short_term_momentum": true,
+    "short_momentum_lookback_days": 10,
+    "momentum_weights": {
+      "short": 0.4,
+      "medium": 0.6
+    },
     "price_stale_policy": {
       "allow_buy": ["LIVE", "RECENT"],
       "allow_sell": ["LIVE", "RECENT", "STALE"]
