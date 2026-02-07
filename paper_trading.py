@@ -1,9 +1,4 @@
-﻿"""
-GlobalWatch Paper Trading Module
-鍏ㄨ嚜鍔ㄦ棤浜哄共棰勭殑妯℃嫙浜ゆ槗绯荤粺
-
-鈿狅笍 SIMULATION ONLY - NO REAL BROKER CONNECTION
-"""
+"""Paper trading engine (simulation only)."""
 
 import json
 import os
@@ -15,7 +10,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 import matplotlib
-matplotlib.use('Agg')  # 闈炰氦浜掑紡鍚庣
+matplotlib.use('Agg')  # NOTE: comment omitted (was garbled/non-ASCII).
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -27,11 +22,11 @@ except ImportError:
     CHROMADB_AVAILABLE = False
     print("[WARN] ChromaDB not available - macro integration disabled")
 
-# 璁剧疆鏃犵紦鍐茶緭鍑猴紝瑙ｅ喅 Windows Terminal 寤惰繜闂
+# NOTE: comment omitted (was garbled/non-ASCII).
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# 瀹夊叏妫€鏌ワ細纭繚涓嶄細杩炴帴鐪熷疄 broker
+# NOTE: comment omitted (was garbled/non-ASCII).
 REAL_BROKER_KEYWORDS = ['alpaca', 'interactive_brokers', 'ib_insync', 'robinhood', 'td_ameritrade']
 for keyword in REAL_BROKER_KEYWORDS:
     try:
@@ -42,10 +37,10 @@ for keyword in REAL_BROKER_KEYWORDS:
 
 
 class MacroSignalAdapter:
-    """瀹忚淇"彿閫傞厤鍣?- 杩炴帴 GlobalWatch ChromaDB"""
+    """class MacroSignalAdapter: docstring omitted (was garbled/non-ASCII)."""
     
     def __init__(self, config):
-        """鍒濆鍖栧畯瑙備俊鍙烽€傞厤鍣?"""
+        """def __init__: docstring omitted (was garbled/non-ASCII)."""
         self.config = config
         self.macro_config = config.get('macro_integration', {})
         self.enabled = self.macro_config.get('enabled', False) and CHROMADB_AVAILABLE
@@ -73,7 +68,7 @@ class MacroSignalAdapter:
             self.enabled = False
 
     def _extract_source_key(self, metadata):
-        """鎻愬彇淇"彿鏉ユ簮閿紙source/publisher/channel 绛夊瓧娈碉級銆?"""
+        """def _extract_source_key: docstring omitted (was garbled/non-ASCII)."""
         source = (
             metadata.get('source')
             or metadata.get('source_name')
@@ -85,7 +80,7 @@ class MacroSignalAdapter:
         return str(source).strip().lower()
 
     def _to_float_optional(self, value):
-        """灏嗗彲閫夋暟鍊煎瓧娈靛畨鍏ㄨ浆鎹负 float锛堝け璐ヨ繑鍥?None锛夈€?"""
+        """def _to_float_optional: docstring omitted (was garbled/non-ASCII)."""
         if value is None:
             return None
         try:
@@ -94,7 +89,7 @@ class MacroSignalAdapter:
             return None
 
     def _parse_correct_flag(self, value):
-        """瑙ｆ瀽 correct_* 瀛楁涓?[0,1] 鍖洪棿銆?"""
+        """def _parse_correct_flag: docstring omitted (was garbled/non-ASCII)."""
         if value is None:
             return None
 
@@ -118,7 +113,7 @@ class MacroSignalAdapter:
         return None
 
     def _append_rolling_accuracy(self, history_map, key, correct_value):
-        """鍚?rolling accuracy 搴忓垪杩藉姞鏍锋湰骞朵繚鐣欏浐瀹氱獥鍙ｃ€?"""
+        """def _append_rolling_accuracy: docstring omitted (was garbled/non-ASCII)."""
         if correct_value is None:
             return
 
@@ -129,7 +124,7 @@ class MacroSignalAdapter:
             del values[:-self.quality_window]
 
     def _update_quality_calibration(self, signals):
-        """璇诲彇 VERIFIED/correct_* 鍥炲～瀛楁骞舵洿鏂?theme/source 鐨?accuracy銆?"""
+        """def _update_quality_calibration: docstring omitted (was garbled/non-ASCII)."""
         summary = {
             'verified_count': 0,
             'with_correct_1d': 0,
@@ -174,7 +169,7 @@ class MacroSignalAdapter:
         return summary
 
     def _get_accuracy_factor(self, theme, source):
-        """杩斿洖 accuracy_factor 浠ュ強閲囩敤鐨?rolling accuracy 淇℃伅銆?"""
+        """def _get_accuracy_factor: docstring omitted (was garbled/non-ASCII)."""
         theme_key = str(theme or 'unknown').strip().lower()
         source_key = str(source or 'unknown').strip().lower()
 
@@ -192,12 +187,12 @@ class MacroSignalAdapter:
         return accuracy_factor, acc, scope
     
     def fetch_recent_signals(self, n=50):
-        """鑾峰彇鏈€杩戠殑 N 鏉′俊鍙凤紙浠?PENDING 鎴?VERIFIED锛?"""
+        """def fetch_recent_signals: docstring omitted (was garbled/non-ASCII)."""
         if not self.enabled:
             return []
         
         try:
-            # 鑾峰彇鎵€鏈変俊鍙?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             results = self.signals_collection.get(
                 include=['metadatas', 'documents']
             )
@@ -206,7 +201,7 @@ class MacroSignalAdapter:
                 print("[MACRO] No signals found in database")
                 return []
             
-            # 杩囨护鐘舵€佸苟鎸夋椂闂存帓搴?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             signals = []
             for i, metadata in enumerate(results['metadatas']):
                 status = metadata.get('status', 'UNKNOWN')
@@ -218,10 +213,10 @@ class MacroSignalAdapter:
                         'document': results['documents'][i] if i < len(results['documents']) else ''
                     })
             
-            # 鎸夋椂闂存埑鎺掑簭锛堟渶鏂扮殑鍦ㄥ墠锛?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             signals.sort(key=lambda x: x['metadata'].get('timestamp', ''), reverse=True)
             
-            # 鍙栨渶杩?N 鏉?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             recent_signals = signals[:n]
             
             print(f"[MACRO] Fetched {len(recent_signals)} recent signals (from {len(signals)} valid)")
@@ -233,16 +228,16 @@ class MacroSignalAdapter:
             return []
     
     def compute_signal_weight(self, signal_timestamp):
-        """璁＄畻淇"彿鏉冮噸锛堝熀浜庢椂闂磋“鍑忥級"""
+        """def compute_signal_weight: docstring omitted (was garbled/non-ASCII)."""
         try:
-            # 瑙ｆ瀽鏃堕棿鎴?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             signal_time = datetime.fromisoformat(signal_timestamp.replace('Z', '+00:00'))
             now = datetime.now(signal_time.tzinfo) if signal_time.tzinfo else datetime.now()
             
-            # 璁＄畻骞撮緞锛堝皬鏃讹級
+            # NOTE: comment omitted (was garbled/non-ASCII).
             age_hours = (now - signal_time).total_seconds() / 3600
             
-            # 鎸囨暟琛板噺锛歸 = exp(-lambda * age_hours)
+            # NOTE: comment omitted (was garbled/non-ASCII).
             decay_lambda = self.macro_config.get('decay_lambda_per_hour', 0.15)
             weight = np.exp(-decay_lambda * age_hours)
             
@@ -253,45 +248,30 @@ class MacroSignalAdapter:
             return 0.0, 0.0
     
     def analyze_signals(self):
-        """鍒嗘瀽瀹忚淇"彿骞惰緭鍑?macro_risk_score + tilts
-        
-        涓ユ牸鐨?k-of-n 纭鏈哄埗锛?
-        A1) 鍙繚鐣?signal_max_age_hours 鍐呯殑淇"彿
-        A2) 姣忎釜 theme 鍙栨渶杩?n 鏉★紝缁熻 bullish/bearish 鏁伴噺锛?= k 鎵嶇‘璁?
-        A3) 鏃堕棿琛板噺浠呯敤浜庡己搴﹁绠楋紝涓嶇敤浜庣‘璁?
-        A4) 杩斿洖澧炲己鐨?confirmed_topics 缁撴瀯
-        A5) macro_risk_score 鍙敱纭涓婚璐＄尞锛宺isk_off 绫诲姞鍒嗭紝risk_on 绫诲彲鎶垫秷
-        A6) 璇︾粏璋冭瘯鏃ュ織
-        
-        Returns:
-            macro_risk_score: 0-10锛岃秺澶ц秺 risk-off
-            confirmed_topics: List[{theme, direction, strength, confidence_effective, top_sources, newest_timestamp}]
-            macro_tilts: {ticker: tilt_delta}
-            signal_summary: 淇"彿缁熻鎽樿
-        """
+        """def analyze_signals: docstring omitted (was garbled/non-ASCII)."""
         if not self.enabled:
             return 0.0, [], {}, {}
         
         print(f"\n[MACRO] Analyzing macro signals from GlobalWatch...")
         
-        # 鑾峰彇鎵€鏈変俊鍙?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         all_signals = self.fetch_recent_signals(n=200)
         
         if not all_signals:
             print("[MACRO] No signals to analyze")
             return 0.0, [], {}, {}
 
-        # 鍏堟洿鏂板熀浜?VERIFIED/correct_* 鐨勮川閲忔牎鍑?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         quality_summary = self._update_quality_calibration(all_signals)
         
-        # A1) 閰嶇疆鍙傛暟
+        # NOTE: comment omitted (was garbled/non-ASCII).
         confirm_k, confirm_n = self.macro_config.get('confirm_k_of_n', [2, 3])
         signal_max_age_hours = self.macro_config.get('signal_max_age_hours', 48)
         decay_lambda = self.macro_config.get('decay_lambda_per_hour', 0.15)
         
         now = datetime.now()
         
-        # A1) 杩囨护锛氬彧淇濈暀 signal_max_age_hours 鍐呯殑淇"彿
+        # NOTE: comment omitted (was garbled/non-ASCII).
         valid_signals = []
         for signal in all_signals:
             metadata = signal['metadata']
@@ -299,7 +279,7 @@ class MacroSignalAdapter:
             
             try:
                 signal_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                # 缁熶竴鏃跺尯
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 if signal_time.tzinfo:
                     now_aware = datetime.now(signal_time.tzinfo)
                 else:
@@ -309,7 +289,7 @@ class MacroSignalAdapter:
                 age_hours = (now_aware - signal_time).total_seconds() / 3600
                 
                 if age_hours > signal_max_age_hours:
-                    continue  # 瓒呰繃绐楀彛锛屼涪寮?
+                    continue  # NOTE: comment omitted (was garbled/non-ASCII).
                 
                 valid_signals.append({
                     'metadata': metadata,
@@ -324,7 +304,7 @@ class MacroSignalAdapter:
                 })
                 
             except Exception as e:
-                # 鏃犳晥鏃堕棿鎴筹紝璺宠繃
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 continue
         
         print(f"[MACRO] Filtered {len(valid_signals)}/{len(all_signals)} signals within {signal_max_age_hours}h window")
@@ -333,7 +313,7 @@ class MacroSignalAdapter:
             print("[MACRO] No valid signals after age filtering")
             return 0.0, [], {}, {}
         
-        # A2) 鎸変富棰樺垎缁?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         theme_groups = {}
         for sig in valid_signals:
             theme = sig['metadata'].get('theme', 'unknown')
@@ -341,12 +321,12 @@ class MacroSignalAdapter:
                 theme_groups[theme] = []
             theme_groups[theme].append(sig)
         
-        # A2) 姣忎釜涓婚锛氭寜鏃堕棿鎺掑簭锛屽彇鏈€杩?n 鏉?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         for theme in theme_groups:
             theme_groups[theme].sort(key=lambda x: x['timestamp'], reverse=True)
             theme_groups[theme] = theme_groups[theme][:confirm_n]
         
-        # A2) 纭鏈哄埗锛氱粺璁?bullish/bearish 鏁伴噺
+        # NOTE: comment omitted (was garbled/non-ASCII).
         confirmed_topics = []
         
         print(f"\n[MACRO] Theme Confirmation (k={confirm_k}, n={confirm_n}, max_age={signal_max_age_hours}h):")
@@ -406,7 +386,7 @@ class MacroSignalAdapter:
                 else:
                     neutral_count += 1
             
-            # A2) 纭閫昏緫锛歜ullish_count >= k 鎴?bearish_count >= k
+            # NOTE: comment omitted (was garbled/non-ASCII).
             confirmed_direction = None
             confirmed_items = []
             
@@ -419,7 +399,7 @@ class MacroSignalAdapter:
                 confirmed_items = bearish_items
                 status = f"[OK] BEARISH ({bearish_count}/{len(signals_list)})"
             else:
-                # 鏈‘璁?
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 max_count = max(bullish_count, bearish_count)
                 needed = confirm_k - max_count
                 if needed > 0:
@@ -429,7 +409,7 @@ class MacroSignalAdapter:
             
             print(f"{theme:<20} {bullish_count:>5} {bearish_count:>5} {neutral_count:>5} {status:<20}")
             
-            # A3) 纭鍚庢墠璁＄畻寮哄害锛堟椂闂磋“鍑忥級
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if confirmed_direction:
                 strength = 0.0
                 confidence_raw_sum = 0.0
@@ -447,16 +427,16 @@ class MacroSignalAdapter:
                 confidence_effective = confidence_effective_sum / len(confirmed_items) if confirmed_items else 0.0
                 accuracy_factor_avg = accuracy_factor_sum / len(confirmed_items) if confirmed_items else 1.0
                 
-                # 鎻愬彇 top sources锛堟渶澶?鏉★級
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 top_sources = []
                 for item in confirmed_items[:3]:
                     doc_preview = item['document'][:100] if item['document'] else 'N/A'
                     top_sources.append(doc_preview)
                 
-                # 鏈€鏂版椂闂存埑
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 newest_timestamp = confirmed_items[0]['timestamp'] if confirmed_items else ''
                 
-                # A4) 澧炲己鐨?confirmed_topics 缁撴瀯
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 confirmed_topics.append({
                     'theme': theme,
                     'direction': confirmed_direction,
@@ -469,7 +449,7 @@ class MacroSignalAdapter:
                     'count': len(confirmed_items)
                 })
                 
-                # A6) 璋冭瘯鏃ュ織
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 print(f"  [DEBUG] {theme}: direction={confirmed_direction}, "
                       f"count={bullish_count if confirmed_direction=='bullish' else bearish_count}/"
                       f"{bearish_count if confirmed_direction=='bullish' else bullish_count}, "
@@ -479,7 +459,7 @@ class MacroSignalAdapter:
         
         print("-" * 70)
         
-        # A5) macro_risk_score 璁＄畻锛氬彧鐢辩‘璁や富棰樿础鐚?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         risk_off_themes = ['risk_off', 'recession', 'rates_up', 'credit_stress', 'inflation_risk', 
                            'geopolitical_risk', 'market_crash', 'volatility_spike']
         risk_on_themes = ['risk_on', 'soft_landing', 'growth_acceleration', 'dovish_fed', 
@@ -492,34 +472,34 @@ class MacroSignalAdapter:
             strength = topic['strength']
             direction = topic['direction']
             
-            # risk_off 绫讳富棰?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             is_risk_off = any(keyword in theme_lower for keyword in risk_off_themes)
-            # risk_on 绫讳富棰?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             is_risk_on = any(keyword in theme_lower for keyword in risk_on_themes)
             
             if is_risk_off:
                 if direction == 'bearish':
-                    # risk_off 涓婚鐪嬭穼 鈫?澧炲姞椋庨櫓鍒嗘暟
-                    risk_score += min(strength * 2.0, 3.0)  # 鍗曚富棰樻渶澶氳础鐚?3 鍒?
+                    # NOTE: comment omitted (was garbled/non-ASCII).
+                    risk_score += min(strength * 2.0, 3.0)  # NOTE: comment omitted (was garbled/non-ASCII).
                 elif direction == 'bullish':
-                    # risk_off 涓婚鐪嬫定 鈫?涔熷鍔犻闄╋紙渚嬪"閫氳儉椋庨櫓鐪嬫定"锛?
+                    # NOTE: comment omitted (was garbled/non-ASCII).
                     risk_score += min(strength * 1.5, 2.5)
             
             elif is_risk_on:
                 if direction == 'bullish':
-                    # risk_on 涓婚鐪嬫定 鈫?鎶垫秷椋庨櫓鍒嗘暟
+                    # NOTE: comment omitted (was garbled/non-ASCII).
                     risk_score -= min(strength * 1.0, 2.0)
                 elif direction == 'bearish':
-                    # risk_on 涓婚鐪嬭穼 鈫?澧炲姞椋庨櫓
+                    # NOTE: comment omitted (was garbled/non-ASCII).
                     risk_score += min(strength * 1.0, 2.0)
         
-        # Clip 鍒?[0, 10]
+        # NOTE: comment omitted (was garbled/non-ASCII).
         risk_score = max(0.0, min(risk_score, 10.0))
         
         print(f"\n[MACRO] Risk Score: {risk_score:.1f}/10.0 (from {len(confirmed_topics)} confirmed topics)")
         print(f"[MACRO] Confirmed Topics: {len(confirmed_topics)}")
         
-        # 鐢熸垚 macro_tilts锛堝熀浜?macro_mapping锛?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         macro_tilts = self._generate_tilts(confirmed_topics)
         
         if macro_tilts:
@@ -527,7 +507,7 @@ class MacroSignalAdapter:
             for ticker, tilt in macro_tilts.items():
                 print(f"  {ticker}: {tilt:+.2%}")
         
-        # 淇"彿鎽樿
+        # NOTE: comment omitted (was garbled/non-ASCII).
         signal_summary = {
             'total_signals_fetched': len(all_signals),
             'valid_signals_in_window': len(valid_signals),
@@ -545,7 +525,7 @@ class MacroSignalAdapter:
         return risk_score, confirmed_topics, macro_tilts, signal_summary
     
     def _generate_tilts(self, confirmed_topics):
-        """鏍规嵁纭鐨勪富棰樼敓鎴愯祫浜у€炬枩"""
+        """def _generate_tilts: docstring omitted (was garbled/non-ASCII)."""
         macro_mapping = self.config.get('macro_mapping', {})
         tilt_max_delta = self.macro_config.get('tilt_max_delta', 0.02)
         
@@ -555,46 +535,46 @@ class MacroSignalAdapter:
             theme = topic['theme'].lower()
             direction = topic['direction']
             
-            # 鏌ユ壘鍖归厤鐨勬槧灏勮鍒?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             for rule_name, rule_config in macro_mapping.items():
-                # 绠€鍗曞尮閰嶏細涓婚鍚嶅寘鍚鍒欏悕
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 if rule_name.lower() in theme or theme in rule_name.lower():
                     
-                    # 搴旂敤鍊炬枩瑙勫垯
+                    # NOTE: comment omitted (was garbled/non-ASCII).
                     if 'tilt' in rule_config:
                         for ticker, tilt_value in rule_config['tilt'].items():
-                            # 鏍规嵁鏂瑰悜璋冩暣鍊炬枩
+                            # NOTE: comment omitted (was garbled/non-ASCII).
                             if direction == 'bearish':
-                                tilt_value = -abs(tilt_value)  # 鍙嶅悜鍊炬枩
+                                tilt_value = -abs(tilt_value)  # NOTE: comment omitted (was garbled/non-ASCII).
                             
-                            # 绱姞鍊炬枩锛堜絾涓嶈秴杩囦笂闄愶級
+                            # NOTE: comment omitted (was garbled/non-ASCII).
                             current_tilt = tilts.get(ticker, 0.0)
                             new_tilt = current_tilt + tilt_value
                             
-                            # 闄愬埗鍦?[-tilt_max_delta, +tilt_max_delta]
+                            # NOTE: comment omitted (was garbled/non-ASCII).
                             tilts[ticker] = max(-tilt_max_delta, min(new_tilt, tilt_max_delta))
         
         return tilts
 
 
 class PaperTradingEngine:
-    """妯℃嫙浜ゆ槗寮曟搸"""
+    """class PaperTradingEngine: docstring omitted (was garbled/non-ASCII)."""
     
     def __init__(self, config_path='paper_config.json'):
-        """鍒濆鍖?"""
+        """def __init__: docstring omitted (was garbled/non-ASCII)."""
         self.config = self.load_config(config_path)
         self.validate_config()
         
-        # 鍒濆鍖栫姸鎬?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.cash = self.config['initial_cash_usd']
         self.initial_cash = self.cash
         self.positions = {}  # {ticker: quantity}
-        self.cost_basis = {}  # {ticker: average_cost} 杩借釜鎴愭湰鍩虹
+        self.cost_basis = {}  # NOTE: comment omitted (was garbled/non-ASCII).
         self.equity_curve = []  # [(timestamp, equity, cash, positions_value)]
-        self.trades_log = []  # 浜ゆ槗璁板綍
-        self.portfolio_snapshots = []  # 缁勫悎蹇収
+        self.trades_log = []  # NOTE: comment omitted (was garbled/non-ASCII).
+        self.portfolio_snapshots = []  # NOTE: comment omitted (was garbled/non-ASCII).
         
-        # 杩愯鐘舵€?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.start_time = None
         self.end_time = None
         self.current_cycle = 0
@@ -606,27 +586,27 @@ class PaperTradingEngine:
         self.current_stale_info = {}
         self.current_turnover_info = {}
         self.current_holding_blocks = []
-        self.forced_until_time = None  # risk_off_forced 缁撴潫鏃堕棿
+        self.forced_until_time = None  # NOTE: comment omitted (was garbled/non-ASCII).
         self.forced_regime_reason = ""
         self.scoreboard_history = []  # 2w scoreboard records
         self.last_diagnostic_hint = ""
         self.current_weights_reused = False
         self.current_macro_reused = False
         
-        # E1) 瀹忚淇"彿骞虫粦
-        self.macro_risk_score_history = []  # 淇濆瓨鏈€杩?N 娆＄殑 risk_score
+        # NOTE: comment omitted (was garbled/non-ASCII).
+        self.macro_risk_score_history = []  # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_smoothing_window = self.config.get('macro_integration', {}).get('smoothing_window', 3)
         self.macro_smoothing_method = self.config.get('macro_integration', {}).get('smoothing_method', 'median')  # 'median' or 'ewma'
         self.macro_ewma_alpha = self.config.get('macro_integration', {}).get('ewma_alpha', 0.4)
         
-        # E2) 瀹忚鍔ㄤ綔鍐峰嵈
-        self.last_macro_cash_target = self.config['objectives']['min_cash_pct']  # 涓婃鐨勭幇閲戠洰鏍?
+        # NOTE: comment omitted (was garbled/non-ASCII).
+        self.last_macro_cash_target = self.config['objectives']['min_cash_pct']  # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_cooldown_cycles = self.config.get('macro_integration', {}).get('cooldown_cycles', 2)
-        self.macro_cooldown_remaining = 0  # 鍓╀綑鍐峰嵈鍛ㄦ湡鏁?
+        self.macro_cooldown_remaining = 0  # NOTE: comment omitted (was garbled/non-ASCII).
         
-        # 浠锋牸缂撳瓨锛堥伩鍏嶉噸澶嶈姹傦級
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.price_cache = {}  # {ticker: (price, timestamp)}
-        self.price_cache_duration = 60  # 缂撳瓨60绉?
+        self.price_cache_duration = 60  # NOTE: comment omitted (was garbled/non-ASCII).
 
         # Signal/Macro refresh decoupling state
         execution_config = self.config.get('execution', {})
@@ -646,20 +626,20 @@ class PaperTradingEngine:
             'signal_summary': {}
         }
         
-        # 瀹忚淇"彿閫傞厤鍣?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_adapter = MacroSignalAdapter(self.config)
         
-        # 灏濊瘯鎭㈠涔嬪墠鐨勭姸鎬?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.resume_from_checkpoint()
         self.rebuild_position_entry_cycles()
         
-        # 鍒涘缓杈撳嚭鐩綍
+        # NOTE: comment omitted (was garbled/non-ASCII).
         os.makedirs('outputs', exist_ok=True)
 
-        # 鍔犺浇 scoreboard 鍘嗗彶锛堢敤浜庤繛缁獥鍙ｈ瘖鏂級
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.load_scoreboard_history()
         
-        # 璁剧疆闅忔満绉嶅瓙锛堢‘淇濆彲澶嶇幇锛?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         np.random.seed(self.config['safety']['random_seed'])
         
         print("[OK] Paper Trading Engine initialized")
@@ -669,7 +649,7 @@ class PaperTradingEngine:
         print(f"   Universe: {len(self.config['universe'])} assets")
     
     def load_config(self, config_path):
-        """鍔犺浇閰嶇疆鏂囦欢"""
+        """def load_config: docstring omitted (was garbled/non-ASCII)."""
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
         
@@ -690,9 +670,17 @@ class PaperTradingEngine:
         execution_config.setdefault('correlation_threshold', 0.80)
         execution_config.setdefault('volatility_floor', 0.08)
         execution_config.setdefault('min_holding_cycles', 4)
+        execution_config.setdefault('allow_high_conviction_override', True)
+        execution_config.setdefault('high_conviction_zscore_threshold', 2.5)
+        execution_config.setdefault('high_conviction_lead_threshold', 0.20)
+        execution_config.setdefault('high_conviction_cash_surplus_buffer', 0.05)
         stale_policy = execution_config.setdefault('price_stale_policy', {})
         stale_policy.setdefault('allow_buy', ['LIVE', 'RECENT'])
         stale_policy.setdefault('allow_sell', ['LIVE', 'RECENT', 'STALE'])
+        regime_config = config.setdefault('regime_filter', {})
+        regime_config.setdefault('cash_risk_on', 0.10)
+        regime_config.setdefault('cash_neutral', 0.15)
+        regime_config.setdefault('cash_risk_off', 0.25)
         macro_config = config.setdefault('macro_integration', {})
         macro_config.setdefault('macro_allow_new_positions', ['TLT', 'GLD'])
         reporting_config = config.setdefault('reporting', {})
@@ -701,7 +689,7 @@ class PaperTradingEngine:
         return config
     
     def validate_config(self):
-        """楠岃瘉閰嶇疆"""
+        """def validate_config: docstring omitted (was garbled/non-ASCII)."""
         assert self.config['paper_mode'] == True, "paper_mode must be True"
         assert self.config['safety']['no_real_broker'] == True, "no_real_broker must be True"
         assert self.config['safety']['simulation_only'] == True, "simulation_only must be True"
@@ -718,17 +706,21 @@ class PaperTradingEngine:
         assert 0.0 <= corr_threshold <= 1.0, "execution.correlation_threshold must be in [0,1]"
         assert float(self.config.get('execution', {}).get('volatility_floor', 0.08)) > 0, "execution.volatility_floor must be > 0"
         assert int(self.config.get('execution', {}).get('min_holding_cycles', 4)) >= 0, "execution.min_holding_cycles must be >= 0"
+        assert isinstance(self.config.get('execution', {}).get('allow_high_conviction_override', True), bool), "execution.allow_high_conviction_override must be bool"
+        assert float(self.config.get('execution', {}).get('high_conviction_zscore_threshold', 2.5)) > 0, "execution.high_conviction_zscore_threshold must be > 0"
+        assert float(self.config.get('execution', {}).get('high_conviction_lead_threshold', 0.20)) >= 0, "execution.high_conviction_lead_threshold must be >= 0"
+        assert float(self.config.get('execution', {}).get('high_conviction_cash_surplus_buffer', 0.05)) >= 0, "execution.high_conviction_cash_surplus_buffer must be >= 0"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         
         print("[OK] Safety checks passed: SIMULATION ONLY mode confirmed")
     
     def resume_from_checkpoint(self):
-        """浠庢鏌ョ偣鎭㈠涔嬪墠鐨勮繍琛岀姸鎬?"""
+        """def resume_from_checkpoint: docstring omitted (was garbled/non-ASCII)."""
         snapshots_path = self.config['reporting']['portfolio_snapshots_path']
         trades_path = self.config['reporting']['trades_log_path']
         
-        # 妫€鏌ユ槸鍚﹀瓨鍦ㄦ鏌ョ偣鏂囦欢
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if not os.path.exists(snapshots_path):
             print("[INFO] No checkpoint found - starting fresh")
             return
@@ -738,31 +730,31 @@ class PaperTradingEngine:
             print("[CHECKPOINT] Detected - attempting to resume")
             print("="*60)
             
-            # 1. 璇诲彇蹇収鏂囦欢
+            # NOTE: comment omitted (was garbled/non-ASCII).
             with open(snapshots_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
                 if not lines:
                     print("[WARN] Checkpoint file is empty - starting fresh")
                     return
                 
-                # 鍔犺浇鎵€鏈夊揩鐓?
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 for line in lines:
                     snapshot = json.loads(line.strip())
                     self.portfolio_snapshots.append(snapshot)
             
-            # 2. 鎭㈠鏈€鍚庣殑鐘舵€?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             last_snapshot = self.portfolio_snapshots[-1]
             
             self.cash = last_snapshot['cash']
-            self.current_cycle = last_snapshot['cycle'] + 1  # 缁х画涓嬩竴涓懆鏈?
+            self.current_cycle = last_snapshot['cycle'] + 1  # NOTE: comment omitted (was garbled/non-ASCII).
             self.status = "RESUMED"
             
-            # 鎭㈠鎸佷粨
+            # NOTE: comment omitted (was garbled/non-ASCII).
             self.positions = {}
             for ticker, pos in last_snapshot['positions'].items():
                 self.positions[ticker] = pos['quantity']
             
-            # 鎭㈠鏉冪泭鏇茬嚎
+            # NOTE: comment omitted (was garbled/non-ASCII).
             for snapshot in self.portfolio_snapshots:
                 timestamp = datetime.fromisoformat(snapshot['timestamp'])
                 self.equity_curve.append((
@@ -772,18 +764,18 @@ class PaperTradingEngine:
                     snapshot['positions_value']
                 ))
             
-            # 鏇存柊宄板€兼潈鐩?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             self.peak_equity = max(s['total_equity'] for s in self.portfolio_snapshots)
             
-            # 3. 璇诲彇浜ゆ槗璁板綍
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if os.path.exists(trades_path):
                 trades_df = pd.read_csv(trades_path)
                 self.trades_log = trades_df.to_dict('records')
                 
-                # 浠庝氦鏄撹褰曢噸寤烘垚鏈熀纭€
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 self.rebuild_cost_basis()
             
-            # 4. 鏄剧ず鎭㈠淇℃伅
+            # NOTE: comment omitted (was garbled/non-ASCII).
             print(f"[OK] Successfully resumed from checkpoint")
             print(f"   Last cycle: {last_snapshot['cycle']}")
             print(f"   Last update: {last_snapshot['timestamp']}")
@@ -794,7 +786,7 @@ class PaperTradingEngine:
             print(f"   Historical snapshots: {len(self.portfolio_snapshots)}")
             print(f"   Historical trades: {len(self.trades_log)}")
             
-            # 鏄剧ず褰撳墠鎸佷粨
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if self.positions:
                 print(f"\n   Current Holdings:")
                 for ticker, qty in sorted(self.positions.items()):
@@ -803,7 +795,7 @@ class PaperTradingEngine:
             
             print("="*60 + "\n")
             
-            # 璇㈤棶鐢ㄦ埛鏄惁缁х画
+            # NOTE: comment omitted (was garbled/non-ASCII).
             response = self.prompt_checkpoint_choice()
             if response == 'n':
                 print("Starting fresh as requested...")
@@ -812,14 +804,14 @@ class PaperTradingEngine:
             print("Resuming from checkpoint as requested...")
             
         except RuntimeError:
-            # 闈炰氦浜掔幆澧冩垨鐢ㄦ埛鏈槑纭€夋嫨锛岀洿鎺ヤ腑姝紝閬垮厤闈欓粯鍦颁粠澶村紑濮?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             raise
         except Exception as e:
             print(f"[WARN] Failed to resume from checkpoint: {e}")
             print("   Starting fresh...")
 
     def prompt_checkpoint_choice(self):
-        """蹇呴』寰楀埌鏄庣‘鐨?y/n 杈撳叆锛岄伩鍏嶈瑙︿粠澶村紑濮嬨€?"""
+        """def prompt_checkpoint_choice: docstring omitted (was garbled/non-ASCII)."""
         env_choice = os.environ.get('GW_CHECKPOINT_ACTION', '').strip().lower()
         if env_choice in ('y', 'yes', 'resume', 'continue'):
             return 'y'
@@ -844,7 +836,7 @@ class PaperTradingEngine:
             print("Please type 'y' to resume or 'n' to start fresh.")
 
     def load_scoreboard_history(self):
-        """鍔犺浇宸叉湁 scoreboard 鍘嗗彶锛屼究浜庤繛缁獥鍙ｈ瘖鏂€?"""
+        """def load_scoreboard_history: docstring omitted (was garbled/non-ASCII)."""
         scoreboard_path = self.config.get('reporting', {}).get('scoreboard_path', 'outputs/scoreboard.jsonl')
         self.scoreboard_history = []
         self.last_diagnostic_hint = ""
@@ -872,7 +864,7 @@ class PaperTradingEngine:
             self.last_diagnostic_hint = ""
 
     def append_scoreboard_record(self):
-        """鍦ㄦ瘡娆?snapshot 鍚庡啓鍏ヤ竴鏉?2w scoreboard 璁板綍銆?"""
+        """def append_scoreboard_record: docstring omitted (was garbled/non-ASCII)."""
         if not self.portfolio_snapshots:
             return None
 
@@ -944,7 +936,7 @@ class PaperTradingEngine:
         return record
     
     def rebuild_cost_basis(self):
-        """浠庝氦鏄撹褰曢噸寤烘垚鏈熀纭€"""
+        """def rebuild_cost_basis: docstring omitted (was garbled/non-ASCII)."""
         self.cost_basis = {}
         position_qty = {}
         
@@ -958,7 +950,7 @@ class PaperTradingEngine:
                 old_qty = position_qty.get(ticker, 0)
                 old_cost = self.cost_basis.get(ticker, 0)
                 
-                # 鍔犳潈骞冲潎鎴愭湰
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 if old_qty > 0:
                     total_cost = (old_qty * old_cost) + (qty * price)
                     position_qty[ticker] = old_qty + qty
@@ -1048,7 +1040,7 @@ class PaperTradingEngine:
         return t
 
     def get_market_data(self, ticker, period='1mo', interval='1d'):
-        """鑾峰彇甯傚満鏁版嵁"""
+        """def get_market_data: docstring omitted (was garbled/non-ASCII)."""
         try:
             if ticker == 'CASH':
                 return None
@@ -1067,16 +1059,7 @@ class PaperTradingEngine:
             return None
 
     def get_current_price(self, ticker):
-        """鑾峰彇褰撳墠浠锋牸锛堝疄鏃舵垨鏈€鏂帮級
-        
-        B1) 杩斿洖涓夊厓缁勶細(price, data_age_minutes, market_status)
-        - market_status 鈭?{"LIVE", "RECENT", "STALE"}
-        - data_age_minutes: 鏁版嵁鏃堕棿鎴充笌 now 鐨勫垎閽熷樊
-        - 鑻ユ棤娉曡幏鍙栨椂闂存埑锛宮arket_status = "STALE", data_age_minutes = 99999
-        
-        Returns:
-            (price, data_age_minutes, market_status) or (None, 99999, "STALE")
-        """
+        """def get_current_price: docstring omitted (was garbled/non-ASCII)."""
         if ticker == 'CASH':
             return (1.0, 0, "LIVE")
         
@@ -1084,11 +1067,11 @@ class PaperTradingEngine:
             import pytz
             now_et = datetime.now(pytz.timezone('US/Eastern'))
             
-            # 鍒涘缓鏂扮殑 Ticker 瀵硅薄锛岄伩鍏嶇紦瀛?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             market_ticker = self._normalize_market_ticker(ticker)
             t = yf.Ticker(market_ticker)
             
-            # 鏂规硶1: 灏濊瘯鑾峰彇鏈€鏂扮殑鍒嗛挓绾ф暟鎹紙5m 闂撮殧锛?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             try:
                 hist = t.history(period='1d', interval='5m')
                 if not hist.empty:
@@ -1108,7 +1091,7 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[PRICE] {ticker}: 5m history failed - {e}")
             
-            # 鏂规硶2: 灏濊瘯 1m 闂撮殧
+            # NOTE: comment omitted (was garbled/non-ASCII).
             try:
                 hist = t.history(period='1d', interval='1m')
                 if not hist.empty:
@@ -1128,7 +1111,7 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[PRICE] {ticker}: 1m history failed - {e}")
             
-            # 鏂规硶3: 灏濊瘯 info锛堟棤鏃堕棿鎴筹紝瑙嗕负 STALE锛?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             try:
                 info = t.info
                 for price_field in ['currentPrice', 'regularMarketPrice', 'ask', 'bid']:
@@ -1140,13 +1123,13 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[PRICE] {ticker}: info failed - {e}")
             
-            # 鏂规硶4: 闄嶇骇鍒版棩绾挎暟鎹紙瑙嗕负 STALE锛?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             try:
                 hist = t.history(period='5d', interval='1d')
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
                     date = hist.index[-1]
-                    # 璁＄畻鏃ョ嚎鏁版嵁鐨勫勾榫?
+                    # NOTE: comment omitted (was garbled/non-ASCII).
                     data_age_minutes = (now_et - date).total_seconds() / 60
                     print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {date.strftime('%Y-%m-%d')}, {data_age_minutes:.0f}min ago) STALE")
                     return (price, data_age_minutes, "STALE")
@@ -1159,7 +1142,7 @@ class PaperTradingEngine:
         return (None, 99999, "STALE")
     
     def calculate_momentum(self, ticker, lookback_days=20):
-        """璁＄畻鍔ㄩ噺鎸囨爣"""
+        """def calculate_momentum: docstring omitted (was garbled/non-ASCII)."""
         try:
             hist = self.get_market_data(ticker, period='3mo', interval='1d')
             if hist is None or len(hist) < lookback_days:
@@ -1171,7 +1154,7 @@ class PaperTradingEngine:
             return 0.0
     
     def calculate_volatility(self, ticker, lookback_days=20):
-        """璁＄畻娉㈠姩鐜?"""
+        """def calculate_volatility: docstring omitted (was garbled/non-ASCII)."""
         try:
             hist = self.get_market_data(ticker, period='3mo', interval='1d')
             if hist is None or len(hist) < lookback_days:
@@ -1184,7 +1167,7 @@ class PaperTradingEngine:
             return 0.20
     
     def _sync_current_macro_from_cache(self):
-        """灏?cached_macro 鎶曞奖鍒?current_macro锛屼緵蹇収鍜屼氦鏄撴棩蹇椾娇鐢?"""
+        """def _sync_current_macro_from_cache: docstring omitted (was garbled/non-ASCII)."""
         macro_risk_score_raw = self.cached_macro.get('macro_risk_score_raw', 0.0)
         self.current_macro = {
             'macro_risk_score': macro_risk_score_raw,
@@ -1207,13 +1190,13 @@ class PaperTradingEngine:
         }
 
     def refresh_macro_cache(self, now=None):
-        """鎸?macro_refresh_minutes 鍒锋柊涓€娆"畯瑙備俊鍙风紦瀛?"""
+        """def refresh_macro_cache: docstring omitted (was garbled/non-ASCII)."""
         if now is None:
             now = datetime.now()
 
         macro_risk_score_raw, confirmed_topics, macro_tilts_raw, signal_summary = self.macro_adapter.analyze_signals()
 
-        # E1) 骞虫粦 macro_risk_score锛堜粎鍦ㄧ湡姝ｅ埛鏂?macro 鏃舵洿鏂帮級
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_risk_score_history.append(macro_risk_score_raw)
         if len(self.macro_risk_score_history) > self.macro_smoothing_window:
             self.macro_risk_score_history = self.macro_risk_score_history[-self.macro_smoothing_window:]
@@ -1236,7 +1219,7 @@ class PaperTradingEngine:
         print(f"[MACRO SMOOTH] Raw: {macro_risk_score_raw:.2f}, Smoothed: {macro_risk_score_smoothed:.2f} "
               f"(method: {self.macro_smoothing_method}, window: {len(self.macro_risk_score_history)})")
 
-        # E3) 杩囨护 macro_tilts锛氬彧淇濈暀 universe 鍐呰祫浜?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         universe_tickers = {asset['ticker'] for asset in self.config['universe']}
         macro_tilts_filtered = {}
         macro_tilts_ignored = {}
@@ -1365,11 +1348,118 @@ class PaperTradingEngine:
             print(f"[CORR] Degraded: correlation filter failed ({e}), fallback to ranked list")
             return list(ranked_tickers), [], [f"error:{e}"]
 
+    def _estimate_current_cash_ratio(self):
+        """Estimate current portfolio cash ratio for high-conviction checks."""
+        if self.portfolio_snapshots:
+            last = self.portfolio_snapshots[-1]
+            equity = float(last.get('total_equity', 0.0))
+            cash = float(last.get('cash', self.cash))
+            if equity > 1e-9:
+                return float(np.clip(cash / equity, 0.0, 1.0))
+
+        if self.equity_curve:
+            _, equity, cash, _ = self.equity_curve[-1]
+            equity = float(equity)
+            cash = float(cash)
+            if equity > 1e-9:
+                return float(np.clip(cash / equity, 0.0, 1.0))
+
+        positions_value = 0.0
+        for ticker, qty in self.positions.items():
+            if qty <= 0:
+                continue
+            price, _, _ = self.get_current_price(ticker)
+            if price is None or price <= 0:
+                continue
+            positions_value += qty * price
+
+        total_equity = self.cash + positions_value
+        if total_equity <= 1e-9:
+            return 1.0
+        return float(np.clip(self.cash / total_equity, 0.0, 1.0))
+
+    def _apply_high_conviction_cash_override(self, selected_assets, asset_metrics, cash_target, regime_state):
+        """Optionally reduce cash target to min cash when conviction is very strong."""
+        execution_cfg = self.config.get('execution', {})
+        min_cash_pct = float(self.config['objectives']['min_cash_pct'])
+        allow_override = bool(execution_cfg.get('allow_high_conviction_override', True))
+        zscore_threshold = float(execution_cfg.get('high_conviction_zscore_threshold', 2.5))
+        lead_threshold = float(execution_cfg.get('high_conviction_lead_threshold', 0.20))
+        cash_surplus_buffer = float(execution_cfg.get('high_conviction_cash_surplus_buffer', 0.05))
+
+        info = {
+            'enabled': allow_override,
+            'applied': False,
+            'regime_state': regime_state,
+            'top_ticker': None,
+            'top_rank_score': 0.0,
+            'lead_ratio': 0.0,
+            'cash_ratio': 0.0,
+            'required_cash_ratio': min_cash_pct + cash_surplus_buffer,
+            'reason': 'not_triggered'
+        }
+
+        if not allow_override:
+            info['reason'] = 'disabled_by_config'
+            return float(cash_target), info
+        if regime_state == 'risk_off_forced':
+            info['reason'] = 'risk_off_forced_active'
+            return float(cash_target), info
+        if not selected_assets:
+            info['reason'] = 'no_selected_assets'
+            return float(cash_target), info
+        if cash_target <= min_cash_pct + 1e-12:
+            info['reason'] = 'already_at_floor'
+            return float(cash_target), info
+
+        ranked = sorted(
+            selected_assets,
+            key=lambda t: float(asset_metrics.get(t, {}).get('rank_score', 0.0)),
+            reverse=True
+        )
+        top_ticker = ranked[0]
+        top_rank_score = float(asset_metrics.get(top_ticker, {}).get('rank_score', 0.0))
+        second_rank_score = float(asset_metrics.get(ranked[1], {}).get('rank_score', 0.0)) if len(ranked) > 1 else None
+
+        if second_rank_score is None:
+            lead_ratio = float('inf') if top_rank_score > 0 else 0.0
+        elif abs(second_rank_score) <= 1e-12:
+            lead_ratio = float('inf') if top_rank_score > 0 else 0.0
+        else:
+            lead_ratio = (top_rank_score - second_rank_score) / abs(second_rank_score)
+
+        current_cash_ratio = self._estimate_current_cash_ratio()
+        has_cash_surplus = current_cash_ratio >= (min_cash_pct + cash_surplus_buffer)
+        strong_zscore = top_rank_score > zscore_threshold
+        strong_lead = lead_ratio >= lead_threshold
+
+        info.update({
+            'top_ticker': top_ticker,
+            'top_rank_score': top_rank_score,
+            'lead_ratio': float(lead_ratio if np.isfinite(lead_ratio) else 9.99),
+            'cash_ratio': current_cash_ratio
+        })
+
+        if has_cash_surplus and (strong_zscore or strong_lead):
+            lead_text = f"{lead_ratio:.2%}" if np.isfinite(lead_ratio) else "INF"
+            print(f"[CASH ADJUST] High-conviction override applied: cash_target reduced to {min_cash_pct:.2%} "
+                  f"(top={top_ticker}, z={top_rank_score:.2f}, lead={lead_text}, cash_ratio={current_cash_ratio:.2%})")
+            info['applied'] = True
+            info['reason'] = 'high_conviction'
+            return float(min_cash_pct), info
+
+        if not has_cash_surplus:
+            info['reason'] = 'insufficient_cash_surplus'
+        elif not (strong_zscore or strong_lead):
+            info['reason'] = 'signal_not_strong_enough'
+
+        return float(cash_target), info
+
     def calculate_target_weights(self):
-        """璁＄畻鐩爣鏉冮噸锛氶闄╅浄杈撅紙鐜伴噾锛? 瓒嬪娍鏀惧ぇ鍣紙tilt/涓婇檺锛?"""
+        """def calculate_target_weights: docstring omitted (was garbled/non-ASCII)."""
 
         def _apply_caps_and_normalize(weights_map, cap_map, invested_budget, fill_gap_max, fill_gap_max_iters, score_map):
-            """鍏堣鍓€佷粎瓒呴绠椾笅璋冿紱灏忕己鍙ｆ椂鍙湪 headroom 鍐呰蒋琛ヨ冻銆?"""
+            """def _apply_caps_and_normalize: docstring omitted (was garbled/non-ASCII)."""
             weights = {k: max(0.0, float(v)) for k, v in weights_map.items() if float(v) > 0}
             capped = set()
             diagnostics = {
@@ -1437,7 +1527,7 @@ class PaperTradingEngine:
                         fill_reason = 'no_headroom'
                         break
 
-                    # 浼樺厛鎸夊綋鍓嶆潈閲嶆瘮渚嬭ˉ瓒筹紱鑻ュ綋鍓嶆潈閲嶅叏涓?鍒欐寜 score 姣斾緥锛涘啀閫€鍖栦负鍧囧寑鍒嗛厤
+                    # NOTE: comment omitted (was garbled/non-ASCII).
                     base_sum = sum(weights.get(k, 0.0) for k in headroom.keys())
                     if base_sum > 1e-12:
                         ratios = {k: weights.get(k, 0.0) / base_sum for k in headroom.keys()}
@@ -1485,7 +1575,7 @@ class PaperTradingEngine:
 
             return {k: v for k, v in weights.items() if v > 1e-10}, diagnostics
 
-        # ========== 姝ラ1: Regime 鍩虹嚎 ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         regime_state, trend_score, regime_details, base_cash_from_regime, base_max_weight = self.compute_regime_state()
         self.current_regime = {
             'regime_state': regime_state,
@@ -1497,10 +1587,11 @@ class PaperTradingEngine:
             'forced_until_time': self.forced_until_time.isoformat() if self.forced_until_time else None
         }
 
-        # ========== 姝ラ2: 璇诲彇 cached macro ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         macro_cfg = self.config.get('macro_integration', {})
         execution_cfg = self.config.get('execution', {})
         macro_mapping = self.config.get('macro_mapping', {})
+        min_cash_pct = float(self.config['objectives']['min_cash_pct'])
         tilt_max_delta = float(macro_cfg.get('tilt_max_delta', 0.02))
         allow_buy_benchmarks = bool(execution_cfg.get('allow_buy_benchmarks', False))
         macro_risk_score_raw = float(self.cached_macro.get('macro_risk_score_raw', 0.0))
@@ -1509,7 +1600,7 @@ class PaperTradingEngine:
         confirmed_topics = self.cached_macro.get('confirmed_topics', [])
         self._sync_current_macro_from_cache()
 
-        # ========== 閫氳矾1: 椋庨櫓闆疯揪锛堢幇閲戠洰鏍囷級 ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         macro_cash_slope = float(macro_cfg.get('macro_cash_slope', 0.02))
         macro_cash_from_risk = macro_cash_slope * macro_risk_score_smoothed
         macro_cash_from_topics = 0.0
@@ -1529,6 +1620,7 @@ class PaperTradingEngine:
                     macro_cash_from_topics += cash_add
                     macro_cash_topic_details.append(f"{rule_name}:{cash_add:+.2%}")
 
+        base_cash_from_regime = max(float(base_cash_from_regime), min_cash_pct)
         cash_target_unclipped = base_cash_from_regime + macro_cash_from_risk + macro_cash_from_topics
         cash_target = float(np.clip(cash_target_unclipped, base_cash_from_regime, 0.60))
         self.last_macro_cash_target = cash_target
@@ -1539,12 +1631,12 @@ class PaperTradingEngine:
         if macro_cash_topic_details:
             print(f"[MACRO PATH1] topic cash_add details: {', '.join(macro_cash_topic_details)}")
 
-        # ========== 閫氳矾2: 瓒嬪娍鏀惧ぇ鍣紙tilt + 鍗曡祫浜т笂闄愶級 ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         macro_allow_new_positions = {str(x).upper() for x in macro_cfg.get('macro_allow_new_positions', ['TLT', 'GLD'])}
         defensive_tilt_assets = set(macro_allow_new_positions) | {'CASH', 'TLT', 'GLD'}
         risk_off_mode = regime_state in ('risk_off', 'risk_off_forced')
 
-        # 鏋勯€?trade_universe锛歜enchmarks 浠呯敤浜?regime/benchmark 璁＄畻锛屼笉鑷姩杩涘叆浜ゆ槗姹?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         benchmark_tickers = {str(t).upper() for t in self.config.get('benchmarks', {}).get('tickers', [])}
         trade_universe_assets = []
         excluded_benchmark_assets = []
@@ -1609,7 +1701,7 @@ class PaperTradingEngine:
             'macro_cash_from_topics': macro_cash_from_topics
         }
 
-        # ========== 姝ラ3: Cross-sectional Ranking + Volatility Scaling ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         strategy = self.config['strategy']
         lookback = int(strategy['lookback_days'])
         vol_target = float(strategy['vol_target'])
@@ -1652,6 +1744,14 @@ class PaperTradingEngine:
         if corr_degraded:
             print(f"[CORR DEGRADED] insufficient data for: {', '.join(corr_degraded[:8])}{' ...' if len(corr_degraded) > 8 else ''}")
 
+        cash_target, high_conviction_info = self._apply_high_conviction_cash_override(
+            selected_assets=selected_assets,
+            asset_metrics=asset_metrics,
+            cash_target=cash_target,
+            regime_state=regime_state
+        )
+        self.current_regime['high_conviction_override'] = dict(high_conviction_info)
+
         rank_signal_map = {t: max(0.0, float(asset_metrics.get(t, {}).get('rank_score', 0.0))) for t in selected_assets}
         if sum(rank_signal_map.values()) <= 1e-12:
             rank_signal_map = {
@@ -1693,11 +1793,11 @@ class PaperTradingEngine:
             print(f"{ticker:<8} {rank_w:>9.2%} {vol:>9.2%} {raw_weights[ticker]:>9.2%}")
         print('-' * 44)
 
-        # 鍏堝簲鐢?cash_target 缂╂斁
+        # NOTE: comment omitted (was garbled/non-ASCII).
         invested_budget = max(0.0, 1.0 - cash_target)
         scaled_weights = {k: v * invested_budget for k, v in raw_weights.items()}
 
-        # 搴旂敤 tilts锛堣秼鍔挎斁澶у櫒锛屼笉鐩存帴寮轰拱锛?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         universe_tickers = {str(asset['ticker']).upper() for asset in trade_universe_assets}
         if applied_tilts:
             print(f"[MACRO PATH2] Applying tilts:")
@@ -1719,7 +1819,7 @@ class PaperTradingEngine:
                 scaled_weights[ticker] = tilt_delta
                 print(f"  {ticker}: NEW position {tilt_delta:.2%}")
 
-        # 鐢熸垚鍗曡祫浜ф湁鏁堜笂闄愶紙base_max_weight + tilt_delta锛宒elta clip 鍒?卤tilt_max_delta锛?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         max_weight_effective = {}
         for asset in trade_universe_assets:
             ticker = asset['ticker']
@@ -1728,7 +1828,7 @@ class PaperTradingEngine:
             tilt_delta = float(np.clip(applied_tilts.get(ticker, 0.0), -tilt_max_delta, tilt_max_delta))
             max_weight_effective[ticker] = float(np.clip(base_max_weight + tilt_delta, 0.0, 1.0))
 
-        # 鍐嶅簲鐢ㄢ€滀笂闄愯鍓?+ 涓嬭皟 + 灏忕己鍙ｈ蒋琛ヨ冻鈥?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         score_map = {k: max(0.0, float(rank_signal_map.get(k, 0.0))) for k in scaled_weights.keys()}
         adjusted_weights, alloc_diag = _apply_caps_and_normalize(
             scaled_weights,
@@ -1748,7 +1848,7 @@ class PaperTradingEngine:
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))
         adjusted_weights['CASH'] = cash_weight
 
-        # 璁板綍鏈疆 macro 搴旂敤缁撴灉锛屼緵 snapshot/trade context 浣跨敤
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_macro['applied_tilts'] = dict(applied_tilts)
         self.current_macro['blocked_tilts'] = dict(blocked_tilts)
         self.current_macro['blocked_tilts_not_trade_universe'] = dict(blocked_tilts_not_trade_universe)
@@ -1757,6 +1857,7 @@ class PaperTradingEngine:
         self.current_macro['cash_target'] = cash_target
         self.current_macro['allocation_diagnostics'] = dict(alloc_diag)
 
+        self.current_regime['dynamic_min_cash'] = cash_target
         self.current_regime['dynamic_max_weight'] = base_max_weight
         self.current_regime['cash_target'] = cash_target
         self.current_regime['max_weight_per_asset_effective'] = dict(max_weight_effective)
@@ -1772,23 +1873,15 @@ class PaperTradingEngine:
         return adjusted_weights
 
     def execute_rebalance(self, target_weights):
-        """鎵ц鍐嶅钩琛?- 甯︿簲澶т繚鎶ゅ櫒锛歝ooldown / weight_threshold / min_notional / stale_price_skip / turnover_cap
+        """def execute_rebalance: docstring omitted (was garbled/non-ASCII)."""
         
-        C1) 璁＄畻璁"垝浜ゆ槗鍚嶄箟閲戦
-        C2) 妫€鏌ユ槸鍚﹁秴杩?turnover_limit
-        C3) 濡傛灉瓒呰繃锛屾寜姣斾緥缂╂斁鎵€鏈変氦鏄?
-        C4) 璁板綍 turnover_notional / turnover_limit / turnover_scale / turnover_capped
-        C5) 涓嶇牬鍧忕幇鏈変笁澶т繚鎶ゅ櫒
-        D1-D5) 淇 get_current_price() 鎺ュ彛涓嶄竴鑷撮棶棰?
-        """
-        
-        # D5) 鑷锛氭祴璇?get_current_price() 杩斿洖涓夊厓缁?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if self.positions:
             test_ticker = list(self.positions.keys())[0]
             test_price, test_age, test_status = self.get_current_price(test_ticker)
             print(f"[SELF-CHECK] get_current_price('{test_ticker}') = (price={test_price}, age={test_age}min, status={test_status})")
         
-        # ========== 鍑嗗浜ゆ槗涓婁笅鏂囦俊鎭?==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         trade_context = self._build_trade_context()
         alloc_trace = [
             f"alloc_budget_{trade_context.get('invested_budget', 0.0):.2%}",
@@ -1804,7 +1897,7 @@ class PaperTradingEngine:
             f"alloc_capped_{','.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else 'none'}"
         ]
         
-        # ========== 淇濇姢鍣?1: Cooldown 妫€鏌?==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         execution_config = self.config.get('execution', {})
         cooldown_minutes = execution_config.get('rebalance_cooldown_minutes', 0)
         min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
@@ -1817,7 +1910,7 @@ class PaperTradingEngine:
                 print(f"[COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
                 return []
         
-        # ========== B2) 鑾峰彇鎵€鏈変环鏍煎苟妫€鏌ユ柊椴滃害 ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         stale_price_skip_minutes = execution_config.get('stale_price_skip_minutes', 60)
         max_stale_ratio = execution_config.get('max_stale_ratio', 0.3)
         stale_policy_cfg = execution_config.get('price_stale_policy', {})
@@ -1826,13 +1919,13 @@ class PaperTradingEngine:
         
         price_info = {}  # {ticker: (price, data_age_minutes, market_status)}
         
-        # 鑾峰彇褰撳墠鎸佷粨鐨勪环鏍?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         for ticker in self.positions.keys():
             price, age, status = self.get_current_price(ticker)
             if price is not None:
                 price_info[ticker] = (price, age, status)
         
-        # 鑾峰彇鐩爣鏉冮噸涓殑浠锋牸
+        # NOTE: comment omitted (was garbled/non-ASCII).
         for ticker in target_weights.keys():
             if ticker == 'CASH' or ticker in price_info:
                 continue
@@ -1840,7 +1933,7 @@ class PaperTradingEngine:
             if price is not None:
                 price_info[ticker] = (price, age, status)
         
-        # B2) 缁熻鍏ㄩ噺浠锋牸 STALE 姒傚喌锛堢敤浜庡揩鐓у睍绀猴級
+        # NOTE: comment omitted (was garbled/non-ASCII).
         stale_count = 0
         total_count = len(price_info)
         
@@ -1856,7 +1949,7 @@ class PaperTradingEngine:
             print("[INFO] All candidate prices are STALE and BUY policy blocks STALE quotes. "
                   "Likely outside market hours; rebalance may be skipped.")
         
-        # 璁板綍姝ｅ父鎯呭喌
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_stale_info = {
             'stale_count': stale_count,
             'stale_ratio': stale_ratio,
@@ -1865,7 +1958,7 @@ class PaperTradingEngine:
             'decision_trace': ''
         }
         
-        # ========== 璁＄畻褰撳墠鎸佷粨浠峰€?==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         current_values = {}
         positions_value = 0.0
         
@@ -1879,14 +1972,14 @@ class PaperTradingEngine:
         
         total_equity = self.cash + positions_value
         
-        # ========== 璁＄畻鐩爣浠峰€?==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         target_values = {}
         for ticker, weight in target_weights.items():
             if ticker == 'CASH':
                 continue
             target_values[ticker] = total_equity * weight
         
-        # ========== 淇濇姢鍣?2: Weight Threshold 杩囨护 ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         weight_threshold = execution_config.get('weight_threshold', 0.0)
         
         tickers_to_trade = []
@@ -1908,12 +2001,12 @@ class PaperTradingEngine:
             
             tickers_to_trade.append(ticker)
         
-        # ========== C1) 璁＄畻璁"垝浜ゆ槗锛堥€氳繃鎵€鏈夎繃婊ゅ櫒鐨勶級==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         
         planned_trades = []  # [{ticker, side, current_value, target_value, desired_trade_value, price, age, status}]
-        stale_candidate_count = 0  # 鍊欓€変氦鏄撲腑 STALE 鏁伴噺
-        policy_skip_count = 0  # 鍥?price_stale_policy 琚烦杩囩殑鍊欓€夋暟閲?
+        stale_candidate_count = 0  # NOTE: comment omitted (was garbled/non-ASCII).
+        policy_skip_count = 0  # NOTE: comment omitted (was garbled/non-ASCII).
         candidate_count = 0
         
         for ticker in tickers_to_trade:
@@ -1937,12 +2030,12 @@ class PaperTradingEngine:
 
             desired_trade_value = abs(target_value - current_value)
             
-            # Min notional 妫€鏌?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if desired_trade_value < min_notional:
                 print(f"[SKIP] {ticker} trade notional ${desired_trade_value:.2f} < min ${min_notional}")
                 continue
             
-            # 鑾峰彇浠锋牸淇℃伅
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if ticker not in price_info:
                 print(f"[SKIP] {ticker} no price info")
                 continue
@@ -1954,7 +2047,7 @@ class PaperTradingEngine:
             if status == "STALE" and age > stale_price_skip_minutes:
                 stale_candidate_count += 1
 
-            # 缁熶竴鎵ц price_stale_policy
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if side == 'BUY' and status not in allow_buy_status:
                 policy_skip_count += 1
                 print(f"[SKIP] {ticker} BUY status={status} not in allow_buy={sorted(allow_buy_status)}")
@@ -1982,7 +2075,7 @@ class PaperTradingEngine:
             blocked_str = ", ".join([f"{x['ticker']}({x['remaining_cycles']})" for x in self.current_holding_blocks])
             print(f"[HOLDING] Blocked by minimum holding period: {blocked_str}")
         
-        # 2) 鍏ㄥ眬鏁版嵁寮傚父淇濇姢锛氭鏌ュ€欓€変氦鏄?STALE 姣斾緥
+        # NOTE: comment omitted (was garbled/non-ASCII).
         stale_ratio_candidates = stale_candidate_count / candidate_count if candidate_count > 0 else 0
         
         print(f"\n[STALE CHECK] Candidate tickers: {candidate_count}, STALE: {stale_candidate_count}, Ratio: {stale_ratio_candidates:.1%}")
@@ -1993,12 +2086,12 @@ class PaperTradingEngine:
                 print("[INFO] All candidate trades depend on STALE prices. "
                       "This typically happens when market is closed or data is delayed.")
             abort_trace = f"stale_abort_ratio_{stale_ratio_candidates:.1%}_gt_{max_stale_ratio:.1%}"
-            # 3) 璁板綍鍒?snapshot
+            # NOTE: comment omitted (was garbled/non-ASCII).
             self.current_stale_info = {
                 'stale_count': stale_count,
                 'stale_ratio': stale_ratio,
                 'price_stale_skip': policy_skip_count > 0,
-                'price_stale_abort': True,  # 鏂板锛氬洜 STALE 姣斾緥杩囬珮鑰屼腑姝?                'stale_candidate_count': stale_candidate_count,
+                'price_stale_abort': True,  # NOTE: comment omitted (was garbled/non-ASCII).
                 'stale_ratio_candidates': stale_ratio_candidates,
                 'decision_trace': abort_trace
             }
@@ -2013,17 +2106,17 @@ class PaperTradingEngine:
             print(f"[DECISION] {abort_trace}")
             return []
         
-        # 鏇存柊 stale_info锛堟甯告儏鍐碉級
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_stale_info['price_stale_skip'] = policy_skip_count > 0
         self.current_stale_info['price_stale_abort'] = False
         self.current_stale_info['stale_candidate_count'] = stale_candidate_count
         self.current_stale_info['stale_ratio_candidates'] = stale_ratio_candidates
         self.current_stale_info['decision_trace'] = f"stale_ok_{stale_ratio_candidates:.1%}_le_{max_stale_ratio:.1%}"
         
-        # C1) 璁＄畻鎬绘崲鎵?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         turnover_notional_pre = sum(abs(t['desired_trade_value']) for t in planned_trades)
         
-        # C2) 妫€鏌ユ崲鎵嬩笂闄?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         max_turnover_pct = execution_config.get('max_turnover_pct_per_rebalance', 0.20)
         turnover_limit = total_equity * max_turnover_pct
         
@@ -2032,18 +2125,18 @@ class PaperTradingEngine:
         
         print(f"\n[TURNOVER] Planned(pre): ${turnover_notional_pre:,.2f}, Limit: ${turnover_limit:,.2f} ({max_turnover_pct:.1%})")
         
-        # C3) 濡傛灉瓒呰繃涓婇檺锛屾寜姣斾緥缂╂斁
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if turnover_notional_pre > turnover_limit:
             turnover_scale = turnover_limit / turnover_notional_pre
             turnover_capped = True
             print(f"[TURNOVER CAP] Scaling all trades by {turnover_scale:.2%}")
             
-            # 缂╂斁鎵€鏈夎鍒掍氦鏄?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             scaled_trades = []
             for trade in planned_trades:
                 scaled_trade_value = trade['desired_trade_value'] * turnover_scale
                 
-                # 缂╂斁鍚庝粛闇€婊¤冻 min_notional
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 if scaled_trade_value < min_notional:
                     print(f"[SKIP] {trade['ticker']} scaled notional ${scaled_trade_value:.2f} < min ${min_notional}")
                     continue
@@ -2053,11 +2146,11 @@ class PaperTradingEngine:
             
             planned_trades = scaled_trades
             
-            # 缂╂斁鍚庣殑鐩爣鎹㈡墜锛堜粛涓烘湡鏈涘悕涔夛級
+            # NOTE: comment omitted (was garbled/non-ASCII).
             actual_turnover_scaled = sum(abs(t['desired_trade_value']) for t in planned_trades)
             print(f"[TURNOVER CAP] Planned(after scaling): ${actual_turnover_scaled:,.2f}")
         
-        # C4) 鍏堣褰?pre锛宲ost 鍦ㄦ渶缁堟垚浜ゅ悗鏇存柊
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_turnover_info = {
             'turnover_notional': turnover_notional_pre,  # backward compatibility
             'turnover_notional_pre': turnover_notional_pre,
@@ -2067,17 +2160,17 @@ class PaperTradingEngine:
             'turnover_capped': turnover_capped
         }
         
-        # ========== 鎵ц浜ゆ槗 ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         trades = []
         turnover_notional_post = 0.0
         
-        # 鍏堝鐞嗗崠鍑?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         for trade in [t for t in planned_trades if t['side'] == 'SELL']:
             ticker = trade['ticker']
             price = trade['price']
             desired_notional = abs(trade['desired_trade_value'])
             
-            # 缂╂斁鍚庡啀鎸夋暣鑲℃崲绠楋紝纭繚鏈€缁堟垚浜や笉瓒呰繃缂╂斁鐩爣
+            # NOTE: comment omitted (was garbled/non-ASCII).
             current_qty = self.positions.get(ticker, 0)
             sell_qty = int(desired_notional / price)
             sell_qty = min(sell_qty, current_qty)
@@ -2085,7 +2178,7 @@ class PaperTradingEngine:
             if sell_qty <= 0:
                 continue
             
-            # 鎵ц鍗栧嚭
+            # NOTE: comment omitted (was garbled/non-ASCII).
             proceeds = sell_qty * price
             cost = proceeds * self.config['objectives']['transaction_cost_pct']
             net_proceeds = proceeds - cost
@@ -2100,14 +2193,14 @@ class PaperTradingEngine:
                     del self.cost_basis[ticker]
                 self.position_entry_cycle.pop(str(ticker).upper(), None)
             
-            # 鏋勫缓鍐崇瓥杞ㄨ抗
+            # NOTE: comment omitted (was garbled/non-ASCII).
             decision_trace = [
                 'cooldown_pass',
                 'weight_threshold_pass',
                 'min_notional_pass',
                 f'price_{trade["status"]}_age_{trade["age"]:.0f}min'
             ]
-            # 1) STALE SELL 鏍囨敞
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if trade['status'] == 'STALE':
                 decision_trace.append('sell_allowed_on_stale')
             if turnover_capped:
@@ -2116,7 +2209,7 @@ class PaperTradingEngine:
                 decision_trace.append('risk_off_de-risk')
             decision_trace.extend(alloc_trace)
             
-            # 鏋勫缓瀹屾暣鐨勪氦鏄撹褰?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
                 'timestamp': datetime.now().isoformat(),
                 'cycle': self.current_cycle,
@@ -2139,26 +2232,26 @@ class PaperTradingEngine:
             
             print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price:.2f} (notional: ${proceeds:.2f}, {trade['status']})")
         
-        # 鍐嶅鐞嗕拱鍏?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         for trade in [t for t in planned_trades if t['side'] == 'BUY']:
             ticker = trade['ticker']
             price = trade['price']
             desired_notional = abs(trade['desired_trade_value'])
             
-            # 缂╂斁鍚庡啀鎸夋暣鑲℃崲绠楋紝纭繚鏈€缁堟垚浜や笉瓒呰繃缂╂斁鐩爣
+            # NOTE: comment omitted (was garbled/non-ASCII).
             buy_qty = int(desired_notional / price)
             
             if buy_qty <= 0:
                 continue
             
-            # 妫€鏌ョ幇閲戞槸鍚﹁冻澶?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             cash_before_trade = self.cash
             required_cash = buy_qty * price
             cost = required_cash * self.config['objectives']['transaction_cost_pct']
             total_required = required_cash + cost
             
             if total_required > self.cash:
-                # 璋冩暣涔板叆鏁伴噺
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 buy_qty = int((self.cash * 0.99) / (price * (1 + self.config['objectives']['transaction_cost_pct'])))
                 
                 if buy_qty <= 0:
@@ -2169,24 +2262,24 @@ class PaperTradingEngine:
                 cost = required_cash * self.config['objectives']['transaction_cost_pct']
                 total_required = required_cash + cost
             
-            # 鎵ц涔板叆
+            # NOTE: comment omitted (was garbled/non-ASCII).
             self.cash -= total_required
             turnover_notional_post += required_cash
             old_qty = self.positions.get(ticker, 0)
             old_cost = self.cost_basis.get(ticker, 0)
             
-            # 鏇存柊鎸佷粨
+            # NOTE: comment omitted (was garbled/non-ASCII).
             self.positions[ticker] = old_qty + buy_qty
             self.position_entry_cycle[str(ticker).upper()] = int(self.current_cycle)
             
-            # 鏇存柊鎴愭湰鍩虹锛堝姞鏉冨钩鍧囷級
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if old_qty > 0:
                 total_cost = (old_qty * old_cost) + (buy_qty * price)
                 self.cost_basis[ticker] = total_cost / (old_qty + buy_qty)
             else:
                 self.cost_basis[ticker] = price
             
-            # 鏋勫缓鍐崇瓥杞ㄨ抗
+            # NOTE: comment omitted (was garbled/non-ASCII).
             decision_trace = [
                 'cooldown_pass',
                 'weight_threshold_pass',
@@ -2204,7 +2297,7 @@ class PaperTradingEngine:
                 decision_trace.append('cash_limited')
             decision_trace.extend(alloc_trace)
             
-            # 鏋勫缓瀹屾暣鐨勪氦鏄撹褰?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
                 'timestamp': datetime.now().isoformat(),
                 'cycle': self.current_cycle,
@@ -2227,7 +2320,7 @@ class PaperTradingEngine:
             
             print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f}, {trade['status']})")
 
-        # 鏈€缁堟垚浜ょ骇鍒?turnover 鍥炲～锛堢敤浜?snapshot / trades 楠屾敹锛?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_turnover_info['turnover_notional_post'] = turnover_notional_post
         if turnover_capped and turnover_notional_post > turnover_limit + 1e-6:
             print(f"[WARN] turnover_notional_post ${turnover_notional_post:,.2f} > limit ${turnover_limit:,.2f}")
@@ -2251,11 +2344,11 @@ class PaperTradingEngine:
             trade['fill_remaining_end'] = trade_context.get('fill_remaining_end', trade_context.get('remaining_gap', 0.0))
             trade['capped_assets'] = ';'.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else ''
         
-        # ========== 鏇存柊浜ゆ槗璁板綍鍜?cooldown 鏃堕棿 ==========
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if trades:
             self.trades_log.extend(trades)
             self.save_trades_immediately()
-            self.last_rebalance_time = datetime.now()  # 鍙湁瀹為檯鎴愪氦鎵嶆洿鏂?
+            self.last_rebalance_time = datetime.now()  # NOTE: comment omitted (was garbled/non-ASCII).
             print(f"[COOLDOWN] Next rebalance allowed after {cooldown_minutes} minutes")
         else:
             print(f"[INFO] No trades executed (all filtered by protections)")
@@ -2263,26 +2356,26 @@ class PaperTradingEngine:
         return trades
     
     def _build_trade_context(self):
-        """鏋勫缓浜ゆ槗涓婁笅鏂囦俊鎭紙鐢ㄤ簬璁板綍浜ゆ槗鐞嗙敱锛?"""
-        # Regime 淇℃伅
+        """def _build_trade_context: docstring omitted (was garbled/non-ASCII)."""
+        # NOTE: comment omitted (was garbled/non-ASCII).
         regime_state = self.current_regime.get('regime_state', 'neutral')
         trend_score = self.current_regime.get('trend_score', 0.5)
         cash_target = self.current_regime.get('cash_target', self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']))
         
-        # Macro 淇℃伅 - E1) 浣跨敤骞虫粦鍚庣殑 risk_score
+        # NOTE: comment omitted (was garbled/non-ASCII).
         macro_risk_score_raw = self.current_macro.get('macro_risk_score', 0.0)
         macro_risk_score_smoothed = self.current_macro.get('macro_risk_score_smoothed', 0.0)
         confirmed_topics = self.current_macro.get('confirmed_topics', [])
         macro_tilts = self.current_macro.get('applied_tilts', self.current_macro.get('macro_tilts', {}))
         alloc_diag = self.current_regime.get('allocation_diagnostics', self.current_macro.get('allocation_diagnostics', {}))
         
-        # 鏍煎紡鍖?macro_topics 涓哄瓧绗︿覆
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if confirmed_topics:
             topics_str = '; '.join([f"{t['theme']}:{t['direction']}" for t in confirmed_topics[:3]])
         else:
             topics_str = 'none'
         
-        # 鏍煎紡鍖?macro_tilts 涓哄瓧绗︿覆
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if macro_tilts:
             tilts_str = '; '.join([f"{k}:{v:+.2%}" for k, v in macro_tilts.items()])
         else:
@@ -2292,11 +2385,11 @@ class PaperTradingEngine:
             'regime_state': regime_state,
             'trend_score': trend_score,
             'cash_target': cash_target,
-            'macro_risk_score': macro_risk_score_smoothed,  # E1) 浣跨敤骞虫粦鍊?
-            'macro_risk_score_raw': macro_risk_score_raw,  # 淇濈暀鍘熷鍊?
+            'macro_risk_score': macro_risk_score_smoothed,  # NOTE: comment omitted (was garbled/non-ASCII).
+            'macro_risk_score_raw': macro_risk_score_raw,  # NOTE: comment omitted (was garbled/non-ASCII).
             'macro_topics': topics_str,
             'macro_tilts': tilts_str,
-            'macro_tilts_dict': macro_tilts,  # 淇濈暀瀛楀吀鏍煎紡渚涘唴閮ㄤ娇鐢?            'invested_budget': alloc_diag.get('invested_budget', 0.0),
+            'macro_tilts_dict': macro_tilts,  # NOTE: comment omitted (was garbled/non-ASCII).
             'total_before_caps': alloc_diag.get('total_before_caps', 0.0),
             'total_after_caps': alloc_diag.get('total_after_caps', 0.0),
             'downscaled': alloc_diag.get('downscaled', False),
@@ -2311,7 +2404,7 @@ class PaperTradingEngine:
         }
 
     def _compute_position_score_for_derisk(self, ticker):
-        """璁＄畻鎸佷粨鍘婚闄╀紭鍏堢骇鍒嗘暟锛岃秺灏忚秺浼樺厛鍗栧嚭銆?"""
+        """def _compute_position_score_for_derisk: docstring omitted (was garbled/non-ASCII)."""
         strategy = self.config.get('strategy', {})
         lookback = int(strategy.get('lookback_days', 40))
         vol_target = float(strategy.get('vol_target', 0.15))
@@ -2342,7 +2435,7 @@ class PaperTradingEngine:
         return float(fallback_score), None, float(volatility), float(drawdown), 'fallback_vol_drawdown'
 
     def _run_circuit_breaker_derisk(self, drawdown, max_dd):
-        """瑙﹀彂鍚庤繘鍏?risk_off_forced锛屽苟鎸夋渶宸瘎鍒嗕紭鍏堢粨鏋勫寲鍑忎粨銆?"""
+        """def _run_circuit_breaker_derisk: docstring omitted (was garbled/non-ASCII)."""
         now = datetime.now()
         execution_config = self.config.get('execution', {})
         regime_config = self.config.get('regime_filter', {})
@@ -2365,7 +2458,7 @@ class PaperTradingEngine:
             'forced_reason': self.forced_regime_reason
         })
 
-        # 璁＄畻褰撳墠鎬绘潈鐩婁笌鐩爣鐜伴噾
+        # NOTE: comment omitted (was garbled/non-ASCII).
         holdings = []
         positions_value = 0.0
 
@@ -2419,7 +2512,7 @@ class PaperTradingEngine:
             }
             return []
 
-        # 鍙?objectives.max_rebalance_pct 涓?turnover cap 鍙岄噸绾︽潫
+        # NOTE: comment omitted (was garbled/non-ASCII).
         max_rebalance_pct = float(self.config.get('objectives', {}).get('max_rebalance_pct', 1.0))
         max_turnover_pct = float(execution_config.get('max_turnover_pct_per_rebalance', 1.0))
         cap_pct = min(max_rebalance_pct, max_turnover_pct)
@@ -2429,7 +2522,7 @@ class PaperTradingEngine:
         turnover_capped = turnover_notional_pre > turnover_limit
         turnover_scale = (turnover_limit / turnover_notional_pre) if turnover_capped and turnover_notional_pre > 0 else 1.0
 
-        holdings.sort(key=lambda x: x['score'])  # 鏈€宸垎鏁颁紭鍏堝崠鍑?
+        holdings.sort(key=lambda x: x['score'])  # NOTE: comment omitted (was garbled/non-ASCII).
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         tx_cost = self.config['objectives']['transaction_cost_pct']
         remaining_cash_needed = cash_needed_initial
@@ -2529,10 +2622,10 @@ class PaperTradingEngine:
         return trades
 
     def check_risk_controls(self):
-        """妫€鏌ラ闄╂帶鍒讹細瑙﹀彂鍚庤繘鍏?risk_off_forced 骞舵墽琛岀粨鏋勫寲鍘婚闄┿€?"""
+        """def check_risk_controls: docstring omitted (was garbled/non-ASCII)."""
         positions_value = 0.0
         for ticker, qty in self.positions.items():
-            price, age_min, status = self.get_current_price(ticker)  # D2) 瑙ｅ寘涓夊厓缁?
+            price, age_min, status = self.get_current_price(ticker)  # NOTE: comment omitted (was garbled/non-ASCII).
             if price:
                 positions_value += qty * price
 
@@ -2555,7 +2648,7 @@ class PaperTradingEngine:
 
         return False
     def record_snapshot(self):
-        """璁板綍缁勫悎蹇収"""
+        """def record_snapshot: docstring omitted (was garbled/non-ASCII)."""
         print(f"[DEBUG] Recording snapshot at {datetime.now().strftime('%H:%M:%S')}")
         import sys; sys.stdout.flush()
         
@@ -2563,7 +2656,7 @@ class PaperTradingEngine:
         positions_detail = {}
         
         for ticker, qty in self.positions.items():
-            price, age_min, status = self.get_current_price(ticker)  # D2) 瑙ｅ寘涓夊厓缁?
+            price, age_min, status = self.get_current_price(ticker)  # NOTE: comment omitted (was garbled/non-ASCII).
             if price:
                 value = qty * price
                 positions_value += value
@@ -2581,7 +2674,7 @@ class PaperTradingEngine:
         total_return = (total_equity - self.initial_cash) / self.initial_cash
         drawdown = (self.peak_equity - total_equity) / self.peak_equity if self.peak_equity > 0 else 0
         
-        # 璁＄畻鍩哄噯鏀剁泭鐜囷紙濡傛灉閰嶇疆浜嗭級
+        # NOTE: comment omitted (was garbled/non-ASCII).
         bench_returns = {}
         bench_avg_return = 0.0
         bench_dispersion = 0.0
@@ -2597,7 +2690,7 @@ class PaperTradingEngine:
                     bench_tickers, evaluation_days
                 )
                 
-                # 璁＄畻瓒呴鏀剁泭锛堢瓥鐣ユ敹鐩?- 鍩哄噯骞冲潎鏀剁泭锛?
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 excess_return = total_return - bench_avg_return
                 win_flag = excess_return > 0
         
@@ -2615,13 +2708,13 @@ class PaperTradingEngine:
             'macro_reused': self.current_macro_reused,
             'last_signal_time': self.last_signal_time.isoformat() if self.last_signal_time else None,
             'last_macro_time': self.last_macro_time.isoformat() if self.last_macro_time else None,
-            # 鍩哄噯姣旇緝瀛楁
+            # NOTE: comment omitted (was garbled/non-ASCII).
             'bench_returns': bench_returns,
             'bench_avg_return': bench_avg_return,
             'bench_dispersion': bench_dispersion,
             'excess_return': excess_return,
             'win_flag': win_flag,
-            # Regime Filter 瀛楁
+            # NOTE: comment omitted (was garbled/non-ASCII).
             'regime_state': self.current_regime.get('regime_state', 'neutral'),
             'trend_score': self.current_regime.get('trend_score', 0.5),
             'dynamic_min_cash': self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']),
@@ -2630,9 +2723,9 @@ class PaperTradingEngine:
             'risk_caps_applied': self.current_regime.get('risk_caps_applied', False),
             'forced_until_time': self.current_regime.get('forced_until_time', self.forced_until_time.isoformat() if self.forced_until_time else None),
             'forced_regime_reason': self.current_regime.get('forced_reason', self.forced_regime_reason),
-            # Macro Integration 瀛楁
+            # NOTE: comment omitted (was garbled/non-ASCII).
             'macro_risk_score_raw': self.current_macro.get('macro_risk_score', 0.0),
-            'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),  # 鍘熷鍊?            'macro_risk_score_smoothed': self.current_macro.get('macro_risk_score_smoothed', 0.0),  # E1) 骞虫粦鍊?            'confirmed_topics_count': len(self.current_macro.get('confirmed_topics', [])),
+            'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),  # NOTE: comment omitted (was garbled/non-ASCII).
             'macro_tilts': self.current_macro.get('macro_tilts', {}),
             'applied_tilts': self.current_macro.get('applied_tilts', {}),
             'capped_assets': self.current_macro.get('capped_assets', []),
@@ -2647,15 +2740,15 @@ class PaperTradingEngine:
             'fill_amount': self.current_regime.get('allocation_diagnostics', {}).get('fill_amount', 0.0),
             'fill_reason': self.current_regime.get('allocation_diagnostics', {}).get('fill_reason', ''),
             'fill_remaining_end': self.current_regime.get('allocation_diagnostics', {}).get('fill_remaining_end', 0.0),
-            'macro_tilts_ignored': self.current_macro.get('macro_tilts_ignored', {}),  # E3) 琚拷鐣ョ殑 tilts
-            'macro_cooldown_remaining': self.macro_cooldown_remaining,  # E2) 鍐峰嵈鍓╀綑鍛ㄦ湡
-            # B3) Price Staleness 瀛楁
+            'macro_tilts_ignored': self.current_macro.get('macro_tilts_ignored', {}),  # NOTE: comment omitted (was garbled/non-ASCII).
+            'macro_cooldown_remaining': self.macro_cooldown_remaining,  # NOTE: comment omitted (was garbled/non-ASCII).
+            # NOTE: comment omitted (was garbled/non-ASCII).
             'stale_count': self.current_stale_info.get('stale_count', 0),
             'stale_ratio': self.current_stale_info.get('stale_ratio', 0.0),
             'price_stale_skip': self.current_stale_info.get('price_stale_skip', False),
-            'price_stale_abort': self.current_stale_info.get('price_stale_abort', False),  # 鏂板
-            'stale_candidate_count': self.current_stale_info.get('stale_candidate_count', 0),  # 鏂板
-            'stale_ratio_candidates': self.current_stale_info.get('stale_ratio_candidates', 0.0),  # 鏂板
+            'price_stale_abort': self.current_stale_info.get('price_stale_abort', False),  # NOTE: comment omitted (was garbled/non-ASCII).
+            'stale_candidate_count': self.current_stale_info.get('stale_candidate_count', 0),  # NOTE: comment omitted (was garbled/non-ASCII).
+            'stale_ratio_candidates': self.current_stale_info.get('stale_ratio_candidates', 0.0),  # NOTE: comment omitted (was garbled/non-ASCII).
             'stale_decision_trace': self.current_stale_info.get('decision_trace', ''),
             'holding_block_count': len(self.current_holding_blocks),
             'holding_blocks': list(self.current_holding_blocks),
@@ -2663,7 +2756,7 @@ class PaperTradingEngine:
             'ranked_candidates': self.current_regime.get('allocation_diagnostics', {}).get('ranked_candidates', []),
             'corr_selected': self.current_regime.get('allocation_diagnostics', {}).get('corr_selected', []),
             'corr_dropped': self.current_regime.get('allocation_diagnostics', {}).get('corr_dropped', []),
-            # C4) Turnover Cap 瀛楁
+            # NOTE: comment omitted (was garbled/non-ASCII).
             'turnover_notional': self.current_turnover_info.get('turnover_notional', 0.0),
             'turnover_notional_pre': self.current_turnover_info.get('turnover_notional_pre', self.current_turnover_info.get('turnover_notional', 0.0)),
             'turnover_notional_post': self.current_turnover_info.get('turnover_notional_post', 0.0),
@@ -2676,7 +2769,7 @@ class PaperTradingEngine:
         self.portfolio_snapshots.append(snapshot)
         self.equity_curve.append((datetime.now(), total_equity, self.cash, positions_value))
 
-        # 姣忎釜 snapshot 鍚庡啓涓€鏉?scoreboard
+        # NOTE: comment omitted (was garbled/non-ASCII).
         scoreboard_record = self.append_scoreboard_record()
         if scoreboard_record:
             snapshot['strategy_return_2w'] = scoreboard_record.get('strategy_return_2w', 0.0)
@@ -2688,22 +2781,22 @@ class PaperTradingEngine:
             snapshot['macro_active_ratio_2w'] = scoreboard_record.get('macro_active_ratio_2w', 0.0)
             snapshot['diagnostic_hint'] = scoreboard_record.get('diagnostic_hint', '')
         
-        # 姣忎釜鍛ㄦ湡鐢熸垚瀹炴椂鎽樿
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.generate_live_summary()
         
         return snapshot
 
     def save_trades_immediately(self):
-        """瀹炴椂淇濆瓨浜ゆ槗璁板綍"""
+        """def save_trades_immediately: docstring omitted (was garbled/non-ASCII)."""
         trades_path = self.config['reporting']['trades_log_path']
         if self.trades_log:
             trades_df = pd.DataFrame(self.trades_log)
             trades_df.to_csv(trades_path, index=False)
         print(f"[OK] Trades updated: {trades_path}")
-        import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
+        import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
 
     def generate_live_summary(self):
-        """鐢熸垚瀹炴椂鎽樿锛堜笉绛夌▼搴忕粨鏉燂級"""
+        """def generate_live_summary: docstring omitted (was garbled/non-ASCII)."""
         if not self.portfolio_snapshots:
             return
         
@@ -2726,7 +2819,7 @@ class PaperTradingEngine:
             f.write(f"  Current Return: {final_snapshot['total_return']:.2%}\n")
             f.write(f"  Current Drawdown: {final_snapshot['drawdown']:.2%}\n\n")
             
-            # Regime Filter 闈㈡澘
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if final_snapshot.get('regime_state'):
                 f.write(f"Market Regime:\n")
                 f.write(f"  State: {final_snapshot['regime_state'].upper()}")
@@ -2740,7 +2833,7 @@ class PaperTradingEngine:
                 f.write(f"  Dynamic Min Cash: {final_snapshot['dynamic_min_cash']:.1%}\n")
                 f.write(f"  Dynamic Max Weight: {final_snapshot['dynamic_max_weight']:.1%}\n\n")
             
-            # Macro Integration 闈㈡澘
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if final_snapshot.get('macro_risk_score', 0) > 0:
                 f.write(f"Macro Signals (GlobalWatch):\n")
                 f.write(f"  Risk Score: {final_snapshot['macro_risk_score']:.1f}/10.0\n")
@@ -2752,7 +2845,7 @@ class PaperTradingEngine:
                         f.write(f"    {ticker}: {tilt:+.2%}\n")
                 f.write("\n")
             
-            # 鍩哄噯姣旇緝闈㈡澘
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if final_snapshot.get('bench_returns'):
                 f.write(f"Benchmark Comparison:\n")
                 f.write(f"  Strategy Return: {final_snapshot['total_return']:.2%}\n")
@@ -2789,36 +2882,26 @@ class PaperTradingEngine:
             f.write("="*60 + "\n")
         
         print(f"[OK] Live summary updated: {summary_path}")
-        import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
+        import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
 
     def get_cost_basis(self, ticker):
-        """鑾峰彇鑲＄エ鐨勬垚鏈熀纭€锛堝钩鍧囦拱鍏ヤ环锛?"""
+        """def get_cost_basis: docstring omitted (was garbled/non-ASCII)."""
         return self.cost_basis.get(ticker, None)
     
     def compute_benchmark_returns(self, tickers, evaluation_days=10):
-        """璁＄畻鍩哄噯鎸囨暟鏀剁泭鐜?
-        
-        Args:
-            tickers: 鍩哄噯鎸囨暟鍒楄〃锛屽 ['QQQ', 'SPY', 'VTI', 'DIA']
-            evaluation_days: 璇勪及鍛ㄦ湡锛堜氦鏄撴棩锛夛紝榛樿10澶╃害绛変簬2鍛?
-        
-        Returns:
-            bench_returns: {ticker: return_pct}
-            bench_avg_return: 骞冲潎鏀剁泭鐜?
-            bench_dispersion: 鏀剁泭鐜囨爣鍑嗗樊锛堢鏁ｅ害锛?
-        """
+        """def compute_benchmark_returns: docstring omitted (was garbled/non-ASCII)."""
         bench_returns = {}
         
         for ticker in tickers:
             try:
-                # 鑾峰彇 evaluation_days+1 澶╃殑鏀剁洏浠凤紙闇€瑕佸涓€澶╄绠楁敹鐩婏級
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 hist = self.get_market_data(ticker, period='1mo', interval='1d')
                 
                 if hist is None or len(hist) < evaluation_days + 1:
                     print(f"[BENCHMARK] {ticker}: insufficient data (need {evaluation_days+1} days)")
                     continue
                 
-                # 璁＄畻鏀剁泭鐜囷細(鏈€鏂颁环 - N澶╁墠浠? / N澶╁墠浠?
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 latest_close = hist['Close'].iloc[-1]
                 past_close = hist['Close'].iloc[-(evaluation_days + 1)]
                 
@@ -2835,7 +2918,7 @@ class PaperTradingEngine:
             print("[BENCHMARK] No valid benchmark data")
             return {}, 0.0, 0.0
         
-        # 璁＄畻骞冲潎鏀剁泭鍜岀鏁ｅ害
+        # NOTE: comment omitted (was garbled/non-ASCII).
         returns_list = list(bench_returns.values())
         bench_avg_return = float(np.mean(returns_list))
         bench_dispersion = float(np.std(returns_list))
@@ -2845,20 +2928,15 @@ class PaperTradingEngine:
         return bench_returns, bench_avg_return, bench_dispersion
     
     def compute_regime_state(self):
-        """璁＄畻甯傚満鐘舵€侊紙鍩轰簬鍥涘ぇ鎸囨暟 MA50 瓒嬪娍锛?        
-        Returns:
-            regime_state: 'risk_on' / 'neutral' / 'risk_off'
-            trend_score: 0.0 - 1.0 (婊¤冻 close > MA50 鐨勬寚鏁版瘮渚?
-            regime_details: {ticker: {'close': float, 'ma50': float, 'above_ma': bool}}
-            dynamic_min_cash: 鏈疆搴斾娇鐢ㄧ殑鏈€灏忕幇閲戞瘮渚?            dynamic_max_weight: 鏈疆搴斾娇鐢ㄧ殑鏈€澶у崟璧勪骇鏉冮噸
-        """
+        """def compute_regime_state: docstring omitted (was garbled/non-ASCII)."""
         regime_config = self.config.get('regime_filter', {})
+        min_cash_pct = float(self.config['objectives']['min_cash_pct'])
 
-        # circuit breaker 寮哄埗 risk_off 绐楀彛浼樺厛
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if self.forced_until_time is not None:
             now = datetime.now()
             if now < self.forced_until_time:
-                dynamic_min_cash = regime_config.get('cash_risk_off', self.config['objectives']['min_cash_pct'])
+                dynamic_min_cash = max(float(regime_config.get('cash_risk_off', min_cash_pct)), min_cash_pct)
                 dynamic_max_weight = regime_config.get('max_weight_risk_off', self.config['objectives']['max_weight_per_asset'])
                 regime_details = {
                     'forced_until_time': self.forced_until_time.isoformat(),
@@ -2872,13 +2950,13 @@ class PaperTradingEngine:
                 self.forced_regime_reason = ""
 
         if not self.config.get('regime_filter', {}).get('enabled', False):
-            # 濡傛灉鏈惎鐢?regime filter锛岃繑鍥為粯璁ゅ€?
+            # NOTE: comment omitted (was garbled/non-ASCII).
             return 'neutral', 0.5, {}, self.config['objectives']['min_cash_pct'], self.config['objectives']['max_weight_per_asset']
 
         regime_config = self.config['regime_filter']
         ma_window = regime_config.get('ma_window', 50)
         
-        # 鑾峰彇鍩哄噯鎸囨暟鍒楄〃
+        # NOTE: comment omitted (was garbled/non-ASCII).
         bench_tickers = self.config.get('benchmarks', {}).get('tickers', ['QQQ', 'SPY', 'VTI', 'DIA'])
         
         print(f"\n[REGIME] Computing market regime using MA{ma_window}...")
@@ -2889,14 +2967,14 @@ class PaperTradingEngine:
         
         for ticker in bench_tickers:
             try:
-                # 鑾峰彇瓒冲鐨勫巻鍙叉暟鎹绠?MA50
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 hist = self.get_market_data(ticker, period='3mo', interval='1d')
                 
                 if hist is None or len(hist) < ma_window:
                     print(f"[REGIME] {ticker}: insufficient data for MA{ma_window}")
                     continue
                 
-                # 璁＄畻 MA50
+                # NOTE: comment omitted (was garbled/non-ASCII).
                 ma50 = hist['Close'].rolling(window=ma_window).mean()
                 latest_close = float(hist['Close'].iloc[-1])
                 latest_ma50 = float(ma50.iloc[-1])
@@ -2922,12 +3000,12 @@ class PaperTradingEngine:
         
         if valid_count == 0:
             print("[REGIME] No valid data, defaulting to neutral")
-            return 'neutral', 0.5, {}, self.config['objectives']['min_cash_pct'], self.config['objectives']['max_weight_per_asset']
+            return 'neutral', 0.5, {}, min_cash_pct, self.config['objectives']['max_weight_per_asset']
         
-        # 璁＄畻 trend_score = 婊¤冻鏉′欢鐨勬暟閲?/ 鎬绘暟
+        # NOTE: comment omitted (was garbled/non-ASCII).
         trend_score = above_ma_count / valid_count
         
-        # 鏍规嵁闃堝€煎垽鏂競鍦虹姸鎬?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         risk_on_threshold = regime_config.get('trend_score_risk_on', 0.75)
         risk_off_threshold = regime_config.get('trend_score_risk_off', 0.50)
         
@@ -2938,8 +3016,8 @@ class PaperTradingEngine:
         else:
             regime_state = 'neutral'
         
-        # 鍔ㄦ€佽皟鏁寸幇閲戝拰鏉冮噸涓婇檺
-        dynamic_min_cash = regime_config.get(f'cash_{regime_state}', self.config['objectives']['min_cash_pct'])
+        # NOTE: comment omitted (was garbled/non-ASCII).
+        dynamic_min_cash = max(float(regime_config.get(f'cash_{regime_state}', min_cash_pct)), min_cash_pct)
         
         if regime_state == 'risk_off':
             dynamic_max_weight = regime_config.get('max_weight_risk_off', 0.20)
@@ -2954,7 +3032,7 @@ class PaperTradingEngine:
         return regime_state, trend_score, regime_details, dynamic_min_cash, dynamic_max_weight
 
     def run_cycle(self):
-        """杩愯涓€涓懆鏈?"""
+        """def run_cycle: docstring omitted (was garbled/non-ASCII)."""
         print(f"\n{'='*60}")
         print(f"Cycle {self.current_cycle} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
@@ -3058,7 +3136,7 @@ class PaperTradingEngine:
         self.current_cycle += 1
 
     def run(self):
-        """杩愯妯℃嫙浜ゆ槗"""
+        """def run: docstring omitted (was garbled/non-ASCII)."""
         print("\n" + "="*60)
         print("Starting Paper Trading Simulation")
         print("="*60)
@@ -3066,14 +3144,14 @@ class PaperTradingEngine:
         print("WARNING: NO BROKER CONNECTION")
         print("="*60 + "\n")
         
-        # F4) 鐗堟湰鎸囩汗鑷
+        # NOTE: comment omitted (was garbled/non-ASCII).
         print("="*60)
         print("ENGINE VERSION FINGERPRINT")
         print("="*60)
         print(f"ENGINE_VERSION: v2.9.1-2026-02-06")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
-        # 娴嬭瘯 get_current_price 杩斿洖涓夊厓缁?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         try:
             test_result = self.get_current_price("QQQ")
             is_tuple = isinstance(test_result, tuple) and len(test_result) == 3
@@ -3083,7 +3161,7 @@ class PaperTradingEngine:
         except Exception as e:
             print(f"PRICE_API_RETURNS_TUPLE: False (Error: {e})")
         
-        # 妫€鏌ュ叧閿姛鑳?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         print(f"HAS_STALE_PRICE_SKIP: {hasattr(self, 'current_stale_info')}")
         print(f"HAS_TURNOVER_CAP: {hasattr(self, 'current_turnover_info')}")
         print(f"HAS_MACRO_COOLDOWN: {hasattr(self, 'macro_cooldown_remaining')}")
@@ -3115,10 +3193,10 @@ class PaperTradingEngine:
                 
                 print(f"[DEBUG] About to sleep at {datetime.now().strftime('%H:%M:%S')}")
                 print(f"[DEBUG] Sleep duration: {sleep_seconds} seconds")
-                import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
+                import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
                 time.sleep(sleep_seconds)
                 print(f"[DEBUG] Woke up at {datetime.now().strftime('%H:%M:%S')}")
-                import sys; sys.stdout.flush()  # 寮哄埗鍒锋柊杈撳嚭
+                import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
             
             print(f"\n{'='*60}")
             print("Final Snapshot")
@@ -3139,35 +3217,35 @@ class PaperTradingEngine:
             self.save_results()
 
     def save_results(self):
-        """淇濆瓨缁撴灉"""
+        """def save_results: docstring omitted (was garbled/non-ASCII)."""
         print(f"\n{'='*60}")
         print("Saving Results")
         print(f"{'='*60}")
         
-        # 淇濆瓨浜ゆ槗鏃ュ織
+        # NOTE: comment omitted (was garbled/non-ASCII).
         trades_path = self.config['reporting']['trades_log_path']
         if self.trades_log:
             trades_df = pd.DataFrame(self.trades_log)
             trades_df.to_csv(trades_path, index=False)
             print(f"[OK] Trades log saved: {trades_path}")
         else:
-            # 鍗充娇娌℃湁浜ゆ槗涔熷垱寤虹┖鏂囦欢
+            # NOTE: comment omitted (was garbled/non-ASCII).
             pd.DataFrame(columns=['timestamp', 'ticker', 'side', 'quantity', 'price', 'cost', 'reason']).to_csv(trades_path, index=False)
             print(f"[OK] Trades log saved (empty): {trades_path}")
         
-        # 淇濆瓨缁勫悎蹇収
+        # NOTE: comment omitted (was garbled/non-ASCII).
         snapshots_path = self.config['reporting']['portfolio_snapshots_path']
         with open(snapshots_path, 'w', encoding='utf-8') as f:
             for snapshot in self.portfolio_snapshots:
                 f.write(json.dumps(snapshot) + '\n')
         print(f"[OK] Portfolio snapshots saved: {snapshots_path}")
         
-        # 鐢熸垚鍥捐〃鍜屾姤鍛?
+        # NOTE: comment omitted (was garbled/non-ASCII).
         self.generate_equity_curve()
         self.generate_summary_report()
     
     def generate_equity_curve(self):
-        """鐢熸垚璧勯噾鏇茬嚎鍥?"""
+        """def generate_equity_curve: docstring omitted (was garbled/non-ASCII)."""
         if not self.equity_curve:
             print("[WARN] No equity curve data to plot")
             return
@@ -3216,7 +3294,7 @@ class PaperTradingEngine:
         plt.close()
     
     def generate_summary_report(self):
-        """鐢熸垚鎽樿鎶ュ憡"""
+        """def generate_summary_report: docstring omitted (was garbled/non-ASCII)."""
         if not self.portfolio_snapshots:
             print("[WARN] No snapshots to generate report")
             return
@@ -3261,7 +3339,7 @@ class PaperTradingEngine:
             f.write(f"  Max Drawdown: {max_drawdown:.2%}\n")
             f.write(f"  Sharpe Ratio: {sharpe:.2f}\n\n")
             
-            # Regime Filter 闈㈡澘
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if final_snapshot.get('regime_state'):
                 f.write(f"Final Market Regime:\n")
                 f.write(f"  State: {final_snapshot['regime_state'].upper()}")
@@ -3275,7 +3353,7 @@ class PaperTradingEngine:
                 f.write(f"  Dynamic Min Cash: {final_snapshot['dynamic_min_cash']:.1%}\n")
                 f.write(f"  Dynamic Max Weight: {final_snapshot['dynamic_max_weight']:.1%}\n\n")
             
-            # Macro Integration 闈㈡澘
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if final_snapshot.get('macro_risk_score', 0) > 0:
                 f.write(f"Final Macro Signals (GlobalWatch):\n")
                 f.write(f"  Risk Score: {final_snapshot['macro_risk_score']:.1f}/10.0\n")
@@ -3287,7 +3365,7 @@ class PaperTradingEngine:
                         f.write(f"    {ticker}: {tilt:+.2%}\n")
                 f.write("\n")
             
-            # 鍩哄噯姣旇緝闈㈡澘
+            # NOTE: comment omitted (was garbled/non-ASCII).
             if final_snapshot.get('bench_returns'):
                 f.write(f"Benchmark Comparison:\n")
                 f.write(f"  Strategy Return: {total_return:.2%}\n")
@@ -3339,7 +3417,7 @@ class PaperTradingEngine:
         print(f"Max Drawdown: {max_drawdown:.2%}")
         print(f"Sharpe Ratio: {sharpe:.2f}")
         
-        # 鏄剧ず鍩哄噯姣旇緝
+        # NOTE: comment omitted (was garbled/non-ASCII).
         if final_snapshot.get('bench_returns'):
             print(f"\nBenchmark Comparison:")
             print(f"  Strategy: {total_return:.2%}")
@@ -3356,7 +3434,7 @@ class PaperTradingEngine:
 
 
 def main():
-    """涓诲嚱鏁?"""
+    """def main: docstring omitted (was garbled/non-ASCII)."""
     import sys
     
     config_path = 'paper_config.json'

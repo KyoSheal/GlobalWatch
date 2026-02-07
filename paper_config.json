@@ -310,6 +310,7 @@
     "correlation_threshold": 0.8,
     "volatility_floor": 0.08,
     "min_holding_cycles": 4,
+    "allow_high_conviction_override": true,
     "price_stale_policy": {
       "allow_buy": ["LIVE", "RECENT"],
       "allow_sell": ["LIVE", "RECENT", "STALE"]
@@ -325,8 +326,8 @@
     "trend_score_risk_on": 0.75,
     "trend_score_risk_off": 0.50,
     "cash_risk_on": 0.10,
-    "cash_neutral": 0.20,
-    "cash_risk_off": 0.35,
+    "cash_neutral": 0.15,
+    "cash_risk_off": 0.25,
     "max_weight_risk_off": 0.20
   },
   "macro_integration": {
