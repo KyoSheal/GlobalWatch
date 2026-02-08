@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V2.10.1)
+# GlobalWatch Paper Trading (V2.10.5)
 
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
@@ -9,13 +9,15 @@
 - This document exposes operation and validation flow, but not proprietary thresholds.
 
 ## 2. Version Delta (vs previous release)
-### 2.1 Key additions from `v2.9.1` to `v2.10.1`
-- 1: cash-efficiency update with optional high-conviction cash override (still respecting cash floor).
-- 2: momentum upgraded from single-timescale to blended multi-timescale signals.
-- 3: high-conviction single-asset weight boost under portfolio risk constraints.
-- 4: exit-signal module using simple price/volume patterns for reduce/exit actions.
-- 5: GlobalWatch structured topic signals with optional LLM topic injection.
-- 6: score smoothing/normalization/clipping plus portfolio-level risk gates.
+### 2.1 Key additions from `v2.9.1` to `v2.10.5`
+- Step 1: cash-efficiency update with optional high-conviction cash override (still respecting cash floor).
+- Step 2: momentum upgraded from single-timescale to blended multi-timescale signals.
+- Step 3: high-conviction single-asset weight boost under portfolio risk constraints.
+- Step 4: exit-signal module using simple price/volume patterns for reduce/exit actions.
+- Step 5: GlobalWatch structured topic signals with optional LLM topic injection.
+- Step 6: score smoothing/normalization/clipping plus portfolio-level risk gates.
+- Step 7: gap-down + volume-z crash exit trigger for black-swan defense.
+- Step 8: adaptive hot-stock cap boost (top momentum + z-score + persistence).
 
 ### 2.2 Safety architecture retained
 - decoupled signal/macro refresh
@@ -59,7 +61,7 @@ Start_Paper_Trading.bat
 - Rebalance aborts when stale ratio of candidates exceeds threshold.
 - Turnover cap is enforced on final tradable notionals.
 
-### 4.3 Portfolio-level safeguards (v2.10.1)
+### 4.3 Portfolio-level safeguards (v2.10.5)
 - score stabilization: optional smoothing, normalization, clipping
 - volatility gate: abort if weighted portfolio volatility is confidently above limit
 - diversity gate: abort if concentration (HHI) exceeds limit
@@ -99,6 +101,14 @@ Note: short purpose labels only; no proprietary threshold logic disclosed.
 - `enable_diversity_check` # diversity gate switch
 - `max_herfindahl_index` # concentration limit
 - `portfolio_vol_min_coverage` # min vol coverage
+- `exit_on_gap_volume` # crash-exit switch
+- `exit_gap_down_pct` # gap trigger
+- `exit_gap_volume_zscore` # volume-z trigger
+- `exit_gap_volume_window` # volume window
+- `max_weight_boost_for_hot` # hot-stock cap add
+- `hot_zscore_threshold` # hot z-score gate
+- `hot_momentum_top_k` # momentum top-k
+- `hot_persistence_cycles` # persistence cycles
 
 ### 5.2 `macro_integration`
 - `macro_cash_slope` # cash sensitivity

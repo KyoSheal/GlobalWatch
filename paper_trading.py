@@ -785,6 +785,7 @@ class PaperTradingEngine:
         self.current_weights_reused = False
         self.current_macro_reused = False
         self.score_history_by_ticker = {}
+        self.hot_momentum_streaks = {}
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_risk_score_history = []  # NOTE: comment omitted (was garbled/non-ASCII).
@@ -882,12 +883,20 @@ class PaperTradingEngine:
         execution_config.setdefault('exit_signal_volume_spike_ratio', 2.0)
         execution_config.setdefault('exit_signal_consecutive_down_days', 3)
         execution_config.setdefault('exit_signal_long_upper_shadow_ratio', 2.0)
+        execution_config.setdefault('exit_on_gap_volume', True)
+        execution_config.setdefault('exit_gap_down_pct', 0.04)
+        execution_config.setdefault('exit_gap_volume_zscore', 2.5)
+        execution_config.setdefault('exit_gap_volume_window', 30)
         execution_config.setdefault('enable_score_smoothing', True)
         execution_config.setdefault('score_smoothing_window', 3)
         execution_config.setdefault('max_portfolio_volatility', 0.25)
         execution_config.setdefault('enable_diversity_check', True)
         execution_config.setdefault('max_herfindahl_index', 0.35)
         execution_config.setdefault('portfolio_vol_min_coverage', 0.70)
+        execution_config.setdefault('max_weight_boost_for_hot', 0.05)
+        execution_config.setdefault('hot_zscore_threshold', 1.5)
+        execution_config.setdefault('hot_momentum_top_k', 3)
+        execution_config.setdefault('hot_persistence_cycles', 2)
         momentum_weights_cfg = execution_config.setdefault('momentum_weights', {})
         momentum_weights_cfg.setdefault('short', 0.4)
         momentum_weights_cfg.setdefault('medium', 0.6)
@@ -959,12 +968,20 @@ class PaperTradingEngine:
         assert float(self.config.get('execution', {}).get('exit_signal_volume_spike_ratio', 2.0)) >= 1.0, "execution.exit_signal_volume_spike_ratio must be >= 1"
         assert int(self.config.get('execution', {}).get('exit_signal_consecutive_down_days', 3)) >= 2, "execution.exit_signal_consecutive_down_days must be >= 2"
         assert float(self.config.get('execution', {}).get('exit_signal_long_upper_shadow_ratio', 2.0)) >= 1.0, "execution.exit_signal_long_upper_shadow_ratio must be >= 1"
+        assert isinstance(self.config.get('execution', {}).get('exit_on_gap_volume', True), bool), "execution.exit_on_gap_volume must be bool"
+        assert float(self.config.get('execution', {}).get('exit_gap_down_pct', 0.04)) > 0, "execution.exit_gap_down_pct must be > 0"
+        assert float(self.config.get('execution', {}).get('exit_gap_volume_zscore', 2.5)) >= 0.0, "execution.exit_gap_volume_zscore must be >= 0"
+        assert int(self.config.get('execution', {}).get('exit_gap_volume_window', 30)) >= 10, "execution.exit_gap_volume_window must be >= 10"
         assert isinstance(self.config.get('execution', {}).get('enable_score_smoothing', True), bool), "execution.enable_score_smoothing must be bool"
         assert int(self.config.get('execution', {}).get('score_smoothing_window', 3)) >= 1, "execution.score_smoothing_window must be >= 1"
         assert float(self.config.get('execution', {}).get('max_portfolio_volatility', 0.25)) > 0, "execution.max_portfolio_volatility must be > 0"
         assert isinstance(self.config.get('execution', {}).get('enable_diversity_check', True), bool), "execution.enable_diversity_check must be bool"
         assert 0.0 < float(self.config.get('execution', {}).get('max_herfindahl_index', 0.35)) <= 1.0, "execution.max_herfindahl_index must be in (0,1]"
         assert 0.0 <= float(self.config.get('execution', {}).get('portfolio_vol_min_coverage', 0.70)) <= 1.0, "execution.portfolio_vol_min_coverage must be in [0,1]"
+        assert float(self.config.get('execution', {}).get('max_weight_boost_for_hot', 0.05)) >= 0.0, "execution.max_weight_boost_for_hot must be >= 0"
+        assert float(self.config.get('execution', {}).get('hot_zscore_threshold', 1.5)) >= 0.0, "execution.hot_zscore_threshold must be >= 0"
+        assert int(self.config.get('execution', {}).get('hot_momentum_top_k', 3)) >= 1, "execution.hot_momentum_top_k must be >= 1"
+        assert int(self.config.get('execution', {}).get('hot_persistence_cycles', 2)) >= 1, "execution.hot_persistence_cycles must be >= 1"
         momentum_weights_cfg = self.config.get('execution', {}).get('momentum_weights', {})
         assert isinstance(momentum_weights_cfg, dict), "execution.momentum_weights must be an object"
         short_w = float(momentum_weights_cfg.get('short', 0.4))
@@ -2023,6 +2040,62 @@ class PaperTradingEngine:
         info['reason'] = 'signal_not_strong_enough'
         return None, info
 
+    def _select_hot_stock_boosts(self, selected_assets, asset_metrics, regime_state):
+        """Select hot stocks eligible for adaptive cap boost."""
+        execution_cfg = self.config.get('execution', {})
+        boost_amount = float(execution_cfg.get('max_weight_boost_for_hot', 0.05))
+        zscore_threshold = float(execution_cfg.get('hot_zscore_threshold', 1.5))
+        persistence_cycles = int(execution_cfg.get('hot_persistence_cycles', 2))
+        top_k = int(execution_cfg.get('hot_momentum_top_k', 3))
+
+        info = {
+            'enabled': boost_amount > 0 and top_k > 0,
+            'boost_amount': float(max(0.0, boost_amount)),
+            'zscore_threshold': float(zscore_threshold),
+            'persistence_cycles': int(max(1, persistence_cycles)),
+            'top_k': int(max(1, top_k)),
+            'momentum_top': [],
+            'boosted_assets': []
+        }
+        if not info['enabled']:
+            return [], info
+        if regime_state == 'risk_off_forced':
+            info['reason'] = 'risk_off_forced_active'
+            return [], info
+
+        ranked_by_momentum = sorted(
+            [t for t in selected_assets if t in asset_metrics],
+            key=lambda t: float(asset_metrics.get(t, {}).get('momentum', 0.0)),
+            reverse=True
+        )
+        top_assets = ranked_by_momentum[:info['top_k']]
+        info['momentum_top'] = list(top_assets)
+
+        top_set = set(top_assets)
+        updated_streaks = {}
+        for ticker in top_set:
+            updated_streaks[ticker] = int(self.hot_momentum_streaks.get(ticker, 0)) + 1
+        for ticker, prev_streak in self.hot_momentum_streaks.items():
+            if ticker not in top_set and prev_streak > 0:
+                updated_streaks[ticker] = 0
+        self.hot_momentum_streaks = updated_streaks
+
+        boosted = []
+        for ticker in top_assets:
+            metric = asset_metrics.get(ticker, {})
+            zscore = float(metric.get('blended_momentum_z', metric.get('rank_score', 0.0)))
+            streak = int(self.hot_momentum_streaks.get(ticker, 0))
+            if zscore > zscore_threshold and streak >= info['persistence_cycles']:
+                boosted.append({
+                    'ticker': ticker,
+                    'zscore': zscore,
+                    'streak': streak,
+                    'momentum': float(metric.get('momentum', 0.0))
+                })
+
+        info['boosted_assets'] = list(boosted)
+        return [x['ticker'] for x in boosted], info
+
     def detect_exit_signals(self, ticker, price_series):
         """Detect simple technical breakdown signals for existing holdings."""
         execution_cfg = self.config.get('execution', {})
@@ -2032,26 +2105,32 @@ class PaperTradingEngine:
         volume_spike_ratio = float(execution_cfg.get('exit_signal_volume_spike_ratio', 2.0))
         consecutive_down_days = int(execution_cfg.get('exit_signal_consecutive_down_days', 3))
         long_upper_shadow_ratio = float(execution_cfg.get('exit_signal_long_upper_shadow_ratio', 2.0))
+        exit_on_gap_volume = bool(execution_cfg.get('exit_on_gap_volume', True))
+        gap_volume_pct = abs(float(execution_cfg.get('exit_gap_down_pct', 0.04)))
+        gap_volume_z_threshold = float(execution_cfg.get('exit_gap_volume_zscore', 2.5))
+        gap_volume_window = int(execution_cfg.get('exit_gap_volume_window', 30))
 
         if price_series is None or price_series.empty:
-            return False, "insufficient_data"
+            return False, "insufficient_data", False
 
         required_cols = {'Open', 'High', 'Low', 'Close'}
         if not required_cols.issubset(set(price_series.columns)):
-            return False, "missing_ohlc"
+            return False, "missing_ohlc", False
 
         window_size = max(lookback_days, consecutive_down_days + 2, 8)
         window = price_series.tail(window_size).copy()
         window = window.dropna(subset=['Open', 'High', 'Low', 'Close'])
         if len(window) < max(6, consecutive_down_days + 1):
-            return False, "insufficient_window"
+            return False, "insufficient_window", False
 
         latest = window.iloc[-1]
         prev = window.iloc[-2]
         triggers = []
+        force_exit = False
 
         prev_close = float(prev['Close'])
         latest_open = float(latest['Open'])
+        gap_return = 0.0
         if prev_close > 0:
             gap_return = (latest_open - prev_close) / prev_close
             if gap_return <= -gap_down_threshold:
@@ -2088,11 +2167,25 @@ class PaperTradingEngine:
                 if base_vol > 0 and latest_vol >= base_vol * volume_spike_ratio:
                     triggers.append(f"vol spike x{latest_vol / base_vol:.1f}")
 
+            if exit_on_gap_volume and prev_close > 0 and len(vol_series) >= max(gap_volume_window + 1, 10):
+                latest_vol = float(vol_series.iloc[-1])
+                baseline = vol_series.iloc[-(gap_volume_window + 1):-1]
+                vol_mu = float(baseline.mean()) if len(baseline) > 0 else 0.0
+                vol_sigma = float(baseline.std()) if len(baseline) > 0 else 0.0
+                volume_z = (latest_vol - vol_mu) / vol_sigma if vol_sigma > 1e-12 else 0.0
+                if gap_return <= -gap_volume_pct and volume_z >= gap_volume_z_threshold:
+                    force_exit = True
+                    triggers.append(f"gap-volume shock ({gap_return:.1%}, z={volume_z:.2f})")
+
+        if force_exit:
+            reason = " + ".join(triggers[:4])
+            return True, reason, True
+
         if len(triggers) >= max(1, min_trigger_count):
             reason = " + ".join(triggers[:3])
-            return True, reason
+            return True, reason, False
 
-        return False, ""
+        return False, "", False
 
     def calculate_target_weights(self):
         """def calculate_target_weights: docstring omitted (was garbled/non-ASCII)."""
@@ -2409,6 +2502,12 @@ class PaperTradingEngine:
             regime_state=regime_state
         )
         self.current_regime['high_conviction_weighting'] = dict(weight_boost_info)
+        hot_boosted_tickers, hot_boost_info = self._select_hot_stock_boosts(
+            selected_assets=selected_assets,
+            asset_metrics=asset_metrics,
+            regime_state=regime_state
+        )
+        self.current_regime['hot_stock_boost'] = dict(hot_boost_info)
 
         rank_signal_map = {t: max(0.0, float(asset_metrics.get(t, {}).get('rank_score', 0.0))) for t in selected_assets}
         if sum(rank_signal_map.values()) <= 1e-12:
@@ -2452,7 +2551,10 @@ class PaperTradingEngine:
         print('-' * 44)
 
         # NOTE: comment omitted (was garbled/non-ASCII).
-        invested_budget = max(0.0, 1.0 - cash_target)
+        invested_budget_raw = max(0.0, 1.0 - cash_target)
+        invested_budget = min(0.90, invested_budget_raw)
+        if invested_budget < invested_budget_raw - 1e-12:
+            print(f"[EXPOSURE CAP] Invested budget clipped: {invested_budget_raw:.2%} -> {invested_budget:.2%} (hard cap 90%)")
         scaled_weights = {k: v * invested_budget for k, v in raw_weights.items()}
 
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -2495,6 +2597,20 @@ class PaperTradingEngine:
             second_score = float(weight_boost_info.get('second_score', 0.0))
             print(f"[WEIGHT BOOST] {boosted_ticker}: score={top_score:.2f} >> 2nd best={second_score:.2f} -> allowed {new_cap:.0%} weight")
 
+        hot_boost_delta = float(max(0.0, execution_cfg.get('max_weight_boost_for_hot', 0.05)))
+        hot_boost_applied = []
+        for ticker in hot_boosted_tickers:
+            if ticker not in max_weight_effective:
+                continue
+            old_cap = float(max_weight_effective.get(ticker, base_max_weight))
+            new_cap = float(np.clip(old_cap + hot_boost_delta, 0.0, 1.0))
+            max_weight_effective[ticker] = new_cap
+            detail = next((x for x in hot_boost_info.get('boosted_assets', []) if x.get('ticker') == ticker), {})
+            zscore = float(detail.get('zscore', 0.0))
+            streak = int(detail.get('streak', 0))
+            print(f"[HOT BOOST] {ticker}: z={zscore:.2f}, streak={streak} -> cap {old_cap:.2%} -> {new_cap:.2%}")
+            hot_boost_applied.append(ticker)
+
         # NOTE: comment omitted (was garbled/non-ASCII).
         score_map = {k: max(0.0, float(rank_signal_map.get(k, 0.0))) for k in scaled_weights.keys()}
         adjusted_weights, alloc_diag = _apply_caps_and_normalize(
@@ -2518,6 +2634,13 @@ class PaperTradingEngine:
         }
         alloc_diag['high_conviction_weight_boost'] = dict(weight_boost_info)
         alloc_diag['boosted_ticker'] = boosted_ticker
+        alloc_diag['invested_budget_raw'] = float(invested_budget_raw)
+        alloc_diag['portfolio_exposure_cap'] = 0.90
+        alloc_diag['hot_boost_enabled'] = bool(hot_boost_info.get('enabled', False))
+        alloc_diag['hot_boost_top_momentum'] = list(hot_boost_info.get('momentum_top', []))
+        alloc_diag['hot_boost_assets'] = list(hot_boost_applied)
+        alloc_diag['hot_boost_details'] = list(hot_boost_info.get('boosted_assets', []))
+        alloc_diag['hot_boost_amount'] = float(hot_boost_delta)
         capped_assets = alloc_diag.get('capped_assets', [])
 
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))
@@ -2672,7 +2795,7 @@ class PaperTradingEngine:
                     continue
 
                 hist = self.get_market_data(ticker, period='3mo', interval='1d')
-                exit_flag, exit_reason = self.detect_exit_signals(ticker, hist)
+                exit_flag, exit_reason, force_exit = self.detect_exit_signals(ticker, hist)
                 if not exit_flag:
                     continue
 
@@ -2682,6 +2805,8 @@ class PaperTradingEngine:
 
                 old_target_weight = float(adjusted_target_weights.get(ticker, 0.0))
                 action = exit_signal_action
+                if force_exit:
+                    action = 'exit'
                 if regime_state_now in ('risk_off', 'risk_off_forced'):
                     action = 'exit'
 
@@ -2694,6 +2819,7 @@ class PaperTradingEngine:
                 self.current_exit_info['signals'].append({
                     'ticker': ticker,
                     'reason': exit_reason,
+                    'force_exit': bool(force_exit),
                     'action': action,
                     'current_weight': float(current_weight),
                     'old_target_weight': float(old_target_weight),
@@ -3938,7 +4064,7 @@ class PaperTradingEngine:
         print("="*60)
         print("ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v2.10.4-2026-02-08")
+        print(f"ENGINE_VERSION: v2.10.5-2026-02-08")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
