@@ -185,6 +185,44 @@ class MacroSignalAdapter:
 
         accuracy_factor = float(np.clip(0.7 + 0.6 * (acc - 0.5), 0.7, 1.3))
         return accuracy_factor, acc, scope
+
+    def _parse_topic_outcome(self, metadata):
+        """Infer topic outcome (+1/-1/0) from metadata if available."""
+        correct_1d = self._parse_correct_flag(metadata.get('correct_1d'))
+        if correct_1d is not None:
+            if correct_1d > 0.5:
+                return 1
+            if correct_1d < 0.5:
+                return -1
+            return 0
+
+        return_1d = self._to_float_optional(metadata.get('return_1d'))
+        topic_score = self._to_float_optional(metadata.get('topic_score', metadata.get('topic_score_raw')))
+        if return_1d is None or topic_score is None:
+            return None
+        if abs(topic_score) <= 1e-12 or abs(return_1d) <= 1e-12:
+            return 0
+        return 1 if (return_1d * topic_score) > 0 else -1
+
+    def _compute_topic_accuracy(self, outcomes):
+        """Compute topic accuracy from recent outcomes."""
+        window = int(self.macro_config.get('topic_memory_window', 50))
+        window = max(1, window)
+        sample = list(outcomes or [])[-window:]
+        informative = [x for x in sample if x in (-1, 1)]
+        if not informative:
+            return 0.5, 0
+        accuracy = float(sum(1 for x in informative if x == 1) / len(informative))
+        return accuracy, len(informative)
+
+    def _topic_accuracy_to_weight(self, accuracy):
+        """Map accuracy bands to adaptive tilt multiplier."""
+        acc = float(accuracy)
+        if acc < 0.40:
+            return 0.75
+        if acc > 0.60:
+            return 1.25
+        return 1.00
     
     def fetch_recent_signals(self, n=50):
         """def fetch_recent_signals: docstring omitted (was garbled/non-ASCII)."""
@@ -589,6 +627,20 @@ class MacroSignalAdapter:
         sector_scores = {}
         sector_weights = {}
         sector_details = {}
+        sector_outcomes = {}
+
+        for sig in valid_signals:
+            metadata = sig.get('metadata', {}) or {}
+            signal_type = str(metadata.get('signal_type', '')).strip().lower()
+            if signal_type != 'topic_sentiment':
+                continue
+            sector = str(metadata.get('topic_sector') or metadata.get('sector') or '').strip().lower()
+            if not sector:
+                continue
+            outcome = self._parse_topic_outcome(metadata)
+            if outcome is None:
+                continue
+            sector_outcomes.setdefault(sector, []).append(int(outcome))
 
         for sig in valid_signals:
             metadata = sig.get('metadata', {}) or {}
@@ -624,13 +676,30 @@ class MacroSignalAdapter:
             except (TypeError, ValueError):
                 recurrence = 1.0
 
-            weight = confidence * min(1.0, recurrence / 3.0)
+            meta_adaptive = self._to_float_optional(metadata.get('topic_adaptive_weight'))
+            meta_accuracy = self._to_float_optional(metadata.get('topic_accuracy'))
+            meta_samples = self._to_float_optional(metadata.get('topic_accuracy_samples'))
+            if meta_adaptive is not None and meta_adaptive > 0:
+                adaptive_weight = float(np.clip(meta_adaptive, 0.5, 1.5))
+                adaptive_accuracy = float(np.clip(meta_accuracy, 0.0, 1.0)) if meta_accuracy is not None else 0.5
+                adaptive_samples = int(max(0, meta_samples)) if meta_samples is not None else 0
+                adaptive_source = "globalwatch_memory"
+            else:
+                adaptive_accuracy, adaptive_samples = self._compute_topic_accuracy(sector_outcomes.get(sector, []))
+                adaptive_weight = self._topic_accuracy_to_weight(adaptive_accuracy)
+                adaptive_source = "local_fallback"
+
+            weight = confidence * min(1.0, recurrence / 3.0) * adaptive_weight
             sector_scores[sector] = sector_scores.get(sector, 0.0) + topic_score * weight
             sector_weights[sector] = sector_weights.get(sector, 0.0) + weight
             sector_details[sector] = {
                 'score': topic_score,
                 'confidence': confidence,
-                'recurrence': recurrence
+                'recurrence': recurrence,
+                'adaptive_weight': adaptive_weight,
+                'adaptive_accuracy': adaptive_accuracy,
+                'adaptive_samples': adaptive_samples,
+                'adaptive_source': adaptive_source
             }
 
         sector_avg_scores = {}
@@ -651,11 +720,22 @@ class MacroSignalAdapter:
                 continue
 
             print(f"[GLOBALWATCH] {direction} {sector} due to LLM {avg_score:+.2f}")
+            detail = sector_details.get(sector, {})
+            print(
+                f"[GLOBALWATCH MEMORY] {sector}: acc={detail.get('adaptive_accuracy', 0.5):.2f}, "
+                f"samples={int(detail.get('adaptive_samples', 0))}, "
+                f"weight={detail.get('adaptive_weight', 1.0):.2f}, "
+                f"source={detail.get('adaptive_source', 'na')}"
+            )
             applied_sector_topics.append({
                 'sector': sector,
                 'score': float(avg_score),
                 'tilt': signed_tilt,
-                'tickers': list(mapped_tickers)
+                'tickers': list(mapped_tickers),
+                'adaptive_weight': float(detail.get('adaptive_weight', 1.0)),
+                'adaptive_accuracy': float(detail.get('adaptive_accuracy', 0.5)),
+                'adaptive_samples': int(detail.get('adaptive_samples', 0)),
+                'adaptive_source': str(detail.get('adaptive_source', 'na'))
             })
 
             for ticker in mapped_tickers:
@@ -824,6 +904,7 @@ class PaperTradingEngine:
         macro_config.setdefault('llm_topic_confidence_threshold', 0.6)
         macro_config.setdefault('llm_topic_score_threshold', 0.5)
         macro_config.setdefault('llm_topic_tilt_scale', 0.02)
+        macro_config.setdefault('topic_memory_window', 50)
         macro_config.setdefault('topic_sector_ticker_map', {
             'semiconductors': ['NVDA', 'SOXX', 'XLK'],
             'technology': ['XLK', 'MSFT', 'AAPL'],
@@ -833,6 +914,7 @@ class PaperTradingEngine:
             'healthcare': ['XLV', 'JNJ', 'MRK'],
             'financials': ['XLF', 'JPM', 'V']
         })
+        config.setdefault('industry_map', {})
         reporting_config = config.setdefault('reporting', {})
         reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
         
@@ -896,7 +978,9 @@ class PaperTradingEngine:
         assert 0.0 <= float(macro_cfg.get('llm_topic_confidence_threshold', 0.6)) <= 1.0, "macro_integration.llm_topic_confidence_threshold must be in [0,1]"
         assert float(macro_cfg.get('llm_topic_score_threshold', 0.5)) >= 0.0, "macro_integration.llm_topic_score_threshold must be >= 0"
         assert float(macro_cfg.get('llm_topic_tilt_scale', 0.02)) >= 0.0, "macro_integration.llm_topic_tilt_scale must be >= 0"
+        assert int(macro_cfg.get('topic_memory_window', 50)) >= 1, "macro_integration.topic_memory_window must be >= 1"
         assert isinstance(macro_cfg.get('topic_sector_ticker_map', {}), dict), "macro_integration.topic_sector_ticker_map must be an object"
+        assert isinstance(self.config.get('industry_map', {}), dict), "industry_map must be an object"
         
         print("[OK] Safety checks passed: SIMULATION ONLY mode confirmed")
     
@@ -1350,6 +1434,52 @@ class PaperTradingEngine:
             return vol
         except:
             return 0.20
+
+    def _build_industry_lookup(self):
+        """Build ticker->industry mapping from config.industry_map."""
+        raw_map = self.config.get('industry_map', {})
+        lookup = {}
+        if not isinstance(raw_map, dict):
+            return lookup
+
+        if raw_map and all(isinstance(v, str) for v in raw_map.values()):
+            for ticker, industry in raw_map.items():
+                t = str(ticker).strip().upper()
+                if t:
+                    lookup[t] = str(industry)
+            return lookup
+
+        for industry, tickers in raw_map.items():
+            if not isinstance(tickers, (list, tuple, set)):
+                continue
+            industry_name = str(industry)
+            for ticker in tickers:
+                t = str(ticker).strip().upper()
+                if t:
+                    lookup[t] = industry_name
+        return lookup
+
+    def calculate_volume_zscore(self, ticker, lookback_days=60):
+        """Calculate volume Z-score versus trailing rolling mean/std."""
+        try:
+            hist = self.get_market_data(ticker, period='6mo', interval='1d')
+            if hist is None or hist.empty or 'Volume' not in hist:
+                return 0.0
+
+            volume_series = hist['Volume'].dropna().astype(float)
+            if len(volume_series) < max(20, int(lookback_days)):
+                return 0.0
+
+            trailing = volume_series.tail(int(lookback_days))
+            vol_mean = float(trailing.mean())
+            vol_std = float(trailing.std())
+            if vol_std <= 1e-12:
+                return 0.0
+
+            latest_volume = float(volume_series.iloc[-1])
+            return float((latest_volume - vol_mean) / vol_std)
+        except Exception:
+            return 0.0
     
     def _sync_current_macro_from_cache(self):
         """def _sync_current_macro_from_cache: docstring omitted (was garbled/non-ASCII)."""
@@ -1447,6 +1577,7 @@ class PaperTradingEngine:
         blend_weight_sum = max(1e-12, float(momentum_short_weight) + float(momentum_medium_weight))
         short_w = float(momentum_short_weight) / blend_weight_sum
         medium_w = float(momentum_medium_weight) / blend_weight_sum
+        industry_lookup = self._build_industry_lookup()
         metrics = {}
         for asset in trade_universe_assets:
             ticker = str(asset.get('ticker', ''))
@@ -1457,12 +1588,18 @@ class PaperTradingEngine:
             short_momentum = self.calculate_momentum(ticker, short_lookback_days) if enable_short_term_momentum else medium_momentum
             blended_momentum = (medium_w * medium_momentum) + (short_w * short_momentum)
             volatility = self.calculate_volatility(ticker, lookback_days)
+            volume_z = self.calculate_volume_zscore(ticker, lookback_days=60)
             base_score = momentum_weight * blended_momentum - vol_weight * (volatility - vol_target)
+            industry_name = industry_lookup.get(str(ticker).upper(), "UNCLASSIFIED")
             metrics[ticker] = {
                 'momentum': float(blended_momentum),
                 'medium_momentum': float(medium_momentum),
                 'short_momentum': float(short_momentum),
                 'volatility': float(max(volatility, 1e-6)),
+                'volume_z': float(volume_z),
+                'industry': industry_name,
+                'industry_strength': 0.0,
+                'volatility_score': 0.0,
                 'base_score': float(base_score),
                 'rank_score': 0.0,
                 'momentum_rank_pct': 0.0,
@@ -1480,6 +1617,9 @@ class PaperTradingEngine:
         med_sigma = float(np.std(medium_values))
         short_mu = float(np.mean(short_values))
         short_sigma = float(np.std(short_values))
+        vol_values = np.array([v['volatility'] for v in metrics.values()], dtype=float)
+        vol_mu = float(np.mean(vol_values))
+        vol_sigma = float(np.std(vol_values))
 
         for ticker, data in metrics.items():
             medium_z = (data['medium_momentum'] - med_mu) / med_sigma if med_sigma > 1e-12 else 0.0
@@ -1491,9 +1631,32 @@ class PaperTradingEngine:
             data['medium_term_z'] = float(medium_z)
             data['short_term_z'] = float(short_z)
             data['blended_momentum_z'] = float(blended_z)
-            data['rank_score'] = float(blended_z)
+            data['volatility_score'] = float((vol_mu - data['volatility']) / vol_sigma) if vol_sigma > 1e-12 else 0.0
             if enable_short_term_momentum:
                 print(f"[MOMENTUM] {ticker}: short={short_z:+.2f}, med={medium_z:+.2f}, blended={blended_z:+.2f}")
+
+        industry_grouped = {}
+        for ticker, data in metrics.items():
+            industry_name = data.get('industry', 'UNCLASSIFIED')
+            industry_grouped.setdefault(industry_name, []).append(float(data.get('blended_momentum_z', 0.0)))
+
+        for ticker, data in metrics.items():
+            industry_name = data.get('industry', 'UNCLASSIFIED')
+            peers = industry_grouped.get(industry_name, [])
+            industry_strength = float(np.mean(peers)) if peers else 0.0
+            momentum_z = float(data.get('blended_momentum_z', 0.0))
+            volatility_score = float(data.get('volatility_score', 0.0))
+            volume_z = float(data.get('volume_z', 0.0))
+            final_score = (
+                0.5 * momentum_z +
+                0.3 * volatility_score +
+                0.2 * industry_strength +
+                0.2 * volume_z
+            )
+            data['industry_strength'] = industry_strength
+            data['final_score_raw'] = float(final_score)
+            data['rank_score'] = float(final_score)
+            data['base_score'] = float(final_score)
 
         metrics = self._apply_score_stability_controls(metrics)
         ranked_for_pct = sorted(metrics.items(), key=lambda x: x[1]['rank_score'], reverse=True)
@@ -2209,12 +2372,16 @@ class PaperTradingEngine:
         )
 
         print(f"\n[RANKING] Top {len(top_ranked)} assets (cross-sectional):")
-        print(f"{'Ticker':<8} {'ShortMom':>10} {'MedMom':>10} {'Volatility':>12} {'RankScore':>11} {'BaseScore':>11}")
-        print('-' * 80)
+        print(f"{'Ticker':<8} {'Industry':<12} {'ShortMom':>9} {'MedMom':>9} {'Vol':>8} {'VolZ':>7} {'IndStr':>8} {'Score':>9}")
+        print('-' * 86)
         for ticker in top_ranked:
             m = asset_metrics[ticker]
-            print(f"{ticker:<8} {m['short_momentum']:>9.2%} {m['medium_momentum']:>9.2%} {m['volatility']:>11.2%} {m['rank_score']:>10.4f} {m['base_score']:>10.4f}")
-        print('-' * 80)
+            industry_name = str(m.get('industry', 'UNCLASSIFIED'))[:12]
+            print(
+                f"{ticker:<8} {industry_name:<12} {m['short_momentum']:>8.2%} {m['medium_momentum']:>8.2%} "
+                f"{m['volatility']:>7.2%} {m.get('volume_z', 0.0):>+6.2f} {m.get('industry_strength', 0.0):>+7.2f} {m['rank_score']:>8.4f}"
+            )
+        print('-' * 86)
 
         corr_selected, corr_decisions, corr_degraded = self._apply_correlation_filter(
             top_ranked,
@@ -3771,7 +3938,7 @@ class PaperTradingEngine:
         print("="*60)
         print("ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v2.10.1-2026-02-07")
+        print(f"ENGINE_VERSION: v2.10.4-2026-02-08")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).

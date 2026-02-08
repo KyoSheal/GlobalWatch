@@ -10,12 +10,12 @@
 
 ## 2. Version Delta (vs previous release)
 ### 2.1 Key additions from `v2.9.1` to `v2.10.1`
-- Step 1: cash-efficiency update with optional high-conviction cash override (still respecting cash floor).
-- Step 2: momentum upgraded from single-timescale to blended multi-timescale signals.
-- Step 3: high-conviction single-asset weight boost under portfolio risk constraints.
-- Step 4: exit-signal module using simple price/volume patterns for reduce/exit actions.
-- Step 5: GlobalWatch structured topic signals with optional LLM topic injection.
-- Step 6: score smoothing/normalization/clipping plus portfolio-level risk gates.
+- 1: cash-efficiency update with optional high-conviction cash override (still respecting cash floor).
+- 2: momentum upgraded from single-timescale to blended multi-timescale signals.
+- 3: high-conviction single-asset weight boost under portfolio risk constraints.
+- 4: exit-signal module using simple price/volume patterns for reduce/exit actions.
+- 5: GlobalWatch structured topic signals with optional LLM topic injection.
+- 6: score smoothing/normalization/clipping plus portfolio-level risk gates.
 
 ### 2.2 Safety architecture retained
 - decoupled signal/macro refresh

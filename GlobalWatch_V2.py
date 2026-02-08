@@ -138,7 +138,8 @@ def load_paper_runtime_settings():
         "enable_llm_topic_signals": True,
         "llm_topic_confidence_threshold": 0.6,
         "llm_topic_score_threshold": 0.5,
-        "llm_topic_model": LOCAL_MODEL
+        "llm_topic_model": LOCAL_MODEL,
+        "topic_memory_window": 50
     }
     config_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
     if not os.path.exists(config_path):
@@ -151,12 +152,182 @@ def load_paper_runtime_settings():
         defaults["llm_topic_confidence_threshold"] = float(macro_cfg.get("llm_topic_confidence_threshold", defaults["llm_topic_confidence_threshold"]))
         defaults["llm_topic_score_threshold"] = float(macro_cfg.get("llm_topic_score_threshold", defaults["llm_topic_score_threshold"]))
         defaults["llm_topic_model"] = str(macro_cfg.get("llm_topic_model", defaults["llm_topic_model"]))
+        defaults["topic_memory_window"] = int(macro_cfg.get("topic_memory_window", defaults["topic_memory_window"]))
     except Exception as e:
         log_error(f"load_paper_runtime_settings error: {str(e)}")
     return defaults
 
 
 RUNTIME_SETTINGS = load_paper_runtime_settings()
+TOPIC_MEMORY_PATH = "outputs/topic_signal_memory.json"
+
+
+def _normalize_theme_key(theme):
+    return str(theme or "").strip().lower()
+
+
+def _coerce_binary_outcome(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1 if value else -1
+    if isinstance(value, (int, float)):
+        if value > 0:
+            return 1
+        if value < 0:
+            return -1
+        return 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "t", "yes", "y", "1", "correct"):
+            return 1
+        if text in ("false", "f", "no", "n", "0", "wrong", "incorrect"):
+            return -1
+        try:
+            return _coerce_binary_outcome(float(text))
+        except Exception:
+            return None
+    return None
+
+
+def load_topic_signal_memory():
+    """Load persistent topic signal feedback memory."""
+    default_state = {
+        "historical_signals": {},
+        "processed_signal_ids": [],
+        "updated_at": datetime.now().isoformat()
+    }
+    try:
+        os.makedirs("outputs", exist_ok=True)
+        if not os.path.exists(TOPIC_MEMORY_PATH):
+            return default_state
+        with open(TOPIC_MEMORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return default_state
+        hist = data.get("historical_signals", {})
+        processed = data.get("processed_signal_ids", [])
+        if not isinstance(hist, dict):
+            hist = {}
+        if not isinstance(processed, list):
+            processed = []
+        return {
+            "historical_signals": hist,
+            "processed_signal_ids": processed,
+            "updated_at": str(data.get("updated_at", datetime.now().isoformat()))
+        }
+    except Exception as e:
+        log_error(f"load_topic_signal_memory error: {str(e)}")
+        return default_state
+
+
+def save_topic_signal_memory(memory_state):
+    """Persist topic signal feedback memory to JSON."""
+    try:
+        os.makedirs("outputs", exist_ok=True)
+        payload = dict(memory_state or {})
+        payload["updated_at"] = datetime.now().isoformat()
+        with open(TOPIC_MEMORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_error(f"save_topic_signal_memory error: {str(e)}")
+
+
+def _infer_topic_outcome_from_metadata(metadata):
+    """Infer topic signal outcome as +1 / -1 / 0 when possible."""
+    if not isinstance(metadata, dict):
+        return None
+
+    correct_1d = _coerce_binary_outcome(metadata.get("correct_1d"))
+    if correct_1d is not None:
+        return int(correct_1d)
+
+    try:
+        ret_1d = float(metadata.get("return_1d", 0.0))
+        topic_score = float(metadata.get("topic_score", metadata.get("topic_score_raw", 0.0)))
+    except Exception:
+        return None
+
+    if abs(topic_score) <= 1e-12 or abs(ret_1d) <= 1e-12:
+        return 0
+    return 1 if (ret_1d * topic_score) > 0 else -1
+
+
+def refresh_topic_signal_memory(memory_state=None):
+    """Backfill topic memory from verified topic_sentiment records."""
+    state = memory_state if isinstance(memory_state, dict) else load_topic_signal_memory()
+    historical = state.setdefault("historical_signals", {})
+    processed_ids = set(state.get("processed_signal_ids", []))
+    window = max(1, int(RUNTIME_SETTINGS.get("topic_memory_window", 50)))
+    updates = 0
+
+    try:
+        results = signals_collection.get(
+            where={"signal_type": "topic_sentiment"},
+            include=["metadatas"]
+        )
+    except Exception as e:
+        log_error(f"refresh_topic_signal_memory fetch error: {str(e)}")
+        return state, 0
+
+    ids = results.get("ids", []) if isinstance(results, dict) else []
+    metadatas = results.get("metadatas", []) if isinstance(results, dict) else []
+    for idx, signal_id in enumerate(ids):
+        if signal_id in processed_ids:
+            continue
+        metadata = metadatas[idx] if idx < len(metadatas) else {}
+        if not isinstance(metadata, dict):
+            continue
+        theme = _normalize_theme_key(metadata.get("topic_sector") or metadata.get("sector") or metadata.get("theme"))
+        if not theme:
+            continue
+
+        outcome = _infer_topic_outcome_from_metadata(metadata)
+        if outcome is None:
+            continue
+
+        history = historical.setdefault(theme, [])
+        history.append(int(outcome))
+        if len(history) > window:
+            del history[:-window]
+        processed_ids.add(signal_id)
+        updates += 1
+
+    state["processed_signal_ids"] = list(processed_ids)[-10000:]
+    state["historical_signals"] = historical
+    return state, updates
+
+
+def evaluate_theme_signal_accuracy(theme: str, memory_state=None):
+    """Return topic accuracy summary over the last N feedback outcomes."""
+    state = memory_state if isinstance(memory_state, dict) else load_topic_signal_memory()
+    historical = state.get("historical_signals", {})
+    key = _normalize_theme_key(theme)
+    history = historical.get(key, [])
+    window = max(1, int(RUNTIME_SETTINGS.get("topic_memory_window", 50)))
+    sample = history[-window:] if isinstance(history, list) else []
+    informative = [x for x in sample if x in (-1, 1)]
+    if not informative:
+        accuracy = 0.5
+    else:
+        accuracy = float(sum(1 for x in informative if x == 1) / len(informative))
+    return {
+        "theme": key,
+        "accuracy": float(accuracy),
+        "samples": int(len(informative)),
+        "window": int(window),
+        "history": list(sample)
+    }
+
+
+def _accuracy_to_adaptive_weight(accuracy):
+    """Map accuracy bands to adaptive tilt weights."""
+    acc = float(accuracy)
+    if acc < 0.40:
+        return 0.75
+    if acc > 0.60:
+        return 1.25
+    return 1.00
 
 
 def query_ollama(model, prompt, num_ctx=8192, temperature=None):
@@ -568,6 +739,11 @@ def record_llm_topic_signals(payload, news_sources):
     if payload_conf < confidence_threshold:
         return 0
 
+    memory_state = load_topic_signal_memory()
+    memory_state, memory_updates = refresh_topic_signal_memory(memory_state)
+    if memory_updates > 0:
+        save_topic_signal_memory(memory_state)
+
     count = 0
     source_str = ",".join(list(set([s for s in news_sources if s]))[:3])
     topic_recurrence = payload.get("topic_recurrence", [])
@@ -593,6 +769,8 @@ def record_llm_topic_signals(payload, news_sources):
 
         direction = "Bullish" if score > 0 else "Bearish" if score < 0 else "Neutral"
         sector_key = str(sector).strip().lower()
+        accuracy_info = evaluate_theme_signal_accuracy(sector_key, memory_state=memory_state)
+        adaptive_weight = _accuracy_to_adaptive_weight(accuracy_info.get("accuracy", 0.5))
         signal_id = str(uuid.uuid4())
         topic_recur = recurrence_map.get(sector_key, 1.0)
         metadata = {
@@ -611,6 +789,10 @@ def record_llm_topic_signals(payload, news_sources):
             "topic_score": float(score),
             "topic_confidence": float(payload_conf),
             "topic_recurrence": float(topic_recur),
+            "topic_memory_window": int(accuracy_info.get("window", int(RUNTIME_SETTINGS.get("topic_memory_window", 50)))),
+            "topic_accuracy": float(accuracy_info.get("accuracy", 0.5)),
+            "topic_accuracy_samples": int(accuracy_info.get("samples", 0)),
+            "topic_adaptive_weight": float(adaptive_weight),
             "summary": str(payload.get("summary", "")),
             "source_tag": "llm+news",
             "price_1h": 0.0,
@@ -634,9 +816,15 @@ def record_llm_topic_signals(payload, news_sources):
                 ids=[signal_id]
             )
             if score > 0:
-                print(f"[GLOBALWATCH] Overweight {sector_key} due to LLM {score:+.2f}")
+                print(
+                    f"[GLOBALWATCH] Overweight {sector_key} due to LLM {score:+.2f} "
+                    f"(acc={accuracy_info.get('accuracy', 0.5):.2f}, w={adaptive_weight:.2f})"
+                )
             else:
-                print(f"[GLOBALWATCH] Underweight {sector_key} due to LLM {score:+.2f}")
+                print(
+                    f"[GLOBALWATCH] Underweight {sector_key} due to LLM {score:+.2f} "
+                    f"(acc={accuracy_info.get('accuracy', 0.5):.2f}, w={adaptive_weight:.2f})"
+                )
             count += 1
         except Exception as e:
             log_error(f"record_llm_topic_signals add error: {str(e)}")

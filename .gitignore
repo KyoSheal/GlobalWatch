@@ -6,6 +6,7 @@ __pycache__/
 memory_db/
 chroma_db/
 outputs/
+backup/
 
 # 如果你有虚拟环境
 venv/

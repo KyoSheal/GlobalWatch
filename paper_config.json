@@ -275,6 +275,19 @@
       "asset_type": "CASH"
     }
   ],
+  "industry_map": {
+    "technology": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "ORCL", "ADBE", "CRM", "INTU", "QQQ", "XLK"],
+    "consumer_defensive": ["WMT", "COST", "PEP", "MCD", "SBUX", "KO", "PG", "XLP"],
+    "consumer_cyclical": ["HD", "LOW", "IWM"],
+    "healthcare": ["JNJ", "MRK", "ABBV", "LLY", "TMO", "XLV"],
+    "financials": ["JPM", "BAC", "GS", "V", "MA", "BRK.B", "XLF"],
+    "energy": ["XOM", "CVX", "COP", "XLE"],
+    "industrials_defense": ["LMT", "RTX", "CAT", "DE", "XLI", "DIA"],
+    "utilities": ["NEE", "DUK"],
+    "broad_market_etf": ["SPY", "VTI", "VOO"],
+    "rates_and_gold": ["TLT", "GLD"],
+    "cash_equivalent": ["CASH"]
+  },
   "objectives": {
     "goal": "capital_preservation_and_growth",
     "risk_level": "medium",
@@ -366,6 +379,7 @@
     "llm_topic_confidence_threshold": 0.6,
     "llm_topic_score_threshold": 0.5,
     "llm_topic_tilt_scale": 0.02,
+    "topic_memory_window": 50,
     "topic_sector_ticker_map": {
       "semiconductors": ["NVDA", "XLK"],
       "technology": ["XLK", "MSFT", "AAPL"],
