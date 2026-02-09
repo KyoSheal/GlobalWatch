@@ -304,6 +304,19 @@
     "momentum_weight": 0.65,
     "vol_weight": 0.35
   },
+  "risk_model": {
+    "enable_cov_diagnostics": true,
+    "returns_period": "6mo",
+    "returns_interval": "1d",
+    "returns_lookback_days": 60,
+    "min_obs": 30,
+    "drop_threshold": 0.5,
+    "shrinkage_alpha": 0.15,
+    "annualization_factor": 252,
+    "max_pair_corr_pairs": 3,
+    "debug_log": false,
+    "fallback_to_diag_on_error": true
+  },
   "execution": {
     "weight_threshold": 0.025,
     "min_trade_notional_usd": 400,

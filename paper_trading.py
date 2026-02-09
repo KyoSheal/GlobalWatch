@@ -1,4 +1,4 @@
-"""Paper trading engine (simulation only)."""
+﻿"""Paper trading engine (simulation only)."""
 
 import json
 import os
@@ -777,6 +777,35 @@ class PaperTradingEngine:
         self.current_turnover_info = {}
         self.current_exit_info = {}
         self.current_risk_check_info = {}
+        self.current_vol_targeting_info = {'enabled': False, 'status': 'disabled'}
+        self.current_cost_est_info = {
+            'enabled': False,
+            'total': 0.0,
+            'fee': 0.0,
+            'slippage': 0.0,
+            'impact': 0.0,
+            'num_trades': 0
+        }
+        self.current_planner_info = {
+            'enabled': False,
+            'status': 'disabled',
+            'turnover_limit': 0.0,
+            'turnover_used_forced': 0.0,
+            'turnover_used_normal': 0.0,
+            'turnover_used_total': 0.0,
+            'num_forced': 0,
+            'num_normal': 0,
+            'num_dropped': 0,
+            'num_adv_clipped': 0,
+            'num_adv_dropped': 0,
+            'adv_limit_enabled': False,
+            'adv_limit_frac': 0.0,
+            'normal_sorted_by': 'notional',
+            'lambda_cost': 1.0,
+            'benefit_mode': 'delta_weight',
+            'dropped': [],
+            'scaled': []
+        }
         self.current_holding_blocks = []
         self.forced_until_time = None  # NOTE: comment omitted (was garbled/non-ASCII).
         self.forced_regime_reason = ""
@@ -819,6 +848,9 @@ class PaperTradingEngine:
             'macro_tilts_ignored': {},
             'signal_summary': {}
         }
+        self.market_data_fetcher = None
+        self.price_fetcher = None
+        self.returns_cache = {}
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_adapter = MacroSignalAdapter(self.config)
@@ -927,6 +959,22 @@ class PaperTradingEngine:
             'financials': ['XLF', 'JPM', 'V']
         })
         config.setdefault('industry_map', {})
+        risk_model_config = config.setdefault('risk_model', {})
+        risk_model_config.setdefault('enable_cov_diagnostics', True)
+        risk_model_config.setdefault('returns_period', '6mo')
+        risk_model_config.setdefault('returns_interval', '1d')
+        risk_model_config.setdefault('returns_lookback_days', 60)
+        risk_model_config.setdefault('min_obs', 30)
+        risk_model_config.setdefault('drop_threshold', 0.5)
+        risk_model_config.setdefault('shrinkage_alpha', 0.15)
+        risk_model_config.setdefault('annualization_factor', 252)
+        risk_model_config.setdefault('max_pair_corr_pairs', 3)
+        risk_model_config.setdefault('debug_log', False)
+        risk_model_config.setdefault('fallback_to_diag_on_error', True)
+        risk_model_config.setdefault('use_cov_vol_for_gate', False)
+        risk_model_config.setdefault('rc_limit', 0.35)
+        risk_model_config.setdefault('min_cov_gate_coverage', 0.6)
+        risk_model_config.setdefault('cov_gate_fallback_to_weighted', True)
         reporting_config = config.setdefault('reporting', {})
         reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
         reporting_config.setdefault('snapshot_live_path', 'outputs/snapshot_live.json')
@@ -1292,6 +1340,122 @@ class PaperTradingEngine:
                 'equity': float(equity)
             })
 
+        cov_diag = {"enabled": True, "status": "error", "error": "cov_diag_uninitialized"}
+        try:
+            diag_weights = {}
+            if total_equity > 0 and isinstance(positions_detail, dict):
+                for ticker, pos in positions_detail.items():
+                    ticker_upper = str(ticker).strip().upper()
+                    if not ticker_upper or ticker_upper == 'CASH':
+                        continue
+                    try:
+                        if isinstance(pos, dict):
+                            pos_value = float(pos.get('value', 0.0) or 0.0)
+                        else:
+                            pos_value = float(pos or 0.0)
+                    except Exception:
+                        continue
+                    if pos_value > 0:
+                        diag_weights[ticker_upper] = float(pos_value / total_equity)
+
+            cycle_id = int(snapshot.get('cycle', self.current_cycle))
+            weight_signature = tuple(
+                sorted(
+                    (str(k), round(float(v), 12))
+                    for k, v in diag_weights.items()
+                    if np.isfinite(float(v))
+                )
+            )
+            cache_key = ("cov_diag_snapshot", cycle_id, weight_signature)
+            cached_entry = self.returns_cache.get(cache_key)
+            cached_result = None
+            if isinstance(cached_entry, dict):
+                cached_meta = cached_entry.get("meta", {})
+                if isinstance(cached_meta, dict):
+                    maybe_result = cached_meta.get("result")
+                    if isinstance(maybe_result, dict):
+                        cached_result = maybe_result
+
+            if isinstance(cached_result, dict):
+                cov_diag = cached_result
+            else:
+                cov_diag = self.compute_cov_risk_diagnostics(diag_weights)
+                self.returns_cache[cache_key] = {
+                    "ts": datetime.now(),
+                    "returns": pd.DataFrame(),
+                    "meta": {
+                        "kind": "cov_diag",
+                        "cycle": cycle_id,
+                        "result": cov_diag
+                    }
+                }
+                for existing_key in list(self.returns_cache.keys()):
+                    if existing_key == cache_key:
+                        continue
+                    if isinstance(existing_key, tuple) and len(existing_key) > 0 and existing_key[0] == "cov_diag_snapshot":
+                        self.returns_cache.pop(existing_key, None)
+        except Exception as e:
+            cov_diag = {"enabled": True, "status": "error", "error": str(e)}
+
+        try:
+            if not isinstance(self.current_risk_check_info, dict):
+                self.current_risk_check_info = {}
+            self.current_risk_check_info["cov_risk_diag"] = cov_diag
+        except Exception:
+            pass
+
+        vt_meta = None
+        if isinstance(snapshot.get('vol_targeting'), dict):
+            vt_meta = dict(snapshot.get('vol_targeting'))
+        elif isinstance(self.current_vol_targeting_info, dict):
+            vt_meta = dict(self.current_vol_targeting_info)
+        elif isinstance(self.current_risk_check_info, dict) and isinstance(self.current_risk_check_info.get('vol_targeting'), dict):
+            vt_meta = dict(self.current_risk_check_info.get('vol_targeting'))
+        else:
+            vt_meta = {'enabled': False, 'status': 'unavailable'}
+        cost_est_meta = snapshot.get('cost_est')
+        if isinstance(cost_est_meta, dict):
+            cost_est_meta = dict(cost_est_meta)
+        elif isinstance(self.current_cost_est_info, dict):
+            cost_est_meta = dict(self.current_cost_est_info)
+        else:
+            cost_est_meta = {
+                'enabled': False,
+                'total': 0.0,
+                'fee': 0.0,
+                'slippage': 0.0,
+                'impact': 0.0,
+                'num_trades': 0
+            }
+        planner_meta = snapshot.get('trade_planner')
+        if isinstance(planner_meta, dict):
+            planner_meta = dict(planner_meta)
+        elif isinstance(self.current_planner_info, dict):
+            planner_meta = dict(self.current_planner_info)
+        else:
+            planner_meta = {
+                'enabled': False,
+                'status': 'disabled',
+                'turnover_limit': 0.0,
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': 0.0,
+                'turnover_used_total': 0.0,
+                'num_forced': 0,
+                'num_normal': 0,
+                'num_dropped': 0,
+                'num_adv_clipped': 0,
+                'num_adv_dropped': 0,
+                'adv_limit_enabled': False,
+                'adv_limit_frac': 0.0,
+                'normal_sorted_by': 'notional',
+                'lambda_cost': 1.0,
+                'benefit_mode': 'delta_weight',
+                'normal_score_stats': {'count': 0},
+                'dropped': [],
+                'scaled': []
+            }
+        planner_turnover_used = float(planner_meta.get('turnover_used_forced', 0.0) or 0.0) + float(planner_meta.get('turnover_used_normal', 0.0) or 0.0)
+
         payload = {
             'timestamp': snapshot.get('timestamp', datetime.now().isoformat()),
             'cycle': int(snapshot.get('cycle', self.current_cycle)),
@@ -1324,7 +1488,30 @@ class PaperTradingEngine:
             },
             'rebalance_trigger': snapshot.get('stale_decision_trace', ''),
             'last_trade_time': self.trades_log[-1].get('timestamp') if self.trades_log else None,
-            'equity_history': equity_history
+            'equity_history': equity_history,
+            'gate_vol_method': snapshot.get('gate_vol_method', self.current_risk_check_info.get('gate_vol_method') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_gate_reason': snapshot.get('cov_gate_reason', self.current_risk_check_info.get('cov_gate_reason') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_gate_used': snapshot.get('cov_gate_used', self.current_risk_check_info.get('cov_gate_used') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_gate_pass': snapshot.get('cov_gate_pass', self.current_risk_check_info.get('cov_gate_pass') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_gate_coverage': snapshot.get('cov_gate_coverage', self.current_risk_check_info.get('cov_gate_coverage') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_gate_vol': snapshot.get('cov_gate_vol', self.current_risk_check_info.get('cov_gate_vol') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_gate_max_rc': snapshot.get('cov_gate_max_rc', self.current_risk_check_info.get('cov_gate_max_rc') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_risk_diag': cov_diag,
+            'portfolio_vol_cov_annualized': cov_diag.get('portfolio_vol_annualized') if isinstance(cov_diag, dict) else None,
+            'max_rc_fraction_cov': cov_diag.get('max_rc_fraction') if isinstance(cov_diag, dict) else None,
+            'max_rc_ticker_cov': cov_diag.get('max_rc_ticker') if isinstance(cov_diag, dict) else None,
+            'avg_pairwise_corr_cov': cov_diag.get('avg_pairwise_corr') if isinstance(cov_diag, dict) else None,
+            'vol_targeting': vt_meta,
+            'vol_targeting_scale': vt_meta.get('scale') if isinstance(vt_meta, dict) else None,
+            'vol_targeting_vol_before': vt_meta.get('vol_before') if isinstance(vt_meta, dict) else None,
+            'vol_targeting_cash_after': vt_meta.get('cash_after') if isinstance(vt_meta, dict) else None,
+            'cost_est': cost_est_meta,
+            'trade_planner': planner_meta,
+            'trade_planner_num_dropped': int(planner_meta.get('num_dropped', 0) or 0),
+            'trade_planner_turnover_used': float(planner_turnover_used),
+            'trade_planner_num_adv_clipped': int(planner_meta.get('num_adv_clipped', 0) or 0),
+            'trade_planner_num_adv_dropped': int(planner_meta.get('num_adv_dropped', 0) or 0),
+            'trade_planner_normal_score_count': int((planner_meta.get('normal_score_stats', {}) or {}).get('count', 0) or 0)
         }
         return payload
 
@@ -1451,6 +1638,18 @@ class PaperTradingEngine:
         self.position_entry_cycle = {}
         self.current_holding_blocks = []
 
+    def set_market_data_fetcher(self, fetcher):
+        """Set optional market data fetcher for backtests/replay injection."""
+        if fetcher is not None and not callable(fetcher):
+            raise ValueError("market_data_fetcher must be callable or None")
+        self.market_data_fetcher = fetcher
+
+    def set_price_fetcher(self, fetcher):
+        """Set optional current price fetcher for backtests/replay injection."""
+        if fetcher is not None and not callable(fetcher):
+            raise ValueError("price_fetcher must be callable or None")
+        self.price_fetcher = fetcher
+
     def _normalize_market_ticker(self, ticker):
         """Normalize ticker symbol for market-data providers like Yahoo."""
         if ticker is None:
@@ -1475,6 +1674,17 @@ class PaperTradingEngine:
             if ticker == 'CASH':
                 return None
 
+            if self.market_data_fetcher is not None:
+                try:
+                    return self.market_data_fetcher(ticker=ticker, period=period, interval=interval)
+                except TypeError:
+                    try:
+                        return self.market_data_fetcher(ticker, period, interval)
+                    except Exception as e:
+                        print(f"[WARN] Injected market_data_fetcher failed for {ticker}: {e}")
+                except Exception as e:
+                    print(f"[WARN] Injected market_data_fetcher failed for {ticker}: {e}")
+
             market_ticker = self._normalize_market_ticker(ticker)
             t = yf.Ticker(market_ticker)
             hist = t.history(period=period, interval=interval)
@@ -1494,6 +1704,20 @@ class PaperTradingEngine:
             return (1.0, 0, "LIVE")
         
         try:
+            if self.price_fetcher is not None:
+                try:
+                    fetch_result = self.price_fetcher(ticker=ticker)
+                except TypeError:
+                    fetch_result = self.price_fetcher(ticker)
+                except Exception as e:
+                    fetch_result = None
+                    print(f"[WARN] Injected price_fetcher failed for {ticker}: {e}")
+
+                if fetch_result is not None:
+                    if isinstance(fetch_result, tuple) and len(fetch_result) == 3:
+                        return fetch_result
+                    print(f"[WARN] Injected price_fetcher returned invalid payload for {ticker}; falling back")
+
             import pytz
             now_et = datetime.now(pytz.timezone('US/Eastern'))
             
@@ -1570,6 +1794,1350 @@ class PaperTradingEngine:
             print(f"[ERROR] All price methods failed for {ticker}: {e}")
         
         return (None, 99999, "STALE")
+
+    def build_returns_matrix(
+        self,
+        tickers: list,
+        lookback_days: int,
+        *,
+        period: str = '6mo',
+        interval: str = '1d',
+        min_obs: int = 30,
+        drop_threshold: float = 0.5,
+    ) -> tuple[pd.DataFrame, dict]:
+        """Build aligned return matrix with diagnostics for future risk-model phases."""
+        meta = {
+            "lookback_days": int(lookback_days) if isinstance(lookback_days, (int, np.integer)) else 0,
+            "min_obs": int(min_obs),
+            "drop_threshold": float(drop_threshold),
+            "input_tickers": [],
+            "used_tickers": [],
+            "missing_tickers": [],
+            "dropped_tickers": [],
+            "rows": 0,
+            "cols": 0,
+            "obs_by_ticker": {},
+            "coverage_by_ticker": {},
+            "overall_row_coverage": 0.0,
+        }
+
+        try:
+            raw_tickers = list(tickers or [])
+            seen = set()
+            normalized = []
+            for raw in raw_tickers:
+                t = str(raw).upper().strip()
+                if not t or t == 'CASH' or t in seen:
+                    continue
+                seen.add(t)
+                normalized.append(t)
+
+            meta["input_tickers"] = list(normalized)
+            if int(lookback_days) <= 0:
+                return pd.DataFrame(), meta
+
+            lookback_days = int(lookback_days)
+            min_obs = int(min_obs)
+            drop_threshold = float(drop_threshold)
+            threshold_obs = float(lookback_days) * (1.0 - drop_threshold)
+
+            series_map = {}
+            missing_tickers = []
+            obs_by_ticker = {t: 0 for t in normalized}
+
+            for ticker in normalized:
+                hist = self.get_market_data(ticker, period=period, interval=interval)
+                if hist is None or hist.empty or 'Close' not in hist.columns:
+                    missing_tickers.append(ticker)
+                    continue
+
+                close = hist['Close'].astype(float).dropna()
+                if close.empty:
+                    missing_tickers.append(ticker)
+                    continue
+
+                daily_returns = close.pct_change().dropna()
+                if daily_returns.empty:
+                    missing_tickers.append(ticker)
+                    continue
+
+                series = daily_returns.tail(lookback_days)
+                series_map[ticker] = series
+                obs_by_ticker[ticker] = int(series.notna().sum())
+
+            returns_df = pd.DataFrame()
+            if series_map:
+                returns_df = pd.concat(series_map, axis=1, join='outer')
+                returns_df = returns_df.dropna(how='all')
+
+            dropped_tickers = []
+            if not returns_df.empty:
+                for ticker in list(returns_df.columns):
+                    obs_i = int(returns_df[ticker].notna().sum())
+                    obs_by_ticker[ticker] = obs_i
+                    if obs_i < min_obs or obs_i < threshold_obs:
+                        dropped_tickers.append(ticker)
+
+                if dropped_tickers:
+                    returns_df = returns_df.drop(columns=dropped_tickers, errors='ignore')
+
+            used_tickers = list(returns_df.columns) if not returns_df.empty else []
+
+            coverage_by_ticker = {}
+            denom = float(lookback_days) if lookback_days > 0 else 0.0
+            for ticker in normalized:
+                obs_i = int(obs_by_ticker.get(ticker, 0))
+                coverage_by_ticker[ticker] = float(obs_i / denom) if denom > 0 else 0.0
+
+            overall_row_coverage = 0.0
+            if returns_df.shape[1] > 0 and len(returns_df.index) > 0:
+                non_na_counts = returns_df.notna().sum(axis=1).astype(float)
+                overall_row_coverage = float((non_na_counts / float(returns_df.shape[1])).mean())
+
+            meta.update({
+                "used_tickers": used_tickers,
+                "missing_tickers": missing_tickers,
+                "dropped_tickers": dropped_tickers,
+                "rows": int(returns_df.shape[0]),
+                "cols": int(returns_df.shape[1]),
+                "obs_by_ticker": obs_by_ticker,
+                "coverage_by_ticker": coverage_by_ticker,
+                "overall_row_coverage": overall_row_coverage,
+            })
+
+            return returns_df, meta
+        except Exception as e:
+            print(f"[WARN] build_returns_matrix failed: {e}")
+            return pd.DataFrame(), meta
+
+    def _get_risk_model_cfg(self) -> dict:
+        """Return risk-model config with safe defaults and type-normalized values."""
+        defaults = {
+            "enable_cov_diagnostics": True,
+            "returns_period": "6mo",
+            "returns_interval": "1d",
+            "returns_lookback_days": 60,
+            "min_obs": 30,
+            "drop_threshold": 0.5,
+            "shrinkage_alpha": 0.15,
+            "annualization_factor": 252,
+            "max_pair_corr_pairs": 3,
+            "debug_log": False,
+            "fallback_to_diag_on_error": True,
+            "use_cov_vol_for_gate": False,
+            "rc_limit": 0.35,
+            "min_cov_gate_coverage": 0.6,
+            "cov_gate_fallback_to_weighted": True,
+            "enable_vol_targeting": False,
+            "vol_target": 0.18,
+            "vol_target_min_coverage": 0.6,
+            "vol_target_min_scale": 0.10,
+            "vol_target_max_scale": 1.00,
+            "vol_target_use_cov_only": True,
+        }
+        try:
+            raw_cfg = self.config.get("risk_model", {})
+            if not isinstance(raw_cfg, dict):
+                raw_cfg = {}
+            cfg = dict(defaults)
+            cfg.update(raw_cfg)
+
+            cfg["enable_cov_diagnostics"] = bool(cfg.get("enable_cov_diagnostics", True))
+            cfg["returns_period"] = str(cfg.get("returns_period", "6mo"))
+            cfg["returns_interval"] = str(cfg.get("returns_interval", "1d"))
+            cfg["returns_lookback_days"] = int(cfg.get("returns_lookback_days", 60))
+            cfg["min_obs"] = int(cfg.get("min_obs", 30))
+            cfg["drop_threshold"] = float(cfg.get("drop_threshold", 0.5))
+            cfg["shrinkage_alpha"] = float(cfg.get("shrinkage_alpha", 0.15))
+            cfg["annualization_factor"] = int(cfg.get("annualization_factor", 252))
+            cfg["max_pair_corr_pairs"] = int(cfg.get("max_pair_corr_pairs", 3))
+            cfg["debug_log"] = bool(cfg.get("debug_log", False))
+            cfg["fallback_to_diag_on_error"] = bool(cfg.get("fallback_to_diag_on_error", True))
+            cfg["use_cov_vol_for_gate"] = bool(cfg.get("use_cov_vol_for_gate", False))
+            cfg["rc_limit"] = float(cfg.get("rc_limit", 0.35))
+            cfg["min_cov_gate_coverage"] = float(cfg.get("min_cov_gate_coverage", 0.6))
+            cfg["cov_gate_fallback_to_weighted"] = bool(cfg.get("cov_gate_fallback_to_weighted", True))
+            cfg["enable_vol_targeting"] = bool(cfg.get("enable_vol_targeting", False))
+            cfg["vol_target"] = float(cfg.get("vol_target", 0.18))
+            cfg["vol_target_min_coverage"] = float(cfg.get("vol_target_min_coverage", 0.6))
+            cfg["vol_target_min_scale"] = float(cfg.get("vol_target_min_scale", 0.10))
+            cfg["vol_target_max_scale"] = float(cfg.get("vol_target_max_scale", 1.00))
+            cfg["vol_target_use_cov_only"] = bool(cfg.get("vol_target_use_cov_only", True))
+
+            cfg["drop_threshold"] = float(np.clip(cfg["drop_threshold"], 0.0, 1.0))
+            cfg["shrinkage_alpha"] = float(np.clip(cfg["shrinkage_alpha"], 0.0, 1.0))
+            if cfg["returns_lookback_days"] < 0:
+                cfg["returns_lookback_days"] = 0
+            if cfg["min_obs"] < 0:
+                cfg["min_obs"] = 0
+            if cfg["annualization_factor"] <= 0:
+                cfg["annualization_factor"] = 252
+            if cfg["max_pair_corr_pairs"] < 0:
+                cfg["max_pair_corr_pairs"] = 0
+            if cfg["rc_limit"] < 0:
+                cfg["rc_limit"] = 0.0
+            cfg["min_cov_gate_coverage"] = float(np.clip(cfg["min_cov_gate_coverage"], 0.0, 1.0))
+            if cfg["vol_target"] <= 0:
+                cfg["vol_target"] = 0.18
+            cfg["vol_target_min_coverage"] = float(np.clip(cfg["vol_target_min_coverage"], 0.0, 1.0))
+            cfg["vol_target_min_scale"] = float(np.clip(cfg["vol_target_min_scale"], 0.0, 1.0))
+            cfg["vol_target_max_scale"] = float(np.clip(cfg["vol_target_max_scale"], 0.0, 1.0))
+            if cfg["vol_target_max_scale"] < cfg["vol_target_min_scale"]:
+                cfg["vol_target_max_scale"] = cfg["vol_target_min_scale"]
+            return cfg
+        except Exception:
+            return dict(defaults)
+
+    def _get_cost_model_cfg(self) -> dict:
+        """Return cost-model config with safe defaults."""
+        defaults = {
+            "enabled": False,
+            "fee_bps": 1.0,
+            "slippage_bps": 2.0,
+            "impact_enabled": False,
+            "impact_k": 0.1,
+            "adv_lookback_days": 20,
+            "debug_log": False
+        }
+        try:
+            raw_cfg = self.config.get("cost_model", {})
+            if not isinstance(raw_cfg, dict):
+                raw_cfg = {}
+            cfg = dict(defaults)
+            cfg.update(raw_cfg)
+
+            cfg["enabled"] = bool(cfg.get("enabled", False))
+            cfg["fee_bps"] = max(0.0, float(cfg.get("fee_bps", 1.0)))
+            cfg["slippage_bps"] = max(0.0, float(cfg.get("slippage_bps", 2.0)))
+            cfg["impact_enabled"] = bool(cfg.get("impact_enabled", False))
+            cfg["impact_k"] = max(0.0, float(cfg.get("impact_k", 0.1)))
+            cfg["adv_lookback_days"] = max(1, int(cfg.get("adv_lookback_days", 20)))
+            cfg["debug_log"] = bool(cfg.get("debug_log", False))
+            return cfg
+        except Exception:
+            return dict(defaults)
+
+    def _get_planner_cfg(self) -> dict:
+        """Return trade-planner config with safe defaults."""
+        defaults = {
+            "enable_trade_planner": False,
+            "planner_debug_log": False,
+            "min_trade_notional": 5.0,
+            "allow_partial_fill": True,
+            "enable_adv_limit": False,
+            "adv_limit_frac": 0.02,
+            "adv_lookback_days": 20,
+            "adv_volume_field": "Volume",
+            "adv_price_field": "Close",
+            "adv_apply_to_forced": True,
+            "enable_cost_sensitive_ranking": False,
+            "lambda_cost": 1.0,
+            "benefit_mode": "delta_weight",
+            "max_audit_items": 20,
+        }
+        try:
+            raw_cfg = self.config.get("trade_planner", {})
+            if not isinstance(raw_cfg, dict):
+                raw_cfg = {}
+            execution_cfg = self.config.get("execution", {})
+            if isinstance(execution_cfg, dict):
+                exec_planner_cfg = execution_cfg.get("trade_planner", {})
+                if isinstance(exec_planner_cfg, dict):
+                    merged = dict(exec_planner_cfg)
+                    merged.update(raw_cfg)
+                    raw_cfg = merged
+            cfg = dict(defaults)
+            cfg.update(raw_cfg)
+            cfg["enable_trade_planner"] = bool(cfg.get("enable_trade_planner", False))
+            cfg["planner_debug_log"] = bool(cfg.get("planner_debug_log", False))
+            cfg["min_trade_notional"] = max(0.0, float(cfg.get("min_trade_notional", 5.0)))
+            cfg["allow_partial_fill"] = bool(cfg.get("allow_partial_fill", True))
+            cfg["enable_adv_limit"] = bool(cfg.get("enable_adv_limit", False))
+            cfg["adv_limit_frac"] = max(0.0, float(cfg.get("adv_limit_frac", 0.02)))
+            cfg["adv_lookback_days"] = max(1, int(cfg.get("adv_lookback_days", 20)))
+            cfg["adv_volume_field"] = str(cfg.get("adv_volume_field", "Volume") or "Volume")
+            cfg["adv_price_field"] = str(cfg.get("adv_price_field", "Close") or "Close")
+            cfg["adv_apply_to_forced"] = bool(cfg.get("adv_apply_to_forced", True))
+            cfg["enable_cost_sensitive_ranking"] = bool(cfg.get("enable_cost_sensitive_ranking", False))
+            cfg["lambda_cost"] = float(cfg.get("lambda_cost", 1.0))
+            cfg["benefit_mode"] = str(cfg.get("benefit_mode", "delta_weight")).lower()
+            if cfg["benefit_mode"] not in ("delta_weight", "delta_notional"):
+                cfg["benefit_mode"] = "delta_weight"
+            cfg["max_audit_items"] = max(1, int(cfg.get("max_audit_items", 20)))
+            return cfg
+        except Exception:
+            return dict(defaults)
+
+    def estimate_adv_notional(self, ticker: str, *, lookback_days: int) -> float | None:
+        """Estimate ADV notional from recent daily Volume*Close."""
+        try:
+            ticker_u = str(ticker).upper().strip()
+            if not ticker_u or ticker_u == "CASH":
+                return None
+            planner_cfg = self._get_planner_cfg()
+            volume_field = str(planner_cfg.get("adv_volume_field", "Volume") or "Volume")
+            price_field = str(planner_cfg.get("adv_price_field", "Close") or "Close")
+            lookback_days = max(1, int(lookback_days))
+            hist = self.get_market_data(ticker_u, period='3mo', interval='1d')
+            if hist is None or hist.empty:
+                return None
+            if volume_field not in hist.columns or price_field not in hist.columns:
+                return None
+            vol = pd.to_numeric(hist[volume_field], errors='coerce').tail(lookback_days)
+            px = pd.to_numeric(hist[price_field], errors='coerce').tail(lookback_days)
+            notional_series = (vol * px).replace([np.inf, -np.inf], np.nan).dropna()
+            if notional_series.empty:
+                return None
+            adv_notional = float(notional_series.mean())
+            if not np.isfinite(adv_notional) or adv_notional <= 0:
+                return None
+            return adv_notional
+        except Exception:
+            return None
+
+    def apply_trade_planner(self, trades: list, equity: float, turnover_limit: float, *, reason_tag: str = "planner") -> tuple[list, dict]:
+        """Prioritize forced trades under turnover budget without changing target generation."""
+        cfg = self._get_planner_cfg()
+        meta = {
+            "enabled": bool(cfg.get("enable_trade_planner", False)),
+            "status": "disabled",
+            "reason_tag": reason_tag,
+            "turnover_limit": float(turnover_limit if turnover_limit is not None else 0.0),
+            "turnover_used_forced": 0.0,
+            "turnover_used_normal": 0.0,
+            "turnover_used_total": 0.0,
+            "num_forced": 0,
+            "num_normal": 0,
+            "num_dropped": 0,
+            "dropped": [],
+            "scaled": [],
+            "adv_limit_enabled": bool(cfg.get("enable_adv_limit", False)),
+            "adv_limit_frac": float(cfg.get("adv_limit_frac", 0.02)),
+            "num_adv_clipped": 0,
+            "num_adv_dropped": 0,
+            "normal_sorted_by": "score" if bool(cfg.get("enable_cost_sensitive_ranking", False)) else "notional",
+            "lambda_cost": float(cfg.get("lambda_cost", 1.0)),
+            "benefit_mode": str(cfg.get("benefit_mode", "delta_weight")),
+            "normal_score_stats": {
+                "count": 0,
+                "benefit_min": None,
+                "benefit_median": None,
+                "benefit_p95": None,
+                "benefit_max": None,
+                "cost_weight_min": None,
+                "cost_weight_median": None,
+                "cost_weight_p95": None,
+                "cost_weight_max": None,
+                "score_min": None,
+                "score_median": None,
+                "score_p95": None,
+                "score_max": None
+            },
+        }
+        if not bool(cfg.get("enable_trade_planner", False)):
+            return trades, meta
+
+        try:
+            budget_notional = float(turnover_limit or 0.0)
+            if budget_notional <= 1.0 and float(equity or 0.0) > 0:
+                budget_notional = float(equity) * budget_notional
+            budget_notional = max(0.0, budget_notional)
+            meta["turnover_limit"] = float(budget_notional)
+
+            min_trade_notional = float(cfg.get("min_trade_notional", 5.0))
+            allow_partial_fill = bool(cfg.get("allow_partial_fill", True))
+            planner_debug_log = bool(cfg.get("planner_debug_log", False))
+            enable_adv_limit = bool(cfg.get("enable_adv_limit", False))
+            adv_limit_frac = float(cfg.get("adv_limit_frac", 0.02))
+            adv_lookback_days = int(cfg.get("adv_lookback_days", 20))
+            adv_apply_to_forced = bool(cfg.get("adv_apply_to_forced", True))
+            enable_cost_sensitive_ranking = bool(cfg.get("enable_cost_sensitive_ranking", False))
+            lambda_cost = float(cfg.get("lambda_cost", 1.0))
+            benefit_mode = str(cfg.get("benefit_mode", "delta_weight")).lower()
+            max_audit_items = int(cfg.get("max_audit_items", 20))
+            cost_cfg = self._get_cost_model_cfg()
+            impact_enabled = bool(cost_cfg.get("impact_enabled", False))
+            if benefit_mode == "delta_notional":
+                meta["benefit_mode"] = "delta_notional_weighted"
+
+            def _extract_notional(trade_obj):
+                try:
+                    if isinstance(trade_obj, dict):
+                        if "desired_trade_value" in trade_obj:
+                            return abs(float(trade_obj.get("desired_trade_value", 0.0) or 0.0))
+                        if "notional" in trade_obj:
+                            return abs(float(trade_obj.get("notional", 0.0) or 0.0))
+                        if "price" in trade_obj and "quantity" in trade_obj:
+                            return abs(float(trade_obj.get("price", 0.0) or 0.0) * float(trade_obj.get("quantity", 0.0) or 0.0))
+                except Exception:
+                    return 0.0
+                return 0.0
+
+            def _is_forced_trade(trade_obj):
+                if not isinstance(trade_obj, dict):
+                    return False
+                if bool(trade_obj.get("is_forced", False)):
+                    return True
+                if str(trade_obj.get("priority", "")).lower() == "forced":
+                    return True
+
+                side_u = str(trade_obj.get("side", "")).upper()
+                if side_u != "SELL":
+                    return False
+
+                force_reason = str(trade_obj.get("force_reason", "")).lower()
+                if force_reason in ("exit_signal", "risk_off", "risk_off_forced", "circuit_breaker", "stale_sell"):
+                    return True
+
+                reason_blob = " ".join([
+                    str(trade_obj.get("reason", "")),
+                    str(trade_obj.get("decision_trace", "")),
+                    str(trade_obj.get("regime_state", "")),
+                    str(trade_obj.get("price_status", "")),
+                ]).lower()
+                if ("exit_signal" in reason_blob) or ("circuit_breaker" in reason_blob) or ("risk_off" in reason_blob):
+                    return True
+                if str(trade_obj.get("status", "")).upper() == "STALE" and "sell" in reason_blob:
+                    return True
+                return False
+
+            def _scale_trade(trade_obj, scale):
+                scaled = dict(trade_obj) if isinstance(trade_obj, dict) else trade_obj
+                old_notional = _extract_notional(scaled)
+                if old_notional <= 0:
+                    return None, 0.0
+
+                scaled_desired_notional = float(max(0.0, old_notional * scale))
+                if isinstance(scaled, dict) and "desired_trade_value" in scaled:
+                    scaled["desired_trade_value"] = scaled_desired_notional
+
+                if isinstance(scaled, dict) and "quantity" in scaled:
+                    try:
+                        old_qty = int(float(scaled.get("quantity", 0) or 0))
+                    except Exception:
+                        old_qty = 0
+                    if old_qty > 0:
+                        new_qty = int(np.floor(old_qty * scale))
+                        if new_qty <= 0:
+                            return None, 0.0
+                        scaled["quantity"] = int(new_qty)
+                        try:
+                            price_v = float(scaled.get("price", 0.0) or 0.0)
+                            if price_v > 0:
+                                scaled_desired_notional = float(new_qty * price_v)
+                                scaled["notional"] = scaled_desired_notional
+                        except Exception:
+                            pass
+
+                if isinstance(scaled, dict):
+                    if "desired_trade_value" in scaled:
+                        scaled["desired_trade_value"] = float(scaled_desired_notional)
+                    scaled["notional"] = float(scaled_desired_notional)
+
+                new_notional = _extract_notional(scaled)
+                if new_notional <= 0:
+                    return None, 0.0
+                if isinstance(scaled, dict) and "notional" in scaled:
+                    scaled["notional"] = float(new_notional)
+                return scaled, float(new_notional)
+
+            def _compute_benefit(trade_obj, notional_v):
+                eq = float(equity or 0.0)
+                if benefit_mode == "delta_notional":
+                    if eq > 0:
+                        return float(abs(notional_v) / eq)
+                    return 0.0
+                try:
+                    if isinstance(trade_obj, dict) and trade_obj.get("delta_weight") is not None:
+                        return float(abs(float(trade_obj.get("delta_weight", 0.0) or 0.0)))
+                except Exception:
+                    pass
+                if eq > 0:
+                    return float(abs(notional_v) / eq)
+                return 0.0
+
+            def _compute_cost_weight(cost_dollars):
+                eq = float(equity or 0.0)
+                if eq <= 0:
+                    return 0.0
+                try:
+                    return float(float(cost_dollars or 0.0) / eq)
+                except Exception:
+                    return 0.0
+
+            prepared = []
+            dropped = []
+            scaled = []
+            dropped_map = {}
+            scaled_map = {}
+            num_adv_clipped = 0
+            num_adv_dropped = 0
+            for idx, trade in enumerate(trades or []):
+                trade_copy = dict(trade) if isinstance(trade, dict) else trade
+                ticker = str(trade_copy.get("ticker", "")).upper().strip() if isinstance(trade_copy, dict) else ""
+                side = str(trade_copy.get("side", "")).upper().strip() if isinstance(trade_copy, dict) else ""
+                notional = _extract_notional(trade_copy)
+                trade_id = f"{ticker}:{side}:{round(float(notional or 0.0), 2)}:{idx}"
+                if isinstance(trade_copy, dict):
+                    trade_copy["_planner_trade_id"] = trade_id
+                    trade_copy["_orig_notional"] = float(notional)
+                if notional < min_trade_notional:
+                    if isinstance(trade_copy, dict):
+                        drop_item = {
+                            "ticker": str(trade_copy.get("ticker", "")),
+                            "side": str(trade_copy.get("side", "")),
+                            "reason": "min_notional",
+                            "adv_clipped": bool(trade_copy.get("adv_clipped", False)),
+                            "adv_participation": trade_copy.get("adv_participation"),
+                            "planner_score": trade_copy.get("planner_score"),
+                            "trade_id": trade_id,
+                            "old_notional": float(notional)
+                        }
+                        dropped.append(drop_item)
+                        dropped_map[trade_id] = drop_item
+                    continue
+                forced = _is_forced_trade(trade_copy)
+                if isinstance(trade_copy, dict):
+                    trade_copy["is_forced"] = bool(forced)
+                    trade_copy["priority"] = "forced" if forced else "normal"
+
+                adv_notional = None
+                if (enable_adv_limit or impact_enabled) and ticker and ticker != "CASH":
+                    adv_notional = self.estimate_adv_notional(ticker, lookback_days=adv_lookback_days)
+
+                cost_est = self.estimate_trade_cost(ticker, side, notional, adv_notional=adv_notional)
+                planner_cost_dollars = float(cost_est.get("total", 0.0) or 0.0)
+                planner_cost_weight = _compute_cost_weight(planner_cost_dollars)
+
+                adv_clipped = False
+                adv_max_notional = None
+                adv_scale_entry = None
+                if enable_adv_limit and adv_notional is not None and adv_notional > 0:
+                    adv_max_notional = float(max(0.0, adv_limit_frac * adv_notional))
+                    if notional > adv_max_notional + 1e-12:
+                        if forced and (not adv_apply_to_forced):
+                            pass
+                        else:
+                            if (not forced) and (not allow_partial_fill):
+                                num_adv_dropped += 1
+                                drop_item = {
+                                    "ticker": ticker,
+                                    "side": side,
+                                    "reason": "adv_limit",
+                                    "adv_clipped": False,
+                                    "adv_participation": float(notional / adv_notional) if adv_notional else None,
+                                    "planner_score": None,
+                                    "trade_id": trade_id,
+                                    "old_notional": float(trade_copy.get("_orig_notional", notional))
+                                }
+                                dropped.append(drop_item)
+                                dropped_map[trade_id] = drop_item
+                                continue
+                            adv_scale = float(adv_max_notional / notional) if notional > 0 else 0.0
+                            scaled_trade, new_notional = _scale_trade(trade_copy, adv_scale)
+                            if scaled_trade is None or new_notional < min_trade_notional:
+                                num_adv_dropped += 1
+                                drop_reason = "adv_limit_forced_qty0" if forced and side == "SELL" else "adv_limit"
+                                drop_item = {
+                                    "ticker": ticker,
+                                    "side": side,
+                                    "reason": drop_reason,
+                                    "adv_clipped": False,
+                                    "adv_participation": float(notional / adv_notional) if adv_notional else None,
+                                    "planner_score": None,
+                                    "trade_id": trade_id,
+                                    "old_notional": float(trade_copy.get("_orig_notional", notional))
+                                }
+                                dropped.append(drop_item)
+                                dropped_map[trade_id] = drop_item
+                                continue
+                            trade_copy = scaled_trade
+                            if isinstance(trade_copy, dict):
+                                trade_copy["_planner_trade_id"] = trade_id
+                                trade_copy["_orig_notional"] = float(trade_copy.get("_orig_notional", notional))
+                            notional = float(new_notional)
+                            adv_clipped = True
+                            num_adv_clipped += 1
+                            adv_scale_entry = {
+                                "ticker": ticker,
+                                "side": side,
+                                "scale": float(adv_scale),
+                                "old_notional": float(_extract_notional(trade)),
+                                "new_notional": float(new_notional),
+                                "reason": "adv_limit",
+                                "adv_clipped": True,
+                                "adv_participation": float(new_notional / adv_notional) if adv_notional else None,
+                                "planner_score": None,
+                                "trade_id": trade_id
+                            }
+                            cost_est = self.estimate_trade_cost(ticker, side, notional, adv_notional=adv_notional)
+                            planner_cost_dollars = float(cost_est.get("total", 0.0) or 0.0)
+                            planner_cost_weight = _compute_cost_weight(planner_cost_dollars)
+
+                adv_participation = cost_est.get("participation")
+                if adv_participation is None and adv_notional is not None and adv_notional > 0:
+                    adv_participation = float(notional / adv_notional)
+
+                planner_benefit = _compute_benefit(trade_copy, notional)
+                planner_score = float(planner_benefit - (lambda_cost * planner_cost_weight))
+
+                if isinstance(trade_copy, dict):
+                    trade_copy["adv_notional"] = float(adv_notional) if adv_notional is not None else None
+                    trade_copy["adv_limit_frac"] = float(adv_limit_frac)
+                    trade_copy["adv_max_notional"] = float(adv_max_notional) if adv_max_notional is not None else None
+                    trade_copy["adv_clipped"] = bool(adv_clipped)
+                    trade_copy["adv_participation"] = float(adv_participation) if adv_participation is not None else None
+                    trade_copy["planner_cost_est"] = cost_est
+                    trade_copy["planner_cost"] = float(planner_cost_dollars)
+                    trade_copy["planner_cost_dollars"] = float(planner_cost_dollars)
+                    trade_copy["planner_cost_weight"] = float(planner_cost_weight)
+                    trade_copy["planner_benefit"] = float(planner_benefit)
+                    trade_copy["planner_score"] = float(planner_score)
+                    trade_copy["notional"] = float(notional)
+                if isinstance(adv_scale_entry, dict):
+                    adv_scale_entry["planner_score"] = float(planner_score)
+                    adv_scale_entry["planner_benefit"] = float(planner_benefit)
+                    adv_scale_entry["planner_cost_dollars"] = float(planner_cost_dollars)
+                    adv_scale_entry["planner_cost_weight"] = float(planner_cost_weight)
+                    scaled.append(adv_scale_entry)
+                    scaled_map[trade_id] = adv_scale_entry
+
+                prepared.append({
+                    "idx": idx,
+                    "trade_id": trade_id,
+                    "trade": trade_copy,
+                    "notional": float(notional),
+                    "forced": bool(forced),
+                    "score": float(planner_score),
+                    "benefit": float(planner_benefit),
+                    "cost": float(planner_cost_dollars),
+                    "cost_weight": float(planner_cost_weight),
+                })
+
+            forced_items = [x for x in prepared if x["forced"]]
+            normal_items = [x for x in prepared if not x["forced"]]
+            forced_items.sort(key=lambda x: (-x["notional"], x["idx"]))
+            if enable_cost_sensitive_ranking:
+                normal_items.sort(key=lambda x: (-x["score"], -x["notional"], -x["benefit"], x["idx"]))
+            else:
+                normal_items.sort(key=lambda x: (-x["notional"], x["idx"]))
+            meta["num_forced"] = len(forced_items)
+            meta["num_normal"] = len(normal_items)
+            normal_benefits = [float(x.get("benefit", 0.0)) for x in normal_items if np.isfinite(float(x.get("benefit", 0.0)))]
+            normal_cost_weights = [float(x.get("cost_weight", 0.0)) for x in normal_items if np.isfinite(float(x.get("cost_weight", 0.0)))]
+            normal_scores = [float(x.get("score", 0.0)) for x in normal_items if np.isfinite(float(x.get("score", 0.0)))]
+
+            def _summary_stats(values):
+                if not values:
+                    return None, None, None, None
+                arr = np.array(values, dtype=float)
+                arr = arr[np.isfinite(arr)]
+                if arr.size == 0:
+                    return None, None, None, None
+                return float(np.min(arr)), float(np.median(arr)), float(np.percentile(arr, 95)), float(np.max(arr))
+
+            b_min, b_med, b_p95, b_max = _summary_stats(normal_benefits)
+            c_min, c_med, c_p95, c_max = _summary_stats(normal_cost_weights)
+            s_min, s_med, s_p95, s_max = _summary_stats(normal_scores)
+            meta["normal_score_stats"] = {
+                "count": int(len(normal_items)),
+                "benefit_min": b_min,
+                "benefit_median": b_med,
+                "benefit_p95": b_p95,
+                "benefit_max": b_max,
+                "cost_weight_min": c_min,
+                "cost_weight_median": c_med,
+                "cost_weight_p95": c_p95,
+                "cost_weight_max": c_max,
+                "score_min": s_min,
+                "score_median": s_med,
+                "score_p95": s_p95,
+                "score_max": s_max,
+            }
+
+            remaining_budget = float(budget_notional)
+            planned_entries = []
+
+            def _consume(group_items, is_forced_group):
+                nonlocal remaining_budget
+                used = 0.0
+                for item in group_items:
+                    tr = item["trade"]
+                    trade_id = item.get("trade_id")
+                    notional = item["notional"]
+                    ticker = str(tr.get("ticker", "")) if isinstance(tr, dict) else ""
+                    side = str(tr.get("side", "")) if isinstance(tr, dict) else ""
+                    score = tr.get("planner_score") if isinstance(tr, dict) else None
+                    adv_clipped = bool(tr.get("adv_clipped", False)) if isinstance(tr, dict) else False
+                    adv_participation = tr.get("adv_participation") if isinstance(tr, dict) else None
+                    old_notional = float(tr.get("_orig_notional", notional) or notional) if isinstance(tr, dict) else float(notional)
+
+                    if remaining_budget <= 1e-12:
+                        drop_item = {
+                            "ticker": ticker,
+                            "side": side,
+                            "reason": "over_budget_forced" if is_forced_group else "over_budget",
+                            "adv_clipped": adv_clipped,
+                            "adv_participation": adv_participation,
+                            "planner_score": score,
+                            "planner_benefit": tr.get("planner_benefit") if isinstance(tr, dict) else None,
+                            "planner_cost_dollars": tr.get("planner_cost_dollars") if isinstance(tr, dict) else None,
+                            "planner_cost_weight": tr.get("planner_cost_weight") if isinstance(tr, dict) else None,
+                            "trade_id": trade_id,
+                            "old_notional": old_notional
+                        }
+                        dropped.append(drop_item)
+                        if isinstance(trade_id, str):
+                            dropped_map[trade_id] = drop_item
+                        continue
+
+                    if notional <= remaining_budget + 1e-12:
+                        planned_entries.append(tr)
+                        remaining_budget -= notional
+                        used += notional
+                        continue
+
+                    if not allow_partial_fill:
+                        drop_item = {
+                            "ticker": ticker,
+                            "side": side,
+                            "reason": "over_budget_forced" if is_forced_group else "over_budget",
+                            "adv_clipped": adv_clipped,
+                            "adv_participation": adv_participation,
+                            "planner_score": score,
+                            "planner_benefit": tr.get("planner_benefit") if isinstance(tr, dict) else None,
+                            "planner_cost_dollars": tr.get("planner_cost_dollars") if isinstance(tr, dict) else None,
+                            "planner_cost_weight": tr.get("planner_cost_weight") if isinstance(tr, dict) else None,
+                            "trade_id": trade_id,
+                            "old_notional": old_notional
+                        }
+                        dropped.append(drop_item)
+                        if isinstance(trade_id, str):
+                            dropped_map[trade_id] = drop_item
+                        continue
+
+                    scale = float(remaining_budget / notional) if notional > 0 else 0.0
+                    scaled_trade, new_notional = _scale_trade(tr, scale)
+                    if scaled_trade is None or new_notional < min_trade_notional:
+                        drop_item = {
+                            "ticker": ticker,
+                            "side": side,
+                            "reason": "over_budget_forced" if is_forced_group else "over_budget",
+                            "adv_clipped": adv_clipped,
+                            "adv_participation": adv_participation,
+                            "planner_score": score,
+                            "planner_benefit": tr.get("planner_benefit") if isinstance(tr, dict) else None,
+                            "planner_cost_dollars": tr.get("planner_cost_dollars") if isinstance(tr, dict) else None,
+                            "planner_cost_weight": tr.get("planner_cost_weight") if isinstance(tr, dict) else None,
+                            "trade_id": trade_id,
+                            "old_notional": old_notional
+                        }
+                        dropped.append(drop_item)
+                        if isinstance(trade_id, str):
+                            dropped_map[trade_id] = drop_item
+                        continue
+
+                    scaled_cost_est = self.estimate_trade_cost(
+                        str(scaled_trade.get("ticker", "")),
+                        str(scaled_trade.get("side", "")),
+                        float(new_notional),
+                        adv_notional=scaled_trade.get("adv_notional")
+                    ) if isinstance(scaled_trade, dict) else {}
+                    scaled_cost = float(scaled_cost_est.get("total", 0.0) or 0.0) if isinstance(scaled_cost_est, dict) else 0.0
+                    scaled_cost_weight = _compute_cost_weight(scaled_cost)
+                    scaled_benefit = _compute_benefit(scaled_trade if isinstance(scaled_trade, dict) else tr, new_notional)
+                    scaled_score = float(scaled_benefit - (lambda_cost * scaled_cost_weight))
+                    if isinstance(scaled_trade, dict):
+                        scaled_trade["_planner_trade_id"] = trade_id
+                        scaled_trade["_orig_notional"] = old_notional
+                        scaled_trade["planner_cost_est"] = scaled_cost_est if isinstance(scaled_cost_est, dict) else {}
+                        scaled_trade["planner_cost"] = float(scaled_cost)
+                        scaled_trade["planner_cost_dollars"] = float(scaled_cost)
+                        scaled_trade["planner_cost_weight"] = float(scaled_cost_weight)
+                        scaled_trade["planner_benefit"] = float(scaled_benefit)
+                        scaled_trade["planner_score"] = float(scaled_score)
+                        if scaled_trade.get("adv_notional") not in (None, 0):
+                            try:
+                                scaled_trade["adv_participation"] = float(new_notional / float(scaled_trade.get("adv_notional")))
+                            except Exception:
+                                pass
+
+                    planned_entries.append(scaled_trade)
+                    scale_item = {
+                        "ticker": ticker,
+                        "side": side,
+                        "scale": float(scale),
+                        "old_notional": old_notional,
+                        "new_notional": float(new_notional),
+                        "reason": "budget_scale",
+                        "adv_clipped": bool(scaled_trade.get("adv_clipped", False)) if isinstance(scaled_trade, dict) else False,
+                        "adv_participation": scaled_trade.get("adv_participation") if isinstance(scaled_trade, dict) else None,
+                        "planner_score": scaled_score,
+                        "planner_benefit": float(scaled_benefit),
+                        "planner_cost_dollars": float(scaled_cost),
+                        "planner_cost_weight": float(scaled_cost_weight),
+                        "trade_id": trade_id
+                    }
+                    scaled.append(scale_item)
+                    if isinstance(trade_id, str):
+                        scaled_map[trade_id] = scale_item
+                    remaining_budget -= new_notional
+                    used += new_notional
+                return used
+
+            used_forced = _consume(forced_items, True)
+            used_normal = _consume(normal_items, False)
+
+            meta["turnover_used_forced"] = float(used_forced)
+            meta["turnover_used_normal"] = float(used_normal)
+            meta["turnover_used_total"] = float(used_forced + used_normal)
+            kept_ids = set()
+            for planned in planned_entries:
+                if isinstance(planned, dict):
+                    planned_id = planned.get("_planner_trade_id")
+                    if isinstance(planned_id, str):
+                        kept_ids.add(planned_id)
+
+            dropped_dedup = []
+            dropped_seen = set()
+            for tid, item in dropped_map.items():
+                if tid in kept_ids:
+                    continue
+                if tid in dropped_seen:
+                    continue
+                dropped_seen.add(tid)
+                dropped_dedup.append(item)
+            for item in dropped:
+                tid = item.get("trade_id")
+                if isinstance(tid, str):
+                    if tid in kept_ids or tid in dropped_seen:
+                        continue
+                    dropped_seen.add(tid)
+                dropped_dedup.append(item)
+
+            scaled_dedup = []
+            scaled_seen = set()
+            for tid, item in scaled_map.items():
+                if tid not in kept_ids:
+                    continue
+                if tid in scaled_seen:
+                    continue
+                scaled_seen.add(tid)
+                scaled_dedup.append(item)
+            for item in scaled:
+                tid = item.get("trade_id")
+                if isinstance(tid, str):
+                    if tid not in kept_ids or tid in scaled_seen:
+                        continue
+                    scaled_seen.add(tid)
+                scaled_dedup.append(item)
+
+            meta["dropped"] = dropped_dedup[:max_audit_items]
+            meta["scaled"] = scaled_dedup[:max_audit_items]
+            meta["num_dropped"] = len(dropped_dedup)
+            meta["num_adv_clipped"] = int(num_adv_clipped)
+            meta["num_adv_dropped"] = int(num_adv_dropped)
+            meta["status"] = "ok"
+
+            if planner_debug_log:
+                print(
+                    f"[PLANNER] forced={meta['num_forced']} normal={meta['num_normal']} "
+                    f"dropped={meta['num_dropped']} adv_clipped={meta['num_adv_clipped']} "
+                    f"used={meta['turnover_used_total']:.2f}/{meta['turnover_limit']:.2f}"
+                )
+
+            return planned_entries, meta
+        except Exception as e:
+            meta["status"] = "error"
+            meta["error"] = str(e)
+            return trades, meta
+
+    def estimate_trade_cost(self, ticker: str, side: str, notional: float, *, adv_notional: float | None = None) -> dict:
+        """Estimate transaction cost components without affecting execution."""
+        cfg = self._get_cost_model_cfg()
+        result = {
+            "enabled": bool(cfg.get("enabled", False)),
+            "status": "ok",
+            "fee": 0.0,
+            "slippage": 0.0,
+            "impact": 0.0,
+            "total": 0.0,
+            "fee_bps": float(cfg.get("fee_bps", 0.0)),
+            "slippage_bps": float(cfg.get("slippage_bps", 0.0)),
+            "impact_enabled": bool(cfg.get("impact_enabled", False)),
+            "impact_k": float(cfg.get("impact_k", 0.0)),
+            "notional": 0.0,
+            "adv_notional": None,
+            "participation": None,
+            "ticker": str(ticker).upper().strip() if ticker is not None else "",
+            "side": str(side).upper().strip() if side is not None else "",
+        }
+        try:
+            n = abs(float(notional or 0.0))
+            if not np.isfinite(n) or n <= 0:
+                result["status"] = "invalid_notional"
+                return result
+
+            result["notional"] = float(n)
+            if not bool(cfg.get("enabled", False)):
+                result["status"] = "disabled"
+                return result
+
+            fee = n * (float(cfg.get("fee_bps", 0.0)) / 10000.0)
+            slippage = n * (float(cfg.get("slippage_bps", 0.0)) / 10000.0)
+            impact = 0.0
+            participation = None
+            adv_val = None
+
+            if bool(cfg.get("impact_enabled", False)) and adv_notional is not None:
+                try:
+                    adv_val = float(adv_notional)
+                    if np.isfinite(adv_val) and adv_val > 0:
+                        participation = float(n / adv_val)
+                        impact = n * float(cfg.get("impact_k", 0.0)) * participation
+                except Exception:
+                    adv_val = None
+                    participation = None
+                    impact = 0.0
+
+            total = fee + slippage + impact
+            result.update({
+                "fee": float(fee),
+                "slippage": float(slippage),
+                "impact": float(impact),
+                "total": float(total),
+                "adv_notional": float(adv_val) if adv_val is not None else None,
+                "participation": float(participation) if participation is not None else None,
+                "status": "ok"
+            })
+
+            if bool(cfg.get("debug_log", False)):
+                print(
+                    f"[COST EST] {result['side']} {result['ticker']} notional=${n:,.2f} "
+                    f"fee=${fee:.2f} slippage=${slippage:.2f} impact=${impact:.2f} total=${total:.2f}"
+                )
+            return result
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            result["total"] = 0.0
+            return result
+
+    def _estimate_covariance_diag_shrink(self, returns_df: pd.DataFrame, alpha: float) -> tuple[pd.DataFrame, dict]:
+        """Estimate covariance with diagonal shrinkage for stability."""
+        meta = {
+            "method": "diag_shrink",
+            "alpha": float(np.clip(alpha, 0.0, 1.0)),
+            "rows": 0,
+            "cols": 0,
+        }
+        try:
+            if not isinstance(returns_df, pd.DataFrame) or returns_df.empty:
+                return pd.DataFrame(), meta
+            if returns_df.shape[1] < 1 or returns_df.shape[0] < 2:
+                meta["rows"] = int(returns_df.shape[0])
+                meta["cols"] = int(returns_df.shape[1])
+                return pd.DataFrame(), meta
+
+            sample_cov = returns_df.cov()
+            meta["rows"] = int(returns_df.shape[0])
+            meta["cols"] = int(sample_cov.shape[1]) if isinstance(sample_cov, pd.DataFrame) else 0
+            if sample_cov.empty:
+                return pd.DataFrame(), meta
+
+            diag_cov = pd.DataFrame(
+                np.diag(np.diag(sample_cov.values)),
+                index=sample_cov.index,
+                columns=sample_cov.columns,
+            )
+            a = float(np.clip(alpha, 0.0, 1.0))
+            shrunk_cov = (1.0 - a) * sample_cov + a * diag_cov
+            return shrunk_cov, meta
+        except Exception as e:
+            meta["error"] = str(e)
+            return pd.DataFrame(), meta
+
+    def _compute_portfolio_vol_and_rc(self, cov: pd.DataFrame, weights: dict, annualization_factor: int) -> dict:
+        """Compute annualized portfolio volatility and risk contributions."""
+        result = {
+            "portfolio_var": 0.0,
+            "portfolio_vol": 0.0,
+            "marginal_contrib": {},
+            "rc_fraction": {},
+            "max_rc_ticker": None,
+            "max_rc_fraction": 0.0,
+        }
+        try:
+            if not isinstance(cov, pd.DataFrame) or cov.empty:
+                return result
+            if not isinstance(weights, dict) or not weights:
+                return result
+
+            tickers = []
+            for ticker in cov.columns:
+                w = float(weights.get(ticker, 0.0) or 0.0)
+                if abs(w) > 1e-12:
+                    tickers.append(ticker)
+
+            if not tickers:
+                return result
+
+            sub_cov = cov.loc[tickers, tickers]
+            w_vec = np.array([float(weights.get(t, 0.0) or 0.0) for t in tickers], dtype=float)
+            cov_values = sub_cov.values.astype(float)
+            annualization_factor = int(annualization_factor) if int(annualization_factor) > 0 else 252
+
+            port_var_daily = float(np.dot(w_vec, np.dot(cov_values, w_vec)))
+            if not np.isfinite(port_var_daily):
+                port_var_daily = 0.0
+
+            result["portfolio_var"] = max(0.0, float(port_var_daily))
+            result["portfolio_vol"] = float(np.sqrt(max(0.0, port_var_daily) * float(annualization_factor)))
+
+            if port_var_daily <= 0:
+                result["marginal_contrib"] = {t: 0.0 for t in tickers}
+                result["rc_fraction"] = {t: 0.0 for t in tickers}
+                return result
+
+            marginal = np.dot(cov_values, w_vec)
+            rc_raw = w_vec * marginal
+            rc_fraction = rc_raw / float(port_var_daily)
+
+            marginal_dict = {}
+            rc_fraction_dict = {}
+            for idx, ticker in enumerate(tickers):
+                marginal_dict[ticker] = float(marginal[idx])
+                rc_fraction_dict[ticker] = float(rc_fraction[idx])
+
+            result["marginal_contrib"] = marginal_dict
+            result["rc_fraction"] = rc_fraction_dict
+
+            if rc_fraction_dict:
+                max_ticker = max(rc_fraction_dict, key=lambda k: rc_fraction_dict[k])
+                result["max_rc_ticker"] = str(max_ticker)
+                result["max_rc_fraction"] = float(rc_fraction_dict[max_ticker])
+
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def compute_cov_risk_diagnostics(self, weights: dict, tickers: list | None = None) -> dict:
+        """Compute covariance diagnostics without altering any trading decisions."""
+        try:
+            cfg = self._get_risk_model_cfg()
+            if not cfg.get("enable_cov_diagnostics", True):
+                return {"enabled": False}
+
+            if not isinstance(weights, dict):
+                weights = {}
+
+            if tickers is None:
+                raw_universe = list(weights.keys())
+            else:
+                raw_universe = list(tickers)
+
+            filtered_tickers = []
+            seen = set()
+            for raw in raw_universe:
+                t = str(raw).upper().strip()
+                if not t or t == "CASH" or t in seen:
+                    continue
+                w = float(weights.get(t, 0.0) or 0.0)
+                if abs(w) <= 1e-12:
+                    continue
+                seen.add(t)
+                filtered_tickers.append(t)
+
+            returns_df, returns_meta = self.build_returns_matrix(
+                filtered_tickers,
+                int(cfg.get("returns_lookback_days", 60)),
+                period=str(cfg.get("returns_period", "6mo")),
+                interval=str(cfg.get("returns_interval", "1d")),
+                min_obs=int(cfg.get("min_obs", 30)),
+                drop_threshold=float(cfg.get("drop_threshold", 0.5)),
+            )
+
+            if returns_df.empty or returns_df.shape[1] < 1:
+                return {
+                    "enabled": True,
+                    "status": "no_data",
+                    "returns_meta": returns_meta,
+                }
+
+            cov, cov_meta = self._estimate_covariance_diag_shrink(
+                returns_df,
+                float(cfg.get("shrinkage_alpha", 0.15)),
+            )
+
+            if cov.empty:
+                if bool(cfg.get("fallback_to_diag_on_error", True)):
+                    try:
+                        var_series = returns_df.var()
+                        cov = pd.DataFrame(
+                            np.diag(var_series.values.astype(float)),
+                            index=var_series.index,
+                            columns=var_series.index,
+                        )
+                        cov_meta = {
+                            "method": "diag_fallback",
+                            "alpha": 1.0,
+                            "rows": int(returns_df.shape[0]),
+                            "cols": int(returns_df.shape[1]),
+                            "fallback": True,
+                        }
+                    except Exception as e:
+                        return {
+                            "enabled": True,
+                            "status": "cov_failed",
+                            "returns_meta": returns_meta,
+                            "cov_meta": {"error": str(e)},
+                        }
+                else:
+                    return {
+                        "enabled": True,
+                        "status": "cov_failed",
+                        "returns_meta": returns_meta,
+                        "cov_meta": cov_meta,
+                    }
+
+            rc_info = self._compute_portfolio_vol_and_rc(
+                cov,
+                weights,
+                int(cfg.get("annualization_factor", 252)),
+            )
+
+            avg_corr = 0.0
+            top_corr_pairs = []
+            try:
+                corr = returns_df.corr()
+                corr_values = []
+                pair_rows = []
+                cols = list(corr.columns)
+                for i in range(len(cols)):
+                    for j in range(i + 1, len(cols)):
+                        cval = corr.iloc[i, j]
+                        if pd.isna(cval):
+                            continue
+                        cval = float(cval)
+                        corr_values.append(cval)
+                        pair_rows.append({
+                            "a": str(cols[i]),
+                            "b": str(cols[j]),
+                            "corr": cval,
+                        })
+
+                if corr_values:
+                    avg_corr = float(np.mean(corr_values))
+                if pair_rows:
+                    k = int(cfg.get("max_pair_corr_pairs", 3))
+                    k = max(0, k)
+                    pair_rows = sorted(pair_rows, key=lambda x: abs(float(x["corr"])), reverse=True)
+                    top_corr_pairs = pair_rows[:k]
+            except Exception:
+                avg_corr = 0.0
+                top_corr_pairs = []
+
+            result = {
+                "enabled": True,
+                "status": "ok",
+                "method": cov_meta.get("method") if isinstance(cov_meta, dict) else None,
+                "returns_meta": returns_meta,
+                "cov_meta": cov_meta,
+                "portfolio_vol_annualized": float(rc_info.get("portfolio_vol", 0.0)) if isinstance(rc_info, dict) else 0.0,
+                "max_rc_fraction": float(rc_info.get("max_rc_fraction", 0.0)) if isinstance(rc_info, dict) else 0.0,
+                "max_rc_ticker": rc_info.get("max_rc_ticker") if isinstance(rc_info, dict) else None,
+                "rc_fraction": rc_info.get("rc_fraction", {}) if isinstance(rc_info, dict) else {},
+                "avg_pairwise_corr": float(avg_corr),
+                "top_corr_pairs": top_corr_pairs,
+            }
+
+            if bool(cfg.get("debug_log", False)):
+                print(
+                    f"[CovRisk] vol={result.get('portfolio_vol_annualized', 0.0):.4f}, "
+                    f"max_rc={result.get('max_rc_fraction', 0.0):.4f} "
+                    f"ticker={result.get('max_rc_ticker')}, "
+                    f"cols={int(returns_df.shape[1])}, rows={int(returns_df.shape[0])}"
+                )
+
+            return result
+        except Exception as e:
+            return {
+                "enabled": True,
+                "status": "error",
+                "error": str(e),
+            }
+
+    def apply_vol_targeting_to_targets(self, target_weights: dict, *, reason_tag: str = "vol_targeting") -> tuple[dict, dict]:
+        """Scale non-cash target weights when covariance vol exceeds configured target."""
+        original = dict(target_weights or {})
+        cfg = self._get_risk_model_cfg()
+        vt_meta = {
+            "enabled": bool(cfg.get("enable_vol_targeting", False)),
+            "status": "disabled",
+            "reason_tag": reason_tag,
+            "vol_before": None,
+            "vol_target": float(cfg.get("vol_target", 0.18)),
+            "scale": 1.0,
+            "coverage": None,
+            "cov_status": None,
+            "method": None,
+            "non_cash_sum_before": 0.0,
+            "non_cash_sum_after": 0.0,
+            "cash_before": 0.0,
+            "cash_after": 0.0,
+            "negative_clipped_count": 0,
+        }
+
+        try:
+            if not bool(cfg.get("enable_vol_targeting", False)):
+                return dict(original), vt_meta
+
+            normalized = {}
+            negative_clipped = 0
+            for raw_ticker, raw_weight in original.items():
+                ticker = str(raw_ticker).upper().strip()
+                if not ticker:
+                    continue
+                try:
+                    w = float(raw_weight) if raw_weight is not None else 0.0
+                except Exception:
+                    w = 0.0
+                if not np.isfinite(w):
+                    w = 0.0
+                if w < 0:
+                    w = 0.0
+                    negative_clipped += 1
+                normalized[ticker] = float(normalized.get(ticker, 0.0) + w)
+
+            cash_w = float(normalized.get("CASH", 0.0))
+            non_cash = {
+                t: float(w)
+                for t, w in normalized.items()
+                if t != "CASH" and float(w) > 1e-12
+            }
+            vt_meta["negative_clipped_count"] = int(negative_clipped)
+            vt_meta["cash_before"] = float(cash_w)
+            vt_meta["non_cash_sum_before"] = float(sum(non_cash.values()))
+
+            if not non_cash:
+                vt_meta["status"] = "no_risky_assets"
+                vt_meta["cash_after"] = float(cash_w)
+                return dict(normalized), vt_meta
+
+            cycle_id = int(self.current_cycle)
+            weight_signature = tuple(
+                sorted(
+                    (str(k), round(float(v), 12))
+                    for k, v in non_cash.items()
+                    if np.isfinite(float(v))
+                )
+            )
+            cache_key = ("vol_targeting_diag", cycle_id, weight_signature)
+            cov_diag = None
+            cached_entry = self.returns_cache.get(cache_key)
+            if isinstance(cached_entry, dict):
+                cached_meta = cached_entry.get("meta", {})
+                if isinstance(cached_meta, dict):
+                    maybe_result = cached_meta.get("result")
+                    if isinstance(maybe_result, dict):
+                        cov_diag = maybe_result
+            if cov_diag is None:
+                cov_diag = self.compute_cov_risk_diagnostics(non_cash, tickers=list(non_cash.keys()))
+                self.returns_cache[cache_key] = {
+                    "ts": datetime.now(),
+                    "returns": pd.DataFrame(),
+                    "meta": {"kind": "vol_targeting_diag", "cycle": cycle_id, "result": cov_diag},
+                }
+                for existing_key in list(self.returns_cache.keys()):
+                    if existing_key == cache_key:
+                        continue
+                    if isinstance(existing_key, tuple) and len(existing_key) > 0 and existing_key[0] == "vol_targeting_diag":
+                        self.returns_cache.pop(existing_key, None)
+
+            if not isinstance(cov_diag, dict):
+                cov_diag = {"status": "error", "error": "invalid_cov_diag"}
+
+            cov_status = str(cov_diag.get("status", "error"))
+            vt_meta["cov_status"] = cov_status
+            vt_meta["method"] = cov_diag.get("method")
+
+            returns_meta = cov_diag.get("returns_meta", {})
+            if not isinstance(returns_meta, dict):
+                returns_meta = {}
+            coverage = float(returns_meta.get("overall_row_coverage", 0.0) or 0.0)
+            vt_meta["coverage"] = float(coverage)
+            min_cov = float(cfg.get("vol_target_min_coverage", 0.6))
+
+            use_cov_only = bool(cfg.get("vol_target_use_cov_only", True))
+            if cov_status.lower() != "ok" or coverage < min_cov:
+                vt_meta["status"] = "cov_unavailable"
+                if not use_cov_only:
+                    vt_meta["status"] = "cov_unavailable_no_scale"
+                vt_meta["cash_after"] = float(cash_w)
+                vt_meta["non_cash_sum_after"] = float(sum(non_cash.values()))
+                return dict(normalized), vt_meta
+
+            vol_before = cov_diag.get("portfolio_vol_annualized")
+            try:
+                vol_before = float(vol_before)
+            except Exception:
+                vol_before = 0.0
+            if not np.isfinite(vol_before) or vol_before <= 0:
+                vt_meta["status"] = "bad_vol"
+                vt_meta["vol_before"] = None
+                vt_meta["cash_after"] = float(cash_w)
+                vt_meta["non_cash_sum_after"] = float(sum(non_cash.values()))
+                return dict(normalized), vt_meta
+
+            vt_meta["vol_before"] = float(vol_before)
+            vol_target = float(cfg.get("vol_target", 0.18))
+            raw_scale = vol_target / vol_before
+            scale = float(np.clip(raw_scale, float(cfg.get("vol_target_min_scale", 0.10)), float(cfg.get("vol_target_max_scale", 1.00))))
+            vt_meta["scale"] = float(scale)
+
+            if scale >= 0.999999:
+                vt_meta["status"] = "already_below_target"
+                vt_meta["scale"] = 1.0
+                vt_meta["cash_after"] = float(cash_w)
+                vt_meta["non_cash_sum_after"] = float(sum(non_cash.values()))
+                return dict(normalized), vt_meta
+
+            scaled_non_cash = {t: max(0.0, float(w) * float(scale)) for t, w in non_cash.items()}
+            old_non_cash_sum = float(sum(non_cash.values()))
+            new_non_cash_sum = float(sum(scaled_non_cash.values()))
+            delta = old_non_cash_sum - new_non_cash_sum
+            new_cash = float(cash_w + delta)
+
+            if new_cash < 0:
+                new_cash = 0.0
+                risky_total = float(sum(scaled_non_cash.values()))
+                if risky_total > 0:
+                    scaled_non_cash = {t: float(max(0.0, w) / risky_total) for t, w in scaled_non_cash.items()}
+                else:
+                    vt_meta["status"] = "degenerate_total"
+                    return {"CASH": 1.0}, vt_meta
+
+            total = float(new_cash + sum(scaled_non_cash.values()))
+            if total <= 0:
+                vt_meta["status"] = "degenerate_total"
+                return {"CASH": 1.0}, vt_meta
+
+            final_weights = {t: float(max(0.0, w) / total) for t, w in scaled_non_cash.items()}
+            final_weights["CASH"] = float(max(0.0, new_cash) / total)
+            final_sum = float(sum(final_weights.values()))
+            if final_sum > 0:
+                final_weights = {k: float(max(0.0, v) / final_sum) for k, v in final_weights.items()}
+            else:
+                final_weights = {"CASH": 1.0}
+
+            vt_meta["status"] = "scaled"
+            vt_meta["non_cash_sum_after"] = float(sum(v for k, v in final_weights.items() if k != "CASH"))
+            vt_meta["cash_after"] = float(final_weights.get("CASH", 0.0))
+            return final_weights, vt_meta
+        except Exception as e:
+            vt_meta["status"] = "error"
+            vt_meta["error"] = str(e)
+            return dict(original), vt_meta
     
     def calculate_momentum(self, ticker, lookback_days=20):
         """def calculate_momentum: docstring omitted (was garbled/non-ASCII)."""
@@ -1958,11 +3526,18 @@ class PaperTradingEngine:
         """Check portfolio-level volatility/diversification before execution."""
         execution_cfg = self.config.get('execution', {})
         strategy_cfg = self.config.get('strategy', {})
+        risk_model_cfg = self._get_risk_model_cfg()
+
         lookback_days = int(strategy_cfg.get('lookback_days', 40))
         max_portfolio_volatility = float(execution_cfg.get('max_portfolio_volatility', 0.25))
         min_coverage = float(execution_cfg.get('portfolio_vol_min_coverage', 0.70))
         enable_diversity_check = bool(execution_cfg.get('enable_diversity_check', True))
         max_hhi = float(execution_cfg.get('max_herfindahl_index', 0.35))
+
+        use_cov_vol_for_gate = bool(risk_model_cfg.get('use_cov_vol_for_gate', False))
+        rc_limit = float(risk_model_cfg.get('rc_limit', 0.35))
+        min_cov_gate_coverage = float(risk_model_cfg.get('min_cov_gate_coverage', 0.6))
+        cov_gate_fallback_to_weighted = bool(risk_model_cfg.get('cov_gate_fallback_to_weighted', True))
 
         invested_weights = {
             str(t).upper(): max(0.0, float(w))
@@ -1987,12 +3562,186 @@ class PaperTradingEngine:
             normalized = [w / invested_budget for w in invested_weights.values()]
             hhi = float(sum(w * w for w in normalized))
 
+        # Build current portfolio weights for covariance diagnostics (read-only).
+        current_position_weights = {}
+        try:
+            snapshot_used = False
+            if self.portfolio_snapshots:
+                last_snapshot = self.portfolio_snapshots[-1]
+                snapshot_equity = float(last_snapshot.get('total_equity', 0.0) or 0.0)
+                snapshot_positions = last_snapshot.get('positions', {})
+                if snapshot_equity > 0 and isinstance(snapshot_positions, dict):
+                    for ticker, pos in snapshot_positions.items():
+                        ticker_upper = str(ticker).strip().upper()
+                        if not ticker_upper or ticker_upper == 'CASH':
+                            continue
+                        try:
+                            pos_value = float(pos.get('value', 0.0) if isinstance(pos, dict) else 0.0)
+                        except Exception:
+                            pos_value = 0.0
+                        if pos_value > 0:
+                            current_position_weights[ticker_upper] = float(pos_value / snapshot_equity)
+                            snapshot_used = True
+
+            if not snapshot_used and self.positions:
+                position_values = {}
+                positions_value = 0.0
+                for ticker, qty in self.positions.items():
+                    if qty is None:
+                        continue
+                    try:
+                        qty_val = float(qty)
+                    except Exception:
+                        continue
+                    if qty_val <= 0:
+                        continue
+                    price, _, _ = self.get_current_price(ticker)
+                    if price is None:
+                        continue
+                    value = float(qty_val * float(price))
+                    if value <= 0:
+                        continue
+                    ticker_upper = str(ticker).strip().upper()
+                    if not ticker_upper or ticker_upper == 'CASH':
+                        continue
+                    position_values[ticker_upper] = float(position_values.get(ticker_upper, 0.0) + value)
+                    positions_value += value
+
+                total_equity_current = float(self.cash) + float(positions_value)
+                if total_equity_current > 0:
+                    for ticker, value in position_values.items():
+                        current_position_weights[ticker] = float(value / total_equity_current)
+        except Exception:
+            current_position_weights = {}
+
+        cov_diag = {"enabled": True, "status": "error", "error": "cov_diag_uninitialized"}
+        cov_gate_coverage = None
+        cov_gate_vol = None
+        cov_gate_max_rc = None
+        cov_gate_pass = None
+        cov_gate_reason = "not_evaluated"
+        cov_gate_used = False
+        gate_vol_method = "weighted_fallback"
+
+        try:
+            cycle_id = int(self.current_cycle)
+            weight_signature = tuple(
+                sorted(
+                    (str(k), round(float(v), 12))
+                    for k, v in current_position_weights.items()
+                    if np.isfinite(float(v))
+                )
+            )
+            cache_key = ("cov_diag_snapshot", cycle_id, weight_signature)
+            cached_result = None
+            cached_entry = self.returns_cache.get(cache_key)
+            if isinstance(cached_entry, dict):
+                cached_meta = cached_entry.get('meta', {})
+                if isinstance(cached_meta, dict):
+                    maybe_result = cached_meta.get('result')
+                    if isinstance(maybe_result, dict):
+                        cached_result = maybe_result
+
+            if isinstance(cached_result, dict):
+                cov_diag = cached_result
+            else:
+                cov_diag = self.compute_cov_risk_diagnostics(current_position_weights)
+                self.returns_cache[cache_key] = {
+                    "ts": datetime.now(),
+                    "returns": pd.DataFrame(),
+                    "meta": {
+                        "kind": "cov_diag",
+                        "cycle": cycle_id,
+                        "result": cov_diag
+                    }
+                }
+                for existing_key in list(self.returns_cache.keys()):
+                    if existing_key == cache_key:
+                        continue
+                    if isinstance(existing_key, tuple) and len(existing_key) > 0 and existing_key[0] == "cov_diag_snapshot":
+                        self.returns_cache.pop(existing_key, None)
+        except Exception as e:
+            cov_diag = {"enabled": True, "status": "error", "error": str(e)}
+
+        cov_status = str(cov_diag.get('status', '')).lower() if isinstance(cov_diag, dict) else 'error'
+        returns_meta = cov_diag.get('returns_meta', {}) if isinstance(cov_diag, dict) else {}
+        if not isinstance(returns_meta, dict):
+            returns_meta = {}
+
+        try:
+            cov_gate_coverage = float(returns_meta.get('overall_row_coverage', 0.0))
+        except Exception:
+            cov_gate_coverage = 0.0
+
+        try:
+            cov_cols = int(returns_meta.get('cols', 0) or 0)
+        except Exception:
+            cov_cols = 0
+
+        try:
+            cov_gate_vol = float(cov_diag.get('portfolio_vol_annualized')) if cov_diag.get('portfolio_vol_annualized') is not None else None
+        except Exception:
+            cov_gate_vol = None
+
+        try:
+            cov_gate_max_rc = float(cov_diag.get('max_rc_fraction')) if cov_diag.get('max_rc_fraction') is not None else None
+        except Exception:
+            cov_gate_max_rc = None
+
+        coverage_ok = bool(cov_status == 'ok' and cov_cols > 0 and cov_gate_coverage is not None and cov_gate_coverage >= min_cov_gate_coverage)
+        vol_ok = bool(cov_gate_vol is not None and cov_gate_vol <= max_portfolio_volatility)
+        if rc_limit > 0:
+            rc_ok = bool(cov_gate_max_rc is not None and cov_gate_max_rc <= rc_limit)
+        else:
+            rc_ok = True
+
         abort_reason = ""
         abort_flag = False
         volatility_confident = known_weight >= min_coverage
-        if volatility_confident and weighted_volatility > max_portfolio_volatility:
-            abort_flag = True
-            abort_reason = "portfolio_volatility"
+
+        if use_cov_vol_for_gate:
+            cov_gate_used = True
+            if coverage_ok:
+                gate_vol_method = "cov"
+                cov_gate_pass = bool(vol_ok and rc_ok)
+                if cov_gate_pass:
+                    cov_gate_reason = "ok"
+                else:
+                    if not vol_ok and not rc_ok:
+                        cov_gate_reason = "vol_and_rc_limit"
+                        abort_reason = "portfolio_cov_vol_and_rc"
+                    elif not vol_ok:
+                        cov_gate_reason = "vol_limit"
+                        abort_reason = "portfolio_cov_volatility"
+                    else:
+                        cov_gate_reason = "rc_limit"
+                        abort_reason = "portfolio_cov_rc_limit"
+                    abort_flag = True
+            else:
+                unavailable_reason = cov_status if cov_status else "unavailable"
+                if cov_status == 'ok' and cov_cols <= 0:
+                    unavailable_reason = "no_data"
+                elif cov_status == 'ok' and (cov_gate_coverage is None or cov_gate_coverage < min_cov_gate_coverage):
+                    unavailable_reason = "low_coverage"
+
+                if cov_gate_fallback_to_weighted:
+                    gate_vol_method = "weighted_fallback"
+                    cov_gate_reason = f"fallback_to_weighted:{unavailable_reason}"
+                    if volatility_confident and weighted_volatility > max_portfolio_volatility:
+                        abort_flag = True
+                        abort_reason = "portfolio_volatility"
+                else:
+                    gate_vol_method = "cov"
+                    cov_gate_pass = False
+                    cov_gate_reason = f"cov_unavailable:{unavailable_reason}"
+                    abort_flag = True
+                    abort_reason = "cov_unavailable"
+        else:
+            gate_vol_method = "weighted_fallback"
+            cov_gate_reason = "disabled"
+            if volatility_confident and weighted_volatility > max_portfolio_volatility:
+                abort_flag = True
+                abort_reason = "portfolio_volatility"
 
         if (not abort_flag) and enable_diversity_check and invested_budget > 1e-12 and hhi > max_hhi:
             abort_flag = True
@@ -2010,7 +3759,19 @@ class PaperTradingEngine:
             'herfindahl_index': float(hhi),
             'max_herfindahl_index': float(max_hhi),
             'invested_budget': float(invested_budget),
-            'asset_volatility_map': vol_map
+            'asset_volatility_map': vol_map,
+            'cov_risk_diag': cov_diag,
+            'gate_vol_method': gate_vol_method,
+            'cov_gate_used': bool(cov_gate_used),
+            'cov_gate_coverage': float(cov_gate_coverage) if cov_gate_coverage is not None else None,
+            'cov_gate_vol': float(cov_gate_vol) if cov_gate_vol is not None else None,
+            'cov_gate_max_rc': float(cov_gate_max_rc) if cov_gate_max_rc is not None else None,
+            'cov_gate_pass': cov_gate_pass,
+            'cov_gate_reason': cov_gate_reason,
+            'rc_limit': float(rc_limit),
+            'min_cov_gate_coverage': float(min_cov_gate_coverage),
+            'use_cov_vol_for_gate': bool(use_cov_vol_for_gate),
+            'cov_gate_fallback_to_weighted': bool(cov_gate_fallback_to_weighted),
         }
 
     def _estimate_current_cash_ratio(self):
@@ -2790,6 +4551,22 @@ class PaperTradingEngine:
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))
         adjusted_weights['CASH'] = cash_weight
 
+        adjusted_weights, vt_meta = self.apply_vol_targeting_to_targets(
+            adjusted_weights,
+            reason_tag="target_weights_final"
+        )
+        self.current_vol_targeting_info = dict(vt_meta) if isinstance(vt_meta, dict) else {'enabled': False, 'status': 'invalid_meta'}
+        if not isinstance(self.current_risk_check_info, dict):
+            self.current_risk_check_info = {}
+        self.current_risk_check_info['vol_targeting'] = dict(self.current_vol_targeting_info)
+        alloc_diag['vol_targeting'] = dict(self.current_vol_targeting_info)
+        if self.current_vol_targeting_info.get('enabled', False):
+            vt_status = str(self.current_vol_targeting_info.get('status', ''))
+            vt_scale = float(self.current_vol_targeting_info.get('scale', 1.0) or 1.0)
+            vt_vol_before = self.current_vol_targeting_info.get('vol_before')
+            vt_vol_target = self.current_vol_targeting_info.get('vol_target')
+            print(f"[VOL TARGET] status={vt_status} scale={vt_scale:.4f} vol_before={vt_vol_before} target={vt_vol_target}")
+
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_macro['applied_tilts'] = dict(applied_tilts)
         self.current_macro['blocked_tilts'] = dict(blocked_tilts)
@@ -2856,7 +4633,38 @@ class PaperTradingEngine:
         }
         self.current_risk_check_info = {
             'checked': False,
-            'abort': False
+            'abort': False,
+            'vol_targeting': dict(self.current_vol_targeting_info) if isinstance(self.current_vol_targeting_info, dict) else {'enabled': False, 'status': 'unavailable'}
+        }
+        planner_cfg = self._get_planner_cfg()
+        self.current_planner_info = {
+            'enabled': bool(planner_cfg.get('enable_trade_planner', False)),
+            'status': 'disabled' if not bool(planner_cfg.get('enable_trade_planner', False)) else 'pending',
+            'turnover_limit': 0.0,
+            'turnover_used_forced': 0.0,
+            'turnover_used_normal': 0.0,
+            'turnover_used_total': 0.0,
+            'num_forced': 0,
+            'num_normal': 0,
+            'num_dropped': 0,
+            'num_adv_clipped': 0,
+            'num_adv_dropped': 0,
+            'adv_limit_enabled': bool(planner_cfg.get('enable_adv_limit', False)),
+            'adv_limit_frac': float(planner_cfg.get('adv_limit_frac', 0.02)),
+            'normal_sorted_by': 'score' if bool(planner_cfg.get('enable_cost_sensitive_ranking', False)) else 'notional',
+            'lambda_cost': float(planner_cfg.get('lambda_cost', 1.0)),
+            'benefit_mode': str(planner_cfg.get('benefit_mode', 'delta_weight')),
+            'dropped': [],
+            'scaled': []
+        }
+        cost_cfg = self._get_cost_model_cfg()
+        self.current_cost_est_info = {
+            'enabled': bool(cost_cfg.get('enabled', False)),
+            'total': 0.0,
+            'fee': 0.0,
+            'slippage': 0.0,
+            'impact': 0.0,
+            'num_trades': 0
         }
         
         if cooldown_minutes > 0 and self.last_rebalance_time is not None:
@@ -3069,6 +4877,16 @@ class PaperTradingEngine:
 
             if status == "STALE" and side == 'SELL':
                 print(f"[ALLOW] {ticker} SELL on STALE price (age: {age:.0f}min) - policy allowed")
+
+            force_reason = None
+            if side == 'SELL':
+                if ticker in exit_signal_actions:
+                    force_reason = 'exit_signal'
+                elif trade_context.get('regime_state') in ('risk_off', 'risk_off_forced'):
+                    force_reason = 'risk_off'
+                elif status == 'STALE':
+                    force_reason = 'stale_sell'
+            is_forced = force_reason is not None
             
             planned_trades.append({
                 'ticker': ticker,
@@ -3078,7 +4896,10 @@ class PaperTradingEngine:
                 'desired_trade_value': desired_trade_value,
                 'price': price,
                 'age': age,
-                'status': status
+                'status': status,
+                'is_forced': is_forced,
+                'priority': 'forced' if is_forced else 'normal',
+                'force_reason': force_reason
             })
 
         if self.current_holding_blocks:
@@ -3113,6 +4934,21 @@ class PaperTradingEngine:
                 'turnover_scale': 1.0,
                 'turnover_capped': False
             }
+            self.current_planner_info = {
+                'enabled': bool(planner_cfg.get('enable_trade_planner', False)),
+                'status': 'skipped_stale_abort',
+                'turnover_limit': total_equity * execution_config.get('max_turnover_pct_per_rebalance', 0.20),
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': 0.0,
+                'turnover_used_total': 0.0,
+                'num_forced': 0,
+                'num_normal': 0,
+                'num_dropped': 0,
+                'dropped': [],
+                'scaled': []
+            }
+            if isinstance(self.current_risk_check_info, dict):
+                self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             print(f"[DECISION] {abort_trace}")
             return []
         
@@ -3125,6 +4961,8 @@ class PaperTradingEngine:
 
         risk_gate = self._evaluate_portfolio_risk_gate(target_weights)
         risk_gate['checked'] = True
+        if isinstance(self.current_vol_targeting_info, dict):
+            risk_gate['vol_targeting'] = dict(self.current_vol_targeting_info)
         self.current_risk_check_info = dict(risk_gate)
 
         if risk_gate.get('volatility_confident', False):
@@ -3154,6 +4992,21 @@ class PaperTradingEngine:
                 'turnover_scale': 1.0,
                 'turnover_capped': False
             }
+            self.current_planner_info = {
+                'enabled': bool(planner_cfg.get('enable_trade_planner', False)),
+                'status': f"skipped_risk_gate_abort_{reason}",
+                'turnover_limit': total_equity * execution_config.get('max_turnover_pct_per_rebalance', 0.20),
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': 0.0,
+                'turnover_used_total': 0.0,
+                'num_forced': 0,
+                'num_normal': 0,
+                'num_dropped': 0,
+                'dropped': [],
+                'scaled': []
+            }
+            if isinstance(self.current_risk_check_info, dict):
+                self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             self.current_stale_info['decision_trace'] = f"{self.current_stale_info.get('decision_trace', '')}|risk_gate_abort_{reason}"
             return []
         
@@ -3168,31 +5021,86 @@ class PaperTradingEngine:
         turnover_capped = False
         
         print(f"\n[TURNOVER] Planned(pre): ${turnover_notional_pre:,.2f}, Limit: ${turnover_limit:,.2f} ({max_turnover_pct:.1%})")
-        
-        # NOTE: comment omitted (was garbled/non-ASCII).
-        if turnover_notional_pre > turnover_limit:
-            turnover_scale = turnover_limit / turnover_notional_pre
-            turnover_capped = True
-            print(f"[TURNOVER CAP] Scaling all trades by {turnover_scale:.2%}")
-            
+        if bool(planner_cfg.get('enable_trade_planner', False)):
+            try:
+                planned_trades, planner_meta = self.apply_trade_planner(
+                    planned_trades,
+                    total_equity,
+                    turnover_limit,
+                    reason_tag="execute_rebalance"
+                )
+                self.current_planner_info = planner_meta
+                if isinstance(self.current_risk_check_info, dict):
+                    self.current_risk_check_info['trade_planner'] = dict(planner_meta)
+
+                planned_after = sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict))
+                turnover_scale = (planned_after / turnover_notional_pre) if turnover_notional_pre > 0 else 1.0
+                turnover_capped = planned_after + 1e-9 < turnover_notional_pre
+                print(
+                    f"[PLANNER] status={planner_meta.get('status')} forced={planner_meta.get('num_forced', 0)} "
+                    f"normal={planner_meta.get('num_normal', 0)} dropped={planner_meta.get('num_dropped', 0)} "
+                    f"used=${planner_meta.get('turnover_used_total', 0.0):,.2f}/${planner_meta.get('turnover_limit', 0.0):,.2f}"
+                )
+            except Exception as e:
+                self.current_planner_info = {
+                    'enabled': True,
+                    'status': 'error',
+                    'error': str(e),
+                    'turnover_limit': turnover_limit,
+                    'turnover_used_forced': 0.0,
+                    'turnover_used_normal': 0.0,
+                    'turnover_used_total': turnover_notional_pre,
+                    'num_forced': 0,
+                    'num_normal': len(planned_trades),
+                    'num_dropped': 0,
+                    'dropped': [],
+                    'scaled': []
+                }
+                if isinstance(self.current_risk_check_info, dict):
+                    self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
+                turnover_scale = 1.0
+                turnover_capped = False
+        else:
             # NOTE: comment omitted (was garbled/non-ASCII).
-            scaled_trades = []
-            for trade in planned_trades:
-                scaled_trade_value = trade['desired_trade_value'] * turnover_scale
+            if turnover_notional_pre > turnover_limit:
+                turnover_scale = turnover_limit / turnover_notional_pre
+                turnover_capped = True
+                print(f"[TURNOVER CAP] Scaling all trades by {turnover_scale:.2%}")
                 
                 # NOTE: comment omitted (was garbled/non-ASCII).
-                if scaled_trade_value < min_notional:
-                    print(f"[SKIP] {trade['ticker']} scaled notional ${scaled_trade_value:.2f} < min ${min_notional}")
-                    continue
+                scaled_trades = []
+                for trade in planned_trades:
+                    scaled_trade_value = trade['desired_trade_value'] * turnover_scale
+                    
+                    # NOTE: comment omitted (was garbled/non-ASCII).
+                    if scaled_trade_value < min_notional:
+                        print(f"[SKIP] {trade['ticker']} scaled notional ${scaled_trade_value:.2f} < min ${min_notional}")
+                        continue
+                    
+                    trade['desired_trade_value'] = scaled_trade_value
+                    scaled_trades.append(trade)
                 
-                trade['desired_trade_value'] = scaled_trade_value
-                scaled_trades.append(trade)
-            
-            planned_trades = scaled_trades
-            
-            # NOTE: comment omitted (was garbled/non-ASCII).
-            actual_turnover_scaled = sum(abs(t['desired_trade_value']) for t in planned_trades)
-            print(f"[TURNOVER CAP] Planned(after scaling): ${actual_turnover_scaled:,.2f}")
+                planned_trades = scaled_trades
+                
+                # NOTE: comment omitted (was garbled/non-ASCII).
+                actual_turnover_scaled = sum(abs(t['desired_trade_value']) for t in planned_trades)
+                print(f"[TURNOVER CAP] Planned(after scaling): ${actual_turnover_scaled:,.2f}")
+
+            self.current_planner_info = {
+                'enabled': False,
+                'status': 'disabled',
+                'turnover_limit': float(turnover_limit),
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': float(sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades)),
+                'turnover_used_total': float(sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades)),
+                'num_forced': 0,
+                'num_normal': len(planned_trades),
+                'num_dropped': 0,
+                'dropped': [],
+                'scaled': []
+            }
+            if isinstance(self.current_risk_check_info, dict):
+                self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_turnover_info = {
@@ -3263,7 +5171,10 @@ class PaperTradingEngine:
                 'side': 'SELL',
                 'quantity': sell_qty,
                 'price': price,
+                'notional': proceeds,
                 'cost': cost,
+                'cost_est': self.estimate_trade_cost(ticker, 'SELL', proceeds, adv_notional=None),
+                'cost_est_total': 0.0,
                 'reason': 'rebalance',
                 'regime_state': trade_context['regime_state'],
                 'trend_score': trade_context['trend_score'],
@@ -3271,6 +5182,19 @@ class PaperTradingEngine:
                 'macro_risk_score': trade_context['macro_risk_score'],
                 'macro_topics': trade_context['macro_topics'],
                 'macro_tilts': trade_context['macro_tilts'],
+                'is_forced': bool(trade.get('is_forced', False)),
+                'priority': str(trade.get('priority', 'normal')),
+                'force_reason': trade.get('force_reason'),
+                'adv_notional': trade.get('adv_notional'),
+                'adv_limit_frac': trade.get('adv_limit_frac'),
+                'adv_max_notional': trade.get('adv_max_notional'),
+                'adv_clipped': bool(trade.get('adv_clipped', False)),
+                'adv_participation': trade.get('adv_participation'),
+                'planner_score': trade.get('planner_score'),
+                'planner_benefit': trade.get('planner_benefit'),
+                'planner_cost': trade.get('planner_cost'),
+                'planner_cost_dollars': trade.get('planner_cost_dollars'),
+                'planner_cost_weight': trade.get('planner_cost_weight'),
                 'decision_trace': ' | '.join(decision_trace),
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
@@ -3351,7 +5275,10 @@ class PaperTradingEngine:
                 'side': 'BUY',
                 'quantity': buy_qty,
                 'price': price,
+                'notional': required_cash,
                 'cost': cost,
+                'cost_est': self.estimate_trade_cost(ticker, 'BUY', required_cash, adv_notional=None),
+                'cost_est_total': 0.0,
                 'reason': 'rebalance',
                 'regime_state': trade_context['regime_state'],
                 'trend_score': trade_context['trend_score'],
@@ -3359,6 +5286,19 @@ class PaperTradingEngine:
                 'macro_risk_score': trade_context['macro_risk_score'],
                 'macro_topics': trade_context['macro_topics'],
                 'macro_tilts': trade_context['macro_tilts'],
+                'is_forced': bool(trade.get('is_forced', False)),
+                'priority': str(trade.get('priority', 'normal')),
+                'force_reason': trade.get('force_reason'),
+                'adv_notional': trade.get('adv_notional'),
+                'adv_limit_frac': trade.get('adv_limit_frac'),
+                'adv_max_notional': trade.get('adv_max_notional'),
+                'adv_clipped': bool(trade.get('adv_clipped', False)),
+                'adv_participation': trade.get('adv_participation'),
+                'planner_score': trade.get('planner_score'),
+                'planner_benefit': trade.get('planner_benefit'),
+                'planner_cost': trade.get('planner_cost'),
+                'planner_cost_dollars': trade.get('planner_cost_dollars'),
+                'planner_cost_weight': trade.get('planner_cost_weight'),
                 'decision_trace': ' | '.join(decision_trace),
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
@@ -3372,6 +5312,9 @@ class PaperTradingEngine:
             print(f"[WARN] turnover_notional_post ${turnover_notional_post:,.2f} > limit ${turnover_limit:,.2f}")
 
         for trade in trades:
+            trade_cost_est = trade.get('cost_est') if isinstance(trade.get('cost_est'), dict) else {}
+            trade_cost_total = float(trade_cost_est.get('total', 0.0) or 0.0)
+            trade['cost_est_total'] = trade_cost_total
             trade['turnover_notional_pre'] = turnover_notional_pre
             trade['turnover_notional_post'] = turnover_notional_post
             trade['turnover_limit'] = turnover_limit
@@ -3389,6 +5332,25 @@ class PaperTradingEngine:
             trade['fill_reason'] = trade_context.get('fill_reason', '')
             trade['fill_remaining_end'] = trade_context.get('fill_remaining_end', trade_context.get('remaining_gap', 0.0))
             trade['capped_assets'] = ';'.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else ''
+
+        cost_summary = {
+            'enabled': bool(cost_cfg.get('enabled', False)),
+            'total': 0.0,
+            'fee': 0.0,
+            'slippage': 0.0,
+            'impact': 0.0,
+            'num_trades': len(trades)
+        }
+        for trade in trades:
+            cost_est = trade.get('cost_est') if isinstance(trade.get('cost_est'), dict) else {}
+            try:
+                cost_summary['total'] += float(cost_est.get('total', 0.0) or 0.0)
+                cost_summary['fee'] += float(cost_est.get('fee', 0.0) or 0.0)
+                cost_summary['slippage'] += float(cost_est.get('slippage', 0.0) or 0.0)
+                cost_summary['impact'] += float(cost_est.get('impact', 0.0) or 0.0)
+            except Exception:
+                continue
+        self.current_cost_est_info = cost_summary
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         if trades:
@@ -3485,6 +5447,16 @@ class PaperTradingEngine:
         now = datetime.now()
         execution_config = self.config.get('execution', {})
         regime_config = self.config.get('regime_filter', {})
+        planner_cfg = self._get_planner_cfg()
+        cost_cfg = self._get_cost_model_cfg()
+        cost_summary = {
+            'enabled': bool(cost_cfg.get('enabled', False)),
+            'total': 0.0,
+            'fee': 0.0,
+            'slippage': 0.0,
+            'impact': 0.0,
+            'num_trades': 0
+        }
 
         forced_days = float(execution_config.get('circuit_breaker_forced_days', 1))
         self.forced_until_time = now + timedelta(days=forced_days)
@@ -3543,6 +5515,20 @@ class PaperTradingEngine:
                 'turnover_scale': 1.0,
                 'turnover_capped': False
             }
+            self.current_planner_info = {
+                'enabled': bool(planner_cfg.get('enable_trade_planner', False)),
+                'status': 'bypass_circuit_breaker',
+                'turnover_limit': 0.0,
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': 0.0,
+                'turnover_used_total': 0.0,
+                'num_forced': 0,
+                'num_normal': 0,
+                'num_dropped': 0,
+                'dropped': [],
+                'scaled': []
+            }
+            self.current_cost_est_info = cost_summary
             return []
 
         target_cash_value = total_equity * forced_cash_target
@@ -3556,6 +5542,20 @@ class PaperTradingEngine:
                 'turnover_scale': 1.0,
                 'turnover_capped': False
             }
+            self.current_planner_info = {
+                'enabled': bool(planner_cfg.get('enable_trade_planner', False)),
+                'status': 'bypass_circuit_breaker',
+                'turnover_limit': 0.0,
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': 0.0,
+                'turnover_used_total': 0.0,
+                'num_forced': 0,
+                'num_normal': 0,
+                'num_dropped': 0,
+                'dropped': [],
+                'scaled': []
+            }
+            self.current_cost_est_info = cost_summary
             return []
 
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -3627,7 +5627,10 @@ class PaperTradingEngine:
                 'side': 'SELL',
                 'quantity': sell_qty,
                 'price': h['price'],
+                'notional': proceeds,
                 'cost': cost,
+                'cost_est': self.estimate_trade_cost(h['ticker'], 'SELL', proceeds, adv_notional=None),
+                'cost_est_total': 0.0,
                 'reason': 'circuit_breaker',
                 'regime_state': 'risk_off_forced',
                 'trend_score': trade_context['trend_score'],
@@ -3635,6 +5638,9 @@ class PaperTradingEngine:
                 'macro_risk_score': trade_context['macro_risk_score'],
                 'macro_topics': trade_context['macro_topics'],
                 'macro_tilts': trade_context['macro_tilts'],
+                'is_forced': True,
+                'priority': 'forced',
+                'force_reason': 'circuit_breaker',
                 'decision_trace': ' | '.join(decision_trace),
                 'price_age_minutes': h['age'],
                 'price_status': str(h['status']).upper(),
@@ -3653,9 +5659,33 @@ class PaperTradingEngine:
             'turnover_scale': turnover_scale,
             'turnover_capped': turnover_capped,
         }
+        self.current_planner_info = {
+            'enabled': bool(planner_cfg.get('enable_trade_planner', False)),
+            'status': 'bypass_circuit_breaker',
+            'turnover_limit': float(turnover_limit),
+            'turnover_used_forced': float(turnover_notional_post),
+            'turnover_used_normal': 0.0,
+            'turnover_used_total': float(turnover_notional_post),
+            'num_forced': len(trades),
+            'num_normal': 0,
+            'num_dropped': 0,
+            'dropped': [],
+            'scaled': []
+        }
 
         for t in trades:
             t['turnover_notional_post'] = turnover_notional_post
+            trade_cost_est = t.get('cost_est') if isinstance(t.get('cost_est'), dict) else {}
+            t['cost_est_total'] = float(trade_cost_est.get('total', 0.0) or 0.0)
+            try:
+                cost_summary['total'] += float(trade_cost_est.get('total', 0.0) or 0.0)
+                cost_summary['fee'] += float(trade_cost_est.get('fee', 0.0) or 0.0)
+                cost_summary['slippage'] += float(trade_cost_est.get('slippage', 0.0) or 0.0)
+                cost_summary['impact'] += float(trade_cost_est.get('impact', 0.0) or 0.0)
+            except Exception:
+                pass
+        cost_summary['num_trades'] = len(trades)
+        self.current_cost_est_info = cost_summary
 
         if trades:
             self.trades_log.extend(trades)
@@ -3823,6 +5853,55 @@ class PaperTradingEngine:
             'diversity_check_enabled': self.current_risk_check_info.get('enable_diversity_check', self.config.get('execution', {}).get('enable_diversity_check', True)),
             'herfindahl_index': self.current_risk_check_info.get('herfindahl_index', 0.0),
             'herfindahl_limit': self.current_risk_check_info.get('max_herfindahl_index', self.config.get('execution', {}).get('max_herfindahl_index', 0.35)),
+            'gate_vol_method': self.current_risk_check_info.get('gate_vol_method', ''),
+            'cov_gate_used': self.current_risk_check_info.get('cov_gate_used', False),
+            'cov_gate_coverage': self.current_risk_check_info.get('cov_gate_coverage', None),
+            'cov_gate_vol': self.current_risk_check_info.get('cov_gate_vol', None),
+            'cov_gate_max_rc': self.current_risk_check_info.get('cov_gate_max_rc', None),
+            'cov_gate_pass': self.current_risk_check_info.get('cov_gate_pass', None),
+            'cov_gate_reason': self.current_risk_check_info.get('cov_gate_reason', ''),
+            'cov_risk_diag': self.current_risk_check_info.get('cov_risk_diag', {}),
+            'vol_targeting': self.current_vol_targeting_info if isinstance(self.current_vol_targeting_info, dict) else {'enabled': False, 'status': 'unavailable'},
+            'vol_targeting_scale': (self.current_vol_targeting_info.get('scale') if isinstance(self.current_vol_targeting_info, dict) else None),
+            'vol_targeting_vol_before': (self.current_vol_targeting_info.get('vol_before') if isinstance(self.current_vol_targeting_info, dict) else None),
+            'vol_targeting_cash_after': (self.current_vol_targeting_info.get('cash_after') if isinstance(self.current_vol_targeting_info, dict) else None),
+            'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {
+                'enabled': False,
+                'total': 0.0,
+                'fee': 0.0,
+                'slippage': 0.0,
+                'impact': 0.0,
+                'num_trades': 0
+            },
+            'trade_planner': dict(self.current_planner_info) if isinstance(self.current_planner_info, dict) else {
+                'enabled': False,
+                'status': 'disabled',
+                'turnover_limit': 0.0,
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': 0.0,
+                'turnover_used_total': 0.0,
+                'num_forced': 0,
+                'num_normal': 0,
+                'num_dropped': 0,
+                'num_adv_clipped': 0,
+                'num_adv_dropped': 0,
+                'adv_limit_enabled': False,
+                'adv_limit_frac': 0.0,
+                'normal_sorted_by': 'notional',
+                'lambda_cost': 1.0,
+                'benefit_mode': 'delta_weight',
+                'normal_score_stats': {'count': 0},
+                'dropped': [],
+                'scaled': []
+            },
+            'trade_planner_num_dropped': int((self.current_planner_info or {}).get('num_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
+            'trade_planner_turnover_used': (
+                float((self.current_planner_info or {}).get('turnover_used_forced', 0.0) or 0.0) +
+                float((self.current_planner_info or {}).get('turnover_used_normal', 0.0) or 0.0)
+            ) if isinstance(self.current_planner_info, dict) else 0.0,
+            'trade_planner_num_adv_clipped': int((self.current_planner_info or {}).get('num_adv_clipped', 0)) if isinstance(self.current_planner_info, dict) else 0,
+            'trade_planner_num_adv_dropped': int((self.current_planner_info or {}).get('num_adv_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
+            'trade_planner_normal_score_count': int((((self.current_planner_info or {}).get('normal_score_stats', {}) or {}).get('count', 0))) if isinstance(self.current_planner_info, dict) else 0,
             'diagnostic_hint': self.last_diagnostic_hint
         }
         
@@ -4212,7 +6291,7 @@ class PaperTradingEngine:
         print("="*60)
         print("ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v2.10.5-2026-02-08")
+        print(f"ENGINE_VERSION: v2.11.3-2026-02-09")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
