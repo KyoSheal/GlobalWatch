@@ -1525,6 +1525,84 @@ class PaperTradingEngine:
         except Exception as e:
             print(f"[WARN] Failed to write live snapshot: {e}")
 
+    def _build_post_rebalance_snapshot(self):
+        """Build a lightweight snapshot from current in-memory state without appending history."""
+        positions_value = 0.0
+        positions_detail = {}
+        for ticker, qty in self.positions.items():
+            price, age_min, status = self.get_current_price(ticker)
+            if not price:
+                continue
+            value = float(qty) * float(price)
+            positions_value += value
+            positions_detail[ticker] = {
+                'quantity': qty,
+                'price': float(price),
+                'value': float(value),
+                'age_minutes': float(age_min) if age_min is not None else None,
+                'status': str(status).upper() if status is not None else None
+            }
+
+        total_equity = float(self.cash) + float(positions_value)
+        total_return = (total_equity - self.initial_cash) / self.initial_cash if self.initial_cash > 0 else 0.0
+        peak_base = max(float(self.peak_equity or 0.0), total_equity)
+        drawdown = (peak_base - total_equity) / peak_base if peak_base > 0 else 0.0
+
+        snapshot = {
+            'timestamp': datetime.now().isoformat(),
+            'cycle': self.current_cycle,
+            'cash': float(self.cash),
+            'positions_value': float(positions_value),
+            'total_equity': float(total_equity),
+            'total_return': float(total_return),
+            'drawdown': float(drawdown),
+            'positions': positions_detail,
+            'status': self.status,
+            'weights_reused': self.current_weights_reused,
+            'macro_reused': self.current_macro_reused,
+            'last_signal_time': self.last_signal_time.isoformat() if self.last_signal_time else None,
+            'last_macro_time': self.last_macro_time.isoformat() if self.last_macro_time else None,
+            'regime_state': self.current_regime.get('regime_state', 'neutral'),
+            'trend_score': self.current_regime.get('trend_score', 0.5),
+            'dynamic_min_cash': self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']),
+            'dynamic_max_weight': self.current_regime.get('dynamic_max_weight', self.config['objectives']['max_weight_per_asset']),
+            'cash_target': self.current_regime.get('cash_target', self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct'])),
+            'risk_caps_applied': self.current_regime.get('risk_caps_applied', False),
+            'forced_until_time': self.current_regime.get('forced_until_time', self.forced_until_time.isoformat() if self.forced_until_time else None),
+            'forced_regime_reason': self.current_regime.get('forced_reason', self.forced_regime_reason),
+            'macro_risk_score_raw': self.current_macro.get('macro_risk_score', 0.0),
+            'macro_risk_score': self.current_macro.get('macro_risk_score', 0.0),
+            'macro_tilts': self.current_macro.get('macro_tilts', {}),
+            'applied_tilts': self.current_macro.get('applied_tilts', {}),
+            'capped_assets': self.current_macro.get('capped_assets', []),
+            'turnover_notional': self.current_turnover_info.get('turnover_notional', 0.0),
+            'turnover_notional_pre': self.current_turnover_info.get('turnover_notional_pre', self.current_turnover_info.get('turnover_notional', 0.0)),
+            'turnover_notional_post': self.current_turnover_info.get('turnover_notional_post', 0.0),
+            'turnover_limit': self.current_turnover_info.get('turnover_limit', 0.0),
+            'turnover_scale': self.current_turnover_info.get('turnover_scale', 1.0),
+            'turnover_capped': self.current_turnover_info.get('turnover_capped', False),
+            'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {'enabled': False, 'total': 0.0, 'fee': 0.0, 'slippage': 0.0, 'impact': 0.0, 'num_trades': 0},
+            'trade_planner': dict(self.current_planner_info) if isinstance(self.current_planner_info, dict) else {'enabled': False, 'status': 'disabled', 'dropped': [], 'scaled': []},
+            'trade_planner_num_dropped': int((self.current_planner_info or {}).get('num_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
+            'trade_planner_turnover_used': (
+                float((self.current_planner_info or {}).get('turnover_used_forced', 0.0) or 0.0) +
+                float((self.current_planner_info or {}).get('turnover_used_normal', 0.0) or 0.0)
+            ) if isinstance(self.current_planner_info, dict) else 0.0,
+            'trade_planner_num_adv_clipped': int((self.current_planner_info or {}).get('num_adv_clipped', 0)) if isinstance(self.current_planner_info, dict) else 0,
+            'trade_planner_num_adv_dropped': int((self.current_planner_info or {}).get('num_adv_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0
+        }
+        return snapshot
+
+    def _write_post_rebalance_live_snapshot(self, trades_count, source="execute_rebalance"):
+        """Refresh live snapshot immediately after trades are persisted."""
+        try:
+            snapshot = self._build_post_rebalance_snapshot()
+            self.write_live_snapshot(snapshot)
+            live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
+            print(f"[SNAPSHOT] Post-rebalance live snapshot written (cycle={self.current_cycle}, trades={int(trades_count)}, path={live_snapshot_path}, source={source})")
+        except Exception as e:
+            print(f"[WARN] Post-rebalance live snapshot refresh failed: {e}")
+
     def save_trade_history_jsonl(self):
         """Write trade history JSONL for Streamlit portfolio monitor."""
         trade_history_path = self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')
@@ -2033,6 +2111,7 @@ class PaperTradingEngine:
         """Return trade-planner config with safe defaults."""
         defaults = {
             "enable_trade_planner": False,
+            "enabled": False,
             "planner_debug_log": False,
             "min_trade_notional": 5.0,
             "allow_partial_fill": True,
@@ -2060,7 +2139,14 @@ class PaperTradingEngine:
                     raw_cfg = merged
             cfg = dict(defaults)
             cfg.update(raw_cfg)
-            cfg["enable_trade_planner"] = bool(cfg.get("enable_trade_planner", False))
+            if "enable_trade_planner" in raw_cfg:
+                enabled_raw = raw_cfg.get("enable_trade_planner")
+            elif "enabled" in raw_cfg:
+                enabled_raw = raw_cfg.get("enabled")
+            else:
+                enabled_raw = cfg.get("enable_trade_planner", False)
+            cfg["enable_trade_planner"] = bool(enabled_raw)
+            cfg["enabled"] = bool(enabled_raw)
             cfg["planner_debug_log"] = bool(cfg.get("planner_debug_log", False))
             cfg["min_trade_notional"] = max(0.0, float(cfg.get("min_trade_notional", 5.0)))
             cfg["allow_partial_fill"] = bool(cfg.get("allow_partial_fill", True))
@@ -5049,9 +5135,11 @@ class PaperTradingEngine:
                 turnover_scale = (planned_after / turnover_notional_pre) if turnover_notional_pre > 0 else 1.0
                 turnover_capped = planned_after + 1e-9 < turnover_notional_pre
                 print(
-                    f"[PLANNER] status={planner_meta.get('status')} forced={planner_meta.get('num_forced', 0)} "
-                    f"normal={planner_meta.get('num_normal', 0)} dropped={planner_meta.get('num_dropped', 0)} "
-                    f"used=${planner_meta.get('turnover_used_total', 0.0):,.2f}/${planner_meta.get('turnover_limit', 0.0):,.2f}"
+                    f"[PLANNER] enabled=true turnover_limit=${planner_meta.get('turnover_limit', 0.0):,.2f} "
+                    f"used_total=${planner_meta.get('turnover_used_total', 0.0):,.2f} "
+                    f"dropped={planner_meta.get('num_dropped', 0)} "
+                    f"scaled={len(planner_meta.get('scaled', [])) if isinstance(planner_meta.get('scaled', []), list) else 0} "
+                    f"status={planner_meta.get('status')}"
                 )
             except Exception as e:
                 self.current_planner_info = {
@@ -5370,6 +5458,7 @@ class PaperTradingEngine:
             self.save_trades_immediately()
             self.last_rebalance_time = datetime.now()  # NOTE: comment omitted (was garbled/non-ASCII).
             print(f"[COOLDOWN] Next rebalance allowed after {cooldown_minutes} minutes")
+            self._write_post_rebalance_live_snapshot(len(trades), source="execute_rebalance")
         else:
             print(f"[INFO] No trades executed (all filtered by protections)")
         
@@ -5703,6 +5792,7 @@ class PaperTradingEngine:
             self.trades_log.extend(trades)
             self.save_trades_immediately()
             self.last_rebalance_time = now
+            self._write_post_rebalance_live_snapshot(len(trades), source="circuit_breaker")
 
         print(f"[CIRCUIT] Forced risk-off active until {self.forced_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"[CIRCUIT] Target cash: {forced_cash_target:.1%}, sold notional: ${turnover_notional_post:,.2f}, remaining cash gap: ${remaining_cash_needed:,.2f}")

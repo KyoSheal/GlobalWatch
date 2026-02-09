@@ -378,7 +378,7 @@
     "signal_refresh_minutes": 1440,
     "macro_refresh_minutes": 60,
     "circuit_breaker_forced_days": 1,
-    "rebalance_cooldown_minutes": 720,
+    "rebalance_cooldown_minutes": 180,
     "max_turnover_pct_per_rebalance": 0.20,
     "stale_price_skip_minutes": 60,
     "stale_abort_ratio": 0.5,
@@ -427,6 +427,30 @@
       "allow_buy": ["LIVE", "RECENT"],
       "allow_sell": ["LIVE", "RECENT", "STALE"]
     }
+  },
+  "trade_planner": {
+    "enabled": false,
+    "enable_trade_planner": false,
+    "planner_debug_log": false,
+    "allow_partial_fill": true,
+    "min_trade_notional": 5.0,
+    "enable_adv_limit": false,
+    "adv_limit_frac": 0.02,
+    "adv_lookback_days": 20,
+    "adv_apply_to_forced": true,
+    "enable_cost_sensitive_ranking": false,
+    "lambda_cost": 1.0,
+    "benefit_mode": "delta_weight",
+    "max_audit_items": 20
+  },
+  "cost_model": {
+    "enabled": false,
+    "fee_bps": 1.0,
+    "slippage_bps": 2.0,
+    "impact_enabled": false,
+    "impact_k": 0.1,
+    "adv_lookback_days": 20,
+    "debug_log": false
   },
   "benchmarks": {
     "tickers": ["QQQ", "SPY", "VTI", "DIA"],
