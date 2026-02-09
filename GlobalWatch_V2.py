@@ -2426,277 +2426,443 @@ def _infer_initial_equity(snapshot, summary_text, fallback_equity):
 
 def render_portfolio_monitor():
     st.title("\U0001F4BC Portfolio Monitor")
-    st.caption("Live paper trading monitor (auto-refresh every 30 seconds)")
-
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=30000, key="portfolio_auto_refresh")
-    except Exception:
-        st.markdown("<meta http-equiv='refresh' content='30'>", unsafe_allow_html=True)
+    st.caption("Live paper trading monitor")
 
     snapshot_path = "outputs/snapshot_live.json"
     summary_path = "outputs/paper_summary_live.txt"
     trades_path = "outputs/trade_history.jsonl"
 
-    snapshot = _safe_read_json(snapshot_path)
-    summary_text = _safe_read_text(summary_path)
-    trades = _safe_read_jsonl(trades_path)
+    defaults = {
+        "pm_auto_refresh_data": False,
+        "pm_auto_refresh_interval": 1200,
+        "pm_refresh_nonce": 0,
+        "pm_window_hours": 48,
+        "pm_resample_rule": "15min",
+        "pm_x_tick_mode": "auto",
+        "pm_x_tick_minutes": 15,
+        "pm_y_mode": "auto",
+        "pm_y_metric": "equity",
+        "pm_y_min": 0.0,
+        "pm_y_max": 1.0,
+        "pm_y_dtick": 0.0,
+        "pm_y_bounds_initialized": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    total_equity = _to_float(snapshot.get("total_equity", snapshot.get("equity", 0.0)))
-    cash = _to_float(snapshot.get("cash", 0.0))
-    positions_value = _to_float(snapshot.get("positions_value", max(0.0, total_equity - cash)))
-    drawdown = _to_float(snapshot.get("drawdown", 0.0))
+    top_col1, top_col2, top_col3 = st.columns([1, 1, 1])
+    refresh_clicked = top_col1.button("Refresh data", key="pm_refresh_button")
+    top_col2.toggle("Auto refresh data", key="pm_auto_refresh_data")
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    metric_col1.metric("Total Equity", f"${total_equity:,.2f}")
-    metric_col2.metric("Cash", f"${cash:,.2f}")
-    metric_col3.metric("Positions", f"${positions_value:,.2f}")
+    interval_options = [60, 300, 1200]
+    interval_value = int(st.session_state.get("pm_auto_refresh_interval", 1200))
+    if interval_value not in interval_options:
+        interval_value = 1200
+        st.session_state["pm_auto_refresh_interval"] = 1200
 
-    risk_cfg = snapshot.get("risk_config", {})
-    if not isinstance(risk_cfg, dict):
-        risk_cfg = {}
-    cash_target = _to_float(risk_cfg.get("cash_target", snapshot.get("cash_target", 0.0)))
-    risk_state = str(risk_cfg.get("risk_state", snapshot.get("regime_state", "UNKNOWN"))).upper()
-    trend_score = _to_float(risk_cfg.get("regime_trend_score", snapshot.get("trend_score", 0.0)))
-    regime_icon = "\U0001F7E2" if "RISK_ON" in risk_state else ("\U0001F534" if "RISK_OFF" in risk_state else "\U0001F7E1")
-    st.markdown(
-        f"**Regime**: {regime_icon} `{risk_state}` | "
-        f"**cash_target**: `{cash_target:.2%}` | **trend_score**: `{trend_score:.2%}`"
+    top_col3.selectbox(
+        "Auto refresh interval (sec)",
+        interval_options,
+        index=interval_options.index(interval_value),
+        key="pm_auto_refresh_interval",
     )
 
-    st.subheader("Current Holdings Composition")
-    position_weights = _build_position_weights(snapshot)
-    if position_weights:
-        position_df = pd.DataFrame(
-            [{"ticker": t, "weight": w} for t, w in position_weights.items()]
-        ).sort_values("weight", ascending=False).set_index("ticker")
-        st.bar_chart(position_df)
-    else:
-        st.info("No position composition found in outputs/snapshot_live.json")
+    if refresh_clicked:
+        st.session_state["pm_refresh_nonce"] = int(st.session_state.get("pm_refresh_nonce", 0)) + 1
 
-    st.subheader("Trade History")
-    if trades:
-        trade_rows = []
-        for trade in trades:
-            timestamp = trade.get("timestamp") or trade.get("time") or trade.get("datetime") or ""
-            ticker = str(trade.get("ticker", ""))
-            side = str(trade.get("side", trade.get("direction", "")))
-            amount = _to_float(
-                trade.get("cost", trade.get("notional", trade.get("amount", trade.get("desired_trade_value", 0.0))))
+    auto_state = "ON" if st.session_state.get("pm_auto_refresh_data") else "OFF"
+    st.caption(
+        f"Data refresh: {auto_state} | interval: {int(st.session_state.get('pm_auto_refresh_interval', 1200))}s"
+    )
+
+    def load_snapshot(path, interval_seconds, refresh_nonce):
+        ttl_seconds = max(1, int(interval_seconds))
+
+        @st.cache_data(ttl=ttl_seconds, show_spinner=False)
+        def _cached_snapshot(snapshot_file, nonce):
+            return _safe_read_json(snapshot_file)
+
+        return _cached_snapshot(path, int(refresh_nonce))
+
+    def load_summary(path, interval_seconds, refresh_nonce):
+        ttl_seconds = max(1, int(interval_seconds))
+
+        @st.cache_data(ttl=ttl_seconds, show_spinner=False)
+        def _cached_summary(summary_file, nonce):
+            return _safe_read_text(summary_file)
+
+        return _cached_summary(path, int(refresh_nonce))
+
+    def load_trade_history(path, interval_seconds, refresh_nonce):
+        ttl_seconds = max(1, int(interval_seconds))
+
+        @st.cache_data(ttl=ttl_seconds, show_spinner=False)
+        def _cached_trades(trades_file, nonce):
+            return _safe_read_jsonl(trades_file)
+
+        return _cached_trades(path, int(refresh_nonce))
+
+    data_container = st.empty()
+
+    def _render_data_panel():
+        interval_seconds = int(st.session_state.get("pm_auto_refresh_interval", 1200))
+        refresh_nonce = int(st.session_state.get("pm_refresh_nonce", 0))
+
+        snapshot = load_snapshot(snapshot_path, interval_seconds, refresh_nonce)
+        summary_text = load_summary(summary_path, interval_seconds, refresh_nonce)
+        trades = load_trade_history(trades_path, interval_seconds, refresh_nonce)
+
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        if not isinstance(trades, list):
+            trades = []
+
+        with data_container.container():
+            total_equity = _to_float(snapshot.get("total_equity", snapshot.get("equity", 0.0)))
+            cash = _to_float(snapshot.get("cash", 0.0))
+            positions_value = _to_float(snapshot.get("positions_value", max(0.0, total_equity - cash)))
+            drawdown = _to_float(snapshot.get("drawdown", 0.0))
+
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            metric_col1.metric("Total Equity", f"${total_equity:,.2f}")
+            metric_col2.metric("Cash", f"${cash:,.2f}")
+            metric_col3.metric("Positions", f"${positions_value:,.2f}")
+
+            risk_cfg = snapshot.get("risk_config", {})
+            if not isinstance(risk_cfg, dict):
+                risk_cfg = {}
+            cash_target = _to_float(risk_cfg.get("cash_target", snapshot.get("cash_target", 0.0)))
+            risk_state = str(risk_cfg.get("risk_state", snapshot.get("regime_state", "UNKNOWN"))).upper()
+            trend_score = _to_float(risk_cfg.get("regime_trend_score", snapshot.get("trend_score", 0.0)))
+            regime_icon = "\U0001F7E2" if "RISK_ON" in risk_state else ("\U0001F534" if "RISK_OFF" in risk_state else "\U0001F7E1")
+            st.markdown(
+                f"**Regime**: {regime_icon} `{risk_state}` | "
+                f"**cash_target**: `{cash_target:.2%}` | **trend_score**: `{trend_score:.2%}`"
             )
-            if "weight_change" in trade:
-                weight_change = _to_float(trade.get("weight_change", 0.0))
+
+            st.subheader("Current Holdings Composition")
+            position_weights = _build_position_weights(snapshot)
+            if position_weights:
+                position_df = pd.DataFrame(
+                    [{"ticker": t, "weight": w} for t, w in position_weights.items()]
+                ).sort_values("weight", ascending=False).set_index("ticker")
+                st.bar_chart(position_df)
             else:
-                old_weight = _to_float(trade.get("old_target_weight", trade.get("current_weight", trade.get("old_weight", 0.0))))
-                new_weight = _to_float(trade.get("new_target_weight", trade.get("target_weight", trade.get("new_weight", 0.0))))
-                weight_change = new_weight - old_weight
-            trade_rows.append(
-                {
-                    "time": str(timestamp),
-                    "ticker": ticker,
-                    "side": side,
-                    "amount": amount,
-                    "weight_change": weight_change,
-                }
-            )
+                st.info("No position composition found in outputs/snapshot_live.json")
 
-        trade_df = pd.DataFrame(trade_rows)
-        if not trade_df.empty:
-            trade_df["time_sort"] = pd.to_datetime(trade_df["time"], errors="coerce")
-            trade_df = trade_df.sort_values("time_sort", ascending=False).drop(columns=["time_sort"])
-            st.dataframe(trade_df, width='stretch', hide_index=True)
-    else:
-        st.info("No trade history found in outputs/trade_history.jsonl")
-
-    st.subheader("Theme Summary")
-    last_macro = snapshot.get("last_macro", {})
-    if not isinstance(last_macro, dict):
-        last_macro = {}
-    topic_summary = snapshot.get("topic_summary") or last_macro.get("topic_summary")
-    macro_summary = snapshot.get("macro_summary") or last_macro.get("summary")
-    if topic_summary:
-        color = _theme_colorize(topic_summary)
-        st.markdown(f"<span style='color:{color}'>{topic_summary}</span>", unsafe_allow_html=True)
-    if macro_summary:
-        st.markdown(macro_summary)
-
-    theme_confidence = snapshot.get("theme_confidence", {})
-    if isinstance(theme_confidence, dict) and theme_confidence:
-        st.markdown("**Theme Confidence**")
-        for theme_name, score in theme_confidence.items():
-            score_val = _to_float(score, 0.0)
-            color = "#00c853" if score_val >= 0 else "#ff4b4b"
-            st.markdown(f"- <span style='color:{color}'>{theme_name}: {score_val:+.2f}</span>", unsafe_allow_html=True)
-
-    st.subheader("Equity Curve")
-    equity_history = snapshot.get("equity_history")
-    if not isinstance(equity_history, list) or not equity_history:
-        st.info("No equity_history found in outputs/snapshot_live.json")
-    else:
-        control_col1, control_col2, control_col3, control_col4 = st.columns(4)
-        window_hours = control_col1.selectbox("Window (hours)", [6, 12, 24, 48, 168], index=3, key="pm_window_hours")
-        resample_rule = control_col2.selectbox(
-            "Resample",
-            ["raw", "1min", "5min", "15min", "1h", "1d"],
-            index=3,
-            key="pm_resample_rule",
-        )
-        x_tick_mode = control_col3.selectbox("X Tick Mode", ["auto", "fixed"], index=0, key="pm_x_tick_mode")
-        x_tick_minutes = control_col4.selectbox("X Tick (min)", [5, 15, 30, 60], index=1, key="pm_x_tick_minutes")
-
-        y_ctrl_col1, y_ctrl_col2, y_ctrl_col3, y_ctrl_col4 = st.columns(4)
-        y_mode = y_ctrl_col1.selectbox("Y Mode", ["auto", "manual"], index=0, key="pm_y_mode")
-        y_metric = y_ctrl_col2.selectbox(
-            "Y Metric",
-            ["equity", "pnl_from_initial"],
-            index=0,
-            key="pm_y_metric",
-        )
-
-        history_payload = json.dumps(equity_history, ensure_ascii=False, sort_keys=True)
-        equity_df = _prepare_equity_curve_cached(history_payload, int(window_hours), str(resample_rule))
-        if equity_df.empty:
-            st.info("No valid equity points in selected window.")
-        else:
-            first_equity = _to_float(equity_df["equity"].iloc[0], 0.0)
-            initial_equity = _infer_initial_equity(snapshot, summary_text, first_equity)
-            y_series = equity_df["equity"] if y_metric == "equity" else (equity_df["equity"] - initial_equity)
-            plot_df = pd.DataFrame({"time": equity_df["time"], "y": y_series})
-
-            y_min_default = float(plot_df["y"].min())
-            y_max_default = float(plot_df["y"].max())
-            if y_max_default <= y_min_default:
-                y_max_default = y_min_default + 1.0
-
-            manual_inputs_disabled = (y_mode != "manual")
-            y_min = y_ctrl_col3.number_input(
-                "Y Min",
-                value=float(y_min_default),
-                step=1.0,
-                disabled=manual_inputs_disabled,
-                key="pm_y_min",
-            )
-            y_max = y_ctrl_col4.number_input(
-                "Y Max",
-                value=float(y_max_default),
-                step=1.0,
-                disabled=manual_inputs_disabled,
-                key="pm_y_max",
-            )
-
-            y_opt_col1, y_opt_col2 = st.columns(2)
-            y_dtick = y_opt_col1.number_input(
-                "Y dtick (0=auto)",
-                value=0.0,
-                step=1.0,
-                disabled=manual_inputs_disabled,
-                key="pm_y_dtick",
-            )
-            y_title = "PnL ($)" if y_metric == "pnl_from_initial" else "Equity ($)"
-            x_tick_label = "auto" if x_tick_mode == "auto" else f"{x_tick_minutes}min"
-            y_mode_label = "auto"
-            if y_mode == "manual":
-                y_mode_label = f"manual [{y_min:.2f}, {y_max:.2f}]"
-            st.caption(f"X: last {window_hours}h @ {resample_rule} | X tick: {x_tick_label} | Y: {y_metric} {y_mode_label}")
-
-            # Plotly first, Altair fallback.
-            plot_rendered = False
-            try:
-                import plotly.graph_objects as pgo
-
-                fig = pgo.Figure()
-                fig.add_trace(
-                    pgo.Scatter(
-                        x=plot_df["time"],
-                        y=plot_df["y"],
-                        mode="lines",
-                        name=y_title,
-                        hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y:,.2f}<extra></extra>",
+            st.subheader("Trade History")
+            if trades:
+                trade_rows = []
+                for trade in trades:
+                    timestamp = trade.get("timestamp") or trade.get("time") or trade.get("datetime") or ""
+                    ticker = str(trade.get("ticker", ""))
+                    side = str(trade.get("side", trade.get("direction", "")))
+                    amount = _to_float(
+                        trade.get("cost", trade.get("notional", trade.get("amount", trade.get("desired_trade_value", 0.0))))
                     )
-                )
+                    if "weight_change" in trade:
+                        weight_change = _to_float(trade.get("weight_change", 0.0))
+                    else:
+                        old_weight = _to_float(
+                            trade.get("old_target_weight", trade.get("current_weight", trade.get("old_weight", 0.0)))
+                        )
+                        new_weight = _to_float(
+                            trade.get("new_target_weight", trade.get("target_weight", trade.get("new_weight", 0.0)))
+                        )
+                        weight_change = new_weight - old_weight
 
-                xaxis_config = {"title": "Time"}
-                if x_tick_mode == "fixed":
-                    dtick_ms = int(x_tick_minutes) * 60 * 1000
-                    time_span = (plot_df["time"].max() - plot_df["time"].min()).total_seconds()
-                    tick_fmt = "%m-%d %H:%M" if time_span <= 7 * 24 * 3600 else "%m-%d"
-                    xaxis_config.update(
+                    trade_rows.append(
                         {
-                            "tickmode": "linear",
-                            "dtick": dtick_ms,
-                            "tickformat": tick_fmt,
+                            "time": str(timestamp),
+                            "ticker": ticker,
+                            "side": side,
+                            "amount": amount,
+                            "weight_change": weight_change,
                         }
                     )
 
-                yaxis_config = {"title": y_title}
-                if y_mode == "manual":
-                    y_low = float(min(y_min, y_max))
-                    y_high = float(max(y_min, y_max))
-                    yaxis_config["range"] = [y_low, y_high]
-                    if y_dtick and y_dtick > 0:
-                        yaxis_config["dtick"] = float(y_dtick)
+                trade_df = pd.DataFrame(trade_rows)
+                if not trade_df.empty:
+                    trade_df["time_sort"] = pd.to_datetime(trade_df["time"], errors="coerce")
+                    trade_df = trade_df.sort_values("time_sort", ascending=False).drop(columns=["time_sort"])
+                    st.dataframe(trade_df, width="stretch", hide_index=True)
+            else:
+                st.info("No trade history found in outputs/trade_history.jsonl")
 
-                fig.update_layout(
-                    margin={"l": 20, "r": 20, "t": 20, "b": 20},
-                    xaxis=xaxis_config,
-                    yaxis=yaxis_config,
-                    hovermode="x unified",
+            st.subheader("Theme Summary")
+            last_macro = snapshot.get("last_macro", {})
+            if not isinstance(last_macro, dict):
+                last_macro = {}
+            topic_summary = snapshot.get("topic_summary") or last_macro.get("topic_summary")
+            macro_summary = snapshot.get("macro_summary") or last_macro.get("summary")
+
+            if topic_summary:
+                color = _theme_colorize(topic_summary)
+                st.markdown(f"<span style='color:{color}'>{topic_summary}</span>", unsafe_allow_html=True)
+            if macro_summary:
+                st.markdown(macro_summary)
+
+            theme_confidence = snapshot.get("theme_confidence", {})
+            if isinstance(theme_confidence, dict) and theme_confidence:
+                st.markdown("**Theme Confidence**")
+                for theme_name, score in theme_confidence.items():
+                    score_val = _to_float(score, 0.0)
+                    color = "#00c853" if score_val >= 0 else "#ff4b4b"
+                    st.markdown(f"- <span style='color:{color}'>{theme_name}: {score_val:+.2f}</span>", unsafe_allow_html=True)
+
+            st.subheader("Equity Curve")
+            equity_history = snapshot.get("equity_history")
+            if not isinstance(equity_history, list) or not equity_history:
+                st.info("No equity_history found in outputs/snapshot_live.json")
+            else:
+                window_options = [6, 12, 24, 48, 168]
+                resample_options = ["raw", "1min", "5min", "15min", "1h", "1d"]
+                x_tick_mode_options = ["auto", "fixed"]
+                x_tick_options = [5, 15, 30, 60]
+                y_mode_options = ["auto", "manual"]
+                y_metric_options = ["equity", "pnl_from_initial"]
+
+                if int(st.session_state.get("pm_window_hours", 48)) not in window_options:
+                    st.session_state["pm_window_hours"] = 48
+                if str(st.session_state.get("pm_resample_rule", "15min")) not in resample_options:
+                    st.session_state["pm_resample_rule"] = "15min"
+                if str(st.session_state.get("pm_x_tick_mode", "auto")) not in x_tick_mode_options:
+                    st.session_state["pm_x_tick_mode"] = "auto"
+                if int(st.session_state.get("pm_x_tick_minutes", 15)) not in x_tick_options:
+                    st.session_state["pm_x_tick_minutes"] = 15
+                if str(st.session_state.get("pm_y_mode", "auto")) not in y_mode_options:
+                    st.session_state["pm_y_mode"] = "auto"
+                if str(st.session_state.get("pm_y_metric", "equity")) not in y_metric_options:
+                    st.session_state["pm_y_metric"] = "equity"
+
+                control_col1, control_col2, control_col3, control_col4 = st.columns(4)
+                control_col1.selectbox(
+                    "Window (hours)",
+                    window_options,
+                    index=window_options.index(int(st.session_state.get("pm_window_hours", 48))),
+                    key="pm_window_hours",
                 )
-                st.plotly_chart(fig, width="stretch")
-                plot_rendered = True
-            except Exception:
-                plot_rendered = False
+                control_col2.selectbox(
+                    "Resample",
+                    resample_options,
+                    index=resample_options.index(str(st.session_state.get("pm_resample_rule", "15min"))),
+                    key="pm_resample_rule",
+                )
+                control_col3.selectbox(
+                    "X Tick Mode",
+                    x_tick_mode_options,
+                    index=x_tick_mode_options.index(str(st.session_state.get("pm_x_tick_mode", "auto"))),
+                    key="pm_x_tick_mode",
+                )
+                control_col4.selectbox(
+                    "X Tick (min)",
+                    x_tick_options,
+                    index=x_tick_options.index(int(st.session_state.get("pm_x_tick_minutes", 15))),
+                    key="pm_x_tick_minutes",
+                )
 
-            if not plot_rendered:
-                try:
-                    import altair as alt
+                y_ctrl_col1, y_ctrl_col2, y_ctrl_col3, y_ctrl_col4 = st.columns(4)
+                y_ctrl_col1.selectbox(
+                    "Y Mode",
+                    y_mode_options,
+                    index=y_mode_options.index(str(st.session_state.get("pm_y_mode", "auto"))),
+                    key="pm_y_mode",
+                )
+                y_ctrl_col2.selectbox(
+                    "Y Metric",
+                    y_metric_options,
+                    index=y_metric_options.index(str(st.session_state.get("pm_y_metric", "equity"))),
+                    key="pm_y_metric",
+                )
 
-                    y_scale = alt.Scale()
-                    if y_mode == "manual":
-                        y_scale = alt.Scale(domain=[float(min(y_min, y_max)), float(max(y_min, y_max))])
+                history_payload = json.dumps(equity_history, ensure_ascii=False, sort_keys=True)
+                equity_df = _prepare_equity_curve_cached(
+                    history_payload,
+                    int(st.session_state.get("pm_window_hours", 48)),
+                    str(st.session_state.get("pm_resample_rule", "15min")),
+                )
 
-                    x_axis = alt.Axis(title="Time")
-                    if x_tick_mode == "fixed":
-                        tick_count = max(2, int((int(window_hours) * 60) / max(1, int(x_tick_minutes))))
-                        x_axis = alt.Axis(title="Time", tickCount=tick_count)
+                if equity_df.empty:
+                    st.info("No valid equity points in selected window.")
+                else:
+                    first_equity = _to_float(equity_df["equity"].iloc[0], 0.0)
+                    initial_equity = _infer_initial_equity(snapshot, summary_text, first_equity)
+                    y_metric = str(st.session_state.get("pm_y_metric", "equity"))
+                    y_series = equity_df["equity"] if y_metric == "equity" else (equity_df["equity"] - initial_equity)
+                    plot_df = pd.DataFrame({"time": equity_df["time"], "y": y_series})
 
-                    y_axis = alt.Axis(title=y_title)
-                    if y_mode == "manual" and y_dtick and y_dtick > 0:
-                        y_axis = alt.Axis(title=y_title, tickMinStep=float(y_dtick))
+                    y_min_default = float(plot_df["y"].min())
+                    y_max_default = float(plot_df["y"].max())
+                    if y_max_default <= y_min_default:
+                        y_max_default = y_min_default + 1.0
 
-                    chart = (
-                        alt.Chart(plot_df)
-                        .mark_line()
-                        .encode(
-                            x=alt.X("time:T", axis=x_axis),
-                            y=alt.Y("y:Q", axis=y_axis, scale=y_scale),
-                            tooltip=[alt.Tooltip("time:T", title="Time"), alt.Tooltip("y:Q", title=y_title, format=",.2f")],
-                        )
-                        .interactive()
+                    if not st.session_state.get("pm_y_bounds_initialized", False):
+                        st.session_state["pm_y_min"] = y_min_default
+                        st.session_state["pm_y_max"] = y_max_default
+                        st.session_state["pm_y_bounds_initialized"] = True
+
+                    manual_inputs_disabled = str(st.session_state.get("pm_y_mode", "auto")) != "manual"
+                    y_min = y_ctrl_col3.number_input(
+                        "Y Min",
+                        value=float(st.session_state.get("pm_y_min", y_min_default)),
+                        step=1.0,
+                        disabled=manual_inputs_disabled,
+                        key="pm_y_min",
                     )
-                    st.altair_chart(chart, width="stretch")
-                except Exception as e:
-                    st.info(f"Unable to render equity curve with Plotly/Altair: {e}")
+                    y_max = y_ctrl_col4.number_input(
+                        "Y Max",
+                        value=float(st.session_state.get("pm_y_max", y_max_default)),
+                        step=1.0,
+                        disabled=manual_inputs_disabled,
+                        key="pm_y_max",
+                    )
 
-    if summary_text:
-        with st.expander("Live Summary Text", expanded=False):
-            st.text(summary_text)
+                    y_opt_col1, _ = st.columns(2)
+                    y_dtick = y_opt_col1.number_input(
+                        "Y dtick (0=auto)",
+                        value=float(st.session_state.get("pm_y_dtick", 0.0)),
+                        step=1.0,
+                        disabled=manual_inputs_disabled,
+                        key="pm_y_dtick",
+                    )
 
-    cash_ratio = (cash / total_equity) if total_equity > 1e-12 else 0.0
-    if drawdown >= 0.10:
-        st.error(f"Major drawdown warning: {drawdown:.2%}")
-    if cash_ratio > 0.90 and total_equity > 0:
-        st.error(f"Position anomaly warning: cash ratio too high ({cash_ratio:.2%})")
+                    y_title = "PnL ($)" if y_metric == "pnl_from_initial" else "Equity ($)"
+                    x_tick_mode = str(st.session_state.get("pm_x_tick_mode", "auto"))
+                    x_tick_minutes = int(st.session_state.get("pm_x_tick_minutes", 15))
+                    x_tick_label = "auto" if x_tick_mode == "auto" else f"{x_tick_minutes}min"
+                    y_mode_label = "auto"
+                    if str(st.session_state.get("pm_y_mode", "auto")) == "manual":
+                        y_mode_label = f"manual [{y_min:.2f}, {y_max:.2f}]"
+                    st.caption(
+                        "X: last "
+                        f"{int(st.session_state.get('pm_window_hours', 48))}h @ {str(st.session_state.get('pm_resample_rule', '15min'))}"
+                        f" | X tick: {x_tick_label} | Y: {y_metric} {y_mode_label}"
+                    )
 
+                    plot_rendered = False
+                    try:
+                        import plotly.graph_objects as pgo
+
+                        fig = pgo.Figure()
+                        fig.add_trace(
+                            pgo.Scatter(
+                                x=plot_df["time"],
+                                y=plot_df["y"],
+                                mode="lines",
+                                name=y_title,
+                                hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y:,.2f}<extra></extra>",
+                            )
+                        )
+
+                        xaxis_config = {"title": "Time"}
+                        if x_tick_mode == "fixed":
+                            dtick_ms = x_tick_minutes * 60 * 1000
+                            time_span = (plot_df["time"].max() - plot_df["time"].min()).total_seconds()
+                            tick_fmt = "%m-%d %H:%M" if time_span <= 7 * 24 * 3600 else "%m-%d"
+                            xaxis_config.update(
+                                {
+                                    "tickmode": "linear",
+                                    "dtick": dtick_ms,
+                                    "tickformat": tick_fmt,
+                                }
+                            )
+
+                        yaxis_config = {"title": y_title}
+                        if str(st.session_state.get("pm_y_mode", "auto")) == "manual":
+                            y_low = float(min(y_min, y_max))
+                            y_high = float(max(y_min, y_max))
+                            yaxis_config["range"] = [y_low, y_high]
+                            if y_dtick and y_dtick > 0:
+                                yaxis_config["dtick"] = float(y_dtick)
+
+                        fig.update_layout(
+                            margin={"l": 20, "r": 20, "t": 20, "b": 20},
+                            xaxis=xaxis_config,
+                            yaxis=yaxis_config,
+                            hovermode="x unified",
+                        )
+                        st.plotly_chart(fig, width="stretch")
+                        plot_rendered = True
+                    except Exception:
+                        plot_rendered = False
+
+                    if not plot_rendered:
+                        try:
+                            import altair as alt
+
+                            y_scale = alt.Scale()
+                            if str(st.session_state.get("pm_y_mode", "auto")) == "manual":
+                                y_scale = alt.Scale(domain=[float(min(y_min, y_max)), float(max(y_min, y_max))])
+
+                            x_axis = alt.Axis(title="Time")
+                            if x_tick_mode == "fixed":
+                                tick_count = max(
+                                    2,
+                                    int(
+                                        (int(st.session_state.get("pm_window_hours", 48)) * 60)
+                                        / max(1, x_tick_minutes)
+                                    ),
+                                )
+                                x_axis = alt.Axis(title="Time", tickCount=tick_count)
+
+                            y_axis = alt.Axis(title=y_title)
+                            if str(st.session_state.get("pm_y_mode", "auto")) == "manual" and y_dtick and y_dtick > 0:
+                                y_axis = alt.Axis(title=y_title, tickMinStep=float(y_dtick))
+
+                            chart = (
+                                alt.Chart(plot_df)
+                                .mark_line()
+                                .encode(
+                                    x=alt.X("time:T", axis=x_axis),
+                                    y=alt.Y("y:Q", axis=y_axis, scale=y_scale),
+                                    tooltip=[
+                                        alt.Tooltip("time:T", title="Time"),
+                                        alt.Tooltip("y:Q", title=y_title, format=",.2f"),
+                                    ],
+                                )
+                                .interactive()
+                            )
+                            st.altair_chart(chart, width="stretch")
+                        except Exception as e:
+                            st.info(f"Unable to render equity curve with Plotly/Altair: {e}")
+
+            if summary_text:
+                with st.expander("Live Summary Text", expanded=False):
+                    st.text(summary_text)
+
+            cash_ratio = (cash / total_equity) if total_equity > 1e-12 else 0.0
+            if drawdown >= 0.10:
+                st.error(f"Major drawdown warning: {drawdown:.2%}")
+            if cash_ratio > 0.90 and total_equity > 0:
+                st.error(f"Position anomaly warning: cash ratio too high ({cash_ratio:.2%})")
+
+    auto_refresh = bool(st.session_state.get("pm_auto_refresh_data", False))
+    interval_seconds = int(st.session_state.get("pm_auto_refresh_interval", 1200))
+
+    if auto_refresh and hasattr(st, "fragment"):
+        @st.fragment(run_every=f"{interval_seconds}s")
+        def _portfolio_refresh_fragment():
+            _render_data_panel()
+
+        _portfolio_refresh_fragment()
+    else:
+        if auto_refresh and not hasattr(st, "fragment"):
+            st.info("Auto refresh requires Streamlit fragment support. Use Refresh data if unavailable.")
+        _render_data_panel()
 st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", page_icon="🦁")
 
 st.sidebar.header("⚙️ Settings")
 st.sidebar.caption(f"Brain: {LOCAL_MODEL}")
 
+page_options = ["\U0001F4E1 Global Macro Signals", "\U0001F4BC Portfolio Monitor"]
+if "page" not in st.session_state or st.session_state.get("page") not in page_options:
+    st.session_state["page"] = page_options[0]
 page_choice = st.sidebar.selectbox(
     "Page",
-    ["\U0001F4E1 Global Macro Signals", "\U0001F4BC Portfolio Monitor"],
-    index=0
+    page_options,
+    index=page_options.index(st.session_state.get("page", page_options[0])),
+    key="page",
 )
 
 # 新增：展示宏观规则库
@@ -3593,5 +3759,6 @@ with tab_warning:
         - Pay attention to evidence - not just the score
         - Act on CRITICAL levels, monitor HIGH levels
         """)
+
 
 
