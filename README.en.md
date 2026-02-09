@@ -44,7 +44,9 @@ Start_Paper_Trading.bat
 
 ### 3.3 Outputs
 - `outputs/paper_trades.csv` # execution log
+- `outputs/trade_history.jsonl` # UI trade table source (Portfolio Monitor)
 - `outputs/portfolio_snapshots.jsonl` # cycle snapshots
+- `outputs/snapshot_live.json` # UI live metrics source (Portfolio Monitor)
 - `outputs/scoreboard.jsonl` # rolling performance windows
 - `outputs/paper_summary_live.txt` # live status
 - `outputs/paper_summary.txt` # final report
@@ -136,6 +138,8 @@ python -m py_compile GlobalWatch_V2.py
 ```powershell
 Get-Content outputs\portfolio_snapshots.jsonl -Tail 3
 Get-Content outputs\paper_trades.csv -Tail 5
+Get-Content outputs\trade_history.jsonl -Tail 5
+Get-Content outputs\snapshot_live.json -Tail 40
 Get-Content outputs\scoreboard.jsonl -Tail 5
 ```
 
@@ -155,7 +159,14 @@ chcp 65001
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 ```
 
-## 8. Safety Notice
+## 8. Portfolio Monitor Data Sync
+- `Portfolio Monitor` reads `outputs/snapshot_live.json` and `outputs/trade_history.jsonl`.
+- If top metrics show `READY/cycle=0` while engine logs show running positions, `snapshot_live.json` is stale.
+- If Trade History is empty but CSV has trades, `trade_history.jsonl` is missing or stale.
+- Current engine writes both files on resume and every cycle snapshot.
+- If mismatch appears, stop old processes, run `python -u paper_trading.py paper_config.json`, then refresh Streamlit.
+
+## 9. Safety Notice
 - Paper trading only.
 - No real broker connection.
 - Not investment advice.

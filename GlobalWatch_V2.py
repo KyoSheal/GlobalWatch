@@ -2240,10 +2240,464 @@ def analyze_single_stock(ticker, news, lang_mode):
 
 # ================= 4. UI 界面 =================
 
+
+
+def _safe_read_json(path):
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log_error(f"_safe_read_json error for {path}: {str(e)}")
+        return {}
+
+
+def _safe_read_text(path):
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        log_error(f"_safe_read_text error for {path}: {str(e)}")
+        return ""
+
+
+def _safe_read_jsonl(path, limit=5000):
+    rows = []
+    try:
+        if not os.path.exists(path):
+            return rows
+        with open(path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                if idx >= limit:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+                except Exception:
+                    continue
+        return rows
+    except Exception as e:
+        log_error(f"_safe_read_jsonl error for {path}: {str(e)}")
+        return rows
+
+
+def _to_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str) and not value.strip():
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _build_position_weights(snapshot):
+    positions = snapshot.get("positions", {})
+    total_equity = _to_float(snapshot.get("total_equity", snapshot.get("equity", 0.0)))
+    result = {}
+    if not isinstance(positions, dict):
+        return result
+
+    for ticker, raw in positions.items():
+        ticker_key = str(ticker).upper().strip()
+        if not ticker_key:
+            continue
+        weight = 0.0
+        if isinstance(raw, dict):
+            if "weight" in raw:
+                weight = _to_float(raw.get("weight", 0.0))
+            elif "value" in raw and total_equity > 0:
+                weight = _to_float(raw.get("value", 0.0)) / total_equity
+        else:
+            weight = _to_float(raw, 0.0)
+        if weight > 0:
+            result[ticker_key] = float(weight)
+    return result
+
+
+def _theme_colorize(text):
+    lower = str(text).lower()
+    positive_keys = ["bull", "positive", "up", "risk_on", "strong", "cooling", "cut"]
+    negative_keys = ["bear", "negative", "down", "risk_off", "weak", "spike", "crisis"]
+    if any(k in lower for k in negative_keys):
+        return "#ff4b4b"
+    if any(k in lower for k in positive_keys):
+        return "#00c853"
+    return "#dddddd"
+
+
+@st.cache_data(ttl=30)
+def _parse_equity_history_cached(history_payload):
+    """Parse equity_history payload into a clean DataFrame."""
+    try:
+        raw = json.loads(history_payload)
+    except Exception:
+        return pd.DataFrame(columns=["time", "equity"])
+    if not isinstance(raw, list) or not raw:
+        return pd.DataFrame(columns=["time", "equity"])
+
+    rows = []
+    for point in raw:
+        if not isinstance(point, dict):
+            continue
+        rows.append(
+            {
+                "time": point.get("time"),
+                "equity": _to_float(point.get("equity", 0.0)),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["time", "equity"])
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).sort_values("time")
+    if df.empty:
+        return pd.DataFrame(columns=["time", "equity"])
+    return df[["time", "equity"]]
+
+
+@st.cache_data(ttl=30)
+def _prepare_equity_curve_cached(history_payload, window_hours, resample_rule):
+    """Apply time-window filtering and optional resampling."""
+    df = _parse_equity_history_cached(history_payload)
+    if df.empty:
+        return df
+
+    cutoff = df["time"].max() - pd.Timedelta(hours=int(window_hours))
+    df = df[df["time"] >= cutoff]
+    if df.empty:
+        return pd.DataFrame(columns=["time", "equity"])
+
+    if str(resample_rule).lower() != "raw":
+        rule_map = {
+            "1min": "1min",
+            "5min": "5min",
+            "15min": "15min",
+            "1h": "1h",
+            "1d": "1d",
+        }
+        rule = rule_map.get(str(resample_rule).lower())
+        if rule:
+            df = (
+                df.set_index("time")["equity"]
+                .resample(rule)
+                .last()
+                .dropna()
+                .reset_index()
+            )
+
+    return df[["time", "equity"]]
+
+
+def _infer_initial_equity(snapshot, summary_text, fallback_equity):
+    """Infer initial equity from snapshot/summary, fallback to first point."""
+    candidates = [
+        snapshot.get("initial_cash"),
+        snapshot.get("initial_cash_usd"),
+        snapshot.get("initial_equity"),
+        snapshot.get("starting_equity"),
+    ]
+    for value in candidates:
+        num = _to_float(value, None)
+        if num is not None and num > 0:
+            return float(num)
+
+    if isinstance(summary_text, str) and summary_text.strip():
+        match = re.search(r"Initial Cash:\s*\$([0-9,]+(?:\.[0-9]+)?)", summary_text)
+        if match:
+            try:
+                return float(match.group(1).replace(",", ""))
+            except Exception:
+                pass
+
+    return float(fallback_equity)
+
+
+def render_portfolio_monitor():
+    st.title("\U0001F4BC Portfolio Monitor")
+    st.caption("Live paper trading monitor (auto-refresh every 30 seconds)")
+
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=30000, key="portfolio_auto_refresh")
+    except Exception:
+        st.markdown("<meta http-equiv='refresh' content='30'>", unsafe_allow_html=True)
+
+    snapshot_path = "outputs/snapshot_live.json"
+    summary_path = "outputs/paper_summary_live.txt"
+    trades_path = "outputs/trade_history.jsonl"
+
+    snapshot = _safe_read_json(snapshot_path)
+    summary_text = _safe_read_text(summary_path)
+    trades = _safe_read_jsonl(trades_path)
+
+    total_equity = _to_float(snapshot.get("total_equity", snapshot.get("equity", 0.0)))
+    cash = _to_float(snapshot.get("cash", 0.0))
+    positions_value = _to_float(snapshot.get("positions_value", max(0.0, total_equity - cash)))
+    drawdown = _to_float(snapshot.get("drawdown", 0.0))
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+    metric_col1.metric("Total Equity", f"${total_equity:,.2f}")
+    metric_col2.metric("Cash", f"${cash:,.2f}")
+    metric_col3.metric("Positions", f"${positions_value:,.2f}")
+
+    risk_cfg = snapshot.get("risk_config", {})
+    if not isinstance(risk_cfg, dict):
+        risk_cfg = {}
+    cash_target = _to_float(risk_cfg.get("cash_target", snapshot.get("cash_target", 0.0)))
+    risk_state = str(risk_cfg.get("risk_state", snapshot.get("regime_state", "UNKNOWN"))).upper()
+    trend_score = _to_float(risk_cfg.get("regime_trend_score", snapshot.get("trend_score", 0.0)))
+    regime_icon = "\U0001F7E2" if "RISK_ON" in risk_state else ("\U0001F534" if "RISK_OFF" in risk_state else "\U0001F7E1")
+    st.markdown(
+        f"**Regime**: {regime_icon} `{risk_state}` | "
+        f"**cash_target**: `{cash_target:.2%}` | **trend_score**: `{trend_score:.2%}`"
+    )
+
+    st.subheader("Current Holdings Composition")
+    position_weights = _build_position_weights(snapshot)
+    if position_weights:
+        position_df = pd.DataFrame(
+            [{"ticker": t, "weight": w} for t, w in position_weights.items()]
+        ).sort_values("weight", ascending=False).set_index("ticker")
+        st.bar_chart(position_df)
+    else:
+        st.info("No position composition found in outputs/snapshot_live.json")
+
+    st.subheader("Trade History")
+    if trades:
+        trade_rows = []
+        for trade in trades:
+            timestamp = trade.get("timestamp") or trade.get("time") or trade.get("datetime") or ""
+            ticker = str(trade.get("ticker", ""))
+            side = str(trade.get("side", trade.get("direction", "")))
+            amount = _to_float(
+                trade.get("cost", trade.get("notional", trade.get("amount", trade.get("desired_trade_value", 0.0))))
+            )
+            if "weight_change" in trade:
+                weight_change = _to_float(trade.get("weight_change", 0.0))
+            else:
+                old_weight = _to_float(trade.get("old_target_weight", trade.get("current_weight", trade.get("old_weight", 0.0))))
+                new_weight = _to_float(trade.get("new_target_weight", trade.get("target_weight", trade.get("new_weight", 0.0))))
+                weight_change = new_weight - old_weight
+            trade_rows.append(
+                {
+                    "time": str(timestamp),
+                    "ticker": ticker,
+                    "side": side,
+                    "amount": amount,
+                    "weight_change": weight_change,
+                }
+            )
+
+        trade_df = pd.DataFrame(trade_rows)
+        if not trade_df.empty:
+            trade_df["time_sort"] = pd.to_datetime(trade_df["time"], errors="coerce")
+            trade_df = trade_df.sort_values("time_sort", ascending=False).drop(columns=["time_sort"])
+            st.dataframe(trade_df, width='stretch', hide_index=True)
+    else:
+        st.info("No trade history found in outputs/trade_history.jsonl")
+
+    st.subheader("Theme Summary")
+    last_macro = snapshot.get("last_macro", {})
+    if not isinstance(last_macro, dict):
+        last_macro = {}
+    topic_summary = snapshot.get("topic_summary") or last_macro.get("topic_summary")
+    macro_summary = snapshot.get("macro_summary") or last_macro.get("summary")
+    if topic_summary:
+        color = _theme_colorize(topic_summary)
+        st.markdown(f"<span style='color:{color}'>{topic_summary}</span>", unsafe_allow_html=True)
+    if macro_summary:
+        st.markdown(macro_summary)
+
+    theme_confidence = snapshot.get("theme_confidence", {})
+    if isinstance(theme_confidence, dict) and theme_confidence:
+        st.markdown("**Theme Confidence**")
+        for theme_name, score in theme_confidence.items():
+            score_val = _to_float(score, 0.0)
+            color = "#00c853" if score_val >= 0 else "#ff4b4b"
+            st.markdown(f"- <span style='color:{color}'>{theme_name}: {score_val:+.2f}</span>", unsafe_allow_html=True)
+
+    st.subheader("Equity Curve")
+    equity_history = snapshot.get("equity_history")
+    if not isinstance(equity_history, list) or not equity_history:
+        st.info("No equity_history found in outputs/snapshot_live.json")
+    else:
+        control_col1, control_col2, control_col3, control_col4 = st.columns(4)
+        window_hours = control_col1.selectbox("Window (hours)", [6, 12, 24, 48, 168], index=3, key="pm_window_hours")
+        resample_rule = control_col2.selectbox(
+            "Resample",
+            ["raw", "1min", "5min", "15min", "1h", "1d"],
+            index=3,
+            key="pm_resample_rule",
+        )
+        x_tick_mode = control_col3.selectbox("X Tick Mode", ["auto", "fixed"], index=0, key="pm_x_tick_mode")
+        x_tick_minutes = control_col4.selectbox("X Tick (min)", [5, 15, 30, 60], index=1, key="pm_x_tick_minutes")
+
+        y_ctrl_col1, y_ctrl_col2, y_ctrl_col3, y_ctrl_col4 = st.columns(4)
+        y_mode = y_ctrl_col1.selectbox("Y Mode", ["auto", "manual"], index=0, key="pm_y_mode")
+        y_metric = y_ctrl_col2.selectbox(
+            "Y Metric",
+            ["equity", "pnl_from_initial"],
+            index=0,
+            key="pm_y_metric",
+        )
+
+        history_payload = json.dumps(equity_history, ensure_ascii=False, sort_keys=True)
+        equity_df = _prepare_equity_curve_cached(history_payload, int(window_hours), str(resample_rule))
+        if equity_df.empty:
+            st.info("No valid equity points in selected window.")
+        else:
+            first_equity = _to_float(equity_df["equity"].iloc[0], 0.0)
+            initial_equity = _infer_initial_equity(snapshot, summary_text, first_equity)
+            y_series = equity_df["equity"] if y_metric == "equity" else (equity_df["equity"] - initial_equity)
+            plot_df = pd.DataFrame({"time": equity_df["time"], "y": y_series})
+
+            y_min_default = float(plot_df["y"].min())
+            y_max_default = float(plot_df["y"].max())
+            if y_max_default <= y_min_default:
+                y_max_default = y_min_default + 1.0
+
+            manual_inputs_disabled = (y_mode != "manual")
+            y_min = y_ctrl_col3.number_input(
+                "Y Min",
+                value=float(y_min_default),
+                step=1.0,
+                disabled=manual_inputs_disabled,
+                key="pm_y_min",
+            )
+            y_max = y_ctrl_col4.number_input(
+                "Y Max",
+                value=float(y_max_default),
+                step=1.0,
+                disabled=manual_inputs_disabled,
+                key="pm_y_max",
+            )
+
+            y_opt_col1, y_opt_col2 = st.columns(2)
+            y_dtick = y_opt_col1.number_input(
+                "Y dtick (0=auto)",
+                value=0.0,
+                step=1.0,
+                disabled=manual_inputs_disabled,
+                key="pm_y_dtick",
+            )
+            y_title = "PnL ($)" if y_metric == "pnl_from_initial" else "Equity ($)"
+            x_tick_label = "auto" if x_tick_mode == "auto" else f"{x_tick_minutes}min"
+            y_mode_label = "auto"
+            if y_mode == "manual":
+                y_mode_label = f"manual [{y_min:.2f}, {y_max:.2f}]"
+            st.caption(f"X: last {window_hours}h @ {resample_rule} | X tick: {x_tick_label} | Y: {y_metric} {y_mode_label}")
+
+            # Plotly first, Altair fallback.
+            plot_rendered = False
+            try:
+                import plotly.graph_objects as pgo
+
+                fig = pgo.Figure()
+                fig.add_trace(
+                    pgo.Scatter(
+                        x=plot_df["time"],
+                        y=plot_df["y"],
+                        mode="lines",
+                        name=y_title,
+                        hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y:,.2f}<extra></extra>",
+                    )
+                )
+
+                xaxis_config = {"title": "Time"}
+                if x_tick_mode == "fixed":
+                    dtick_ms = int(x_tick_minutes) * 60 * 1000
+                    time_span = (plot_df["time"].max() - plot_df["time"].min()).total_seconds()
+                    tick_fmt = "%m-%d %H:%M" if time_span <= 7 * 24 * 3600 else "%m-%d"
+                    xaxis_config.update(
+                        {
+                            "tickmode": "linear",
+                            "dtick": dtick_ms,
+                            "tickformat": tick_fmt,
+                        }
+                    )
+
+                yaxis_config = {"title": y_title}
+                if y_mode == "manual":
+                    y_low = float(min(y_min, y_max))
+                    y_high = float(max(y_min, y_max))
+                    yaxis_config["range"] = [y_low, y_high]
+                    if y_dtick and y_dtick > 0:
+                        yaxis_config["dtick"] = float(y_dtick)
+
+                fig.update_layout(
+                    margin={"l": 20, "r": 20, "t": 20, "b": 20},
+                    xaxis=xaxis_config,
+                    yaxis=yaxis_config,
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig, width="stretch")
+                plot_rendered = True
+            except Exception:
+                plot_rendered = False
+
+            if not plot_rendered:
+                try:
+                    import altair as alt
+
+                    y_scale = alt.Scale()
+                    if y_mode == "manual":
+                        y_scale = alt.Scale(domain=[float(min(y_min, y_max)), float(max(y_min, y_max))])
+
+                    x_axis = alt.Axis(title="Time")
+                    if x_tick_mode == "fixed":
+                        tick_count = max(2, int((int(window_hours) * 60) / max(1, int(x_tick_minutes))))
+                        x_axis = alt.Axis(title="Time", tickCount=tick_count)
+
+                    y_axis = alt.Axis(title=y_title)
+                    if y_mode == "manual" and y_dtick and y_dtick > 0:
+                        y_axis = alt.Axis(title=y_title, tickMinStep=float(y_dtick))
+
+                    chart = (
+                        alt.Chart(plot_df)
+                        .mark_line()
+                        .encode(
+                            x=alt.X("time:T", axis=x_axis),
+                            y=alt.Y("y:Q", axis=y_axis, scale=y_scale),
+                            tooltip=[alt.Tooltip("time:T", title="Time"), alt.Tooltip("y:Q", title=y_title, format=",.2f")],
+                        )
+                        .interactive()
+                    )
+                    st.altair_chart(chart, width="stretch")
+                except Exception as e:
+                    st.info(f"Unable to render equity curve with Plotly/Altair: {e}")
+
+    if summary_text:
+        with st.expander("Live Summary Text", expanded=False):
+            st.text(summary_text)
+
+    cash_ratio = (cash / total_equity) if total_equity > 1e-12 else 0.0
+    if drawdown >= 0.10:
+        st.error(f"Major drawdown warning: {drawdown:.2%}")
+    if cash_ratio > 0.90 and total_equity > 0:
+        st.error(f"Position anomaly warning: cash ratio too high ({cash_ratio:.2%})")
+
 st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", page_icon="🦁")
 
 st.sidebar.header("⚙️ Settings")
-st.sidebar.caption(f"Brain: {LOCAL_MODEL}") # 显示当前模型
+st.sidebar.caption(f"Brain: {LOCAL_MODEL}")
+
+page_choice = st.sidebar.selectbox(
+    "Page",
+    ["\U0001F4E1 Global Macro Signals", "\U0001F4BC Portfolio Monitor"],
+    index=0
+)
 
 # 新增：展示宏观规则库
 with st.sidebar.expander("📚 Macro Rules Library"):
@@ -2256,6 +2710,10 @@ enable_toast = st.sidebar.checkbox("Desktop Notify", value=True)
 auto_run = st.sidebar.checkbox("Auto Run", value=True)
 
 if 'last_run' not in st.session_state: st.session_state['last_run'] = datetime.now() - timedelta(days=1)
+
+if page_choice == "\U0001F4BC Portfolio Monitor":
+    render_portfolio_monitor()
+    st.stop()
 
 st.title("🦁 GlobalWatch: DeepSeek-R1 推理版")
 st.caption("🚀 Powered by Chain-of-Thought Reasoning")

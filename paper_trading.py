@@ -841,6 +841,9 @@ class PaperTradingEngine:
         print(f"   Duration: {self.config['duration_hours']} hours")
         print(f"   Rebalance Interval: {self.config['rebalance_minutes']} minutes")
         print(f"   Universe: {len(self.config['universe'])} assets")
+        print(f"   CWD: {os.getcwd()}")
+        print(f"   Live Snapshot Path: {self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')}")
+        print(f"   Trade History Path: {self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')}")
     
     def load_config(self, config_path):
         """def load_config: docstring omitted (was garbled/non-ASCII)."""
@@ -926,6 +929,8 @@ class PaperTradingEngine:
         config.setdefault('industry_map', {})
         reporting_config = config.setdefault('reporting', {})
         reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
+        reporting_config.setdefault('snapshot_live_path', 'outputs/snapshot_live.json')
+        reporting_config.setdefault('trade_history_path', 'outputs/trade_history.jsonl')
         
         return config
     
@@ -1088,6 +1093,9 @@ class PaperTradingEngine:
                 self.clear_checkpoint()
                 return
             print("Resuming from checkpoint as requested...")
+            self.write_live_snapshot(last_snapshot)
+            self.generate_live_summary()
+            self.save_trade_history_jsonl()
             
         except RuntimeError:
             # NOTE: comment omitted (was garbled/non-ASCII).
@@ -1220,6 +1228,142 @@ class PaperTradingEngine:
             print(f"[SCOREBOARD] Failed to append record: {e}")
 
         return record
+
+    def _format_topic_summary(self, confirmed_topics):
+        """Build a compact topic summary string for live dashboard use."""
+        if not isinstance(confirmed_topics, list) or not confirmed_topics:
+            return ""
+        parts = []
+        for topic in confirmed_topics[:5]:
+            if not isinstance(topic, dict):
+                continue
+            theme = str(topic.get('theme', '')).strip()
+            direction = str(topic.get('direction', '')).strip()
+            if not theme:
+                continue
+            if direction:
+                parts.append(f"{theme}:{direction}")
+            else:
+                parts.append(theme)
+        return "; ".join(parts)
+
+    def _build_live_snapshot_payload(self, snapshot):
+        """Build a compact, UI-friendly live snapshot payload."""
+        total_equity = float(snapshot.get('total_equity', 0.0) or 0.0)
+        cash = float(snapshot.get('cash', 0.0) or 0.0)
+        positions_value = float(snapshot.get('positions_value', max(0.0, total_equity - cash)) or 0.0)
+        positions_detail = snapshot.get('positions', {})
+
+        position_weights = {}
+        if isinstance(positions_detail, dict) and total_equity > 0:
+            for ticker, pos in positions_detail.items():
+                t = str(ticker).upper().strip()
+                if not t:
+                    continue
+                if isinstance(pos, dict):
+                    value = float(pos.get('value', 0.0) or 0.0)
+                else:
+                    value = float(pos or 0.0)
+                if value > 0:
+                    position_weights[t] = float(value / total_equity)
+
+        regime_state_raw = str(snapshot.get('regime_state', 'neutral'))
+        regime_state_upper = regime_state_raw.upper()
+        if regime_state_upper == "RISK_OFF_FORCED":
+            regime_state_upper = "RISK_OFF_FORCED"
+
+        confirmed_topics = self.current_macro.get('confirmed_topics', []) if isinstance(self.current_macro, dict) else []
+        macro_tilts = self.current_macro.get('applied_tilts', self.current_macro.get('macro_tilts', {})) if isinstance(self.current_macro, dict) else {}
+        signal_summary = self.current_macro.get('signal_summary', {}) if isinstance(self.current_macro, dict) else {}
+        topic_summary = self._format_topic_summary(confirmed_topics)
+        macro_summary = ""
+        if isinstance(signal_summary, dict) and signal_summary:
+            confirmed_count = int(signal_summary.get('confirmed_topics', len(confirmed_topics)))
+            valid_signals = int(signal_summary.get('valid_signals_in_window', 0))
+            macro_summary = f"confirmed_topics={confirmed_count}, valid_signals={valid_signals}"
+        elif topic_summary:
+            macro_summary = f"confirmed_topics={len(confirmed_topics)}"
+
+        equity_history = []
+        for ts, equity, _cash, _posv in self.equity_curve[-200:]:
+            time_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+            equity_history.append({
+                'time': time_str,
+                'equity': float(equity)
+            })
+
+        payload = {
+            'timestamp': snapshot.get('timestamp', datetime.now().isoformat()),
+            'cycle': int(snapshot.get('cycle', self.current_cycle)),
+            'status': snapshot.get('status', self.status),
+            'total_equity': total_equity,
+            'cash': cash,
+            'positions_value': positions_value,
+            'drawdown': float(snapshot.get('drawdown', 0.0) or 0.0),
+            'return': float(snapshot.get('total_return', 0.0) or 0.0),
+            'positions': position_weights,
+            'positions_detail': positions_detail,
+            'risk_config': {
+                'cash_target': float(snapshot.get('cash_target', 0.0) or 0.0),
+                'max_weight': float(snapshot.get('dynamic_max_weight', self.config.get('objectives', {}).get('max_weight_per_asset', 0.25)) or 0.0),
+                'risk_state': regime_state_upper,
+                'regime_trend_score': float(snapshot.get('trend_score', 0.0) or 0.0),
+                'cash_override_reason': snapshot.get('forced_regime_reason', '') or None
+            },
+            'macro_summary': macro_summary,
+            'topic_summary': topic_summary,
+            'macro_signal_score': float(self.current_macro.get('macro_risk_score_smoothed', self.current_macro.get('macro_risk_score', 0.0)) if isinstance(self.current_macro, dict) else 0.0),
+            'theme_confidence': {},
+            'last_macro': {
+                'macro_risk_score_raw': float(snapshot.get('macro_risk_score_raw', 0.0) or 0.0),
+                'macro_risk_score_smoothed': float(snapshot.get('macro_risk_score', 0.0) or 0.0),
+                'confirmed_topics': confirmed_topics,
+                'macro_tilts': macro_tilts,
+                'topic_summary': topic_summary,
+                'summary': macro_summary
+            },
+            'rebalance_trigger': snapshot.get('stale_decision_trace', ''),
+            'last_trade_time': self.trades_log[-1].get('timestamp') if self.trades_log else None,
+            'equity_history': equity_history
+        }
+        return payload
+
+    def write_live_snapshot(self, snapshot):
+        """Write UI-friendly live snapshot to outputs/snapshot_live.json."""
+        try:
+            live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
+            payload = self._build_live_snapshot_payload(snapshot)
+            with open(live_snapshot_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[WARN] Failed to write live snapshot: {e}")
+
+    def save_trade_history_jsonl(self):
+        """Write trade history JSONL for Streamlit portfolio monitor."""
+        trade_history_path = self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')
+
+        def _sanitize(value):
+            if isinstance(value, dict):
+                return {k: _sanitize(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_sanitize(v) for v in value]
+            if isinstance(value, tuple):
+                return [_sanitize(v) for v in value]
+            if isinstance(value, (np.floating, float)):
+                if not np.isfinite(value):
+                    return None
+                return float(value)
+            if isinstance(value, (np.integer, int)):
+                return int(value)
+            return value
+
+        try:
+            with open(trade_history_path, 'w', encoding='utf-8') as f:
+                for trade in self.trades_log:
+                    trade_clean = _sanitize(trade)
+                    f.write(json.dumps(trade_clean, ensure_ascii=False, allow_nan=False) + '\n')
+        except Exception as e:
+            print(f"[WARN] Failed to write trade history JSONL: {e}")
     
     def rebuild_cost_basis(self):
         """def rebuild_cost_basis: docstring omitted (was garbled/non-ASCII)."""
@@ -3696,6 +3840,9 @@ class PaperTradingEngine:
             snapshot['avg_cash_2w'] = scoreboard_record.get('avg_cash_2w', 0.0)
             snapshot['macro_active_ratio_2w'] = scoreboard_record.get('macro_active_ratio_2w', 0.0)
             snapshot['diagnostic_hint'] = scoreboard_record.get('diagnostic_hint', '')
+
+        # Write compact live snapshot for Streamlit monitor.
+        self.write_live_snapshot(snapshot)
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.generate_live_summary()
@@ -3708,6 +3855,7 @@ class PaperTradingEngine:
         if self.trades_log:
             trades_df = pd.DataFrame(self.trades_log)
             trades_df.to_csv(trades_path, index=False)
+            self.save_trade_history_jsonl()
         print(f"[OK] Trades updated: {trades_path}")
         import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
 
