@@ -1650,8 +1650,8 @@ class PaperTradingEngine:
             raise ValueError("price_fetcher must be callable or None")
         self.price_fetcher = fetcher
 
-    def _normalize_market_ticker(self, ticker):
-        """Normalize ticker symbol for market-data providers like Yahoo."""
+    def to_yahoo_symbol(self, ticker):
+        """Return provider symbol for Yahoo/yfinance without unsafe ticker rewrites."""
         if ticker is None:
             return ticker
         t = str(ticker).strip()
@@ -1664,9 +1664,21 @@ class PaperTradingEngine:
         }
         if upper in explicit_map:
             return explicit_map[upper]
-        if '.' in upper and upper.count('.') == 1 and upper.split('.')[0].isalpha():
-            return upper.replace('.', '-')
+        # Keep exchange suffix formats such as ".TO" unchanged for Yahoo.
         return t
+
+    def to_safe_key(self, ticker):
+        """Return a filesystem/cache-safe key without changing provider symbols."""
+        if ticker is None:
+            return ticker
+        t = str(ticker).strip().upper()
+        if not t:
+            return t
+        return t.replace('.', '-').replace('/', '-')
+
+    def _normalize_market_ticker(self, ticker):
+        """Backward-compatible wrapper for existing call sites."""
+        return self.to_yahoo_symbol(ticker)
 
     def get_market_data(self, ticker, period='1mo', interval='1d'):
         """def get_market_data: docstring omitted (was garbled/non-ASCII)."""
