@@ -270,6 +270,61 @@
       "asset_type": "ETF"
     },
     {
+      "ticker": "BMO.TO",
+      "name": "Bank of Montreal",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "RY.TO",
+      "name": "Royal Bank of Canada",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "CNR.TO",
+      "name": "Canadian National Railway Co",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "CP.TO",
+      "name": "Canadian Pacific Kansas City Ltd",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "FTS.TO",
+      "name": "Fortis Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MFC.TO",
+      "name": "Manulife Financial Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "CNQ.TO",
+      "name": "Canadian Natural Resources Ltd",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "SU.TO",
+      "name": "Suncor Energy Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "BP",
+      "name": "BP p.l.c.",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "XIU.TO",
+      "name": "iShares S&P/TSX 60 Index ETF",
+      "asset_type": "ETF"
+    },
+    {
+      "ticker": "AEM.TO",
+      "name": "Agnico Eagle Mines Ltd",
+      "asset_type": "STOCK"
+    },
+    {
       "ticker": "CASH",
       "name": "Cash Equivalent",
       "asset_type": "CASH"
@@ -280,12 +335,12 @@
     "consumer_defensive": ["WMT", "COST", "PEP", "MCD", "SBUX", "KO", "PG", "XLP"],
     "consumer_cyclical": ["HD", "LOW", "IWM"],
     "healthcare": ["JNJ", "MRK", "ABBV", "LLY", "TMO", "XLV"],
-    "financials": ["JPM", "BAC", "GS", "V", "MA", "BRK.B", "XLF"],
-    "energy": ["XOM", "CVX", "COP", "XLE"],
-    "industrials_defense": ["LMT", "RTX", "CAT", "DE", "XLI", "DIA"],
-    "utilities": ["NEE", "DUK"],
-    "broad_market_etf": ["SPY", "VTI", "VOO"],
-    "rates_and_gold": ["TLT", "GLD"],
+    "financials": ["JPM", "BAC", "GS", "V", "MA", "BRK.B", "XLF", "BMO.TO", "RY.TO", "MFC.TO"],
+    "energy": ["XOM", "CVX", "COP", "XLE", "CNQ.TO", "SU.TO", "BP"],
+    "industrials_defense": ["LMT", "RTX", "CAT", "DE", "XLI", "DIA", "CNR.TO", "CP.TO"],
+    "utilities": ["NEE", "DUK", "FTS.TO"],
+    "broad_market_etf": ["SPY", "VTI", "VOO", "XIU.TO"],
+    "rates_and_gold": ["TLT", "GLD", "AEM.TO"],
     "cash_equivalent": ["CASH"]
   },
   "objectives": {
