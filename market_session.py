@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, date as date_cls
+from datetime import datetime, time, timedelta, date as date_cls, timezone
 from typing import Any, Dict, Optional
 
 try:
@@ -24,7 +24,7 @@ def _parse_datetime(value: Any, tz_name: Optional[str] = None) -> Optional[datet
         dt = value
     elif isinstance(value, (int, float)):
         try:
-            dt = datetime.fromtimestamp(float(value))
+            dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
         except Exception:
             return None
     elif isinstance(value, str):
@@ -53,8 +53,9 @@ def _parse_datetime(value: Any, tz_name: Optional[str] = None) -> Optional[datet
     else:
         return None
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tzinfo)
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        # Treat naive timestamps as UTC to avoid misinterpreting local wall clock as ET.
+        dt = dt.replace(tzinfo=timezone.utc)
     try:
         return dt.astimezone(tzinfo)
     except Exception:
@@ -133,6 +134,7 @@ def get_market_session_state(
     return {
         "state": state,
         "now_et": now_et.isoformat(),
+        "now_utc": now_et.astimezone(timezone.utc).isoformat(),
         "trading_date_et": trading_date.isoformat(),
         "last_completed_trading_date_et": last_completed.isoformat(),
         "open_time_et": open_dt.isoformat(),
@@ -148,4 +150,3 @@ def is_market_open_for_trading(session_dict: Dict[str, Any]) -> bool:
     if not isinstance(session_dict, dict):
         return False
     return str(session_dict.get("state", "")).upper() == "OPEN" and bool(session_dict.get("open_grace_passed"))
-

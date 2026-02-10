@@ -43,11 +43,13 @@ except Exception as e:
     print(f"[WARN] market_session unavailable: {e}")
 
     def get_market_session_state(now_dt, tz_market="America/New_York", open_time_et="09:30", close_time_et="16:00", open_grace_min=15, close_grace_min=10):
+        now_fallback = datetime.now(timezone.utc)
         return {
             "state": "OPEN",
-            "now_et": datetime.now().isoformat(),
-            "trading_date_et": datetime.now().date().isoformat(),
-            "last_completed_trading_date_et": datetime.now().date().isoformat(),
+            "now_et": now_fallback.isoformat(),
+            "now_utc": now_fallback.isoformat(),
+            "trading_date_et": now_fallback.date().isoformat(),
+            "last_completed_trading_date_et": now_fallback.date().isoformat(),
             "open_grace_passed": True,
             "close_grace_passed": False,
             "open_grace_min": int(open_grace_min),
@@ -834,6 +836,7 @@ class PaperTradingEngine:
         self.current_rebalance_skipped_reason = ""
         self._debug_session_override = None
         self._debug_now_override = None
+        self._debug_now_override_warned = False
         self.current_turnover_info = {}
         self.current_exit_info = {}
         self.current_risk_check_info = {}
@@ -1345,7 +1348,7 @@ class PaperTradingEngine:
                 diagnostic_hint = "underperforming_no_clear_driver"
 
         record = {
-            'timestamp': latest.get('timestamp', datetime.now().isoformat()),
+            'timestamp': latest.get('timestamp', self._now().isoformat()),
             'strategy_return_2w': float(strategy_return_2w),
             'bench_avg_return_2w': float(bench_avg_return_2w),
             'excess_return_2w': float(excess_return_2w),
@@ -1549,7 +1552,7 @@ class PaperTradingEngine:
         last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
 
         payload = {
-            'timestamp': snapshot.get('timestamp', datetime.now().isoformat()),
+            'timestamp': snapshot.get('timestamp', self._now().isoformat()),
             'account_id': self.account_id,
             'session_id': self.session_id,
             'config_hash': snapshot.get('config_hash', self.config_hash),
@@ -1665,6 +1668,17 @@ class PaperTradingEngine:
         try:
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
             payload = self._build_live_snapshot_payload(snapshot)
+            price_debug_items = 0
+            if isinstance(payload, dict) and isinstance(payload.get('price_debug'), dict):
+                price_debug_items = len(payload.get('price_debug', {}))
+            print(f"[PRICE_DEBUG_SAVE] items={price_debug_items}")
+            if price_debug_items == 0 and isinstance(payload, dict):
+                holdings_count = 0
+                positions_obj = payload.get('positions_detail')
+                if isinstance(positions_obj, dict):
+                    holdings_count = len([k for k, v in positions_obj.items() if str(k).upper() != 'CASH' and (v or 0)])
+                if holdings_count > 0:
+                    print(f"[WARN] [PRICE_DEBUG_SAVE] holdings={holdings_count} but price_debug is empty")
             self.atomic_write_json(live_snapshot_path, payload)
         except Exception as e:
             print(f"[WARN] Failed to write live snapshot: {e}")
@@ -1696,7 +1710,7 @@ class PaperTradingEngine:
         last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
 
         snapshot = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': self._now().isoformat(),
             'account_id': self.account_id,
             'session_id': self.session_id,
             'env': self.runtime_env,
@@ -1769,7 +1783,9 @@ class PaperTradingEngine:
         open_grace_min = int(reporting_cfg.get('market_open_grace_min', 15) or 15)
         close_grace_min = int(reporting_cfg.get('market_close_grace_min', 10) or 10)
 
-        now_val = now_dt if now_dt is not None else self._now()
+        now_val = self._coerce_datetime_utc(now_dt) if now_dt is not None else self._now()
+        if now_val is None:
+            now_val = self._now()
         session_override = getattr(self, '_debug_session_override', None)
         if callable(session_override):
             try:
@@ -1796,6 +1812,7 @@ class PaperTradingEngine:
         session.setdefault('open_grace_passed', False)
         session.setdefault('close_grace_passed', False)
         session.setdefault('now_et', now_val.isoformat())
+        session.setdefault('now_utc', now_val.astimezone(timezone.utc).isoformat() if isinstance(now_val, datetime) else self._now().isoformat())
         today_str = now_val.date().isoformat()
         session.setdefault('trading_date_et', today_str)
         session.setdefault('last_completed_trading_date_et', today_str)
@@ -1864,7 +1881,7 @@ class PaperTradingEngine:
             snapshot_path = reporting_cfg.get('snapshot_live_path', 'outputs/snapshot_live.json')
             trades_csv_path = reporting_cfg.get('trades_log_path', 'outputs/paper_trades.csv')
             report_dirs = self._resolve_daily_report_dirs()
-            now_local = datetime.now()
+            now_local = self._now()
 
             stale_ratio = float(
                 self.current_stale_info.get(
@@ -2107,12 +2124,30 @@ class PaperTradingEngine:
             try:
                 value = override()
                 if isinstance(value, datetime):
-                    return value
+                    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+                        if not getattr(self, '_debug_now_override_warned', False):
+                            print("[WARN] _debug_now_override returned naive datetime; assuming UTC")
+                            self._debug_now_override_warned = True
+                        return value.replace(tzinfo=timezone.utc)
+                    return value.astimezone(timezone.utc)
             except Exception:
                 pass
         if isinstance(override, datetime):
-            return override
-        return datetime.now()
+            if override.tzinfo is None or override.tzinfo.utcoffset(override) is None:
+                if not getattr(self, '_debug_now_override_warned', False):
+                    print("[WARN] _debug_now_override is naive datetime; assuming UTC")
+                    self._debug_now_override_warned = True
+                return override.replace(tzinfo=timezone.utc)
+            return override.astimezone(timezone.utc)
+        return datetime.now(timezone.utc)
+
+    def _coerce_datetime_utc(self, value):
+        """Normalize datetime values to timezone-aware UTC for safe arithmetic."""
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def to_yahoo_symbol(self, ticker):
         """Return provider symbol for Yahoo/yfinance without unsafe ticker rewrites."""
@@ -5521,10 +5556,14 @@ class PaperTradingEngine:
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
             print(f"[GATE] Rebalance skipped: market_closed_gate (session={session_state})")
+            self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_market_closed_gate")
             return []
 
-        if attempt_cooldown_minutes > 0 and self.last_rebalance_attempt_time is not None:
-            time_since_attempt = (now_rebalance - self.last_rebalance_attempt_time).total_seconds() / 60
+        last_attempt_ref = self._coerce_datetime_utc(self.last_rebalance_attempt_time)
+        if isinstance(last_attempt_ref, datetime) and self.last_rebalance_attempt_time is not last_attempt_ref:
+            self.last_rebalance_attempt_time = last_attempt_ref
+        if attempt_cooldown_minutes > 0 and last_attempt_ref is not None:
+            time_since_attempt = (now_rebalance - last_attempt_ref).total_seconds() / 60
             if time_since_attempt < attempt_cooldown_minutes:
                 remaining = attempt_cooldown_minutes - time_since_attempt
                 self.current_rebalance_skipped_reason = 'attempt_cooldown'
@@ -5540,7 +5579,12 @@ class PaperTradingEngine:
         # Count this as an attempt even if later aborted by stale/risk filters.
         self.last_rebalance_attempt_time = now_rebalance
 
-        last_success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
+        last_success_raw = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
+        last_success_ref = self._coerce_datetime_utc(last_success_raw)
+        if self.last_rebalance_success_time is not None and isinstance(last_success_ref, datetime):
+            self.last_rebalance_success_time = last_success_ref
+        elif self.last_rebalance_time is not None and isinstance(last_success_ref, datetime):
+            self.last_rebalance_time = last_success_ref
         if cooldown_minutes > 0 and last_success_ref is not None:
             time_since_last = (now_rebalance - last_success_ref).total_seconds() / 60
             if time_since_last < cooldown_minutes:
@@ -6188,7 +6232,7 @@ class PaperTradingEngine:
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': self._now().isoformat(),
                 'account_id': self.account_id,
                 'session_id': self.session_id,
                 'config_hash': self.config_hash,
@@ -6311,7 +6355,7 @@ class PaperTradingEngine:
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': self._now().isoformat(),
                 'account_id': self.account_id,
                 'session_id': self.session_id,
                 'config_hash': self.config_hash,
@@ -6863,7 +6907,7 @@ class PaperTradingEngine:
                 win_flag = excess_return > 0
         
         snapshot = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': self._now().isoformat(),
             'account_id': self.account_id,
             'session_id': self.session_id,
             'env': self.runtime_env,
@@ -7014,7 +7058,7 @@ class PaperTradingEngine:
         }
         
         self.portfolio_snapshots.append(snapshot)
-        self.equity_curve.append((datetime.now(), total_equity, self.cash, positions_value))
+        self.equity_curve.append((self._now(), total_equity, self.cash, positions_value))
 
         # NOTE: comment omitted (was garbled/non-ASCII).
         scoreboard_record = self.append_scoreboard_record()
@@ -7284,20 +7328,24 @@ class PaperTradingEngine:
 
     def run_cycle(self):
         """def run_cycle: docstring omitted (was garbled/non-ASCII)."""
+        now = self._now()
+        now_local = now.astimezone()
         print(f"\n{'='*60}")
-        print(f"Cycle {self.current_cycle} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Cycle {self.current_cycle} - {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}")
 
-        now = datetime.now()
         self._refresh_market_session_state(now)
 
         # Macro refresh decoupling
-        if self.last_macro_time is None:
+        last_macro_ref = self._coerce_datetime_utc(self.last_macro_time)
+        if isinstance(last_macro_ref, datetime) and self.last_macro_time is not last_macro_ref:
+            self.last_macro_time = last_macro_ref
+        if last_macro_ref is None:
             self.refresh_macro_cache(now=now)
             self.current_macro_reused = False
             print(f"[MACRO REFRESH] First refresh completed")
         else:
-            macro_elapsed = (now - self.last_macro_time).total_seconds() / 60
+            macro_elapsed = (now - last_macro_ref).total_seconds() / 60
             if macro_elapsed >= self.macro_refresh_minutes:
                 self.refresh_macro_cache(now=now)
                 self.current_macro_reused = False
@@ -7308,14 +7356,17 @@ class PaperTradingEngine:
                 print(f"[MACRO REFRESH] Reused cached macro ({macro_elapsed:.1f}m < {self.macro_refresh_minutes}m)")
 
         # Signal refresh decoupling (target weights)
-        if not self.cached_target_weights or self.last_signal_time is None:
+        last_signal_ref = self._coerce_datetime_utc(self.last_signal_time)
+        if isinstance(last_signal_ref, datetime) and self.last_signal_time is not last_signal_ref:
+            self.last_signal_time = last_signal_ref
+        if not self.cached_target_weights or last_signal_ref is None:
             target_weights = self.calculate_target_weights()
             self.cached_target_weights = dict(target_weights)
             self.last_signal_time = now
             self.current_weights_reused = False
             print("[SIGNAL REFRESH] First target weight calculation completed")
         else:
-            signal_elapsed = (now - self.last_signal_time).total_seconds() / 60
+            signal_elapsed = (now - last_signal_ref).total_seconds() / 60
             if signal_elapsed >= self.signal_refresh_minutes:
                 target_weights = self.calculate_target_weights()
                 self.cached_target_weights = dict(target_weights)
@@ -8026,11 +8077,15 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
 
     def _make_session(state, open_grace_passed=False, close_grace_passed=False):
         now_local = now_holder["value"]
-        if now_local.tzinfo is None:
+        if now_local.tzinfo is None or now_local.tzinfo.utcoffset(now_local) is None:
             now_local = now_local.replace(tzinfo=timezone.utc)
+        now_utc = now_local.astimezone(timezone.utc)
+        market_tz = ZoneInfo("America/New_York") if ZoneInfo is not None else timezone.utc
+        now_et = now_utc.astimezone(market_tz)
         return {
             "state": str(state),
-            "now_et": now_local.isoformat(),
+            "now_et": now_et.isoformat(),
+            "now_utc": now_utc.isoformat(),
             "trading_date_et": "2026-02-10",
             "last_completed_trading_date_et": "2026-02-09",
             "open_grace_passed": bool(open_grace_passed),
@@ -8051,13 +8106,36 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
         engine.save_trade_history_jsonl()
         return trades, snapshot
 
+    # Session timezone sanity probe (UTC -> ET conversion correctness).
+    session_probe = get_market_session_state(
+        datetime(2026, 2, 10, 12, 0, 0, tzinfo=timezone.utc),
+        tz_market="America/New_York",
+        open_time_et="09:30",
+        close_time_et="16:00",
+        open_grace_min=15,
+        close_grace_min=10,
+    )
+    probe_now_et = None
+    probe_now_utc = None
+    try:
+        probe_now_et = datetime.fromisoformat(str((session_probe or {}).get("now_et", "")))
+        probe_now_utc = datetime.fromisoformat(str((session_probe or {}).get("now_utc", "")))
+    except Exception:
+        probe_now_et = None
+        probe_now_utc = None
+    _check(
+        "TZ-A",
+        isinstance(probe_now_et, datetime) and isinstance(probe_now_utc, datetime) and probe_now_utc.hour == 12 and probe_now_et.hour == 7,
+        "market_session converts UTC time to ET correctly (12:00 UTC -> 07:00 ET)",
+    )
+
     # CASE-1 PRE_OPEN
     now_holder["value"] = datetime(2026, 2, 10, 5, 0, 0)
     attempt_before_c1 = engine.last_rebalance_attempt_time
     trades1, snap1 = _run_case(
         session=_make_session("PRE_OPEN", open_grace_passed=False),
         mode="live_buy",
-        positions={},
+        positions={"AAA": 10},
         cash=30000.0,
         target_weights={"AAA": 0.5, "CASH": 0.5},
     )
@@ -8065,6 +8143,7 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("CASE1-B", snap1.get("rebalance_skipped_reason") == "market_closed_gate", "PRE_OPEN skip reason is market_closed_gate")
     _check("CASE1-C", "stale_abort" not in str(snap1.get("stale_decision_trace", "")), "PRE_OPEN does not stale-abort")
     _check("CASE1-D", engine.last_rebalance_attempt_time == attempt_before_c1, "PRE_OPEN does not update attempt timestamp")
+    _check("CASE1-E", isinstance(snap1.get("price_debug"), dict) and len(snap1.get("price_debug", {})) > 0, "PRE_OPEN with holdings still writes non-empty price_debug")
 
     # CASE-2 OPEN + no grace
     now_holder["value"] = datetime(2026, 2, 10, 9, 35, 0)
@@ -8150,6 +8229,16 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     price_ts = str((sample_dbg or {}).get("price_ts", ""))
     _check("S3-C", (("+" in now_ts or now_ts.endswith("Z")) and ("+" in price_ts or price_ts.endswith("Z"))), "price_debug timestamps are timezone-aware ISO")
     _check("S3-D", isinstance(sample_dbg, dict) and (sample_dbg.get("tz_ok") is False) and ("naive_ts_detected" in str(sample_dbg.get("notes", ""))), "tz_ok=false branch captured")
+    age_diff_ok = False
+    try:
+        sample_now_dt = datetime.fromisoformat(now_ts.replace("Z", "+00:00"))
+        sample_price_dt = datetime.fromisoformat(price_ts.replace("Z", "+00:00"))
+        sample_age = float((sample_dbg or {}).get("age_min", 0.0) or 0.0)
+        age_diff = (sample_now_dt.astimezone(timezone.utc) - sample_price_dt.astimezone(timezone.utc)).total_seconds() / 60.0
+        age_diff_ok = abs(age_diff - sample_age) <= 0.1
+    except Exception:
+        age_diff_ok = False
+    _check("S3-E", age_diff_ok, "age_min matches now_ts - price_ts in UTC")
 
     # S5 checks.
     snapshot_path = reporting_cfg["snapshot_live_path"]
