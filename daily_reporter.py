@@ -1248,6 +1248,23 @@ def _run_session_smoke_tests() -> int:
     et_tz = _coerce_zone(MARKET_TZ)
     snap = {"stale_ratio": 1.0, "observe_count": 10}
 
+    def _decide_report_date(session_obj: Dict[str, Any], closed: bool, reason_obj: Dict[str, Any]) -> Tuple[str, str]:
+        state = str(session_obj.get("state", "")).upper()
+        trading_date = str(session_obj.get("trading_date_et", "")).strip()
+        last_completed = str(session_obj.get("last_completed_trading_date_et", "")).strip()
+        method = str(reason_obj.get("method", "")).strip().lower() if isinstance(reason_obj, dict) else ""
+        is_time_close = bool(closed and method == "time")
+        is_stale_close = bool(closed and method == "stale_streak" and state == "OPEN")
+        trigger_mode = "backfill_last_completed"
+        report_date = last_completed
+        if is_time_close:
+            trigger_mode = "post_close_time"
+            report_date = trading_date or last_completed
+        elif is_stale_close:
+            trigger_mode = "open_stale_streak"
+            report_date = trading_date or last_completed
+        return trigger_mode, report_date
+
     # case1: PRE_OPEN must not be closed by stale, and streak must reset.
     tracker1 = {"streak": 10, "ratio_threshold": 0.8, "threshold": 3}
     now1 = datetime(2026, 2, 10, 5, 0, tzinfo=et_tz)  # Tue 05:00 ET
@@ -1258,6 +1275,10 @@ def _run_session_smoke_tests() -> int:
     assert int(_as_float(tracker1.get("streak"), -1)) == 0
     assert str(session1.get("trading_date_et")) == "2026-02-10"
     assert str(session1.get("last_completed_trading_date_et")) == "2026-02-09"
+    mode1, report_date1 = _decide_report_date(session1, closed1, reason1)
+    assert mode1 == "backfill_last_completed"
+    assert report_date1 == "2026-02-09"
+    assert report_date1 != str(session1.get("trading_date_et"))
 
     # case2: OPEN (+ open grace passed) may close by stale streak.
     tracker2 = {"streak": 2, "ratio_threshold": 0.8, "threshold": 3}
@@ -1268,6 +1289,9 @@ def _run_session_smoke_tests() -> int:
     assert bool(session2.get("open_grace_passed"))
     assert bool(closed2)
     assert str(reason2.get("method", "")).lower() == "stale_streak"
+    mode2, report_date2 = _decide_report_date(session2, closed2, reason2)
+    assert mode2 == "open_stale_streak"
+    assert report_date2 == str(session2.get("trading_date_et"))
 
     # case3: POST_CLOSE (+ close grace passed) closes by time.
     tracker3 = {"streak": 0, "ratio_threshold": 0.8, "threshold": 3}
@@ -1278,6 +1302,9 @@ def _run_session_smoke_tests() -> int:
     assert bool(session3.get("close_grace_passed"))
     assert bool(closed3)
     assert str(reason3.get("method", "")).lower() == "time"
+    mode3, report_date3 = _decide_report_date(session3, closed3, reason3)
+    assert mode3 == "post_close_time"
+    assert report_date3 == str(session3.get("trading_date_et"))
 
     print("SESSION_SMOKE_OK")
     return 0
