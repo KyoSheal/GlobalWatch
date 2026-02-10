@@ -1233,7 +1233,7 @@ class PaperTradingEngine:
                 self.clear_checkpoint()
                 return
             print("Resuming from checkpoint as requested...")
-            self.write_live_snapshot(last_snapshot)
+            self.write_live_snapshot(last_snapshot, source="resume_checkpoint")
             self.generate_live_summary()
             self.save_trade_history_jsonl()
             
@@ -1386,6 +1386,71 @@ class PaperTradingEngine:
             else:
                 parts.append(theme)
         return "; ".join(parts)
+
+    def _extract_snapshot_relevant_tickers(self, snapshot):
+        """Collect relevant tickers for snapshot price-debug coverage."""
+        out = []
+        seen = set()
+
+        def _add(ticker):
+            t = str(ticker).upper().strip()
+            if not t or t == 'CASH' or t in seen:
+                return
+            seen.add(t)
+            out.append(t)
+
+        if isinstance(self.positions, dict):
+            for ticker in self.positions.keys():
+                _add(ticker)
+
+        positions_detail = snapshot.get('positions')
+        if isinstance(positions_detail, dict):
+            for ticker in positions_detail.keys():
+                _add(ticker)
+
+        for key in ('target_weights',):
+            maybe_map = snapshot.get(key)
+            if isinstance(maybe_map, dict):
+                for ticker in maybe_map.keys():
+                    _add(ticker)
+
+        for key in ('planned_trades', 'candidate_trades', 'ranked_candidates'):
+            maybe_list = snapshot.get(key)
+            if not isinstance(maybe_list, list):
+                continue
+            for row in maybe_list:
+                if isinstance(row, dict):
+                    _add(row.get('ticker', ''))
+                else:
+                    _add(row)
+
+        return out
+
+    def build_live_snapshot(self, snapshot):
+        """Centralized builder for all live snapshot writes."""
+        payload = self._build_live_snapshot_payload(snapshot)
+
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        cap_raw = reporting_cfg.get('max_price_debug_items', 50)
+        try:
+            cap = max(1, int(cap_raw))
+        except Exception:
+            cap = 50
+
+        relevant_tickers = self._extract_snapshot_relevant_tickers(snapshot if isinstance(snapshot, dict) else {})
+        incoming_debug = payload.get('price_debug') if isinstance(payload, dict) else None
+        if not isinstance(incoming_debug, dict):
+            incoming_debug = {}
+
+        collected_debug = self._collect_price_debug(
+            relevant_tickers=relevant_tickers,
+            planned_trades=(snapshot or {}).get('planned_trades') if isinstance(snapshot, dict) else None,
+            price_debug_cache=incoming_debug,
+            cap=cap,
+        )
+        payload['price_debug'] = collected_debug
+        self.current_price_debug = dict(collected_debug)
+        return payload
 
     def _build_live_snapshot_payload(self, snapshot):
         """Build a compact, UI-friendly live snapshot payload."""
@@ -1663,20 +1728,22 @@ class PaperTradingEngine:
             content += '\n'
         self.atomic_write_text(path, content)
 
-    def write_live_snapshot(self, snapshot):
+    def write_live_snapshot(self, snapshot, source="unknown"):
         """Write UI-friendly live snapshot to outputs/snapshot_live.json."""
         try:
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
-            payload = self._build_live_snapshot_payload(snapshot)
+            payload = self.build_live_snapshot(snapshot)
             price_debug_items = 0
             if isinstance(payload, dict) and isinstance(payload.get('price_debug'), dict):
                 price_debug_items = len(payload.get('price_debug', {}))
-            print(f"[PRICE_DEBUG_SAVE] items={price_debug_items}")
+            print(f"[PRICE_DEBUG_SAVE] items={price_debug_items} source={source}")
             if price_debug_items == 0 and isinstance(payload, dict):
                 holdings_count = 0
                 positions_obj = payload.get('positions_detail')
                 if isinstance(positions_obj, dict):
                     holdings_count = len([k for k, v in positions_obj.items() if str(k).upper() != 'CASH' and (v or 0)])
+                if holdings_count <= 0 and isinstance(self.positions, dict):
+                    holdings_count = len([k for k, v in self.positions.items() if str(k).upper() != 'CASH' and float(v or 0) > 0])
                 if holdings_count > 0:
                     print(f"[WARN] [PRICE_DEBUG_SAVE] holdings={holdings_count} but price_debug is empty")
             self.atomic_write_json(live_snapshot_path, payload)
@@ -1768,7 +1835,7 @@ class PaperTradingEngine:
         """Refresh live snapshot immediately after trades are persisted."""
         try:
             snapshot = self._build_post_rebalance_snapshot()
-            self.write_live_snapshot(snapshot)
+            self.write_live_snapshot(snapshot, source=f"post_rebalance:{source}")
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
             print(f"[SNAPSHOT] Post-rebalance live snapshot written (cycle={self.current_cycle}, trades={int(trades_count)}, path={live_snapshot_path}, source={source})")
         except Exception as e:
@@ -1866,6 +1933,8 @@ class PaperTradingEngine:
 
             payload['latest_daily_report_date'] = str(report_date)
             payload['latest_daily_report_path'] = str(report_path)
+            pd_items = len(payload.get('price_debug', {})) if isinstance(payload.get('price_debug'), dict) else 0
+            print(f"[PRICE_DEBUG_SAVE] items={pd_items} source=update_daily_report_ref")
             self.atomic_write_json(snapshot_path, payload)
         except Exception as e:
             print(f"[WARN] Failed to update snapshot daily report pointer: {e}")
@@ -2549,20 +2618,20 @@ class PaperTradingEngine:
             debug_status="MISSING",
         )
 
-    def _update_cycle_price_debug(self, candidate_tickers=None, planned_trades=None, price_debug_cache=None):
-        """Build capped price_debug map for relevant tickers and store in engine state."""
+    def _collect_price_debug(self, relevant_tickers=None, planned_trades=None, price_debug_cache=None, cap=None):
+        """Collect capped price_debug for holdings + relevant tickers without changing trading decisions."""
         reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
-        cap_raw = reporting_cfg.get('max_price_debug_items', 50)
+        cap_raw = cap if cap is not None else reporting_cfg.get('max_price_debug_items', 50)
         try:
-            cap = max(1, int(cap_raw))
+            cap_val = max(1, int(cap_raw))
         except Exception:
-            cap = 50
+            cap_val = 50
 
         price_debug_cache = dict(price_debug_cache) if isinstance(price_debug_cache, dict) else {}
         holdings = [str(t).upper() for t in self.positions.keys() if str(t).upper() != 'CASH']
         candidate_set = set(holdings)
-        if isinstance(candidate_tickers, (list, tuple, set)):
-            for t in candidate_tickers:
+        if isinstance(relevant_tickers, (list, tuple, set)):
+            for t in relevant_tickers:
                 t_u = str(t).upper().strip()
                 if t_u and t_u != 'CASH':
                     candidate_set.add(t_u)
@@ -2598,29 +2667,82 @@ class PaperTradingEngine:
                 ordered.append(t)
                 seen.add(t)
 
-        selected = ordered[:cap]
+        selected = ordered[:cap_val]
         market_state = None
         if isinstance(self.current_market_session, dict):
             market_state = self.current_market_session.get('state')
 
         price_debug = {}
-        missing_count = 0
-        stale_count = 0
+        now_iso = self._now().isoformat()
+        default_thresholds = {"live_max_min": 10.0, "recent_max_min": 60.0}
         for t_u in selected:
             dbg = price_debug_cache.get(t_u)
             if not isinstance(dbg, dict):
-                _price, _age, _status, dbg = self.get_current_price(t_u, return_debug=True)
+                try:
+                    _price, _age, _status, dbg = self.get_current_price(t_u, return_debug=True)
+                except Exception as e:
+                    dbg = {
+                        "ticker": t_u,
+                        "now_ts": now_iso,
+                        "status": "MISSING",
+                        "age_min": None,
+                        "source": "missing",
+                        "price_ts": None,
+                        "tz_ok": False,
+                        "thresholds": dict(default_thresholds),
+                        "notes": f"price_debug_collect_error={e}",
+                    }
             if not isinstance(dbg, dict):
-                continue
+                dbg = {
+                    "ticker": t_u,
+                    "now_ts": now_iso,
+                    "status": "MISSING",
+                    "age_min": None,
+                    "source": "missing",
+                    "price_ts": None,
+                    "tz_ok": False,
+                    "thresholds": dict(default_thresholds),
+                    "notes": "price_debug_missing_payload",
+                }
             dbg_row = dict(dbg)
+            dbg_row.setdefault("ticker", t_u)
+            dbg_row.setdefault("now_ts", now_iso)
+            dbg_row["status"] = str(dbg_row.get("status", "MISSING")).upper()
+            dbg_row.setdefault("age_min", None)
+            dbg_row.setdefault("source", "missing")
+            dbg_row.setdefault("price_ts", None)
+            dbg_row.setdefault("tz_ok", False)
+            dbg_row.setdefault("thresholds", dict(default_thresholds))
+            dbg_row.setdefault("notes", None)
             if market_state is not None:
                 dbg_row["market_session_state"] = str(market_state)
-            status = str(dbg_row.get('status', '')).upper()
+            price_debug[t_u] = dbg_row
+        return price_debug
+
+    def _update_cycle_price_debug(self, candidate_tickers=None, planned_trades=None, price_debug_cache=None):
+        """Build capped price_debug map for relevant tickers and store in engine state."""
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        cap_raw = reporting_cfg.get('max_price_debug_items', 50)
+        try:
+            cap = max(1, int(cap_raw))
+        except Exception:
+            cap = 50
+
+        price_debug = self._collect_price_debug(
+            relevant_tickers=candidate_tickers,
+            planned_trades=planned_trades,
+            price_debug_cache=price_debug_cache,
+            cap=cap,
+        )
+
+        missing_count = 0
+        stale_count = 0
+        for dbg_row in price_debug.values():
+            status = str((dbg_row or {}).get('status', '')).upper()
             if status == 'MISSING':
                 missing_count += 1
             if status == 'STALE':
                 stale_count += 1
-            price_debug[t_u] = dbg_row
 
         self.current_price_debug = price_debug
         print(f"[PRICE_DEBUG] n={len(price_debug)} cap={cap} missing={missing_count} stale={stale_count}")
@@ -7073,7 +7195,7 @@ class PaperTradingEngine:
             snapshot['diagnostic_hint'] = scoreboard_record.get('diagnostic_hint', '')
 
         # Write compact live snapshot for Streamlit monitor.
-        self.write_live_snapshot(snapshot)
+        self.write_live_snapshot(snapshot, source="record_snapshot")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.generate_live_summary()
@@ -8144,6 +8266,14 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("CASE1-C", "stale_abort" not in str(snap1.get("stale_decision_trace", "")), "PRE_OPEN does not stale-abort")
     _check("CASE1-D", engine.last_rebalance_attempt_time == attempt_before_c1, "PRE_OPEN does not update attempt timestamp")
     _check("CASE1-E", isinstance(snap1.get("price_debug"), dict) and len(snap1.get("price_debug", {})) > 0, "PRE_OPEN with holdings still writes non-empty price_debug")
+    case1_live_price_debug_ok = False
+    try:
+        with open(reporting_cfg["snapshot_live_path"], "r", encoding="utf-8") as f:
+            case1_live_payload = json.load(f)
+        case1_live_price_debug_ok = isinstance(case1_live_payload.get("price_debug"), dict) and len(case1_live_payload.get("price_debug", {})) > 0
+    except Exception:
+        case1_live_price_debug_ok = False
+    _check("CASE1-F", case1_live_price_debug_ok, "PRE_OPEN snapshot_live.json persists non-empty price_debug when holdings > 0")
 
     # CASE-2 OPEN + no grace
     now_holder["value"] = datetime(2026, 2, 10, 9, 35, 0)
