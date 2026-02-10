@@ -1,51 +1,36 @@
-# GlobalWatch Paper Trading (V2.11.3)
+# GlobalWatch Paper Trading (V3.1.2)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
 
 ## 项目概览
-GlobalWatch Paper Trading 是一个本地运行的量化策略仿真与执行验证框架。  
-系统不连接真实券商，核心目标是让策略行为可观察、可审计、可迭代。
+GlobalWatch Paper Trading 是一个本地优先的量化研究与模拟执行系统。  
+系统不连接真实券商，目标是让策略行为可观察、可审计、可复现、可迭代。
 
-系统能力由三层组成：
-- 行情与量化选股/权重逻辑
-- Regime 与宏观主题信号叠加
-- 执行风控与监控输出（供 Streamlit 使用）
+系统能力主要由三层组成：
+- 量化层：横截面排序、仓位分配、相关性过滤、风险约束
+- 执行层：陈旧报价策略、换手限制、交易规划器、强制去风险路径
+- 系统层：checkpoint 恢复、快照输出、前端监控联动、结构化审计数据
 
-## V2.11.3 版本更新
-本次版本重点是执行规划器与审计输出增强，同时保持主策略流程稳定。
+## V3.1.2 更新摘要（System + Quant）
+本版本完成 S1-S5 的系统化升级，核心变化如下。
 
-主要改动：
-- 规划器评分量纲统一（`benefit` 与 `cost_weight` 可直接比较）
-- 审计去重修复（同一笔交易不会同时出现在 `scaled` 与 `dropped`）
-- 快照中新增更完整的规划器统计字段，便于调参与排障
-- 引擎指纹版本更新为 `v2.11.3-2026-02-09`
+### System 更新
+- 新增市场会话感知 gate（market-session aware gate）：闭市和开盘缓冲阶段不执行 rebalance
+- 新增 rebalance attempt cooldown：失败/中止后避免每轮空转重试
+- 输出改为原子写：`snapshot_live.json` 与 `trade_history.jsonl` 避免半截读取
+- 运行身份增强：快照与交易记录写入 `session_id`、`config_hash`
+- 新增离线可重复的 S1-S5 自动 dry-run 验收入口（PASS/FAIL + 退出码）
 
-## 功能说明
-### 量化层
-- 横截面排序与候选筛选
-- 波动约束与权重分配
-- 相关性过滤与分散化控制
-- Regime 联动的现金/仓位管理
-- 宏观主题信号倾斜
-- 协方差诊断与波动目标能力接口
+### Quant 更新
+- stale ratio 统计口径修正为仅统计 policy-pass 的可交易候选
+- stale-abort 仅允许在 OPEN 且通过 open grace 后触发
+- 增强 `price_debug` 可解释性：`source`、`price_ts`、`tz_ok`、阈值与状态依据
 
-### 执行与风控层
-- BUY/SELL 的陈旧报价策略
-- stale 比例中止保护
-- 单轮换手约束
-- 熔断与 risk-off 去风险路径
-- 强制交易优先的执行规划器
-- 成本估算与结构化决策日志
+### 引擎版本
+- ENGINE_VERSION 更新为：`v3.1.2-2026-02-10`
 
-### 系统层
-- checkpoint 恢复与 fresh 启动
-- 配置驱动的可复现实验
-- 逐轮快照落盘
-- 实时摘要与报告输出
-- Streamlit 前端联动
-
-## 启动方式
+## 快速启动
 ### 启动纸面交易引擎
 ```bash
 python -u paper_trading.py paper_config.json
@@ -62,123 +47,75 @@ streamlit run GlobalWatch_V2.py
 - `Start_GlobalWatch_And_Paper.bat`
 
 ## 输出文件说明
-运行产物位于 `outputs/`：
-
-- `snapshot_live.json`：前端实时状态主数据
-- `trade_history.jsonl`：前端交易表数据
-- `portfolio_snapshots.jsonl`：逐轮快照审计
-- `paper_trades.csv`：执行导向交易日志
+运行产物默认在 `outputs/`：
+- `snapshot_live.json`：前端实时状态主数据源
+- `trade_history.jsonl`：前端交易历史表数据
+- `portfolio_snapshots.jsonl`：逐轮组合快照（审计）
+- `paper_trades.csv`：交易流水
 - `paper_summary_live.txt`：滚动文字摘要
-- `paper_summary.txt`：最终汇总
+- `paper_summary.txt`：结束后的汇总报告
 - `scoreboard.jsonl`：滚动绩效诊断
-- `equity_curve.png`：结束时净值曲线图
+- `equity_curve.png`：净值曲线图
 
 ## Web 页面怎么看
-Streamlit 里有两个主要页面：
-
+Streamlit 主要包含两个页面：
 - `Global Macro Signals`：宏观/主题信号观察与诊断
-- `Portfolio Monitor`：净值、现金、持仓结构、交易历史、摘要信息
+- `Portfolio Monitor`：净值、现金、持仓结构、交易历史与摘要
 
 数据来源对应关系：
-- 顶部指标和图表：`outputs/snapshot_live.json`
+- 顶部指标与图表：`outputs/snapshot_live.json`
 - 交易历史表：`outputs/trade_history.jsonl`（必要时可回退 `outputs/paper_trades.csv`）
 - 文本摘要：`outputs/paper_summary_live.txt`
 
 如果页面显示与引擎日志不一致，先确认 `snapshot_live.json` 是否仍在持续更新。
 
-## 关键配置速查（`paper_config.json`）
-这里只列参数用途，不公开核心阈值细节。
+## 关键配置速查（paper_config.json）
+这里只列参数用途，不展开策略阈值细节。
 
 ### execution
 - `signal_refresh_minutes`：信号刷新周期
 - `macro_refresh_minutes`：宏观刷新周期
-- `weight_threshold`：调仓触发阈值
+- `weight_threshold`：触发调仓的权重偏离阈值
 - `min_trade_notional_usd`：最小交易金额
 - `max_turnover_pct_per_rebalance`：单轮换手上限
-- `max_stale_ratio`：stale 中止阈值
-- `price_stale_policy.allow_buy`：买入报价策略
-- `price_stale_policy.allow_sell`：卖出报价策略
-- `circuit_breaker_forced_days`：强制 risk-off 持续时长
-- `fill_gap_max`：小缺口补足上限
-- `fill_gap_max_iters`：补足迭代上限
-- `allow_buy_benchmarks`：是否允许买入基准资产
-- `cross_section_top_n`：横截面入选数量
-- `correlation_lookback_days`：相关性回看窗口
-- `correlation_threshold`：相关性过滤阈值
-- `volatility_floor`：波动率下限
-- `min_holding_cycles`：最短持有轮数
-- `enable_exit_signals`：技术退出信号开关
-- `exit_signal_lookback_days`：退出信号窗口
-- `exit_on_gap_volume`：跳空放量退出开关
-- `max_weight_boost_for_hot`：强势资产权重增量
-- `hot_zscore_threshold`：强势资产 zscore 门槛
-- `hot_momentum_top_k`：强势资产动量排名门槛
-- `hot_persistence_cycles`：强势资产连续出现门槛
-
-### macro_integration
-- `enable_llm_topic_signals`：LLM 主题信号开关
-- `topic_memory_window`：主题记忆窗口
-- `llm_topic_confidence_threshold`：主题置信门槛
-- `llm_topic_score_threshold`：主题强度门槛
-- `llm_topic_tilt_scale`：主题倾斜缩放
-- `macro_cash_slope`：宏观风险到现金映射斜率
-- `tilt_max_delta`：单资产倾斜上限
-- `macro_allow_new_positions`：risk-off 可新开仓白名单
-
-### risk_model
-- `enable_cov_diagnostics`：协方差诊断开关
-- `shrinkage_alpha`：协方差收缩强度
-- `annualization_factor`：年化系数
-- `max_pair_corr_pairs`：输出相关性对数量
-- `fallback_to_diag_on_error`：协方差失败回退策略
-- `enable_vol_targeting`：波动目标开关
-- `vol_target`：目标年化波动
-- `vol_target_min_coverage`：最小覆盖率要求
-- `vol_target_min_scale`：缩放下限
-- `vol_target_max_scale`：缩放上限
-- `vol_target_use_cov_only`：仅协方差口径缩放
+- `max_stale_ratio`：stale 比例中止阈值
+- `price_stale_policy.allow_buy`：买入允许的报价状态
+- `price_stale_policy.allow_sell`：卖出允许的报价状态
+- `rebalance_cooldown_minutes`：成功调仓后的冷却
+- `rebalance_attempt_cooldown_minutes`：尝试级冷却（含失败/中止）
 
 ### trade_planner
-- `enable_trade_planner`：规划器总开关
-- `allow_partial_fill`：是否允许部分成交
+- `enable_trade_planner`：是否启用规划器
+- `allow_partial_fill`：预算不足时是否允许最后一笔部分缩放
 - `min_trade_notional`：规划器最小交易金额
-- `enable_adv_limit`：ADV 容量约束开关
-- `adv_limit_frac`：单笔参与率上限
-- `adv_lookback_days`：ADV 回看窗口
-- `adv_apply_to_forced`：强制交易是否应用 ADV 限制
-- `enable_cost_sensitive_ranking`：成本敏感排序开关
+- `enable_cost_sensitive_ranking`：是否启用成本敏感排序
 - `lambda_cost`：成本惩罚强度
-- `benefit_mode`：收益代理计算模式
-- `max_audit_items`：审计列表最大条数
-
-### cost_model
-- `enabled`：成本估算开关
-- `fee_bps`：手续费基点
-- `slippage_bps`：滑点基点
-- `impact_enabled`：冲击成本开关
-- `impact_k`：冲击系数
-- `adv_lookback_days`：参与率估算窗口
+- `benefit_mode`：收益代理模式
 
 ### reporting
-- `trades_log_path`：交易 CSV 输出路径
-- `portfolio_snapshots_path`：快照输出路径
-- `summary_report_path`：汇总报告路径
-- `scoreboard_path`：记分板路径
 - `snapshot_live_path`：实时快照路径
-- `trade_history_path`：前端交易历史路径
+- `trade_history_path`：交易历史 JSONL 路径
+- `trades_log_path`：交易 CSV 路径
+- `daily_report_dirs`：日报输出目录列表
+- `max_price_debug_items`：每轮写入 price_debug 的 ticker 上限
 
-## 校验命令
+## 验证命令
 ```bash
 python -m py_compile paper_trading.py
 python -m py_compile GlobalWatch_V2.py
 ```
 
-可选快速冒烟：
+S1-S5 离线自动验收（推荐）：
 ```bash
-python -u -c "from paper_trading import PaperTradingEngine; e=PaperTradingEngine('paper_config.json'); print('SMOKE_OK')"
+python paper_trading.py --debug-system-s1-5 --debug-outdir /tmp/gw_dryrun
+```
+
+或用环境变量触发：
+```bash
+GW_DEBUG_SYSTEM_S1_5=1 python paper_trading.py --debug-outdir /tmp/gw_dryrun
 ```
 
 ## 说明
-- 仅用于模拟交易。
-- 不连接真实券商。
-- 不构成投资建议。
+- 仅用于模拟交易
+- 不连接真实券商
+- 不构成投资建议

@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V2.11.3)
+﻿# GlobalWatch Paper Trading (V3.1.2)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -13,15 +13,17 @@ The system combines:
 - execution safeguards (stale price policy, turnover control, forced de-risking)
 - live monitoring outputs for the Streamlit interface
 
-## What Is New in V2.11.3
-This release focuses on planner quality and audit clarity while preserving the main strategy flow.
+## What Is New in V3.1.2
+This release consolidates S1-S5 upgrades and renames the engine fingerprint to `v3.1.2`.
 
 Main improvements:
-- planner score normalization now uses comparable units (`benefit` vs `cost_weight`)
-- planner audit records are cleaned so one trade cannot appear as both scaled and dropped
-- richer planner diagnostics in snapshot payloads (including score distribution summary)
-- stronger snapshot fields for UI and troubleshooting
-- engine fingerprint version updated to `v2.11.3-2026-02-09`
+- market-session aware rebalance gate prevents closed-market stale abort and pre-open misfires
+- stale-ratio denominator now uses policy-pass tradable candidates only
+- per-cycle `price_debug` provides source, price timestamp, timezone quality, and threshold reasoning
+- rebalance attempt cooldown suppresses noisy repeated retries after abort/skip outcomes
+- atomic writes for `snapshot_live.json` and `trade_history.jsonl` improve UI read stability
+- `session_id` + `config_hash` are now embedded in snapshots and trades for run isolation
+- built-in deterministic offline dry-run validation 
 
 ## Functional Capabilities
 ### Quant layer
@@ -184,3 +186,4 @@ python -u -c "from paper_trading import PaperTradingEngine; e=PaperTradingEngine
 - Paper trading only.
 - No real broker connection.
 - Not investment advice.
+

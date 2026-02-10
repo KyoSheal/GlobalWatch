@@ -7,6 +7,9 @@ memory_db/
 chroma_db/
 outputs/
 backup/
+globalwatch/
+papertrader/
+tools/
 
 # 如果你有虚拟环境
 venv/

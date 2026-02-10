@@ -5,11 +5,12 @@ import os
 import sys
 import time
 import uuid
+import hashlib
 import argparse
+import shutil
 import pandas as pd
 import numpy as np
-import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 import matplotlib
 matplotlib.use('Agg')  # NOTE: comment omitted (was garbled/non-ASCII).
@@ -22,12 +23,39 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+try:
     import daily_reporter
     DAILY_REPORTER_AVAILABLE = True
 except Exception as e:
     daily_reporter = None  # type: ignore
     DAILY_REPORTER_AVAILABLE = False
     print(f"[WARN] daily_reporter unavailable: {e}")
+
+try:
+    from market_session import get_market_session_state, is_market_open_for_trading
+    MARKET_SESSION_AVAILABLE = True
+except Exception as e:
+    MARKET_SESSION_AVAILABLE = False
+    print(f"[WARN] market_session unavailable: {e}")
+
+    def get_market_session_state(now_dt, tz_market="America/New_York", open_time_et="09:30", close_time_et="16:00", open_grace_min=15, close_grace_min=10):
+        return {
+            "state": "OPEN",
+            "now_et": datetime.now().isoformat(),
+            "trading_date_et": datetime.now().date().isoformat(),
+            "last_completed_trading_date_et": datetime.now().date().isoformat(),
+            "open_grace_passed": True,
+            "close_grace_passed": False,
+            "open_grace_min": int(open_grace_min),
+            "close_grace_min": int(close_grace_min),
+        }
+
+    def is_market_open_for_trading(session_dict):
+        return True
 
 # ChromaDB for macro signals
 try:
@@ -769,10 +797,15 @@ class PaperTradingEngine:
         """def __init__: docstring omitted (was garbled/non-ASCII)."""
         self.config = self.load_config(config_path)
         self.validate_config()
+        self.config_hash = self._compute_config_hash(self.config)
         reporting_cfg = self.config.get('reporting', {})
         self.account_id = str(reporting_cfg.get('account_id', 'paper_main') or 'paper_main').strip()
         self.runtime_env = str(reporting_cfg.get('env', 'live') or 'live').strip().lower()
-        self.session_id = str(os.environ.get('GW_SESSION_ID') or uuid.uuid4().hex)
+        configured_session_id = str(os.environ.get('GW_SESSION_ID', '') or '').strip()
+        if configured_session_id:
+            self.session_id = configured_session_id
+        else:
+            self.session_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.cash = self.config['initial_cash_usd']
@@ -789,10 +822,18 @@ class PaperTradingEngine:
         self.current_cycle = 0
         self.peak_equity = self.cash
         self.status = "READY"  # READY/RUNNING/COMPLETED
-        self.last_rebalance_time = None  # for cooldown checks
+        self.last_rebalance_time = None  # backward-compatible alias of last successful rebalance time
+        self.last_rebalance_attempt_time = None
+        self.last_rebalance_success_time = None
         self.current_regime = {}
         self.current_macro = {}
         self.current_stale_info = {}
+        self.current_price_debug = {}
+        self.current_market_session = {}
+        self.current_rebalance_gate = {"allowed": True, "reason": "", "session_state": "UNKNOWN"}
+        self.current_rebalance_skipped_reason = ""
+        self._debug_session_override = None
+        self._debug_now_override = None
         self.current_turnover_info = {}
         self.current_exit_info = {}
         self.current_risk_check_info = {}
@@ -914,6 +955,8 @@ class PaperTradingEngine:
         execution_config = config.setdefault('execution', {})
         execution_config.setdefault('signal_refresh_minutes', 1440)
         execution_config.setdefault('macro_refresh_minutes', 60)
+        execution_config.setdefault('rebalance_cooldown_minutes', 0)
+        execution_config.setdefault('rebalance_attempt_cooldown_minutes', execution_config.get('rebalance_cooldown_minutes', 0))
         execution_config.setdefault('max_stale_ratio', 0.3)
         execution_config.setdefault('circuit_breaker_forced_days', 1)
         execution_config.setdefault('fill_gap_max', 0.03)
@@ -1013,8 +1056,17 @@ class PaperTradingEngine:
         ])
         reporting_config.setdefault('daily_report_stale_ratio_threshold', 0.8)
         reporting_config.setdefault('daily_report_stale_streak_threshold', 3)
+        reporting_config.setdefault('max_price_debug_items', 50)
         
         return config
+
+    def _compute_config_hash(self, config_obj):
+        """Compute a stable short hash for the loaded config."""
+        try:
+            serialized = json.dumps(config_obj, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+            return hashlib.sha256(serialized.encode('utf-8')).hexdigest()[:12]
+        except Exception:
+            return "unknown"
     
     def validate_config(self):
         """def validate_config: docstring omitted (was garbled/non-ASCII)."""
@@ -1024,6 +1076,8 @@ class PaperTradingEngine:
         assert self.config.get('execution', {}).get('signal_refresh_minutes', 1440) > 0, "execution.signal_refresh_minutes must be > 0"
         assert self.config.get('execution', {}).get('macro_refresh_minutes', 60) > 0, "execution.macro_refresh_minutes must be > 0"
         assert self.config.get('execution', {}).get('max_stale_ratio', 0.3) >= 0, "execution.max_stale_ratio must be >= 0"
+        assert float(self.config.get('execution', {}).get('rebalance_cooldown_minutes', 0)) >= 0, "execution.rebalance_cooldown_minutes must be >= 0"
+        assert float(self.config.get('execution', {}).get('rebalance_attempt_cooldown_minutes', self.config.get('execution', {}).get('rebalance_cooldown_minutes', 0))) >= 0, "execution.rebalance_attempt_cooldown_minutes must be >= 0"
         assert self.config.get('execution', {}).get('circuit_breaker_forced_days', 1) > 0, "execution.circuit_breaker_forced_days must be > 0"
         assert self.config.get('execution', {}).get('fill_gap_max', 0.03) >= 0, "execution.fill_gap_max must be >= 0"
         assert int(self.config.get('execution', {}).get('fill_gap_max_iters', 2)) >= 1, "execution.fill_gap_max_iters must be >= 1"
@@ -1077,6 +1131,7 @@ class PaperTradingEngine:
         assert (short_w + medium_w) > 0, "execution.momentum_weights short+medium must be > 0"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
+        assert int(self.config.get('reporting', {}).get('max_price_debug_items', 50)) >= 1, "reporting.max_price_debug_items must be >= 1"
         macro_cfg = self.config.get('macro_integration', {})
         assert isinstance(macro_cfg.get('enable_llm_topic_signals', True), bool), "macro_integration.enable_llm_topic_signals must be bool"
         assert 0.0 <= float(macro_cfg.get('llm_topic_confidence_threshold', 0.6)) <= 1.0, "macro_integration.llm_topic_confidence_threshold must be in [0,1]"
@@ -1489,11 +1544,15 @@ class PaperTradingEngine:
                 'scaled': []
             }
         planner_turnover_used = float(planner_meta.get('turnover_used_forced', 0.0) or 0.0) + float(planner_meta.get('turnover_used_normal', 0.0) or 0.0)
+        last_attempt_time = self.last_rebalance_attempt_time.isoformat() if isinstance(self.last_rebalance_attempt_time, datetime) else self.last_rebalance_attempt_time
+        success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
+        last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
 
         payload = {
             'timestamp': snapshot.get('timestamp', datetime.now().isoformat()),
             'account_id': self.account_id,
             'session_id': self.session_id,
+            'config_hash': snapshot.get('config_hash', self.config_hash),
             'env': self.runtime_env,
             'cycle': int(snapshot.get('cycle', self.current_cycle)),
             'status': snapshot.get('status', self.status),
@@ -1523,6 +1582,31 @@ class PaperTradingEngine:
                 'topic_summary': topic_summary,
                 'summary': macro_summary
             },
+            'market_session': snapshot.get('market_session', dict(self.current_market_session) if isinstance(self.current_market_session, dict) else {}),
+            'rebalance_gate': snapshot.get('rebalance_gate', dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {}),
+            'rebalance_skipped_reason': snapshot.get('rebalance_skipped_reason', self.current_rebalance_skipped_reason),
+            'price_debug': snapshot.get('price_debug', dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {}),
+            'last_rebalance_attempt_time': snapshot.get('last_rebalance_attempt_time', last_attempt_time),
+            'last_rebalance_success_time': snapshot.get('last_rebalance_success_time', last_success_time),
+            'stale_count': snapshot.get('stale_count', self.current_stale_info.get('stale_count', 0)),
+            'stale_ratio': snapshot.get('stale_ratio', self.current_stale_info.get('stale_ratio', 0.0)),
+            'stale_candidate_count': snapshot.get('stale_candidate_count', self.current_stale_info.get('stale_candidate_count', 0)),
+            'stale_ratio_candidates': snapshot.get('stale_ratio_candidates', self.current_stale_info.get('stale_ratio_candidates', 0.0)),
+            'stale_candidate_count_policy_pass': snapshot.get(
+                'stale_candidate_count_policy_pass',
+                self.current_stale_info.get('stale_candidate_count_policy_pass', self.current_stale_info.get('stale_candidate_count', 0))
+            ),
+            'stale_ratio_candidates_policy_pass': snapshot.get(
+                'stale_ratio_candidates_policy_pass',
+                self.current_stale_info.get('stale_ratio_candidates_policy_pass', self.current_stale_info.get('stale_ratio_candidates', 0.0))
+            ),
+            'stale_candidates_policy_pass': snapshot.get(
+                'stale_candidates_policy_pass',
+                self.current_stale_info.get('stale_candidates_policy_pass', {
+                    'stale': self.current_stale_info.get('stale_candidate_count', 0),
+                    'total': self.current_stale_info.get('stale_candidate_count', 0),
+                })
+            ),
             'rebalance_trigger': snapshot.get('stale_decision_trace', ''),
             'last_trade_time': self.trades_log[-1].get('timestamp') if self.trades_log else None,
             'equity_history': equity_history,
@@ -1552,13 +1636,36 @@ class PaperTradingEngine:
         }
         return payload
 
+    def atomic_write_text(self, path, content):
+        """Atomically write text content using tmp + fsync + replace."""
+        folder = os.path.dirname(path) or '.'
+        os.makedirs(folder, exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+
+    def atomic_write_json(self, path, obj):
+        """Atomically write a JSON object."""
+        content = json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False)
+        self.atomic_write_text(path, content)
+
+    def atomic_write_jsonl(self, path, list_of_dicts):
+        """Atomically rewrite a JSONL file."""
+        lines = [json.dumps(item, ensure_ascii=False, allow_nan=False) for item in list_of_dicts]
+        content = '\n'.join(lines)
+        if lines:
+            content += '\n'
+        self.atomic_write_text(path, content)
+
     def write_live_snapshot(self, snapshot):
         """Write UI-friendly live snapshot to outputs/snapshot_live.json."""
         try:
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
             payload = self._build_live_snapshot_payload(snapshot)
-            with open(live_snapshot_path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+            self.atomic_write_json(live_snapshot_path, payload)
         except Exception as e:
             print(f"[WARN] Failed to write live snapshot: {e}")
 
@@ -1584,9 +1691,16 @@ class PaperTradingEngine:
         total_return = (total_equity - self.initial_cash) / self.initial_cash if self.initial_cash > 0 else 0.0
         peak_base = max(float(self.peak_equity or 0.0), total_equity)
         drawdown = (peak_base - total_equity) / peak_base if peak_base > 0 else 0.0
+        last_attempt_time = self.last_rebalance_attempt_time.isoformat() if isinstance(self.last_rebalance_attempt_time, datetime) else self.last_rebalance_attempt_time
+        success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
+        last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
 
         snapshot = {
             'timestamp': datetime.now().isoformat(),
+            'account_id': self.account_id,
+            'session_id': self.session_id,
+            'env': self.runtime_env,
+            'config_hash': self.config_hash,
             'cycle': self.current_cycle,
             'cash': float(self.cash),
             'positions_value': float(positions_value),
@@ -1599,6 +1713,12 @@ class PaperTradingEngine:
             'macro_reused': self.current_macro_reused,
             'last_signal_time': self.last_signal_time.isoformat() if self.last_signal_time else None,
             'last_macro_time': self.last_macro_time.isoformat() if self.last_macro_time else None,
+            'market_session': dict(self.current_market_session) if isinstance(self.current_market_session, dict) else {},
+            'rebalance_gate': dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {},
+            'rebalance_skipped_reason': self.current_rebalance_skipped_reason,
+            'price_debug': dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {},
+            'last_rebalance_attempt_time': last_attempt_time,
+            'last_rebalance_success_time': last_success_time,
             'regime_state': self.current_regime.get('regime_state', 'neutral'),
             'trend_score': self.current_regime.get('trend_score', 0.5),
             'dynamic_min_cash': self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct']),
@@ -1640,6 +1760,61 @@ class PaperTradingEngine:
         except Exception as e:
             print(f"[WARN] Post-rebalance live snapshot refresh failed: {e}")
 
+    def _refresh_market_session_state(self, now_dt=None):
+        """Update in-memory market session + rebalance gate state."""
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        tz_market = str(reporting_cfg.get('market_tz', 'America/New_York') or 'America/New_York')
+        open_time_et = reporting_cfg.get('market_open_time_et', '09:30')
+        close_time_et = reporting_cfg.get('market_close_time_et', '16:00')
+        open_grace_min = int(reporting_cfg.get('market_open_grace_min', 15) or 15)
+        close_grace_min = int(reporting_cfg.get('market_close_grace_min', 10) or 10)
+
+        now_val = now_dt if now_dt is not None else self._now()
+        session_override = getattr(self, '_debug_session_override', None)
+        if callable(session_override):
+            try:
+                session = session_override(now_val)
+            except TypeError:
+                session = session_override()
+            except Exception:
+                session = None
+        elif isinstance(session_override, dict):
+            session = dict(session_override)
+        else:
+            session = get_market_session_state(
+                now_dt=now_val,
+                tz_market=tz_market,
+                open_time_et=open_time_et,
+                close_time_et=close_time_et,
+                open_grace_min=open_grace_min,
+                close_grace_min=close_grace_min,
+            )
+        if not isinstance(session, dict):
+            session = {}
+
+        session.setdefault('state', 'UNKNOWN')
+        session.setdefault('open_grace_passed', False)
+        session.setdefault('close_grace_passed', False)
+        session.setdefault('now_et', now_val.isoformat())
+        today_str = now_val.date().isoformat()
+        session.setdefault('trading_date_et', today_str)
+        session.setdefault('last_completed_trading_date_et', today_str)
+        session.setdefault('open_grace_min', int(open_grace_min))
+        session.setdefault('close_grace_min', int(close_grace_min))
+        allowed = bool(is_market_open_for_trading(session))
+        state = str(session.get('state', 'UNKNOWN')).upper()
+        reason = 'market_open' if allowed else 'market_closed_gate'
+        gate = {
+            'allowed': bool(allowed),
+            'reason': reason,
+            'session_state': state,
+        }
+
+        self.current_market_session = dict(session) if isinstance(session, dict) else {}
+        self.current_rebalance_gate = dict(gate)
+        self.current_rebalance_skipped_reason = '' if allowed else 'market_closed_gate'
+        return self.current_market_session, self.current_rebalance_gate
+
     def _resolve_daily_report_dirs(self):
         """Resolve and deduplicate Daily Report output directories."""
         reporting_cfg = self.config.get('reporting', {})
@@ -1674,13 +1849,7 @@ class PaperTradingEngine:
 
             payload['latest_daily_report_date'] = str(report_date)
             payload['latest_daily_report_path'] = str(report_path)
-
-            folder = os.path.dirname(snapshot_path) or '.'
-            os.makedirs(folder, exist_ok=True)
-            tmp_path = snapshot_path + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, snapshot_path)
+            self.atomic_write_json(snapshot_path, payload)
         except Exception as e:
             print(f"[WARN] Failed to update snapshot daily report pointer: {e}")
 
@@ -1808,10 +1977,16 @@ class PaperTradingEngine:
             return value
 
         try:
-            with open(trade_history_path, 'w', encoding='utf-8') as f:
-                for trade in self.trades_log:
-                    trade_clean = _sanitize(trade)
-                    f.write(json.dumps(trade_clean, ensure_ascii=False, allow_nan=False) + '\n')
+            trade_rows = []
+            for trade in self.trades_log:
+                trade_clean = _sanitize(trade)
+                if isinstance(trade_clean, dict):
+                    trade_clean.setdefault('account_id', self.account_id)
+                    trade_clean.setdefault('session_id', self.session_id)
+                    trade_clean.setdefault('env', self.runtime_env)
+                    trade_clean.setdefault('config_hash', self.config_hash)
+                trade_rows.append(trade_clean)
+            self.atomic_write_jsonl(trade_history_path, trade_rows)
         except Exception as e:
             print(f"[WARN] Failed to write trade history JSONL: {e}")
     
@@ -1900,6 +2075,7 @@ class PaperTradingEngine:
         self.status = "READY"
         self.position_entry_cycle = {}
         self.current_holding_blocks = []
+        self.current_price_debug = {}
 
     def set_market_data_fetcher(self, fetcher):
         """Set optional market data fetcher for backtests/replay injection."""
@@ -1912,6 +2088,31 @@ class PaperTradingEngine:
         if fetcher is not None and not callable(fetcher):
             raise ValueError("price_fetcher must be callable or None")
         self.price_fetcher = fetcher
+
+    def _get_yfinance_module(self):
+        """Lazily import yfinance so offline dry-runs do not require it at import time."""
+        global yf
+        if yf is None:
+            try:
+                import yfinance as _yf
+                yf = _yf
+            except Exception:
+                return None
+        return yf
+
+    def _now(self):
+        """Current wall-clock time with optional deterministic debug override."""
+        override = getattr(self, '_debug_now_override', None)
+        if callable(override):
+            try:
+                value = override()
+                if isinstance(value, datetime):
+                    return value
+            except Exception:
+                pass
+        if isinstance(override, datetime):
+            return override
+        return datetime.now()
 
     def to_yahoo_symbol(self, ticker):
         """Return provider symbol for Yahoo/yfinance without unsafe ticker rewrites."""
@@ -1960,8 +2161,13 @@ class PaperTradingEngine:
                 except Exception as e:
                     print(f"[WARN] Injected market_data_fetcher failed for {ticker}: {e}")
 
+            yf_mod = self._get_yfinance_module()
+            if yf_mod is None:
+                print(f"[WARN] yfinance unavailable for {ticker}; skipping market data fetch")
+                return None
+
             market_ticker = self._normalize_market_ticker(ticker)
-            t = yf.Ticker(market_ticker)
+            t = yf_mod.Ticker(market_ticker)
             hist = t.history(period=period, interval=interval)
             
             if hist.empty:
@@ -1973,11 +2179,137 @@ class PaperTradingEngine:
             print(f"[WARN] Error fetching data for {ticker}: {e}")
             return None
 
-    def get_current_price(self, ticker):
-        """def get_current_price: docstring omitted (was garbled/non-ASCII)."""
+    def get_current_price(self, ticker, return_debug=False):
+        """Get current price with backward-compatible tuple return; optionally include debug payload."""
+        import pytz
+
+        now_raw = self._now()
+        if now_raw.tzinfo is None or now_raw.tzinfo.utcoffset(now_raw) is None:
+            now_utc = now_raw.replace(tzinfo=timezone.utc)
+        else:
+            now_utc = now_raw.astimezone(timezone.utc)
+        default_thresholds = {"live_max_min": 10.0, "recent_max_min": 60.0}
+
+        def _emit_result(
+            price,
+            age_min,
+            status,
+            *,
+            source='missing',
+            price_ts=None,
+            tz_ok=False,
+            thresholds=None,
+            notes=None,
+            bar_interval=None,
+            raw_price_ts=None,
+            raw_tz=None,
+            debug_status=None,
+        ):
+            final_status = str(status).upper() if status is not None else "STALE"
+            if thresholds is None:
+                thresholds = default_thresholds
+
+            if isinstance(price_ts, datetime):
+                price_ts_iso = price_ts.isoformat()
+            elif isinstance(price_ts, str):
+                price_ts_iso = price_ts
+            else:
+                price_ts_iso = None
+
+            try:
+                age_num = float(age_min) if age_min is not None and np.isfinite(float(age_min)) else None
+            except Exception:
+                age_num = None
+
+            debug_payload = {
+                "ticker": str(ticker).upper(),
+                "now_ts": now_utc.isoformat(),
+                "status": str(debug_status or ("MISSING" if price is None else final_status)).upper(),
+                "age_min": age_num,
+                "source": str(source),
+                "price_ts": price_ts_iso,
+                "tz_ok": bool(tz_ok),
+                "thresholds": {
+                    "live_max_min": float(thresholds.get("live_max_min", default_thresholds["live_max_min"])),
+                    "recent_max_min": float(thresholds.get("recent_max_min", default_thresholds["recent_max_min"])),
+                },
+                "notes": str(notes) if notes else None,
+            }
+            if bar_interval is not None:
+                debug_payload["bar_interval"] = str(bar_interval)
+            if raw_price_ts is not None:
+                debug_payload["raw_price_ts"] = str(raw_price_ts)
+            if raw_tz is not None:
+                debug_payload["raw_tz"] = str(raw_tz)
+
+            if return_debug:
+                return (price, age_min, final_status, debug_payload)
+            return (price, age_min, final_status)
+
+        def _normalize_ts(raw_ts):
+            """Normalize raw timestamp into timezone-aware datetime for age calculation."""
+            note_items = []
+            raw_ts_str = None
+            raw_tz = None
+            ts_obj = None
+            tz_ok = False
+            if raw_ts is None:
+                return ts_obj, tz_ok, note_items, raw_ts_str, raw_tz
+
+            try:
+                raw_ts_str = str(raw_ts)
+                raw_tz = str(getattr(raw_ts, 'tz', None)) if hasattr(raw_ts, 'tz') else None
+                if hasattr(raw_ts, 'to_pydatetime'):
+                    ts_obj = raw_ts.to_pydatetime()
+                elif isinstance(raw_ts, datetime):
+                    ts_obj = raw_ts
+                else:
+                    note_items.append("price_ts_parse_error")
+                    return None, False, note_items, raw_ts_str, raw_tz
+
+                if ts_obj.tzinfo is None or ts_obj.tzinfo.utcoffset(ts_obj) is None:
+                    tz_ok = False
+                    note_items.append("naive_ts_detected")
+                    try:
+                        if ZoneInfo is not None:
+                            ts_obj = ts_obj.replace(tzinfo=ZoneInfo('America/New_York'))
+                        else:
+                            ts_obj = pytz.timezone('US/Eastern').localize(ts_obj)
+                        note_items.append("localized_assumption=America/New_York")
+                    except Exception:
+                        note_items.append("localized_assumption_failed")
+                else:
+                    tz_ok = True
+                    if raw_tz is None:
+                        raw_tz = str(ts_obj.tzinfo)
+            except Exception:
+                return None, False, ["price_ts_parse_error"], raw_ts_str, raw_tz
+
+            return ts_obj, tz_ok, note_items, raw_ts_str, raw_tz
+
+        def _classify_status(age_min, thresholds):
+            if age_min is None:
+                return "STALE"
+            if age_min < thresholds["live_max_min"]:
+                return "LIVE"
+            if age_min < thresholds["recent_max_min"]:
+                return "RECENT"
+            return "STALE"
+
         if ticker == 'CASH':
-            return (1.0, 0, "LIVE")
-        
+            return _emit_result(
+                1.0,
+                0.0,
+                "LIVE",
+                source="manual_fallback",
+                price_ts=now_utc,
+                tz_ok=True,
+                thresholds={"live_max_min": 1.0, "recent_max_min": 5.0},
+                notes="cash_proxy",
+                bar_interval=None,
+            )
+
+        fallback_notes = []
         try:
             if self.price_fetcher is not None:
                 try:
@@ -1986,61 +2318,127 @@ class PaperTradingEngine:
                     fetch_result = self.price_fetcher(ticker)
                 except Exception as e:
                     fetch_result = None
+                    fallback_notes.append(f"price_fetcher_error={e}")
                     print(f"[WARN] Injected price_fetcher failed for {ticker}: {e}")
 
                 if fetch_result is not None:
+                    if isinstance(fetch_result, tuple) and len(fetch_result) == 4:
+                        price, age_min, status, injected_debug = fetch_result
+                        if return_debug and isinstance(injected_debug, dict):
+                            debug_copy = dict(injected_debug)
+                            debug_copy.setdefault("ticker", str(ticker).upper())
+                            debug_copy.setdefault("now_ts", now_utc.isoformat())
+                            debug_copy.setdefault("status", str(status).upper())
+                            debug_copy.setdefault("age_min", float(age_min) if age_min is not None else None)
+                            debug_copy.setdefault("source", "injected_price_fetcher")
+                            debug_copy.setdefault("price_ts", None)
+                            debug_copy.setdefault("tz_ok", False)
+                            debug_copy.setdefault("thresholds", default_thresholds)
+                            debug_copy.setdefault("notes", "injected_price_fetcher")
+                            return (price, age_min, str(status).upper(), debug_copy)
+                        return (price, age_min, str(status).upper())
                     if isinstance(fetch_result, tuple) and len(fetch_result) == 3:
-                        return fetch_result
+                        price, age_min, status = fetch_result
+                        return _emit_result(
+                            price,
+                            age_min,
+                            status,
+                            source="injected_price_fetcher",
+                            price_ts=None,
+                            tz_ok=False,
+                            thresholds=default_thresholds,
+                            notes="injected_price_fetcher",
+                            bar_interval=None,
+                        )
                     print(f"[WARN] Injected price_fetcher returned invalid payload for {ticker}; falling back")
 
-            import pytz
-            now_et = datetime.now(pytz.timezone('US/Eastern'))
-            
-            # NOTE: comment omitted (was garbled/non-ASCII).
+            now_et = now_utc.astimezone(pytz.timezone('US/Eastern'))
+
+            yf_mod = self._get_yfinance_module()
+            if yf_mod is None:
+                print(f"[WARN] yfinance unavailable for {ticker}; skipping price fetch")
+                return _emit_result(
+                    None,
+                    99999.0,
+                    "STALE",
+                    source="missing",
+                    price_ts=None,
+                    tz_ok=False,
+                    thresholds=default_thresholds,
+                    notes="yfinance_unavailable",
+                    bar_interval=None,
+                    raw_price_ts=None,
+                    raw_tz=None,
+                    debug_status="MISSING",
+                )
+
             market_ticker = self._normalize_market_ticker(ticker)
-            t = yf.Ticker(market_ticker)
-            
-            # NOTE: comment omitted (was garbled/non-ASCII).
+            t = yf_mod.Ticker(market_ticker)
+
             try:
                 hist = t.history(period='1d', interval='5m')
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
-                    timestamp = hist.index[-1]
-                    data_age_minutes = (now_et - timestamp).total_seconds() / 60
-                    
-                    if data_age_minutes < 10:
-                        market_status = "LIVE"
-                    elif data_age_minutes < 60:
-                        market_status = "RECENT"
+                    raw_ts = hist.index[-1]
+                    ts_obj, tz_ok, note_items, raw_ts_str, raw_tz = _normalize_ts(raw_ts)
+                    thresholds = {"live_max_min": 10.0, "recent_max_min": 60.0}
+                    if ts_obj is not None:
+                        age_min = (now_utc - ts_obj.astimezone(timezone.utc)).total_seconds() / 60.0
                     else:
-                        market_status = "STALE"
-                    
-                    print(f"[PRICE] {ticker}: ${price:.2f} (5m @ {timestamp.strftime('%H:%M ET')}, {data_age_minutes:.0f}min ago) {market_status}")
-                    return (price, data_age_minutes, market_status)
+                        age_min = 99999.0
+                    market_status = _classify_status(age_min, thresholds)
+                    ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M ET') if isinstance(ts_obj, datetime) else "N/A"
+                    print(f"[PRICE] {ticker}: ${price:.2f} (5m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
+                    return _emit_result(
+                        price,
+                        age_min,
+                        market_status,
+                        source="yfinance_history_5m",
+                        price_ts=ts_obj,
+                        tz_ok=tz_ok,
+                        thresholds=thresholds,
+                        notes=';'.join(note_items) if note_items else None,
+                        bar_interval="5m",
+                        raw_price_ts=raw_ts_str,
+                        raw_tz=raw_tz,
+                    )
+                fallback_notes.append("empty_history_5m")
             except Exception as e:
+                fallback_notes.append(f"history_5m_error={e}")
                 print(f"[PRICE] {ticker}: 5m history failed - {e}")
-            
-            # NOTE: comment omitted (was garbled/non-ASCII).
+
             try:
                 hist = t.history(period='1d', interval='1m')
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
-                    timestamp = hist.index[-1]
-                    data_age_minutes = (now_et - timestamp).total_seconds() / 60
-                    
-                    if data_age_minutes < 5:
-                        market_status = "LIVE"
-                    elif data_age_minutes < 60:
-                        market_status = "RECENT"
+                    raw_ts = hist.index[-1]
+                    ts_obj, tz_ok, note_items, raw_ts_str, raw_tz = _normalize_ts(raw_ts)
+                    thresholds = {"live_max_min": 5.0, "recent_max_min": 60.0}
+                    if ts_obj is not None:
+                        age_min = (now_utc - ts_obj.astimezone(timezone.utc)).total_seconds() / 60.0
                     else:
-                        market_status = "STALE"
-                    
-                    print(f"[PRICE] {ticker}: ${price:.2f} (1m @ {timestamp.strftime('%H:%M ET')}, {data_age_minutes:.0f}min ago) {market_status}")
-                    return (price, data_age_minutes, market_status)
+                        age_min = 99999.0
+                    market_status = _classify_status(age_min, thresholds)
+                    ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M ET') if isinstance(ts_obj, datetime) else "N/A"
+                    print(f"[PRICE] {ticker}: ${price:.2f} (1m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
+                    return _emit_result(
+                        price,
+                        age_min,
+                        market_status,
+                        source="yfinance_history_1m",
+                        price_ts=ts_obj,
+                        tz_ok=tz_ok,
+                        thresholds=thresholds,
+                        notes=';'.join(note_items) if note_items else None,
+                        bar_interval="1m",
+                        raw_price_ts=raw_ts_str,
+                        raw_tz=raw_tz,
+                    )
+                fallback_notes.append("empty_history_1m")
             except Exception as e:
+                fallback_notes.append(f"history_1m_error={e}")
                 print(f"[PRICE] {ticker}: 1m history failed - {e}")
-            
-            # NOTE: comment omitted (was garbled/non-ASCII).
+
             try:
                 info = t.info
                 for price_field in ['currentPrice', 'regularMarketPrice', 'ask', 'bid']:
@@ -2048,27 +2446,150 @@ class PaperTradingEngine:
                         price = float(info[price_field])
                         if price > 0:
                             print(f"[PRICE] {ticker}: ${price:.2f} (from info.{price_field}) STALE (no timestamp)")
-                            return (price, 99999, "STALE")
+                            return _emit_result(
+                                price,
+                                99999.0,
+                                "STALE",
+                                source="yfinance_info",
+                                price_ts=None,
+                                tz_ok=False,
+                                thresholds=default_thresholds,
+                                notes=f"price_field={price_field};no_price_timestamp",
+                                bar_interval=None,
+                                raw_price_ts=None,
+                                raw_tz=None,
+                            )
+                fallback_notes.append("missing_info_price_fields")
             except Exception as e:
+                fallback_notes.append(f"info_error={e}")
                 print(f"[PRICE] {ticker}: info failed - {e}")
-            
-            # NOTE: comment omitted (was garbled/non-ASCII).
+
             try:
                 hist = t.history(period='5d', interval='1d')
                 if not hist.empty:
                     price = float(hist['Close'].iloc[-1])
-                    date = hist.index[-1]
-                    # NOTE: comment omitted (was garbled/non-ASCII).
-                    data_age_minutes = (now_et - date).total_seconds() / 60
-                    print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {date.strftime('%Y-%m-%d')}, {data_age_minutes:.0f}min ago) STALE")
-                    return (price, data_age_minutes, "STALE")
+                    raw_ts = hist.index[-1]
+                    ts_obj, tz_ok, note_items, raw_ts_str, raw_tz = _normalize_ts(raw_ts)
+                    if ts_obj is not None:
+                        age_min = (now_utc - ts_obj.astimezone(timezone.utc)).total_seconds() / 60.0
+                    else:
+                        age_min = 99999.0
+                    ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d') if isinstance(ts_obj, datetime) else "N/A"
+                    print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {ts_label}, {age_min:.0f}min ago) STALE")
+                    return _emit_result(
+                        price,
+                        age_min,
+                        "STALE",
+                        source="cached_last_close",
+                        price_ts=ts_obj,
+                        tz_ok=tz_ok,
+                        thresholds=default_thresholds,
+                        notes=';'.join(note_items) if note_items else None,
+                        bar_interval="1d",
+                        raw_price_ts=raw_ts_str,
+                        raw_tz=raw_tz,
+                    )
+                fallback_notes.append("empty_history_daily")
             except Exception as e:
+                fallback_notes.append(f"history_daily_error={e}")
                 print(f"[PRICE] {ticker}: daily history failed - {e}")
-                
+
         except Exception as e:
+            fallback_notes.append(f"all_methods_error={e}")
             print(f"[ERROR] All price methods failed for {ticker}: {e}")
-        
-        return (None, 99999, "STALE")
+
+        final_notes = ';'.join(fallback_notes[:4]) if fallback_notes else "all_price_methods_failed"
+        return _emit_result(
+            None,
+            99999.0,
+            "STALE",
+            source="missing",
+            price_ts=None,
+            tz_ok=False,
+            thresholds=default_thresholds,
+            notes=final_notes,
+            bar_interval=None,
+            raw_price_ts=None,
+            raw_tz=None,
+            debug_status="MISSING",
+        )
+
+    def _update_cycle_price_debug(self, candidate_tickers=None, planned_trades=None, price_debug_cache=None):
+        """Build capped price_debug map for relevant tickers and store in engine state."""
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        cap_raw = reporting_cfg.get('max_price_debug_items', 50)
+        try:
+            cap = max(1, int(cap_raw))
+        except Exception:
+            cap = 50
+
+        price_debug_cache = dict(price_debug_cache) if isinstance(price_debug_cache, dict) else {}
+        holdings = [str(t).upper() for t in self.positions.keys() if str(t).upper() != 'CASH']
+        candidate_set = set(holdings)
+        if isinstance(candidate_tickers, (list, tuple, set)):
+            for t in candidate_tickers:
+                t_u = str(t).upper().strip()
+                if t_u and t_u != 'CASH':
+                    candidate_set.add(t_u)
+
+        planned_notional = {}
+        if isinstance(planned_trades, list):
+            for tr in planned_trades:
+                if not isinstance(tr, dict):
+                    continue
+                t_u = str(tr.get('ticker', '')).upper().strip()
+                if not t_u or t_u == 'CASH':
+                    continue
+                try:
+                    n = abs(float(tr.get('desired_trade_value', tr.get('notional', 0.0)) or 0.0))
+                except Exception:
+                    n = 0.0
+                if n > planned_notional.get(t_u, 0.0):
+                    planned_notional[t_u] = n
+                candidate_set.add(t_u)
+
+        ordered = []
+        seen = set()
+        for t in holdings:
+            if t not in seen:
+                ordered.append(t)
+                seen.add(t)
+        for t, _ in sorted(planned_notional.items(), key=lambda x: x[1], reverse=True):
+            if t not in seen:
+                ordered.append(t)
+                seen.add(t)
+        for t in sorted(candidate_set):
+            if t not in seen:
+                ordered.append(t)
+                seen.add(t)
+
+        selected = ordered[:cap]
+        market_state = None
+        if isinstance(self.current_market_session, dict):
+            market_state = self.current_market_session.get('state')
+
+        price_debug = {}
+        missing_count = 0
+        stale_count = 0
+        for t_u in selected:
+            dbg = price_debug_cache.get(t_u)
+            if not isinstance(dbg, dict):
+                _price, _age, _status, dbg = self.get_current_price(t_u, return_debug=True)
+            if not isinstance(dbg, dict):
+                continue
+            dbg_row = dict(dbg)
+            if market_state is not None:
+                dbg_row["market_session_state"] = str(market_state)
+            status = str(dbg_row.get('status', '')).upper()
+            if status == 'MISSING':
+                missing_count += 1
+            if status == 'STALE':
+                stale_count += 1
+            price_debug[t_u] = dbg_row
+
+        self.current_price_debug = price_debug
+        print(f"[PRICE_DEBUG] n={len(price_debug)} cap={cap} missing={missing_count} stale={stale_count}")
+        return price_debug
 
     def build_returns_matrix(
         self,
@@ -4906,7 +5427,10 @@ class PaperTradingEngine:
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         execution_config = self.config.get('execution', {})
-        cooldown_minutes = execution_config.get('rebalance_cooldown_minutes', 0)
+        cooldown_minutes = float(execution_config.get('rebalance_cooldown_minutes', 0) or 0)
+        attempt_cooldown_minutes = float(
+            execution_config.get('rebalance_attempt_cooldown_minutes', cooldown_minutes) or cooldown_minutes
+        )
         min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
         enable_exit_signals = bool(execution_config.get('enable_exit_signals', True))
         exit_signal_action = str(execution_config.get('exit_signal_action', 'reduce')).lower()
@@ -4954,11 +5478,74 @@ class PaperTradingEngine:
             'impact': 0.0,
             'num_trades': 0
         }
-        
-        if cooldown_minutes > 0 and self.last_rebalance_time is not None:
-            time_since_last = (datetime.now() - self.last_rebalance_time).total_seconds() / 60
+
+        now_rebalance = self._now()
+        session, gate = self._refresh_market_session_state(now_rebalance)
+        session_state = str((session or {}).get('state', 'UNKNOWN')).upper() if isinstance(session, dict) else 'UNKNOWN'
+        open_grace_passed = bool((session or {}).get('open_grace_passed', False)) if isinstance(session, dict) else False
+        if not bool(gate.get('allowed', False)):
+            self.current_stale_info = {
+                'stale_count': 0,
+                'stale_ratio': 0.0,
+                'price_stale_skip': False,
+                'price_stale_abort': False,
+                'stale_candidate_count': 0,
+                'stale_ratio_candidates': 0.0,
+                'stale_candidate_count_policy_pass': 0,
+                'stale_ratio_candidates_policy_pass': 0.0,
+                'stale_candidates_policy_pass': {'stale': 0, 'total': 0},
+                'decision_trace': f"market_closed_gate_{session_state}"
+            }
+            self.current_turnover_info = {
+                'turnover_notional': 0.0,
+                'turnover_notional_pre': 0.0,
+                'turnover_notional_post': 0.0,
+                'turnover_limit': 0.0,
+                'turnover_scale': 1.0,
+                'turnover_capped': False
+            }
+            self.current_planner_info = {
+                'enabled': bool(planner_cfg.get('enable_trade_planner', False)),
+                'status': 'skipped_market_closed_gate',
+                'turnover_limit': 0.0,
+                'turnover_used_forced': 0.0,
+                'turnover_used_normal': 0.0,
+                'turnover_used_total': 0.0,
+                'num_forced': 0,
+                'num_normal': 0,
+                'num_dropped': 0,
+                'dropped': [],
+                'scaled': []
+            }
+            if isinstance(self.current_risk_check_info, dict):
+                self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
+            self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
+            print(f"[GATE] Rebalance skipped: market_closed_gate (session={session_state})")
+            return []
+
+        if attempt_cooldown_minutes > 0 and self.last_rebalance_attempt_time is not None:
+            time_since_attempt = (now_rebalance - self.last_rebalance_attempt_time).total_seconds() / 60
+            if time_since_attempt < attempt_cooldown_minutes:
+                remaining = attempt_cooldown_minutes - time_since_attempt
+                self.current_rebalance_skipped_reason = 'attempt_cooldown'
+                if not isinstance(self.current_stale_info, dict):
+                    self.current_stale_info = {}
+                self.current_stale_info['price_stale_abort'] = False
+                self.current_stale_info['decision_trace'] = 'attempt_cooldown'
+                self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
+                print(f"[ATTEMPT COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
+                self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_attempt_cooldown")
+                return []
+
+        # Count this as an attempt even if later aborted by stale/risk filters.
+        self.last_rebalance_attempt_time = now_rebalance
+
+        last_success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
+        if cooldown_minutes > 0 and last_success_ref is not None:
+            time_since_last = (now_rebalance - last_success_ref).total_seconds() / 60
             if time_since_last < cooldown_minutes:
                 remaining = cooldown_minutes - time_since_last
+                self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
                 print(f"[COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
                 return []
         
@@ -4970,20 +5557,25 @@ class PaperTradingEngine:
         allow_sell_status = {s.upper() for s in stale_policy_cfg.get('allow_sell', ['LIVE', 'RECENT', 'STALE'])}
         
         price_info = {}  # {ticker: (price, data_age_minutes, market_status)}
+        price_debug_cache = {}
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         for ticker in self.positions.keys():
-            price, age, status = self.get_current_price(ticker)
+            price, age, status, dbg = self.get_current_price(ticker, return_debug=True)
             if price is not None:
                 price_info[ticker] = (price, age, status)
+            if isinstance(dbg, dict):
+                price_debug_cache[str(ticker).upper()] = dbg
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         for ticker in target_weights.keys():
             if ticker == 'CASH' or ticker in price_info:
                 continue
-            price, age, status = self.get_current_price(ticker)
+            price, age, status, dbg = self.get_current_price(ticker, return_debug=True)
             if price is not None:
                 price_info[ticker] = (price, age, status)
+            if isinstance(dbg, dict):
+                price_debug_cache[str(ticker).upper()] = dbg
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         stale_count = 0
@@ -5007,6 +5599,11 @@ class PaperTradingEngine:
             'stale_ratio': stale_ratio,
             'price_stale_skip': False,
             'price_stale_abort': False,
+            'stale_candidate_count': 0,
+            'stale_ratio_candidates': 0.0,
+            'stale_candidate_count_policy_pass': 0,
+            'stale_ratio_candidates_policy_pass': 0.0,
+            'stale_candidates_policy_pass': {'stale': 0, 'total': 0},
             'decision_trace': ''
         }
         
@@ -5111,9 +5708,9 @@ class PaperTradingEngine:
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         
         planned_trades = []  # [{ticker, side, current_value, target_value, desired_trade_value, price, age, status}]
-        stale_candidate_count = 0  # NOTE: comment omitted (was garbled/non-ASCII).
+        stale_count_policy_pass = 0
+        candidate_count_policy_pass = 0
         policy_skip_count = 0  # NOTE: comment omitted (was garbled/non-ASCII).
-        candidate_count = 0
         
         for ticker in tickers_to_trade:
             current_value = current_values.get(ticker, 0.0)
@@ -5149,9 +5746,6 @@ class PaperTradingEngine:
             price, age, status = price_info[ticker]
             
             status = str(status).upper()
-            candidate_count += 1
-            if status == "STALE" and age > stale_price_skip_minutes:
-                stale_candidate_count += 1
 
             # NOTE: comment omitted (was garbled/non-ASCII).
             if side == 'BUY' and status not in allow_buy_status:
@@ -5162,6 +5756,11 @@ class PaperTradingEngine:
                 policy_skip_count += 1
                 print(f"[SKIP] {ticker} SELL status={status} not in allow_sell={sorted(allow_sell_status)}")
                 continue
+
+            # Candidate for stale-ratio only after policy pass.
+            candidate_count_policy_pass += 1
+            if status == "STALE" and age > stale_price_skip_minutes:
+                stale_count_policy_pass += 1
 
             if status == "STALE" and side == 'SELL':
                 print(f"[ALLOW] {ticker} SELL on STALE price (age: {age:.0f}min) - policy allowed")
@@ -5194,15 +5793,28 @@ class PaperTradingEngine:
         if self.current_holding_blocks:
             blocked_str = ", ".join([f"{x['ticker']}({x['remaining_cycles']})" for x in self.current_holding_blocks])
             print(f"[HOLDING] Blocked by minimum holding period: {blocked_str}")
+
+        self._update_cycle_price_debug(
+            candidate_tickers=tickers_to_trade,
+            planned_trades=planned_trades,
+            price_debug_cache=price_debug_cache,
+        )
         
         # NOTE: comment omitted (was garbled/non-ASCII).
-        stale_ratio_candidates = stale_candidate_count / candidate_count if candidate_count > 0 else 0
+        stale_ratio_candidates = (
+            stale_count_policy_pass / candidate_count_policy_pass if candidate_count_policy_pass > 0 else 0.0
+        )
+        stale_abort_allowed = bool(session_state == 'OPEN' and open_grace_passed)
         
-        print(f"\n[STALE CHECK] Candidate tickers: {candidate_count}, STALE: {stale_candidate_count}, Ratio: {stale_ratio_candidates:.1%}")
+        print(
+            f"\n[STALE CHECK] Policy-pass candidates: {candidate_count_policy_pass}, "
+            f"STALE: {stale_count_policy_pass}, Ratio: {stale_ratio_candidates:.1%} "
+            f"(abort_allowed={str(stale_abort_allowed).lower()}, session={session_state})"
+        )
         
-        if stale_ratio_candidates > max_stale_ratio:
+        if stale_abort_allowed and candidate_count_policy_pass > 0 and stale_ratio_candidates > max_stale_ratio:
             print(f"[STALE ABORT] STALE ratio {stale_ratio_candidates:.1%} > threshold {max_stale_ratio:.1%}, aborting rebalance")
-            if candidate_count > 0 and stale_candidate_count == candidate_count:
+            if stale_count_policy_pass == candidate_count_policy_pass:
                 print("[INFO] All candidate trades depend on STALE prices. "
                       "This typically happens when market is closed or data is delayed.")
             abort_trace = f"stale_abort_ratio_{stale_ratio_candidates:.1%}_gt_{max_stale_ratio:.1%}"
@@ -5212,7 +5824,11 @@ class PaperTradingEngine:
                 'stale_ratio': stale_ratio,
                 'price_stale_skip': policy_skip_count > 0,
                 'price_stale_abort': True,  # NOTE: comment omitted (was garbled/non-ASCII).
+                'stale_candidate_count': candidate_count_policy_pass,
                 'stale_ratio_candidates': stale_ratio_candidates,
+                'stale_candidate_count_policy_pass': candidate_count_policy_pass,
+                'stale_ratio_candidates_policy_pass': stale_ratio_candidates,
+                'stale_candidates_policy_pass': {'stale': stale_count_policy_pass, 'total': candidate_count_policy_pass},
                 'decision_trace': abort_trace
             }
             self.current_turnover_info = {
@@ -5240,13 +5856,25 @@ class PaperTradingEngine:
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             print(f"[DECISION] {abort_trace}")
             return []
+        elif candidate_count_policy_pass == 0:
+            print("[STALE CHECK] Skip stale-abort: no policy-pass tradable candidates.")
+        elif not stale_abort_allowed:
+            print(f"[STALE CHECK] Skip stale-abort outside tradable session (state={session_state}, open_grace={open_grace_passed}).")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_stale_info['price_stale_skip'] = policy_skip_count > 0
         self.current_stale_info['price_stale_abort'] = False
-        self.current_stale_info['stale_candidate_count'] = stale_candidate_count
+        self.current_stale_info['stale_candidate_count'] = candidate_count_policy_pass
         self.current_stale_info['stale_ratio_candidates'] = stale_ratio_candidates
-        self.current_stale_info['decision_trace'] = f"stale_ok_{stale_ratio_candidates:.1%}_le_{max_stale_ratio:.1%}"
+        self.current_stale_info['stale_candidate_count_policy_pass'] = candidate_count_policy_pass
+        self.current_stale_info['stale_ratio_candidates_policy_pass'] = stale_ratio_candidates
+        self.current_stale_info['stale_candidates_policy_pass'] = {'stale': stale_count_policy_pass, 'total': candidate_count_policy_pass}
+        if candidate_count_policy_pass == 0:
+            self.current_stale_info['decision_trace'] = "stale_skip_no_policy_pass_candidates"
+        elif not stale_abort_allowed:
+            self.current_stale_info['decision_trace'] = f"stale_skip_session_{session_state}"
+        else:
+            self.current_stale_info['decision_trace'] = f"stale_ok_{stale_ratio_candidates:.1%}_le_{max_stale_ratio:.1%}"
 
         risk_gate = self._evaluate_portfolio_risk_gate(target_weights)
         risk_gate['checked'] = True
@@ -5563,6 +6191,7 @@ class PaperTradingEngine:
                 'timestamp': datetime.now().isoformat(),
                 'account_id': self.account_id,
                 'session_id': self.session_id,
+                'config_hash': self.config_hash,
                 'env': self.runtime_env,
                 'cycle': self.current_cycle,
                 'ticker': ticker,
@@ -5685,6 +6314,7 @@ class PaperTradingEngine:
                 'timestamp': datetime.now().isoformat(),
                 'account_id': self.account_id,
                 'session_id': self.session_id,
+                'config_hash': self.config_hash,
                 'env': self.runtime_env,
                 'cycle': self.current_cycle,
                 'ticker': ticker,
@@ -5787,7 +6417,8 @@ class PaperTradingEngine:
         if trades:
             self.trades_log.extend(trades)
             self.save_trades_immediately()
-            self.last_rebalance_time = datetime.now()  # NOTE: comment omitted (was garbled/non-ASCII).
+            self.last_rebalance_success_time = self._now()
+            self.last_rebalance_time = self.last_rebalance_success_time  # backward compatibility
             print(f"[COOLDOWN] Next rebalance allowed after {cooldown_minutes} minutes")
             self._write_post_rebalance_live_snapshot(len(trades), source="execute_rebalance")
         else:
@@ -6068,6 +6699,7 @@ class PaperTradingEngine:
                 'timestamp': now.isoformat(),
                 'account_id': self.account_id,
                 'session_id': self.session_id,
+                'config_hash': self.config_hash,
                 'env': self.runtime_env,
                 'ticker': h['ticker'],
                 'side': 'SELL',
@@ -6145,7 +6777,8 @@ class PaperTradingEngine:
         if trades:
             self.trades_log.extend(trades)
             self.save_trades_immediately()
-            self.last_rebalance_time = now
+            self.last_rebalance_success_time = now
+            self.last_rebalance_time = self.last_rebalance_success_time  # backward compatibility
             self._write_post_rebalance_live_snapshot(len(trades), source="circuit_breaker")
 
         print(f"[CIRCUIT] Forced risk-off active until {self.forced_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -6205,6 +6838,9 @@ class PaperTradingEngine:
         
         total_return = (total_equity - self.initial_cash) / self.initial_cash
         drawdown = (self.peak_equity - total_equity) / self.peak_equity if self.peak_equity > 0 else 0
+        last_attempt_time = self.last_rebalance_attempt_time.isoformat() if isinstance(self.last_rebalance_attempt_time, datetime) else self.last_rebalance_attempt_time
+        success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
+        last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         bench_returns = {}
@@ -6228,6 +6864,10 @@ class PaperTradingEngine:
         
         snapshot = {
             'timestamp': datetime.now().isoformat(),
+            'account_id': self.account_id,
+            'session_id': self.session_id,
+            'env': self.runtime_env,
+            'config_hash': self.config_hash,
             'cycle': self.current_cycle,
             'cash': self.cash,
             'positions_value': positions_value,
@@ -6240,6 +6880,12 @@ class PaperTradingEngine:
             'macro_reused': self.current_macro_reused,
             'last_signal_time': self.last_signal_time.isoformat() if self.last_signal_time else None,
             'last_macro_time': self.last_macro_time.isoformat() if self.last_macro_time else None,
+            'market_session': dict(self.current_market_session) if isinstance(self.current_market_session, dict) else {},
+            'rebalance_gate': dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {},
+            'rebalance_skipped_reason': self.current_rebalance_skipped_reason,
+            'price_debug': dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {},
+            'last_rebalance_attempt_time': last_attempt_time,
+            'last_rebalance_success_time': last_success_time,
             # NOTE: comment omitted (was garbled/non-ASCII).
             'bench_returns': bench_returns,
             'bench_avg_return': bench_avg_return,
@@ -6281,6 +6927,12 @@ class PaperTradingEngine:
             'price_stale_abort': self.current_stale_info.get('price_stale_abort', False),  # NOTE: comment omitted (was garbled/non-ASCII).
             'stale_candidate_count': self.current_stale_info.get('stale_candidate_count', 0),  # NOTE: comment omitted (was garbled/non-ASCII).
             'stale_ratio_candidates': self.current_stale_info.get('stale_ratio_candidates', 0.0),  # NOTE: comment omitted (was garbled/non-ASCII).
+            'stale_candidate_count_policy_pass': self.current_stale_info.get('stale_candidate_count_policy_pass', self.current_stale_info.get('stale_candidate_count', 0)),
+            'stale_ratio_candidates_policy_pass': self.current_stale_info.get('stale_ratio_candidates_policy_pass', self.current_stale_info.get('stale_ratio_candidates', 0.0)),
+            'stale_candidates_policy_pass': self.current_stale_info.get('stale_candidates_policy_pass', {
+                'stale': self.current_stale_info.get('stale_candidate_count', 0),
+                'total': self.current_stale_info.get('stale_candidate_count', 0)
+            }),
             'stale_decision_trace': self.current_stale_info.get('decision_trace', ''),
             'exit_signals_enabled': self.current_exit_info.get('enabled', False),
             'exit_signals_triggered': self.current_exit_info.get('triggered_count', 0),
@@ -6637,6 +7289,7 @@ class PaperTradingEngine:
         print(f"{'='*60}")
 
         now = datetime.now()
+        self._refresh_market_session_state(now)
 
         # Macro refresh decoupling
         if self.last_macro_time is None:
@@ -6730,7 +7383,13 @@ class PaperTradingEngine:
             for trade in trades:
                 print(f"  {trade['side']} {trade['quantity']} {trade['ticker']} @ ${trade['price']:.2f} (cost: ${trade['cost']:.2f})")
         else:
-            print("No trades executed (portfolio already balanced)")
+            if self.current_rebalance_skipped_reason == 'market_closed_gate':
+                session_state = str((self.current_rebalance_gate or {}).get('session_state', 'UNKNOWN')).upper() if isinstance(self.current_rebalance_gate, dict) else 'UNKNOWN'
+                print(f"No trades executed (market_closed_gate, session={session_state})")
+            elif self.current_rebalance_skipped_reason == 'attempt_cooldown':
+                print("No trades executed (attempt_cooldown)")
+            else:
+                print("No trades executed (portfolio already balanced)")
 
         self.current_cycle += 1
 
@@ -6747,7 +7406,7 @@ class PaperTradingEngine:
         print("="*60)
         print("ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v2.11.3-2026-02-09")
+        print(f"ENGINE_VERSION: v3.1.2-2026-02-10")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -7170,6 +7829,373 @@ def debug_run_planner_once(config_path: str = "paper_config.json", turnover_limi
     }
 
 
+def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "outputs/gw_dryrun", turnover_limit: float | None = None) -> int:
+    """Offline deterministic acceptance dry-run for S1..S5."""
+    pass_count = 0
+    fail_count = 0
+
+    def _check(check_id: str, condition: bool, message: str):
+        nonlocal pass_count, fail_count
+        if bool(condition):
+            pass_count += 1
+            print(f"[PASS] {check_id} {message}")
+        else:
+            fail_count += 1
+            print(f"[FAIL] {check_id} {message}")
+
+    outdir_abs = os.path.abspath(str(outdir or "outputs/gw_dryrun"))
+    if os.path.exists(outdir_abs):
+        shutil.rmtree(outdir_abs, ignore_errors=True)
+    os.makedirs(outdir_abs, exist_ok=True)
+
+    base_path = str(config_path or "paper_config.json")
+    if os.path.exists(base_path):
+        with open(base_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    else:
+        cfg = {}
+
+    cfg.setdefault("paper_mode", True)
+    cfg.setdefault("safety", {})
+    cfg["safety"].setdefault("no_real_broker", True)
+    cfg["safety"].setdefault("simulation_only", True)
+    cfg["safety"].setdefault("random_seed", 42)
+    cfg.setdefault("initial_cash_usd", 30000.0)
+    cfg.setdefault("duration_hours", 1)
+    cfg.setdefault("rebalance_minutes", 1)
+    cfg.setdefault("universe", ["AAA", "BBB", "CCC"])
+    cfg.setdefault("strategy", {"lookback_days": 40})
+    cfg.setdefault("benchmarks", {"tickers": [], "evaluation_days": 10})
+    cfg["benchmarks"]["tickers"] = []
+
+    obj = cfg.setdefault("objectives", {})
+    obj.setdefault("min_cash_pct", 0.05)
+    obj.setdefault("max_weight_per_asset", 0.5)
+    obj.setdefault("max_drawdown_pct", 0.50)
+    obj.setdefault("transaction_cost_pct", 0.001)
+
+    execution_cfg = cfg.setdefault("execution", {})
+    execution_cfg["rebalance_cooldown_minutes"] = 0
+    execution_cfg["rebalance_attempt_cooldown_minutes"] = 10
+    execution_cfg["max_stale_ratio"] = 0.3
+    execution_cfg["stale_price_skip_minutes"] = 60
+    execution_cfg["min_trade_notional_usd"] = 1
+    execution_cfg["weight_threshold"] = 0.0
+    execution_cfg["enable_exit_signals"] = False
+    execution_cfg["max_turnover_pct_per_rebalance"] = 1.0
+    execution_cfg["max_portfolio_volatility"] = 999.0
+    execution_cfg["portfolio_vol_min_coverage"] = 1.0
+    execution_cfg["enable_diversity_check"] = False
+    if turnover_limit is not None:
+        try:
+            eq = float(cfg.get("initial_cash_usd", 30000.0) or 30000.0)
+            execution_cfg["max_turnover_pct_per_rebalance"] = max(0.0, float(turnover_limit) / max(eq, 1.0))
+        except Exception:
+            pass
+    stale_policy = execution_cfg.setdefault("price_stale_policy", {})
+    stale_policy["allow_buy"] = ["LIVE", "RECENT"]
+    stale_policy["allow_sell"] = ["LIVE", "RECENT", "STALE"]
+
+    macro_cfg = cfg.setdefault("macro_integration", {})
+    macro_cfg["enabled"] = False
+    macro_cfg["enable_llm_topic_signals"] = False
+
+    risk_cfg = cfg.setdefault("risk_model", {})
+    risk_cfg["enable_cov_diagnostics"] = False
+    risk_cfg["use_cov_vol_for_gate"] = False
+
+    reporting_cfg = cfg.setdefault("reporting", {})
+    reporting_cfg["snapshot_live_path"] = os.path.join(outdir_abs, "snapshot_live.json")
+    reporting_cfg["trade_history_path"] = os.path.join(outdir_abs, "trade_history.jsonl")
+    reporting_cfg["trades_log_path"] = os.path.join(outdir_abs, "paper_trades.csv")
+    reporting_cfg["portfolio_snapshots_path"] = os.path.join(outdir_abs, "portfolio_snapshots.jsonl")
+    reporting_cfg["summary_report_path"] = os.path.join(outdir_abs, "paper_summary.txt")
+    reporting_cfg["equity_curve_path"] = os.path.join(outdir_abs, "equity_curve.png")
+    reporting_cfg["scoreboard_path"] = os.path.join(outdir_abs, "scoreboard.jsonl")
+    reporting_cfg["daily_report_dirs"] = [os.path.join(outdir_abs, "Daily Report")]
+    reporting_cfg["max_price_debug_items"] = 50
+    reporting_cfg["account_id"] = "paper_main"
+    reporting_cfg["env"] = "live"
+
+    dryrun_config_path = os.path.join(outdir_abs, "dryrun_config.json")
+    with open(dryrun_config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+    old_checkpoint_env = os.environ.get("GW_CHECKPOINT_ACTION")
+    old_session_env = os.environ.get("GW_SESSION_ID")
+    os.environ["GW_CHECKPOINT_ACTION"] = "fresh"
+    os.environ["GW_SESSION_ID"] = "DRYRUN-S1S5"
+    try:
+        engine = PaperTradingEngine(dryrun_config_path)
+    finally:
+        if old_checkpoint_env is None:
+            os.environ.pop("GW_CHECKPOINT_ACTION", None)
+        else:
+            os.environ["GW_CHECKPOINT_ACTION"] = old_checkpoint_env
+        if old_session_env is None:
+            os.environ.pop("GW_SESSION_ID", None)
+        else:
+            os.environ["GW_SESSION_ID"] = old_session_env
+
+    engine.set_market_data_fetcher(lambda *args, **kwargs: None)
+
+    def _risk_gate_stub(target_weights):
+        invested_budget = 0.0
+        if isinstance(target_weights, dict):
+            invested_budget = float(sum(float(v) for k, v in target_weights.items() if str(k).upper() != "CASH"))
+        return {
+            "abort": False,
+            "abort_reason": "",
+            "weighted_volatility": 0.0,
+            "max_portfolio_volatility": 999.0,
+            "volatility_known_weight": 0.0,
+            "volatility_confident": False,
+            "min_coverage": 1.0,
+            "enable_diversity_check": False,
+            "herfindahl_index": 0.0,
+            "max_herfindahl_index": 1.0,
+            "invested_budget": invested_budget,
+            "asset_volatility_map": {},
+            "cov_risk_diag": {"enabled": False, "status": "disabled"},
+            "gate_vol_method": "weighted_fallback",
+            "cov_gate_used": False,
+            "cov_gate_coverage": None,
+            "cov_gate_vol": None,
+            "cov_gate_max_rc": None,
+            "cov_gate_pass": None,
+            "cov_gate_reason": "disabled",
+            "rc_limit": 1.0,
+            "min_cov_gate_coverage": 1.0,
+            "use_cov_vol_for_gate": False,
+            "cov_gate_fallback_to_weighted": True,
+        }
+
+    engine._evaluate_portfolio_risk_gate = _risk_gate_stub
+
+    class StubPriceProvider:
+        def __init__(self):
+            self.mode = "live_buy"
+            self.base_now = datetime(2026, 2, 10, 15, 30, tzinfo=timezone.utc)
+
+        def set_mode(self, mode):
+            self.mode = str(mode or "live_buy")
+
+        def _mk_debug(self, ticker, status, age_min, source, tz_ok=True, notes=None):
+            age_val = float(age_min) if age_min is not None else 0.0
+            price_ts = (self.base_now - timedelta(minutes=age_val)).isoformat()
+            return {
+                "ticker": str(ticker).upper(),
+                "now_ts": self.base_now.isoformat(),
+                "status": str(status).upper(),
+                "age_min": float(age_min) if age_min is not None else None,
+                "source": str(source),
+                "price_ts": price_ts,
+                "tz_ok": bool(tz_ok),
+                "thresholds": {"live_max_min": 10.0, "recent_max_min": 60.0},
+                "notes": notes,
+                "bar_interval": "1m",
+                "raw_price_ts": price_ts,
+                "raw_tz": "UTC",
+            }
+
+        def __call__(self, ticker=None, **kwargs):
+            t = str((ticker if ticker is not None else kwargs.get("ticker", ""))).upper()
+            if not t:
+                t = "UNKNOWN"
+
+            if self.mode in ("stale_buy", "stale_sell"):
+                price = {"AAA": 100.0, "BBB": 110.0, "CCC": 120.0}.get(t, 90.0)
+                notes = "naive_ts_detected;localized_assumption=America/New_York" if t == "AAA" else None
+                tz_ok = False if t == "AAA" else True
+                dbg = self._mk_debug(t, "STALE", 180.0, "stub_stale", tz_ok=tz_ok, notes=notes)
+                return (price, 180.0, "STALE", dbg)
+
+            if self.mode == "live_buy":
+                price = {"AAA": 100.0, "BBB": 110.0, "CCC": 120.0}.get(t, 95.0)
+                dbg = self._mk_debug(t, "LIVE", 1.0, "stub_live", tz_ok=True, notes=None)
+                return (price, 1.0, "LIVE", dbg)
+
+            dbg = self._mk_debug(t, "MISSING", None, "stub_missing", tz_ok=False, notes="missing")
+            return (None, 99999.0, "MISSING", dbg)
+
+    provider = StubPriceProvider()
+    engine.set_price_fetcher(provider)
+
+    now_holder = {"value": datetime(2026, 2, 10, 8, 0, 0)}
+    engine._debug_now_override = lambda: now_holder["value"]
+
+    def _make_session(state, open_grace_passed=False, close_grace_passed=False):
+        now_local = now_holder["value"]
+        if now_local.tzinfo is None:
+            now_local = now_local.replace(tzinfo=timezone.utc)
+        return {
+            "state": str(state),
+            "now_et": now_local.isoformat(),
+            "trading_date_et": "2026-02-10",
+            "last_completed_trading_date_et": "2026-02-09",
+            "open_grace_passed": bool(open_grace_passed),
+            "close_grace_passed": bool(close_grace_passed),
+            "open_grace_min": 15,
+            "close_grace_min": 10,
+        }
+
+    def _run_case(*, session, mode, positions, cash, target_weights):
+        engine._debug_session_override = dict(session)
+        provider.set_mode(mode)
+        engine.positions = {str(k).upper(): int(v) for k, v in (positions or {}).items() if int(v) > 0}
+        engine.cash = float(cash)
+        for t in list(engine.positions.keys()):
+            engine.cost_basis.setdefault(t, 100.0)
+        trades = engine.execute_rebalance(dict(target_weights))
+        snapshot = engine.record_snapshot()
+        engine.save_trade_history_jsonl()
+        return trades, snapshot
+
+    # CASE-1 PRE_OPEN
+    now_holder["value"] = datetime(2026, 2, 10, 5, 0, 0)
+    attempt_before_c1 = engine.last_rebalance_attempt_time
+    trades1, snap1 = _run_case(
+        session=_make_session("PRE_OPEN", open_grace_passed=False),
+        mode="live_buy",
+        positions={},
+        cash=30000.0,
+        target_weights={"AAA": 0.5, "CASH": 0.5},
+    )
+    _check("CASE1-A", trades1 == [], "PRE_OPEN does not trade")
+    _check("CASE1-B", snap1.get("rebalance_skipped_reason") == "market_closed_gate", "PRE_OPEN skip reason is market_closed_gate")
+    _check("CASE1-C", "stale_abort" not in str(snap1.get("stale_decision_trace", "")), "PRE_OPEN does not stale-abort")
+    _check("CASE1-D", engine.last_rebalance_attempt_time == attempt_before_c1, "PRE_OPEN does not update attempt timestamp")
+
+    # CASE-2 OPEN + no grace
+    now_holder["value"] = datetime(2026, 2, 10, 9, 35, 0)
+    attempt_before_c2 = engine.last_rebalance_attempt_time
+    trades2, snap2 = _run_case(
+        session=_make_session("OPEN", open_grace_passed=False),
+        mode="live_buy",
+        positions={},
+        cash=30000.0,
+        target_weights={"AAA": 0.5, "CASH": 0.5},
+    )
+    _check("CASE2-A", trades2 == [], "OPEN pre-grace does not trade")
+    _check("CASE2-B", snap2.get("rebalance_skipped_reason") == "market_closed_gate", "OPEN pre-grace skip reason is market_closed_gate")
+    _check("CASE2-C", "stale_abort" not in str(snap2.get("stale_decision_trace", "")), "OPEN pre-grace does not stale-abort")
+    _check("CASE2-D", engine.last_rebalance_attempt_time == attempt_before_c2, "OPEN pre-grace does not update attempt timestamp")
+
+    # CASE-3 OPEN + grace, BUY candidates all STALE but policy blocks them.
+    now_holder["value"] = datetime(2026, 2, 10, 10, 30, 0)
+    trades3, snap3 = _run_case(
+        session=_make_session("OPEN", open_grace_passed=True),
+        mode="stale_buy",
+        positions={},
+        cash=30000.0,
+        target_weights={"AAA": 0.34, "BBB": 0.33, "CCC": 0.33, "CASH": 0.0},
+    )
+    policy_total_c3 = int(snap3.get("stale_candidate_count_policy_pass", (snap3.get("stale_candidates_policy_pass", {}) or {}).get("total", 0)) or 0)
+    policy_ratio_c3 = float(snap3.get("stale_ratio_candidates_policy_pass", 0.0) or 0.0)
+    _check("CASE3-A", trades3 == [], "STALE BUY candidates are skipped by policy")
+    _check("CASE3-B", (policy_total_c3 == 0 or abs(policy_ratio_c3) <= 1e-9), "policy-pass stale denominator is zero (or ratio zero)")
+    _check("CASE3-C", "stale_abort" not in str(snap3.get("stale_decision_trace", "")), "no stale-abort when no policy-pass candidates")
+    _check("CASE3-D", isinstance(snap3.get("stale_candidates_policy_pass"), dict), "snapshot contains stale_candidates_policy_pass")
+
+    # CASE-4 OPEN + grace, SELL candidates all STALE and policy allows STALE -> stale-abort.
+    now_holder["value"] = datetime(2026, 2, 10, 10, 50, 0)
+    trades4, snap4 = _run_case(
+        session=_make_session("OPEN", open_grace_passed=True),
+        mode="stale_sell",
+        positions={"AAA": 50, "BBB": 40, "CCC": 30},
+        cash=1000.0,
+        target_weights={"AAA": 0.0, "BBB": 0.0, "CCC": 0.0, "CASH": 1.0},
+    )
+    attempt_after_c4 = engine.last_rebalance_attempt_time
+    _check("CASE4-A", trades4 == [], "stale-abort returns no trades")
+    _check("CASE4-B", "stale_abort" in str(snap4.get("stale_decision_trace", "")), "stale-abort trigger recorded")
+    _check("CASE4-C", abs(float(snap4.get("stale_ratio_candidates_policy_pass", 0.0) or 0.0) - 1.0) <= 1e-9, "policy-pass stale ratio equals 1.0")
+
+    # CASE-5 immediate retry should be blocked by attempt cooldown.
+    now_holder["value"] = datetime(2026, 2, 10, 10, 50, 0)
+    trades5, snap5 = _run_case(
+        session=_make_session("OPEN", open_grace_passed=True),
+        mode="stale_sell",
+        positions={"AAA": 50, "BBB": 40, "CCC": 30},
+        cash=1000.0,
+        target_weights={"AAA": 0.0, "BBB": 0.0, "CCC": 0.0, "CASH": 1.0},
+    )
+    _check("CASE5-A", trades5 == [], "attempt cooldown returns no trades")
+    _check("CASE5-B", snap5.get("rebalance_skipped_reason") == "attempt_cooldown", "attempt cooldown skip reason recorded")
+    _check("CASE5-C", engine.last_rebalance_attempt_time == attempt_after_c4, "attempt timestamp unchanged when blocked by attempt cooldown")
+    _check("CASE5-D", "stale_abort" not in str(snap5.get("stale_decision_trace", "")), "attempt cooldown path is not stale-abort")
+
+    # CASE-6 optional executed trade (for trade-level identity fields).
+    now_holder["value"] = datetime(2026, 2, 10, 11, 5, 0)
+    trades6, _snap6 = _run_case(
+        session=_make_session("OPEN", open_grace_passed=True),
+        mode="live_buy",
+        positions={},
+        cash=30000.0,
+        target_weights={"AAA": 0.5, "CASH": 0.5},
+    )
+    _check("CASE6-A", isinstance(trades6, list), "execution case ran deterministically")
+
+    # S3 checks.
+    for idx, snap in enumerate([snap1, snap2, snap3, snap4, snap5], start=1):
+        _check(f"S3-{idx}A", isinstance(snap.get("price_debug"), dict), f"case-{idx} snapshot has price_debug dict")
+    sample_dbg = None
+    if isinstance(snap3.get("price_debug"), dict):
+        sample_dbg = snap3.get("price_debug", {}).get("AAA")
+        if sample_dbg is None and snap3.get("price_debug"):
+            sample_dbg = next(iter(snap3.get("price_debug", {}).values()))
+    required_fields = ["ticker", "now_ts", "status", "age_min", "source", "price_ts", "tz_ok", "thresholds"]
+    _check("S3-B", isinstance(sample_dbg, dict) and all(k in sample_dbg for k in required_fields), "price_debug contains required fields")
+    now_ts = str((sample_dbg or {}).get("now_ts", ""))
+    price_ts = str((sample_dbg or {}).get("price_ts", ""))
+    _check("S3-C", (("+" in now_ts or now_ts.endswith("Z")) and ("+" in price_ts or price_ts.endswith("Z"))), "price_debug timestamps are timezone-aware ISO")
+    _check("S3-D", isinstance(sample_dbg, dict) and (sample_dbg.get("tz_ok") is False) and ("naive_ts_detected" in str(sample_dbg.get("notes", ""))), "tz_ok=false branch captured")
+
+    # S5 checks.
+    snapshot_path = reporting_cfg["snapshot_live_path"]
+    trade_history_path = reporting_cfg["trade_history_path"]
+    _check("S5-A", os.path.exists(snapshot_path), "snapshot_live.json exists")
+    _check("S5-B", os.path.exists(trade_history_path), "trade_history.jsonl exists")
+
+    parsed_snapshot = None
+    try:
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            parsed_snapshot = json.load(f)
+        snapshot_parse_ok = True
+    except Exception:
+        snapshot_parse_ok = False
+    _check("S5-C", snapshot_parse_ok, "snapshot_live.json parseable via json.load")
+
+    parsed_trade_rows = []
+    trade_parse_ok = True
+    try:
+        with open(trade_history_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                parsed_trade_rows.append(json.loads(line_s))
+    except Exception:
+        trade_parse_ok = False
+    _check("S5-D", trade_parse_ok, "trade_history.jsonl parseable line-by-line")
+
+    _check(
+        "S5-E",
+        isinstance(parsed_snapshot, dict) and bool(parsed_snapshot.get("session_id")) and bool(parsed_snapshot.get("config_hash")),
+        "snapshot includes session_id and config_hash",
+    )
+    if parsed_trade_rows:
+        first_trade = parsed_trade_rows[0]
+        _check(
+            "S5-F",
+            isinstance(first_trade, dict) and bool(first_trade.get("session_id")) and bool(first_trade.get("config_hash")),
+            "trade rows include session_id and config_hash",
+        )
+
+    print(f"DRYRUN_SUMMARY pass={pass_count} fail={fail_count}")
+    return 1 if fail_count > 0 else 0
+
+
 def main():
     """def main: docstring omitted (was garbled/non-ASCII)."""
     parser = argparse.ArgumentParser(description="Paper trading engine")
@@ -7185,22 +8211,41 @@ def main():
         default=None,
         help="Optional absolute turnover limit for planner dry-run.",
     )
+    parser.add_argument(
+        "--debug-system-s1-5",
+        action="store_true",
+        help="Run offline deterministic S1..S5 acceptance dry-run and exit.",
+    )
+    parser.add_argument(
+        "--debug-outdir",
+        type=str,
+        default="outputs/gw_dryrun",
+        help="Output directory for --debug-system-s1-5 artifacts.",
+    )
     args = parser.parse_args()
 
     debug_env = str(os.environ.get("GW_DEBUG_PLANNER_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
+    debug_system_env = str(os.environ.get("GW_DEBUG_SYSTEM_S1_5", "")).strip().lower() in ("1", "true", "yes", "on")
     if bool(args.debug_planner_once or debug_env):
         debug_run_planner_once(args.config_path, turnover_limit=args.debug_turnover_limit)
-        return
+        return 0
+    if bool(args.debug_system_s1_5 or debug_system_env):
+        return debug_run_system_s1_s5(
+            config_path=args.config_path,
+            outdir=args.debug_outdir,
+            turnover_limit=args.debug_turnover_limit,
+        )
 
     config_path = args.config_path
     print(f"Loading config: {config_path}")
 
     engine = PaperTradingEngine(config_path)
     engine.run()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
 
 
 
