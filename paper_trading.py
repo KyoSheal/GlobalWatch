@@ -853,6 +853,20 @@ class PaperTradingEngine:
             'impact': 0.0,
             'num_trades': 0
         }
+        self.current_news_overlay_info = {
+            'enabled': False,
+            'status': 'disabled',
+            'mode': 'risk_only',
+            'alpha': 0.08,
+            'applied_cash_delta': 0.0,
+            'worst_l2': None,
+            'worst_delta': 0.0,
+            'used_signals': 0,
+            'ticker_deltas': {},
+            'l2_deltas': {},
+        }
+        self._industry_chroma_client = None
+        self._industry_collection_cache = {}
         self.current_planner_info = {
             'enabled': False,
             'status': 'disabled',
@@ -1034,6 +1048,15 @@ class PaperTradingEngine:
             'financials': ['XLF', 'JPM', 'V']
         })
         config.setdefault('industry_map', {})
+        config.setdefault('ticker_tags', {})
+        news_overlay_cfg = config.setdefault('news_overlay', {})
+        news_overlay_cfg.setdefault('enabled', False)
+        news_overlay_cfg.setdefault('industry_collection', 'industry_signals')
+        news_overlay_cfg.setdefault('max_age_hours', 48)
+        news_overlay_cfg.setdefault('alpha', 0.08)
+        news_overlay_cfg.setdefault('mode', 'risk_only')
+        news_overlay_cfg.setdefault('min_confidence', 0.55)
+        news_overlay_cfg.setdefault('max_abs_delta', 0.10)
         risk_model_config = config.setdefault('risk_model', {})
         risk_model_config.setdefault('enable_cov_diagnostics', True)
         risk_model_config.setdefault('returns_period', '6mo')
@@ -1147,6 +1170,16 @@ class PaperTradingEngine:
         assert int(macro_cfg.get('topic_memory_window', 50)) >= 1, "macro_integration.topic_memory_window must be >= 1"
         assert isinstance(macro_cfg.get('topic_sector_ticker_map', {}), dict), "macro_integration.topic_sector_ticker_map must be an object"
         assert isinstance(self.config.get('industry_map', {}), dict), "industry_map must be an object"
+        assert isinstance(self.config.get('ticker_tags', {}), dict), "ticker_tags must be an object"
+        news_overlay_cfg = self.config.get('news_overlay', {})
+        assert isinstance(news_overlay_cfg, dict), "news_overlay must be an object"
+        assert isinstance(news_overlay_cfg.get('enabled', False), bool), "news_overlay.enabled must be bool"
+        assert isinstance(news_overlay_cfg.get('industry_collection', 'industry_signals'), str), "news_overlay.industry_collection must be string"
+        assert float(news_overlay_cfg.get('max_age_hours', 48)) >= 0.0, "news_overlay.max_age_hours must be >= 0"
+        assert 0.0 <= float(news_overlay_cfg.get('alpha', 0.08)) <= 1.0, "news_overlay.alpha must be in [0,1]"
+        assert str(news_overlay_cfg.get('mode', 'risk_only')).lower() in ('risk_only', 'symmetric'), "news_overlay.mode must be risk_only|symmetric"
+        assert 0.0 <= float(news_overlay_cfg.get('min_confidence', 0.55)) <= 1.0, "news_overlay.min_confidence must be in [0,1]"
+        assert 0.0 <= float(news_overlay_cfg.get('max_abs_delta', 0.10)) <= 1.0, "news_overlay.max_abs_delta must be in [0,1]"
         
         print("[OK] Safety checks passed: SIMULATION ONLY mode confirmed")
     
@@ -1704,7 +1737,11 @@ class PaperTradingEngine:
             'trade_planner_turnover_used': float(planner_turnover_used),
             'trade_planner_num_adv_clipped': int(planner_meta.get('num_adv_clipped', 0) or 0),
             'trade_planner_num_adv_dropped': int(planner_meta.get('num_adv_dropped', 0) or 0),
-            'trade_planner_normal_score_count': int((planner_meta.get('normal_score_stats', {}) or {}).get('count', 0) or 0)
+            'trade_planner_normal_score_count': int((planner_meta.get('normal_score_stats', {}) or {}).get('count', 0) or 0),
+            'news_overlay_debug': snapshot.get(
+                'news_overlay_debug',
+                dict(self.current_news_overlay_info) if isinstance(self.current_news_overlay_info, dict) else {'enabled': False, 'status': 'unavailable'}
+            ),
         }
         return payload
 
@@ -1831,7 +1868,8 @@ class PaperTradingEngine:
                 float((self.current_planner_info or {}).get('turnover_used_normal', 0.0) or 0.0)
             ) if isinstance(self.current_planner_info, dict) else 0.0,
             'trade_planner_num_adv_clipped': int((self.current_planner_info or {}).get('num_adv_clipped', 0)) if isinstance(self.current_planner_info, dict) else 0,
-            'trade_planner_num_adv_dropped': int((self.current_planner_info or {}).get('num_adv_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0
+            'trade_planner_num_adv_dropped': int((self.current_planner_info or {}).get('num_adv_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
+            'news_overlay_debug': dict(self.current_news_overlay_info) if isinstance(self.current_news_overlay_info, dict) else {'enabled': False, 'status': 'unavailable'},
         }
         return snapshot
 
@@ -4240,6 +4278,272 @@ class PaperTradingEngine:
                     lookup[t] = industry_name
         return lookup
 
+    def _get_news_overlay_cfg(self):
+        defaults = {
+            'enabled': False,
+            'industry_collection': 'industry_signals',
+            'max_age_hours': 48.0,
+            'alpha': 0.08,
+            'mode': 'risk_only',
+            'min_confidence': 0.55,
+            'max_abs_delta': 0.10,
+        }
+        raw = self.config.get('news_overlay', {}) if isinstance(self.config, dict) else {}
+        cfg = dict(defaults)
+        if isinstance(raw, dict):
+            cfg.update(raw)
+        try:
+            cfg['enabled'] = bool(cfg.get('enabled', False))
+            cfg['industry_collection'] = str(cfg.get('industry_collection', 'industry_signals'))
+            cfg['max_age_hours'] = max(0.0, float(cfg.get('max_age_hours', 48.0)))
+            cfg['alpha'] = float(np.clip(float(cfg.get('alpha', 0.08)), 0.0, 1.0))
+            cfg['mode'] = str(cfg.get('mode', 'risk_only')).lower()
+            if cfg['mode'] not in ('risk_only', 'symmetric'):
+                cfg['mode'] = 'risk_only'
+            cfg['min_confidence'] = float(np.clip(float(cfg.get('min_confidence', 0.55)), 0.0, 1.0))
+            cfg['max_abs_delta'] = float(np.clip(float(cfg.get('max_abs_delta', 0.10)), 0.0, 1.0))
+        except Exception:
+            cfg = dict(defaults)
+        return cfg
+
+    def _build_ticker_tags_lookup(self):
+        tag_lookup = {}
+        raw_tags = self.config.get('ticker_tags', {}) if isinstance(self.config, dict) else {}
+        if isinstance(raw_tags, dict):
+            for ticker, row in raw_tags.items():
+                t = str(ticker).strip().upper()
+                if not t:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                l2_tags = sorted({str(x).strip() for x in row.get('L2', []) if str(x).strip()})
+                l3_tags = sorted({str(x).strip() for x in row.get('L3', []) if str(x).strip()})
+                keywords = sorted({str(x).strip().lower() for x in row.get('keywords', []) if str(x).strip()})
+                tag_lookup[t] = {
+                    'L2': l2_tags,
+                    'L3': l3_tags,
+                    'keywords': keywords,
+                }
+
+        fallback_industry = self._build_industry_lookup()
+        for ticker, industry_name in fallback_industry.items():
+            t = str(ticker).strip().upper()
+            if not t:
+                continue
+            if t not in tag_lookup:
+                tag_lookup[t] = {'L2': [str(industry_name)], 'L3': [], 'keywords': []}
+            else:
+                l2_existing = set(tag_lookup[t].get('L2', []))
+                if str(industry_name) not in l2_existing:
+                    tag_lookup[t]['L2'] = sorted(list(l2_existing | {str(industry_name)}))
+        return tag_lookup
+
+    def _parse_iso_datetime(self, value):
+        if value is None:
+            return None
+        try:
+            text = str(value).replace('Z', '+00:00')
+            dt_obj = datetime.fromisoformat(text)
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+            return dt_obj.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _get_industry_signals_collection(self, collection_name, chroma_path):
+        if not CHROMADB_AVAILABLE:
+            return None
+        cache_key = (str(chroma_path), str(collection_name))
+        if cache_key in self._industry_collection_cache:
+            return self._industry_collection_cache[cache_key]
+        try:
+            if self._industry_chroma_client is None or getattr(self._industry_chroma_client, "_path_cache", None) != str(chroma_path):
+                client = chromadb.PersistentClient(path=str(chroma_path))
+                setattr(client, "_path_cache", str(chroma_path))
+                self._industry_chroma_client = client
+            coll = self._industry_chroma_client.get_or_create_collection(name=str(collection_name))
+            self._industry_collection_cache[cache_key] = coll
+            return coll
+        except Exception as e:
+            print(f"[NEWS_OVERLAY] WARN collection init failed: {e}")
+            return None
+
+    def _read_recent_industry_signals(self):
+        cfg = self._get_news_overlay_cfg()
+        if not bool(cfg.get('enabled', False)):
+            return []
+        if not CHROMADB_AVAILABLE:
+            return []
+
+        chroma_path = self.config.get('macro_integration', {}).get('chroma_path', './memory_db')
+        collection_name = cfg.get('industry_collection', 'industry_signals')
+        collection = self._get_industry_signals_collection(collection_name=collection_name, chroma_path=chroma_path)
+        if collection is None:
+            return []
+
+        include = ['metadatas', 'documents']
+        try:
+            results = collection.get(include=include)
+        except Exception as e:
+            print(f"[NEWS_OVERLAY] WARN collection read failed: {e}")
+            return []
+
+        metadata_rows = results.get('metadatas', []) if isinstance(results, dict) else []
+        document_rows = results.get('documents', []) if isinstance(results, dict) else []
+        now_utc = datetime.now(timezone.utc)
+        max_age_hours = float(cfg.get('max_age_hours', 48.0))
+        min_confidence = float(cfg.get('min_confidence', 0.55))
+        latest_by_l2 = {}
+
+        for idx, meta in enumerate(metadata_rows):
+            if not isinstance(meta, dict):
+                continue
+            if str(meta.get('scope', '')).lower() != 'industry':
+                continue
+            confidence = float(meta.get('confidence', 0.0) or 0.0)
+            if confidence < min_confidence:
+                continue
+            ts = self._parse_iso_datetime(meta.get('timestamp'))
+            if ts is None:
+                continue
+            age_hours = (now_utc - ts).total_seconds() / 3600.0
+            if age_hours > max_age_hours:
+                continue
+
+            l2 = str(meta.get('L2', '')).strip()
+            if not l2:
+                continue
+
+            risk_delta = float(meta.get('risk_delta', 0.0) or 0.0)
+            doc = document_rows[idx] if idx < len(document_rows) else None
+            payload = None
+            if isinstance(doc, str) and doc.strip():
+                try:
+                    payload = json.loads(doc)
+                except Exception:
+                    payload = None
+
+            row = {
+                'L2': l2,
+                'timestamp': ts.isoformat(),
+                'confidence': confidence,
+                'risk_delta': risk_delta,
+                'horizon': str(meta.get('horizon', '1d')),
+                'payload': payload if isinstance(payload, dict) else {},
+            }
+            prev = latest_by_l2.get(l2)
+            if prev is None:
+                latest_by_l2[l2] = row
+            else:
+                prev_ts = self._parse_iso_datetime(prev.get('timestamp'))
+                if prev_ts is None or ts > prev_ts:
+                    latest_by_l2[l2] = row
+
+        return list(latest_by_l2.values())
+
+    def apply_news_overlay_to_cash_target(self, tickers, cash_target):
+        cfg = self._get_news_overlay_cfg()
+        info = {
+            'enabled': bool(cfg.get('enabled', False)),
+            'status': 'disabled',
+            'mode': cfg.get('mode', 'risk_only'),
+            'alpha': float(cfg.get('alpha', 0.08)),
+            'applied_cash_delta': 0.0,
+            'worst_l2': None,
+            'worst_delta': 0.0,
+            'used_signals': 0,
+            'ticker_deltas': {},
+            'l2_deltas': {},
+            'max_abs_delta': float(cfg.get('max_abs_delta', 0.10)),
+            'min_confidence': float(cfg.get('min_confidence', 0.55)),
+            'max_age_hours': float(cfg.get('max_age_hours', 48.0)),
+        }
+        base_cash = float(cash_target)
+        if not info['enabled']:
+            return base_cash, info
+
+        try:
+            signal_rows = self._read_recent_industry_signals()
+            if not signal_rows:
+                info['status'] = 'no_data'
+                return base_cash, info
+
+            alpha = float(cfg.get('alpha', 0.08))
+            max_abs_delta = float(cfg.get('max_abs_delta', 0.10))
+            mode = str(cfg.get('mode', 'risk_only')).lower()
+            l2_delta_map = {}
+            for row in signal_rows:
+                l2 = str(row.get('L2', '')).strip()
+                if not l2:
+                    continue
+                risk_delta = float(row.get('risk_delta', 0.0) or 0.0)
+                delta = float(np.clip(risk_delta * alpha, -max_abs_delta, max_abs_delta))
+                if mode == 'risk_only' and delta > 0:
+                    delta = 0.0
+                l2_delta_map[l2] = delta
+
+            if not l2_delta_map:
+                info['status'] = 'filtered_empty'
+                return base_cash, info
+
+            ticker_tags = self._build_ticker_tags_lookup()
+            ticker_deltas = {}
+            ordered_tickers = []
+            for ticker in (tickers or []):
+                t = str(ticker).strip().upper()
+                if t and t != 'CASH' and t not in ordered_tickers:
+                    ordered_tickers.append(t)
+
+            for ticker in ordered_tickers:
+                tags = ticker_tags.get(ticker, {})
+                l2_tags = tags.get('L2', []) if isinstance(tags, dict) else []
+                deltas = [l2_delta_map.get(str(l2), None) for l2 in l2_tags]
+                deltas = [d for d in deltas if d is not None]
+                if deltas:
+                    ticker_deltas[ticker] = float(min(deltas))
+
+            if not ticker_deltas:
+                info['status'] = 'no_ticker_match'
+                info['l2_deltas'] = dict(l2_delta_map)
+                info['used_signals'] = len(l2_delta_map)
+                return base_cash, info
+
+            worst_ticker = min(ticker_deltas, key=lambda x: ticker_deltas[x])
+            worst_delta = float(ticker_deltas.get(worst_ticker, 0.0))
+            applied_cash_delta = float(np.clip(abs(min(0.0, worst_delta)), 0.0, max_abs_delta))
+            min_cash = float(self.config.get('objectives', {}).get('min_cash_pct', 0.10))
+            new_cash = float(np.clip(base_cash + applied_cash_delta, min_cash, 0.60))
+
+            worst_l2 = None
+            worst_l2_delta = 0.0
+            for l2, d in l2_delta_map.items():
+                if d < worst_l2_delta:
+                    worst_l2_delta = float(d)
+                    worst_l2 = str(l2)
+
+            info['status'] = 'applied' if applied_cash_delta > 0 else 'neutral'
+            info['applied_cash_delta'] = applied_cash_delta
+            info['worst_l2'] = worst_l2
+            info['worst_delta'] = worst_l2_delta
+            info['used_signals'] = len(l2_delta_map)
+            info['l2_deltas'] = {k: float(v) for k, v in list(l2_delta_map.items())[:20]}
+            info['ticker_deltas'] = {k: float(v) for k, v in list(ticker_deltas.items())[:30]}
+            info['cash_target_before'] = base_cash
+            info['cash_target_after'] = new_cash
+            info['worst_ticker'] = worst_ticker
+
+            print(
+                f"[NEWS_OVERLAY] used={info['used_signals']} worst_L2={info['worst_l2']} "
+                f"risk_delta={info['worst_delta']:+.4f} confidence>={info['min_confidence']:.2f} "
+                f"applied_delta={info['applied_cash_delta']:+.4f}"
+            )
+            return new_cash, info
+        except Exception as e:
+            info['status'] = 'error'
+            info['error'] = str(e)
+            print(f"[NEWS_OVERLAY] WARN apply failed: {e}")
+            return base_cash, info
+
     def calculate_volume_zscore(self, ticker, lookback_days=60):
         """Calculate volume Z-score versus trailing rolling mean/std."""
         try:
@@ -5380,6 +5684,16 @@ class PaperTradingEngine:
             cash_target = float(np.clip(cash_target + cash_tilt, base_cash_from_regime, 0.60))
             print(f"[MACRO PATH2] CASH tilt {cash_tilt:+.2%} -> cash_target {cash_target_before_cash_tilt:.2%} -> {cash_target:.2%}")
 
+        overlay_tickers = sorted(list(trade_universe_tickers))
+        cash_target, news_overlay_info = self.apply_news_overlay_to_cash_target(
+            overlay_tickers,
+            cash_target=cash_target,
+        )
+        self.current_news_overlay_info = dict(news_overlay_info) if isinstance(news_overlay_info, dict) else {
+            'enabled': False,
+            'status': 'unavailable',
+        }
+
         self.current_regime['dynamic_min_cash'] = cash_target
         self.current_regime['cash_target'] = cash_target
         self.current_regime['cash_target_components'] = {
@@ -5387,8 +5701,10 @@ class PaperTradingEngine:
             'macro_cash_slope': macro_cash_slope,
             'macro_risk_score_smoothed': macro_risk_score_smoothed,
             'macro_cash_from_risk': macro_cash_from_risk,
-            'macro_cash_from_topics': macro_cash_from_topics
+            'macro_cash_from_topics': macro_cash_from_topics,
+            'news_overlay_cash_delta': float((self.current_news_overlay_info or {}).get('applied_cash_delta', 0.0) or 0.0),
         }
+        self.current_regime['news_overlay'] = dict(self.current_news_overlay_info) if isinstance(self.current_news_overlay_info, dict) else {}
 
         # NOTE: comment omitted (was garbled/non-ASCII).
         strategy = self.config['strategy']
@@ -7263,6 +7579,7 @@ class PaperTradingEngine:
             'trade_planner_num_adv_clipped': int((self.current_planner_info or {}).get('num_adv_clipped', 0)) if isinstance(self.current_planner_info, dict) else 0,
             'trade_planner_num_adv_dropped': int((self.current_planner_info or {}).get('num_adv_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
             'trade_planner_normal_score_count': int((((self.current_planner_info or {}).get('normal_score_stats', {}) or {}).get('count', 0))) if isinstance(self.current_planner_info, dict) else 0,
+            'news_overlay_debug': dict(self.current_news_overlay_info) if isinstance(self.current_news_overlay_info, dict) else {'enabled': False, 'status': 'unavailable'},
             'diagnostic_hint': self.last_diagnostic_hint
         }
         

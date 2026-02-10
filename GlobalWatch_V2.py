@@ -1,68 +1,79 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import feedparser
 import ollama
+import argparse
+import sys
 from datetime import datetime, timedelta, timezone
 import time
 import json
 import re
+import hashlib
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import chromadb
 import uuid
 import urllib.parse
+import urllib.request
 import os
+
+try:
+    import chromadb
+    CHROMADB_IMPORTED = True
+except Exception:
+    chromadb = None  # type: ignore
+    CHROMADB_IMPORTED = False
 
 try:
     import daily_reporter
 except Exception:
     daily_reporter = None  # type: ignore
 
-# === 0. 基础设置 ===
+# === 0. 鍩虹璁剧疆 ===
 try:
     from plyer import notification
     TOAST_AVAILABLE = True
 except ImportError:
     TOAST_AVAILABLE = False
 
-# === 0.1. 日志工具函数 ===
+# === 0.1. 鏃ュ織宸ュ叿鍑芥暟 ===
 def log_error(message):
     """
-    记录错误到文件和控制台
+    璁板綍閿欒鍒版枃浠跺拰鎺у埗鍙?
     Args:
-        message: 错误消息
+        message: 閿欒娑堟伅
     """
     try:
-        # 确保 outputs 目录存在
+        # 纭繚 outputs 鐩綍瀛樺湪
         os.makedirs("outputs", exist_ok=True)
         
-        # 写入日志文件
+        # 鍐欏叆鏃ュ織鏂囦欢
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_entry = f"[{timestamp}] {message}\n"
         
         with open("outputs/error.log", "a", encoding="utf-8") as f:
             f.write(log_entry)
     except Exception as e:
-        # 日志本身失败也不能崩溃
+        # 鏃ュ織鏈韩澶辫触涔熶笉鑳藉穿婧?
         print(f"Logging failed: {e}")
 
 def safe_format_number(value, decimals=2, default="N/A"):
     """
-    安全格式化数字，处理 None/NaN/inf
+    瀹夊叏鏍煎紡鍖栨暟瀛楋紝澶勭悊 None/NaN/inf
     Args:
-        value: 数值
-        decimals: 小数位数
-        default: 默认值（当无法格式化时）
+        value: 鏁板€?
+        decimals: 灏忔暟浣嶆暟
+        default: 榛樿鍊硷紙褰撴棤娉曟牸寮忓寲鏃讹級
     Returns:
-        格式化后的字符串
+        鏍煎紡鍖栧悗鐨勫瓧绗︿覆
     """
     try:
         if value is None:
             return default
         if pd.isna(value) or not pd.api.types.is_number(value):
             return default
-        if not (-1e10 < value < 1e10):  # 检查 inf
+        if not (-1e10 < value < 1e10):  # 妫€鏌?inf
             return default
         return f"{value:,.{decimals}f}"
     except Exception as e:
@@ -74,14 +85,46 @@ LOCAL_MODEL = "gemma3:12"
 # Temperature range: 0.1 ~ 0.3 (configured in ollama.chat calls)
 TEMPERATURE = 0.2  # Default temperature for model calls
 
-# 初始化记忆库
-chroma_client = chromadb.PersistentClient(path="./memory_db")
-collection = chroma_client.get_or_create_collection(name="market_events")
+class _NoopCollection:
+    """Fallback collection that keeps the app running when Chroma is unavailable."""
 
-# 初始化信号追踪数据库
-signals_collection = chroma_client.get_or_create_collection(name="trading_signals")
+    def add(self, *args, **kwargs):
+        return None
 
-# 宏观逻辑库
+    def update(self, *args, **kwargs):
+        return None
+
+    def get(self, *args, **kwargs):
+        return {"ids": [], "metadatas": [], "documents": []}
+
+    def query(self, *args, **kwargs):
+        return {"ids": [[]], "metadatas": [[]], "documents": [[]]}
+
+
+CHROMA_AVAILABLE = False
+CHROMA_INIT_ERROR = ""
+chroma_client = None
+collection = _NoopCollection()
+signals_collection = _NoopCollection()
+
+if CHROMADB_IMPORTED:
+    try:
+        # 鍒濆鍖栬蹇嗗簱
+        chroma_client = chromadb.PersistentClient(path="./memory_db")
+        collection = chroma_client.get_or_create_collection(name="market_events")
+        # 鍒濆鍖栦俊鍙疯拷韪暟鎹簱
+        signals_collection = chroma_client.get_or_create_collection(name="trading_signals")
+        CHROMA_AVAILABLE = True
+        print("[CHROMA] PersistentClient ready: ./memory_db")
+    except Exception as e:
+        CHROMA_INIT_ERROR = str(e)
+        log_error(f"Chroma initialization failed, using no-op memory: {CHROMA_INIT_ERROR}")
+        print(f"[WARN] Chroma disabled (no-op memory): {CHROMA_INIT_ERROR}")
+else:
+    CHROMA_INIT_ERROR = "chromadb import failed"
+    print("[WARN] Chroma disabled: chromadb package not available")
+
+# 瀹忚閫昏緫搴?
 MACRO_LOGIC_KNOWLEDGE = """
 GLOBAL MACRO RULES:
 1. CAD (Loonie) is a Petro-currency. Oil UP -> CAD Stronger.
@@ -90,7 +133,7 @@ GLOBAL MACRO RULES:
 4. TECH STOCKS (e.g. NVDA) are sensitive to Interest Rates & AI hype.
 """
 
-# Early-Warning 监控列表配置
+# Early-Warning 鐩戞帶鍒楄〃閰嶇疆
 WATCHLIST = {
     "Gold": {
         "ticker": "GC=F",
@@ -115,14 +158,14 @@ WATCHLIST = {
 }
 
 ASSETS_DB = {
-    "USD (美元)": {"ticker": "USD", "type": "fiat_base"},
-    "CNY (人民币)": {"ticker": "CNY=X", "type": "fiat_quote"}, 
-    "CAD (加币)": {"ticker": "CAD=X", "type": "fiat_quote"},
-    "GBP (英镑)": {"ticker": "GBP=X", "type": "fiat_quote"},
-    "JPY (日元)": {"ticker": "JPY=X", "type": "fiat_quote"},
-    "Gold (黄金)": {"ticker": "GC=F", "type": "commodity"},  
-    "Crude Oil (原油)": {"ticker": "CL=F", "type": "commodity"},
-    "Bitcoin (比特币)": {"ticker": "BTC-USD", "type": "crypto"}
+    "USD (缇庡厓)": {"ticker": "USD", "type": "fiat_base"},
+    "CNY (浜烘皯甯?": {"ticker": "CNY=X", "type": "fiat_quote"}, 
+    "CAD (鍔犲竵)": {"ticker": "CAD=X", "type": "fiat_quote"},
+    "GBP (鑻遍晳)": {"ticker": "GBP=X", "type": "fiat_quote"},
+    "JPY (鏃ュ厓)": {"ticker": "JPY=X", "type": "fiat_quote"},
+    "Gold (榛勯噾)": {"ticker": "GC=F", "type": "commodity"},  
+    "Crude Oil (鍘熸补)": {"ticker": "CL=F", "type": "commodity"},
+    "Bitcoin (姣旂壒甯?": {"ticker": "BTC-USD", "type": "crypto"}
 }
 
 MACRO_ANCHORS = {"Crude Oil": "CL=F", "Gold": "GC=F"}
@@ -133,9 +176,9 @@ RSS_FEEDS = {
     "BBC": "http://feeds.bbci.co.uk/news/business/rss.xml"
 }
 
-REFRESH_OPTIONS = {"手动": 0, "5 分钟": 300, "10 分钟": 600, "30 分钟": 1800}
+REFRESH_OPTIONS = {"鎵嬪姩": 0, "5 鍒嗛挓": 300, "10 鍒嗛挓": 600, "30 鍒嗛挓": 1800}
 
-# ================= 1. 深度解析函数 (V3.0 新增) =================
+# ================= 1. 娣卞害瑙ｆ瀽鍑芥暟 (V3.0 鏂板) =================
 
 def load_paper_runtime_settings():
     """Load optional runtime settings from paper_config.json."""
@@ -165,6 +208,1263 @@ def load_paper_runtime_settings():
 
 RUNTIME_SETTINGS = load_paper_runtime_settings()
 TOPIC_MEMORY_PATH = "outputs/topic_signal_memory.json"
+
+
+def build_industry_membership(config):
+    """Build validated L2/L3 membership maps from config."""
+    taxonomy = config.get("industry_taxonomy", {}) if isinstance(config, dict) else {}
+    l2_list = taxonomy.get("L2", []) if isinstance(taxonomy, dict) else []
+    l3_map = taxonomy.get("L3", {}) if isinstance(taxonomy, dict) else {}
+    ticker_tags = config.get("ticker_tags", {}) if isinstance(config, dict) else {}
+
+    if not isinstance(l2_list, list):
+        raise ValueError("industry_taxonomy.L2 must be a list")
+    if not isinstance(l3_map, dict):
+        raise ValueError("industry_taxonomy.L3 must be a dict")
+    if not isinstance(ticker_tags, dict):
+        raise ValueError("ticker_tags must be a dict")
+
+    l2_clean = [str(x).strip() for x in l2_list if str(x).strip()]
+    if not (8 <= len(l2_clean) <= 10):
+        raise ValueError(f"L2 count must be within 8-10, got {len(l2_clean)}")
+    l2_set = set(l2_clean)
+
+    l3_to_parent = {}
+    for l2, l3_values in l3_map.items():
+        l2_name = str(l2).strip()
+        if l2_name not in l2_set:
+            raise ValueError(f"L3 parent '{l2_name}' is not declared in L2")
+        if not isinstance(l3_values, list):
+            raise ValueError(f"industry_taxonomy.L3.{l2_name} must be a list")
+        for l3 in l3_values:
+            l3_name = str(l3).strip()
+            if not l3_name:
+                continue
+            if l3_name in l3_to_parent and l3_to_parent[l3_name] != l2_name:
+                raise ValueError(f"L3 tag '{l3_name}' is mapped to multiple L2 parents")
+            l3_to_parent[l3_name] = l2_name
+
+    l2_to_tickers = {l2: set() for l2 in l2_clean}
+    l3_to_tickers = {}
+    ticker_to_tags = {}
+
+    for raw_ticker, raw_tags in ticker_tags.items():
+        ticker = str(raw_ticker).strip().upper()
+        if not ticker:
+            continue
+        if not isinstance(raw_tags, dict):
+            raise ValueError(f"ticker_tags.{ticker} must be an object")
+
+        l2_tags = [str(x).strip() for x in raw_tags.get("L2", []) if str(x).strip()]
+        l3_tags = [str(x).strip() for x in raw_tags.get("L3", []) if str(x).strip()]
+        keywords = [str(x).strip() for x in raw_tags.get("keywords", []) if str(x).strip()]
+
+        invalid_l2 = [x for x in l2_tags if x not in l2_set]
+        if invalid_l2:
+            raise ValueError(f"ticker {ticker} references undefined L2 tags: {invalid_l2}")
+
+        invalid_l3 = [x for x in l3_tags if x not in l3_to_parent]
+        if invalid_l3:
+            raise ValueError(f"ticker {ticker} references undefined L3 tags: {invalid_l3}")
+
+        for l3 in l3_tags:
+            parent_l2 = l3_to_parent.get(l3)
+            if parent_l2 and parent_l2 not in l2_tags:
+                raise ValueError(f"ticker {ticker} has L3 '{l3}' but missing parent L2 '{parent_l2}'")
+
+        dedup_l2 = sorted(set(l2_tags))
+        dedup_l3 = sorted(set(l3_tags))
+        dedup_keywords = sorted(set(keywords))
+
+        ticker_to_tags[ticker] = {
+            "L2": dedup_l2,
+            "L3": dedup_l3,
+            "keywords": dedup_keywords
+        }
+
+        for l2 in dedup_l2:
+            l2_to_tickers[l2].add(ticker)
+        for l3 in dedup_l3:
+            parent_l2 = l3_to_parent[l3]
+            key = (parent_l2, l3)
+            l3_to_tickers.setdefault(key, set()).add(ticker)
+
+    weak_l2 = []
+    for l2, members in l2_to_tickers.items():
+        if l2 == "cash_equivalent":
+            continue
+        if len(members) < 3:
+            weak_l2.append((l2, len(members)))
+    if weak_l2:
+        weak_desc = ", ".join([f"{name}={count}" for name, count in weak_l2])
+        raise ValueError(f"L2 ticker count below minimum (3): {weak_desc}")
+
+    return l2_to_tickers, l3_to_tickers, ticker_to_tags
+
+
+def match_news_to_tags(news_item, ticker_to_tags):
+    """Match a news item against ticker tags for future routing."""
+    item = news_item if isinstance(news_item, dict) else {}
+    title = str(item.get("title", ""))
+    summary = str(item.get("summary", ""))
+    text = f"{title} {summary}".lower()
+
+    matched_tickers = set()
+    matched_l2 = set()
+    matched_l3 = set()
+    matched_keywords = set()
+
+    for ticker, tags in (ticker_to_tags or {}).items():
+        tag_obj = tags if isinstance(tags, dict) else {}
+        l2_tags = [str(x) for x in tag_obj.get("L2", [])]
+        l3_tags = [str(x) for x in tag_obj.get("L3", [])]
+        keywords = [str(x).lower() for x in tag_obj.get("keywords", [])]
+
+        ticker_hit = ticker.lower() in text
+        keyword_hits = [kw for kw in keywords if kw and kw in text]
+        if ticker_hit or keyword_hits:
+            matched_tickers.add(ticker)
+            matched_l2.update(l2_tags)
+            matched_l3.update(l3_tags)
+            matched_keywords.update(keyword_hits)
+
+    return {
+        "matched_tickers": sorted(matched_tickers),
+        "matched_L2": sorted(matched_l2),
+        "matched_L3": sorted(matched_l3),
+        "matched_keywords": sorted(matched_keywords)
+    }
+
+
+def dump_industry_taxonomy_preview(config_path, output_path=None):
+    """Load taxonomy config, validate, print summary, and dump preview JSON."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    l2_to_tickers, l3_to_tickers, ticker_to_tags = build_industry_membership(cfg)
+
+    if output_path is None:
+        output_path = (
+            cfg.get("reporting", {}).get("industry_taxonomy_preview_path")
+            or cfg.get("taxonomy_preview_path")
+            or "outputs/industry_taxonomy_preview.json"
+        )
+
+    l2_counts = {k: len(v) for k, v in l2_to_tickers.items()}
+    l3_counts = {
+        f"{l2}:{l3}": len(v)
+        for (l2, l3), v in sorted(l3_to_tickers.items(), key=lambda x: (x[0][0], x[0][1]))
+    }
+    cross_industry = sorted(
+        [t for t, tags in ticker_to_tags.items() if len(tags.get("L2", [])) > 1]
+    )
+
+    preview = {
+        "generated_at": datetime.now().isoformat(),
+        "config_path": config_path,
+        "output_path": output_path,
+        "industry_taxonomy": cfg.get("industry_taxonomy", {}),
+        "ticker_tags": ticker_to_tags,
+        "stats": {
+            "l2_count": len(l2_to_tickers),
+            "ticker_tag_count": len(ticker_to_tags),
+            "l2_counts": l2_counts,
+            "l3_counts": l3_counts,
+            "cross_industry_tickers": cross_industry
+        }
+    }
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(preview, f, indent=2, ensure_ascii=False)
+
+    print(f"[TAXONOMY] L2 count: {len(l2_to_tickers)}")
+    for l2 in sorted(l2_to_tickers.keys()):
+        print(f"[TAXONOMY] {l2}: {len(l2_to_tickers[l2])} tickers")
+    for ticker in sorted(ticker_to_tags.keys()):
+        tags = ticker_to_tags.get(ticker, {})
+        l2_tags = ",".join(tags.get("L2", []))
+        l3_tags = ",".join(tags.get("L3", []))
+        keywords = ",".join(tags.get("keywords", []))
+        print(
+            f"[TAXONOMY] ticker={ticker} L2=[{l2_tags}] "
+            f"L3=[{l3_tags}] keywords=[{keywords}]"
+        )
+    if cross_industry:
+        sample = ", ".join(cross_industry[:10])
+        print(f"[TAXONOMY] Cross-industry tickers: {sample}")
+    else:
+        print("[TAXONOMY] Cross-industry tickers: none")
+    print(f"[TAXONOMY_PREVIEW] Wrote: {output_path}")
+
+
+def _run_taxonomy_cli_if_requested():
+    """Run taxonomy dump CLI and return exit code or None when not requested."""
+    if "--dump-industry-taxonomy" not in sys.argv:
+        return None
+
+    parser = argparse.ArgumentParser(description="Industry taxonomy preview dump")
+    parser.add_argument("--dump-industry-taxonomy", action="store_true")
+    parser.add_argument("--config", default="paper_config.json")
+    parser.add_argument("--output", default=None)
+    args, _ = parser.parse_known_args()
+
+    try:
+        dump_industry_taxonomy_preview(args.config, output_path=args.output)
+        return 0
+    except Exception as e:
+        print(f"[TAXONOMY] ERROR: {e}")
+        return 1
+
+
+def _load_json_config(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _default_news_overlay_cfg():
+    return {
+        "enabled": False,
+        "industry_collection": "industry_signals",
+        "max_age_hours": 48,
+        "alpha": 0.08,
+        "mode": "risk_only",
+        "min_confidence": 0.55,
+        "max_abs_delta": 0.10,
+    }
+
+
+def _default_news_sources_cfg():
+    return {
+        "market_rss_enabled": True,
+        "ticker_rss_enabled": True,
+        "industry_rss_enabled": True,
+        "timeout_seconds": 8,
+        "retries": 1,
+        "max_per_l2": 8,
+        "max_total": 60,
+        "max_portfolio_tickers": 20,
+        "max_candidate_tickers": 20,
+        "market_rss_feeds": dict(RSS_FEEDS),
+        "ticker_rss_template": "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
+        "industry_rss_template": "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+        "industry_topic_queries": {
+            "technology": ["semiconductors", "cloud software", "internet advertising", "ai infrastructure"],
+            "energy": ["oil market", "natural gas demand", "energy producers"],
+            "healthcare": ["pharma pipeline", "biotech approvals", "medical devices"],
+            "financials": ["banking sector", "payment networks", "insurance trends"],
+            "industrials_defense": ["defense contracts", "industrial demand", "rail logistics"],
+            "consumer": ["consumer spending", "retail sales", "restaurant traffic"],
+            "utilities": ["regulated utility", "power grid", "renewables"],
+            "broad_market_etf": ["equity index flows", "etf rotation", "market breadth"],
+            "rates_and_gold": ["treasury yields", "gold demand", "rate expectations"],
+            "cash_equivalent": ["cash allocation", "money market yields"],
+        },
+        "industry_keyword_map": {
+            "energy": ["opec", "oil", "brent", "wti", "natural gas"],
+            "technology": ["semiconductor", "chip", "ai", "cloud", "saas"],
+            "healthcare": ["fda", "drug", "pharma", "biotech"],
+            "financials": ["bank", "credit", "payment", "insurance", "yield curve"],
+            "industrials_defense": ["defense", "aerospace", "rail", "logistics"],
+            "consumer": ["retail", "consumer", "restaurant", "beverage"],
+            "utilities": ["utility", "grid", "power", "renewable"],
+            "rates_and_gold": ["treasury", "bond", "rate hike", "gold"],
+            "broad_market_etf": ["index", "etf", "market breadth", "equity market"],
+        },
+    }
+
+
+def _merge_cfg(defaults, override):
+    merged = dict(defaults)
+    if isinstance(override, dict):
+        merged.update(override)
+    return merged
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _to_iso_utc(dt_obj):
+    if isinstance(dt_obj, datetime):
+        if dt_obj.tzinfo is None:
+            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+        return dt_obj.astimezone(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_feed_entry_time(entry):
+    parsed = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+    if parsed:
+        try:
+            return datetime(*parsed[:6], tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def _fetch_feed_entries(url, timeout_seconds=8, retries=1):
+    timeout_seconds = max(1, _safe_int(timeout_seconds, 8))
+    retries = max(0, _safe_int(retries, 1))
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; GlobalWatch/2.11; +https://localhost)"
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                payload = resp.read()
+            feed = feedparser.parse(payload)
+            return getattr(feed, "entries", []) or []
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(0.2)
+                continue
+    if last_error:
+        raise last_error
+    return []
+
+
+class NewsProvider:
+    provider_name = "base"
+
+    def fetch(self, context):
+        return []
+
+
+class MarketRSSProvider(NewsProvider):
+    provider_name = "market_rss"
+
+    def __init__(self, feed_map, timeout_seconds, retries):
+        self.feed_map = feed_map if isinstance(feed_map, dict) else {}
+        self.timeout_seconds = timeout_seconds
+        self.retries = retries
+
+    def fetch(self, context):
+        out = []
+        for source, url in self.feed_map.items():
+            try:
+                entries = _fetch_feed_entries(url, timeout_seconds=self.timeout_seconds, retries=self.retries)
+            except Exception as e:
+                log_error(f"[TAXONOMY_PREVIEW] market feed failed {source}: {e}")
+                continue
+            for entry in entries:
+                title = str(getattr(entry, "title", "") or "").strip()
+                link = str(getattr(entry, "link", "") or "").strip()
+                summary = str(getattr(entry, "summary", "") or "").strip()
+                if not title or not link:
+                    continue
+                published_dt = _parse_feed_entry_time(entry)
+                out.append(
+                    {
+                        "source": str(source),
+                        "published_at": _to_iso_utc(published_dt) if published_dt else None,
+                        "title": title,
+                        "summary": summary,
+                        "url": link,
+                        "raw_text": "",
+                    }
+                )
+        return out
+
+
+class TickerYahooRSSProvider(NewsProvider):
+    provider_name = "ticker_yahoo_rss"
+
+    def __init__(self, template, timeout_seconds, retries, max_tickers=20):
+        self.template = template
+        self.timeout_seconds = timeout_seconds
+        self.retries = retries
+        self.max_tickers = max_tickers
+
+    def fetch(self, context):
+        tickers = []
+        for group_key in ("portfolio_tickers", "candidate_tickers"):
+            for ticker in context.get(group_key, []):
+                t = str(ticker).strip().upper()
+                if t and t not in tickers and t != "CASH":
+                    tickers.append(t)
+        tickers = tickers[: max(1, _safe_int(self.max_tickers, 20))]
+
+        out = []
+        for ticker in tickers:
+            url = str(self.template).format(ticker=urllib.parse.quote(ticker))
+            try:
+                entries = _fetch_feed_entries(url, timeout_seconds=self.timeout_seconds, retries=self.retries)
+            except Exception as e:
+                log_error(f"[TAXONOMY_PREVIEW] ticker feed failed {ticker}: {e}")
+                continue
+            for entry in entries[:6]:
+                title = str(getattr(entry, "title", "") or "").strip()
+                link = str(getattr(entry, "link", "") or "").strip()
+                summary = str(getattr(entry, "summary", "") or "").strip()
+                if not title or not link:
+                    continue
+                published_dt = _parse_feed_entry_time(entry)
+                out.append(
+                    {
+                        "source": f"YahooRSS:{ticker}",
+                        "published_at": _to_iso_utc(published_dt) if published_dt else None,
+                        "title": title,
+                        "summary": summary,
+                        "url": link,
+                        "raw_text": "",
+                        "seed_ticker": ticker,
+                    }
+                )
+        return out
+
+
+class IndustryGoogleRSSProvider(NewsProvider):
+    provider_name = "industry_google_rss"
+
+    def __init__(self, template, topic_queries, timeout_seconds, retries):
+        self.template = template
+        self.topic_queries = topic_queries if isinstance(topic_queries, dict) else {}
+        self.timeout_seconds = timeout_seconds
+        self.retries = retries
+
+    def fetch(self, context):
+        out = []
+        requested_l2 = context.get("industry_topics", [])
+        for l2 in requested_l2:
+            queries = self.topic_queries.get(l2, [l2])
+            if not isinstance(queries, list):
+                queries = [str(queries)]
+            for query_text in queries[:3]:
+                query = urllib.parse.quote(str(query_text))
+                url = str(self.template).format(query=query)
+                try:
+                    entries = _fetch_feed_entries(url, timeout_seconds=self.timeout_seconds, retries=self.retries)
+                except Exception as e:
+                    log_error(f"[TAXONOMY_PREVIEW] industry feed failed {l2}:{query_text}: {e}")
+                    continue
+                for entry in entries[:5]:
+                    title = str(getattr(entry, "title", "") or "").strip()
+                    link = str(getattr(entry, "link", "") or "").strip()
+                    summary = str(getattr(entry, "summary", "") or "").strip()
+                    if not title or not link:
+                        continue
+                    published_dt = _parse_feed_entry_time(entry)
+                    out.append(
+                        {
+                            "source": f"GoogleNews:{l2}",
+                            "published_at": _to_iso_utc(published_dt) if published_dt else None,
+                            "title": title,
+                            "summary": summary,
+                            "url": link,
+                            "raw_text": "",
+                            "seed_l2": l2,
+                            "seed_query": str(query_text),
+                        }
+                    )
+        return out
+
+
+def _stable_news_id(item):
+    source = str(item.get("source", "")).strip().lower()
+    title = str(item.get("title", "")).strip().lower()
+    published = str(item.get("published_at", "")).strip().lower()
+    url = str(item.get("url", "")).strip().lower()
+    base = f"{source}|{title}|{published}|{url}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:20]
+
+
+def _parse_iso_or_none(value):
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _within_hours(value, max_age_hours):
+    dt_obj = _parse_iso_or_none(value)
+    if dt_obj is None:
+        return False
+    age = datetime.now(timezone.utc) - dt_obj
+    return age.total_seconds() <= max(0.0, float(max_age_hours)) * 3600.0
+
+
+def _dedup_and_limit_news(items, max_total=60):
+    dedup = {}
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title", "")).strip()
+        url = str(raw.get("url", "")).strip()
+        if not title and not url:
+            continue
+        url_key = url.lower()
+        title_key = normalize_title(title) if title else ""
+        key = url_key or f"title::{title_key}"
+        if key in dedup:
+            continue
+        item = dict(raw)
+        item["id"] = _stable_news_id(item)
+        dedup[key] = item
+    merged = list(dedup.values())
+    merged.sort(
+        key=lambda x: _parse_iso_or_none(x.get("published_at")) or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return merged[: max(1, _safe_int(max_total, 60))]
+
+
+def _build_l3_to_l2_map(industry_taxonomy):
+    l3_map = {}
+    if not isinstance(industry_taxonomy, dict):
+        return l3_map
+    l3_obj = industry_taxonomy.get("L3", {})
+    if not isinstance(l3_obj, dict):
+        return l3_map
+    for l2, l3_values in l3_obj.items():
+        if not isinstance(l3_values, list):
+            continue
+        for l3 in l3_values:
+            l3_map[str(l3)] = str(l2)
+    return l3_map
+
+
+def map_news_items_to_taxonomy(news_items, ticker_to_tags, industry_taxonomy, industry_keyword_map):
+    mapped = []
+    l3_to_l2 = _build_l3_to_l2_map(industry_taxonomy)
+    keyword_map = industry_keyword_map if isinstance(industry_keyword_map, dict) else {}
+    for item in news_items:
+        row = dict(item)
+        match = match_news_to_tags(row, ticker_to_tags)
+        matched_tickers = set(match.get("matched_tickers", []))
+        matched_l2 = set(match.get("matched_L2", []))
+        matched_l3 = set(match.get("matched_L3", []))
+        matched_keywords = set(match.get("matched_keywords", []))
+
+        text = f"{row.get('title', '')} {row.get('summary', '')}".lower()
+        for l2, keywords in keyword_map.items():
+            if not isinstance(keywords, list):
+                continue
+            for kw in keywords:
+                key = str(kw).strip().lower()
+                if key and key in text:
+                    matched_l2.add(str(l2))
+                    matched_keywords.add(key)
+
+        for l3 in list(matched_l3):
+            parent = l3_to_l2.get(str(l3))
+            if parent:
+                matched_l2.add(parent)
+
+        row["matched_tickers"] = sorted(matched_tickers)
+        row["matched_L2"] = sorted(matched_l2)
+        row["matched_L3"] = sorted(matched_l3)
+        row["matched_keywords"] = sorted(matched_keywords)
+        mapped.append(row)
+    return mapped
+
+
+def bucket_news_by_l2(mapped_news, l2_list, max_per_l2=8):
+    buckets = {str(l2): [] for l2 in l2_list}
+    for item in mapped_news:
+        l2_tags = item.get("matched_L2", [])
+        if not isinstance(l2_tags, list):
+            continue
+        for l2 in l2_tags:
+            key = str(l2)
+            if key not in buckets:
+                continue
+            if len(buckets[key]) >= max(1, _safe_int(max_per_l2, 8)):
+                continue
+            buckets[key].append(item)
+    return buckets
+
+
+def _neutral_industry_signal(l2, asof_utc, evidence_items, reason="neutral"):
+    sample_evidence = []
+    for item in evidence_items[:8]:
+        sample_evidence.append(
+            {
+                "id": item.get("id"),
+                "source": item.get("source"),
+                "title": item.get("title"),
+                "url": item.get("url"),
+            }
+        )
+    return {
+        "asof_utc": asof_utc,
+        "scope": "industry",
+        "L2": l2,
+        "L3_focus": [],
+        "risk_delta": 0.0,
+        "confidence": 0.3,
+        "horizon": "1d",
+        "top_drivers": [reason],
+        "impacted_tickers": [],
+        "evidence": sample_evidence,
+        "notes_speculative": True,
+    }
+
+
+def _normalize_industry_signal(signal, l2, asof_utc, evidence_items):
+    if not isinstance(signal, dict):
+        signal = {}
+    normalized = _neutral_industry_signal(l2, asof_utc, evidence_items, reason="fallback")
+    normalized["L2"] = str(signal.get("L2") or l2)
+    normalized["scope"] = "industry"
+    normalized["L3_focus"] = [str(x) for x in signal.get("L3_focus", []) if str(x).strip()][:8]
+    normalized["risk_delta"] = float(np.clip(_safe_float(signal.get("risk_delta", 0.0), 0.0), -1.0, 1.0))
+    normalized["confidence"] = float(np.clip(_safe_float(signal.get("confidence", 0.0), 0.0), 0.0, 1.0))
+    normalized["horizon"] = str(signal.get("horizon", "1d"))
+    drivers = signal.get("top_drivers", [])
+    if isinstance(drivers, list):
+        normalized["top_drivers"] = [str(x) for x in drivers if str(x).strip()][:5]
+    impacted = []
+    raw_impacted = signal.get("impacted_tickers", [])
+    if isinstance(raw_impacted, list):
+        for item in raw_impacted[:8]:
+            if not isinstance(item, dict):
+                continue
+            impacted.append(
+                {
+                    "ticker": str(item.get("ticker", "")).upper(),
+                    "direction": str(item.get("direction", "neutral")),
+                    "magnitude": float(np.clip(_safe_float(item.get("magnitude", 0.0), 0.0), -1.0, 1.0)),
+                    "reason": str(item.get("reason", ""))[:240],
+                }
+            )
+    normalized["impacted_tickers"] = impacted
+    evidence = []
+    raw_evidence = signal.get("evidence", [])
+    if isinstance(raw_evidence, list) and raw_evidence:
+        for item in raw_evidence[:8]:
+            if not isinstance(item, dict):
+                continue
+            evidence.append(
+                {
+                    "id": item.get("id"),
+                    "source": item.get("source"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                }
+            )
+    if not evidence:
+        for item in evidence_items[:8]:
+            evidence.append(
+                {
+                    "id": item.get("id"),
+                    "source": item.get("source"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                }
+            )
+    normalized["evidence"] = evidence
+    normalized["notes_speculative"] = bool(signal.get("notes_speculative", False))
+    normalized["asof_utc"] = str(signal.get("asof_utc", asof_utc))
+    if normalized["confidence"] < 0.4:
+        normalized["risk_delta"] = 0.0
+    return normalized
+
+
+def _build_industry_llm_prompt(l2, news_items, asof_utc):
+    compact_rows = []
+    for item in news_items[:8]:
+        compact_rows.append(
+            {
+                "id": item.get("id"),
+                "source": item.get("source"),
+                "title": str(item.get("title", ""))[:180],
+                "summary": str(item.get("summary", ""))[:220],
+                "url": item.get("url"),
+                "matched_tickers": item.get("matched_tickers", []),
+                "matched_L2": item.get("matched_L2", []),
+                "matched_L3": item.get("matched_L3", []),
+            }
+        )
+    schema = {
+        "asof_utc": asof_utc,
+        "scope": "industry",
+        "L2": l2,
+        "L3_focus": ["string"],
+        "risk_delta": "float in [-1,1]",
+        "confidence": "float in [0,1]",
+        "horizon": "1d|1w|1m",
+        "top_drivers": ["string <=5"],
+        "impacted_tickers": [{"ticker": "str", "direction": "up|down|neutral", "magnitude": "float[-1,1]", "reason": "str"}],
+        "evidence": [{"id": "string", "source": "string", "title": "string", "url": "string"}],
+        "notes_speculative": False,
+    }
+    prompt = (
+        "You are an industry risk signal parser. Return STRICT JSON only.\n"
+        "Do not output markdown, comments, or extra text.\n"
+        "Rules:\n"
+        "1) Use only facts from evidence items.\n"
+        "2) If evidence is weak or mixed, return risk_delta=0 and confidence<=0.4.\n"
+        "3) Keep top_drivers <=5 and impacted_tickers <=8.\n\n"
+        f"Industry L2: {l2}\n"
+        f"Asof UTC: {asof_utc}\n"
+        f"Evidence items:\n{json.dumps(compact_rows, ensure_ascii=False)}\n\n"
+        f"JSON schema:\n{json.dumps(schema, ensure_ascii=False)}"
+    )
+    return prompt
+
+
+def _generate_industry_signal_with_llm(l2, items, model_name):
+    asof_utc = datetime.now(timezone.utc).isoformat()
+    prompt = _build_industry_llm_prompt(l2, items, asof_utc)
+    try:
+        resp = ollama.chat(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.1},
+        )
+        raw_text = (
+            resp.get("message", {}).get("content")
+            if isinstance(resp, dict)
+            else ""
+        )
+        parsed = robust_json_parse(raw_text, model_name, max_retries=1)
+        return _normalize_industry_signal(parsed, l2, asof_utc, items), raw_text, None
+    except Exception as e:
+        neutral = _neutral_industry_signal(l2, asof_utc, items, reason=f"llm_error:{e}")
+        return neutral, "", str(e)
+
+
+def write_industry_signals_to_chroma(signals, collection_name="industry_signals", chroma_path="./memory_db", client_override=None):
+    if not isinstance(signals, list) or not signals:
+        return {"written": 0, "collection": collection_name}
+    if not CHROMADB_IMPORTED:
+        return {"written": 0, "collection": collection_name, "error": "chromadb_unavailable"}
+
+    client = client_override
+    if client is None:
+        client = chromadb.PersistentClient(path=chroma_path)
+    coll = client.get_or_create_collection(name=collection_name)
+
+    ids = []
+    docs = []
+    metas = []
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        l2 = str(signal.get("L2", "unknown"))
+        asof = str(signal.get("asof_utc", datetime.now(timezone.utc).isoformat()))
+        date_key = asof[:10]
+        payload = json.dumps(signal, ensure_ascii=False)
+        item_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+        row_id = f"industry::{l2}::{date_key}::{item_hash}"
+        ids.append(row_id)
+        docs.append(payload)
+        metas.append(
+            {
+                "timestamp": asof,
+                "status": "PENDING",
+                "scope": "industry",
+                "L2": l2,
+                "confidence": float(np.clip(_safe_float(signal.get("confidence", 0.0), 0.0), 0.0, 1.0)),
+                "risk_delta": float(np.clip(_safe_float(signal.get("risk_delta", 0.0), 0.0), -1.0, 1.0)),
+                "horizon": str(signal.get("horizon", "1d")),
+                "source_count": len(signal.get("evidence", []) if isinstance(signal.get("evidence"), list) else []),
+                "ticker_count": len(signal.get("impacted_tickers", []) if isinstance(signal.get("impacted_tickers"), list) else []),
+                "version": "industry_news_v1",
+            }
+        )
+    if ids:
+        coll.upsert(ids=ids, documents=docs, metadatas=metas)
+    return {"written": len(ids), "collection": collection_name}
+
+
+def run_industry_news_pipeline(
+    config,
+    *,
+    portfolio_tickers=None,
+    candidate_tickers=None,
+    synthetic_news=None,
+    llm_stub=None,
+    chroma_client_override=None,
+    chroma_path_override=None,
+):
+    cfg = config if isinstance(config, dict) else {}
+    news_overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
+    sources_cfg = _merge_cfg(_default_news_sources_cfg(), cfg.get("news_sources", {}))
+    industry_taxonomy = cfg.get("industry_taxonomy", {})
+
+    l2_to_tickers, _l3_to_tickers, ticker_to_tags = build_industry_membership(cfg)
+    l2_list = list(l2_to_tickers.keys())
+    context = {
+        "portfolio_tickers": portfolio_tickers or [],
+        "candidate_tickers": candidate_tickers or [],
+        "industry_topics": l2_list,
+    }
+
+    all_items = []
+    if isinstance(synthetic_news, list):
+        all_items = [dict(x) for x in synthetic_news if isinstance(x, dict)]
+    else:
+        providers = []
+        if bool(sources_cfg.get("market_rss_enabled", True)):
+            providers.append(
+                MarketRSSProvider(
+                    sources_cfg.get("market_rss_feeds", {}),
+                    timeout_seconds=_safe_int(sources_cfg.get("timeout_seconds", 8), 8),
+                    retries=_safe_int(sources_cfg.get("retries", 1), 1),
+                )
+            )
+        if bool(sources_cfg.get("ticker_rss_enabled", True)):
+            providers.append(
+                TickerYahooRSSProvider(
+                    sources_cfg.get("ticker_rss_template", ""),
+                    timeout_seconds=_safe_int(sources_cfg.get("timeout_seconds", 8), 8),
+                    retries=_safe_int(sources_cfg.get("retries", 1), 1),
+                    max_tickers=_safe_int(
+                        max(
+                            _safe_int(sources_cfg.get("max_portfolio_tickers", 20), 20),
+                            _safe_int(sources_cfg.get("max_candidate_tickers", 20), 20),
+                        ),
+                        20,
+                    ),
+                )
+            )
+        if bool(sources_cfg.get("industry_rss_enabled", True)):
+            providers.append(
+                IndustryGoogleRSSProvider(
+                    sources_cfg.get("industry_rss_template", ""),
+                    sources_cfg.get("industry_topic_queries", {}),
+                    timeout_seconds=_safe_int(sources_cfg.get("timeout_seconds", 8), 8),
+                    retries=_safe_int(sources_cfg.get("retries", 1), 1),
+                )
+            )
+
+        for provider in providers:
+            try:
+                fetched = provider.fetch(context)
+                if isinstance(fetched, list):
+                    all_items.extend(fetched)
+            except Exception as e:
+                log_error(f"[TAXONOMY_PREVIEW] provider {provider.provider_name} failed: {e}")
+
+    max_age_hours = _safe_float(news_overlay_cfg.get("max_age_hours", 48), 48.0)
+    age_filtered = []
+    for item in all_items:
+        row = dict(item)
+        if not row.get("published_at"):
+            row["published_at"] = datetime.now(timezone.utc).isoformat()
+        if _within_hours(row.get("published_at"), max_age_hours):
+            age_filtered.append(row)
+
+    deduped = _dedup_and_limit_news(age_filtered, max_total=_safe_int(sources_cfg.get("max_total", 60), 60))
+    mapped = map_news_items_to_taxonomy(
+        deduped,
+        ticker_to_tags=ticker_to_tags,
+        industry_taxonomy=industry_taxonomy,
+        industry_keyword_map=sources_cfg.get("industry_keyword_map", {}),
+    )
+    buckets = bucket_news_by_l2(
+        mapped,
+        l2_list=l2_list,
+        max_per_l2=_safe_int(sources_cfg.get("max_per_l2", 8), 8),
+    )
+
+    generated_signals = []
+    llm_errors = []
+    llm_model = str(
+        cfg.get("news_overlay", {}).get(
+            "llm_model",
+            cfg.get("macro_integration", {}).get("llm_topic_model", LOCAL_MODEL),
+        )
+    )
+    for l2, items in buckets.items():
+        if not items:
+            continue
+        if callable(llm_stub):
+            try:
+                stub_obj = llm_stub(l2, items)
+                if isinstance(stub_obj, str):
+                    parsed = robust_json_parse(stub_obj, llm_model, max_retries=1)
+                    normalized = _normalize_industry_signal(
+                        parsed,
+                        l2,
+                        datetime.now(timezone.utc).isoformat(),
+                        items,
+                    )
+                else:
+                    normalized = _normalize_industry_signal(
+                        stub_obj,
+                        l2,
+                        datetime.now(timezone.utc).isoformat(),
+                        items,
+                    )
+                err = None
+            except Exception as e:
+                normalized = _neutral_industry_signal(l2, datetime.now(timezone.utc).isoformat(), items, reason="stub_error")
+                err = str(e)
+        else:
+            normalized, _raw_text, err = _generate_industry_signal_with_llm(l2, items, llm_model)
+
+        if err:
+            llm_errors.append({"L2": l2, "error": err})
+        generated_signals.append(normalized)
+
+    collection_name = str(news_overlay_cfg.get("industry_collection", "industry_signals"))
+    chroma_path = (
+        str(chroma_path_override)
+        if chroma_path_override
+        else str(cfg.get("macro_integration", {}).get("chroma_path", "./memory_db"))
+    )
+    write_info = write_industry_signals_to_chroma(
+        generated_signals,
+        collection_name=collection_name,
+        chroma_path=chroma_path,
+        client_override=chroma_client_override,
+    )
+
+    return {
+        "raw_count": len(all_items),
+        "filtered_count": len(age_filtered),
+        "dedup_count": len(deduped),
+        "mapped_news": mapped,
+        "buckets": buckets,
+        "signals": generated_signals,
+        "write_info": write_info,
+        "ticker_to_tags": ticker_to_tags,
+        "l2_to_tickers": {k: sorted(list(v)) for k, v in l2_to_tickers.items()},
+        "llm_errors": llm_errors,
+        "config_used": {
+            "news_overlay": news_overlay_cfg,
+            "news_sources": sources_cfg,
+        },
+    }
+
+
+def _build_synthetic_industry_news():
+    now = datetime.now(timezone.utc)
+    return [
+        {
+            "source": "Synthetic:Industry",
+            "published_at": (now - timedelta(hours=2)).isoformat(),
+            "title": "OPEC discusses deeper production cuts as oil demand rises",
+            "summary": "Energy equities and integrated producers react to supply guidance.",
+            "url": "https://synthetic.local/news/opec-energy-1",
+            "raw_text": "",
+        },
+        {
+            "source": "Synthetic:Industry",
+            "published_at": (now - timedelta(hours=1)).isoformat(),
+            "title": "US FDA delays biotech review for obesity treatment",
+            "summary": "Healthcare and biotech names face regulatory uncertainty.",
+            "url": "https://synthetic.local/news/fda-healthcare-1",
+            "raw_text": "",
+        },
+        {
+            "source": "Synthetic:Ticker",
+            "published_at": (now - timedelta(minutes=50)).isoformat(),
+            "title": "NVDA supply chain constraints raise semiconductor execution risk",
+            "summary": "AI chip demand remains strong but near-term delivery risk increases.",
+            "url": "https://synthetic.local/news/nvda-1",
+            "raw_text": "",
+        },
+        {
+            "source": "Synthetic:Ticker",
+            "published_at": (now - timedelta(minutes=45)).isoformat(),
+            "title": "XLK ETF inflows continue amid cautious software outlook",
+            "summary": "Investors rotate to large-cap technology while cloud guidance softens.",
+            "url": "https://synthetic.local/news/xlk-1",
+            "raw_text": "",
+        },
+        {
+            "source": "Synthetic:Market",
+            "published_at": (now - timedelta(minutes=30)).isoformat(),
+            "title": "Treasury yields jump after stronger inflation print",
+            "summary": "Rates-sensitive assets and duration exposure reprice lower.",
+            "url": "https://synthetic.local/news/rates-1",
+            "raw_text": "",
+        },
+        {
+            "source": "Synthetic:Noise",
+            "published_at": (now - timedelta(minutes=20)).isoformat(),
+            "title": "Local sports team wins regional final",
+            "summary": "No market relevance expected.",
+            "url": "https://synthetic.local/news/noise-1",
+            "raw_text": "",
+        },
+        {
+            "source": "Synthetic:Duplicate",
+            "published_at": (now - timedelta(minutes=18)).isoformat(),
+            "title": "OPEC discusses deeper production cuts as oil demand rises",
+            "summary": "Duplicate headline for de-dup check.",
+            "url": "https://synthetic.local/news/opec-energy-1",
+            "raw_text": "",
+        },
+    ]
+
+
+def run_industry_news_dryrun(config_path="paper_config.json", outdir="outputs/gw_industry_dryrun"):
+    os.makedirs(outdir, exist_ok=True)
+    cfg = _load_json_config(config_path)
+    checks = []
+
+    def _check(name, condition, detail):
+        passed = bool(condition)
+        checks.append({"name": name, "pass": passed, "detail": detail})
+        print(f"[DRYRUN] {'PASS' if passed else 'FAIL'} {name}: {detail}")
+        return passed
+
+    synthetic_news = _build_synthetic_industry_news()
+    _check("SYN-A", len(synthetic_news) >= 6, "synthetic news count >= 6")
+
+    attempt_state = {"bad_once": False}
+
+    def _llm_stub(l2, items):
+        l2_norm = str(l2).lower()
+        if l2_norm == "utilities" and not attempt_state["bad_once"]:
+            attempt_state["bad_once"] = True
+            return "INVALID_JSON_OUTPUT"
+        risk_map = {
+            "energy": (-0.7, 0.82),
+            "technology": (-0.5, 0.78),
+            "healthcare": (-0.3, 0.74),
+            "rates_and_gold": (-0.4, 0.71),
+            "financials": (-0.2, 0.62),
+            "utilities": (0.0, 0.35),
+        }
+        risk_delta, confidence = risk_map.get(l2_norm, (0.0, 0.35))
+        evidence_rows = []
+        for item in items[:5]:
+            evidence_rows.append(
+                {
+                    "id": item.get("id"),
+                    "source": item.get("source"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                }
+            )
+        impacted = []
+        for ticker in sorted({t for row in items for t in row.get("matched_tickers", [])})[:6]:
+            impacted.append(
+                {
+                    "ticker": ticker,
+                    "direction": "down" if risk_delta < 0 else "neutral",
+                    "magnitude": abs(risk_delta),
+                    "reason": f"{l2} headline pressure",
+                }
+            )
+        return {
+            "asof_utc": datetime.now(timezone.utc).isoformat(),
+            "scope": "industry",
+            "L2": l2,
+            "L3_focus": [],
+            "risk_delta": risk_delta,
+            "confidence": confidence,
+            "horizon": "1d",
+            "top_drivers": [f"{l2} synthetic driver"],
+            "impacted_tickers": impacted,
+            "evidence": evidence_rows,
+            "notes_speculative": False,
+        }
+
+    chroma_path = os.path.join(outdir, "memory_db")
+    result = run_industry_news_pipeline(
+        cfg,
+        portfolio_tickers=["NVDA", "XOM", "TLT"],
+        candidate_tickers=["XLK", "XLE", "MRK", "JPM"],
+        synthetic_news=synthetic_news,
+        llm_stub=_llm_stub,
+        chroma_path_override=chroma_path,
+    )
+
+    mapped = result.get("mapped_news", [])
+    buckets = result.get("buckets", {})
+    signals = result.get("signals", [])
+    write_info = result.get("write_info", {})
+
+    _check("SYN-B", len(mapped) >= 6, f"mapped news count={len(mapped)}")
+    non_empty_l2 = [l2 for l2, rows in buckets.items() if isinstance(rows, list) and len(rows) > 0]
+    _check("SYN-C", len(non_empty_l2) >= 3, f"L2 buckets with news={len(non_empty_l2)}")
+
+    schema_ok = True
+    for sig in signals:
+        if not isinstance(sig, dict):
+            schema_ok = False
+            break
+        for key in ("asof_utc", "scope", "L2", "risk_delta", "confidence", "horizon", "evidence"):
+            if key not in sig:
+                schema_ok = False
+                break
+    _check("SYN-D", schema_ok, "signal schema validation")
+
+    written = int(write_info.get("written", 0) or 0)
+    _check("SYN-E", written >= 3, f"chroma writes={written}")
+
+    overlay_ok = False
+    overlay_tickers = []
+    try:
+        from paper_trading import PaperTradingEngine
+
+        dryrun_cfg_path = os.path.join(outdir, "dryrun_news_overlay_config.json")
+        cfg_copy = json.loads(json.dumps(cfg))
+        cfg_copy.setdefault("news_overlay", {})
+        cfg_copy["news_overlay"]["enabled"] = True
+        cfg_copy["news_overlay"]["industry_collection"] = cfg_copy["news_overlay"].get("industry_collection", "industry_signals")
+        cfg_copy["news_overlay"]["mode"] = "risk_only"
+        cfg_copy["news_overlay"]["alpha"] = float(cfg_copy["news_overlay"].get("alpha", 0.08))
+        cfg_copy["news_overlay"]["min_confidence"] = float(cfg_copy["news_overlay"].get("min_confidence", 0.55))
+        cfg_copy.setdefault("macro_integration", {})
+        cfg_copy["macro_integration"]["chroma_path"] = chroma_path
+        with open(dryrun_cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg_copy, f, ensure_ascii=False, indent=2)
+
+        old_checkpoint_env = os.environ.get("GW_CHECKPOINT_ACTION")
+        os.environ["GW_CHECKPOINT_ACTION"] = "fresh"
+        engine = None
+        try:
+            engine = PaperTradingEngine(dryrun_cfg_path)
+        finally:
+            if old_checkpoint_env is None:
+                os.environ.pop("GW_CHECKPOINT_ACTION", None)
+            else:
+                os.environ["GW_CHECKPOINT_ACTION"] = old_checkpoint_env
+
+        _new_cash_target, overlay_info = engine.apply_news_overlay_to_cash_target(
+            ["NVDA", "XLK", "XOM", "TLT"],
+            cash_target=0.2,
+        )
+        ticker_deltas = overlay_info.get("ticker_deltas", {})
+        overlay_tickers = [t for t, d in ticker_deltas.items() if _safe_float(d, 0.0) <= 0]
+        overlay_ok = len(overlay_tickers) >= 2
+    except Exception as e:
+        overlay_ok = False
+        log_error(f"[DRYRUN] paper overlay verification failed: {e}")
+    _check("SYN-F", overlay_ok, f"paper overlay tickers with delta<=0: {overlay_tickers}")
+
+    preview_payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "config_path": config_path,
+        "outdir": outdir,
+        "result_summary": {
+            "raw_count": result.get("raw_count", 0),
+            "filtered_count": result.get("filtered_count", 0),
+            "dedup_count": result.get("dedup_count", 0),
+            "l2_with_news": non_empty_l2,
+            "signal_count": len(signals),
+            "write_info": write_info,
+        },
+        "checks": checks,
+        "signals": signals[:10],
+    }
+    out_json = os.path.join(outdir, "industry_news_dryrun_summary.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(preview_payload, f, ensure_ascii=False, indent=2)
+    print(f"[TAXONOMY_PREVIEW] Dryrun summary written: {out_json}")
+
+    pass_count = len([c for c in checks if c["pass"]])
+    fail_count = len([c for c in checks if not c["pass"]])
+    print(f"DRYRUN_SUMMARY pass={pass_count} fail={fail_count}")
+    return 0 if fail_count == 0 else 1
+
+
+def _run_industry_news_cli_if_requested():
+    env_trigger = str(os.environ.get("GW_DEBUG_INDUSTRY_NEWS", "0")).strip() in ("1", "true", "TRUE", "yes")
+    arg_trigger = "--debug-industry-news" in sys.argv
+    if not env_trigger and not arg_trigger:
+        return None
+
+    parser = argparse.ArgumentParser(description="Industry news pipeline debug runner")
+    parser.add_argument("--debug-industry-news", action="store_true")
+    parser.add_argument("--config", default="paper_config.json")
+    parser.add_argument("--debug-outdir", default="outputs/gw_industry_dryrun")
+    args, _ = parser.parse_known_args()
+    try:
+        return run_industry_news_dryrun(config_path=args.config, outdir=args.debug_outdir)
+    except Exception as e:
+        print(f"[TAXONOMY_PREVIEW] ERROR industry dryrun failed: {e}")
+        return 1
+
+
+def _get_runtime_portfolio_tickers(snapshot_path="outputs/snapshot_live.json"):
+    tickers = []
+    try:
+        if not os.path.exists(snapshot_path):
+            return tickers
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        positions = obj.get("positions_detail", {})
+        if isinstance(positions, dict):
+            for ticker, row in positions.items():
+                t = str(ticker).strip().upper()
+                if not t or t == "CASH":
+                    continue
+                qty = 0.0
+                if isinstance(row, dict):
+                    qty = _safe_float(row.get("quantity", 0.0), 0.0)
+                if qty > 0 and t not in tickers:
+                    tickers.append(t)
+    except Exception as e:
+        log_error(f"_get_runtime_portfolio_tickers error: {e}")
+    return tickers
+
+
+def _get_runtime_candidate_tickers(cfg, limit=20):
+    out = []
+    try:
+        universe = cfg.get("universe", []) if isinstance(cfg, dict) else []
+        for row in universe:
+            if not isinstance(row, dict):
+                continue
+            t = str(row.get("ticker", "")).strip().upper()
+            if not t or t == "CASH" or t in out:
+                continue
+            out.append(t)
+            if len(out) >= max(1, _safe_int(limit, 20)):
+                break
+    except Exception as e:
+        log_error(f"_get_runtime_candidate_tickers error: {e}")
+    return out
+
+
+def run_industry_news_pipeline_runtime(config_path="paper_config.json"):
+    try:
+        cfg = _load_json_config(config_path)
+    except Exception as e:
+        log_error(f"[INDUSTRY_NEWS] config load failed: {e}")
+        return {"status": "config_error", "error": str(e)}
+
+    overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
+    if not bool(overlay_cfg.get("enabled", False)):
+        return {"status": "disabled"}
+
+    portfolio_tickers = _get_runtime_portfolio_tickers(
+        snapshot_path=cfg.get("reporting", {}).get("snapshot_live_path", "outputs/snapshot_live.json")
+    )
+    candidate_tickers = _get_runtime_candidate_tickers(
+        cfg,
+        limit=_safe_int(cfg.get("news_sources", {}).get("max_candidate_tickers", 20), 20),
+    )
+
+    result = run_industry_news_pipeline(
+        cfg,
+        portfolio_tickers=portfolio_tickers,
+        candidate_tickers=candidate_tickers,
+    )
+    write_info = result.get("write_info", {})
+    print(
+        f"[INDUSTRY_NEWS] signals={len(result.get('signals', []))} "
+        f"writes={int(write_info.get('written', 0) or 0)} "
+        f"collection={write_info.get('collection', overlay_cfg.get('industry_collection', 'industry_signals'))}"
+    )
+    return {"status": "ok", "result": result}
 
 
 def _normalize_theme_key(theme):
@@ -348,16 +1648,16 @@ def query_ollama(model, prompt, num_ctx=8192, temperature=None):
 
 def parse_deepseek_output(text):
     """
-    专门解析 DeepSeek-R1 的输出
-    返回: (思考过程文本, 纯净的JSON文本)
+    涓撻棬瑙ｆ瀽 DeepSeek-R1 鐨勮緭鍑?
+    杩斿洖: (鎬濊€冭繃绋嬫枃鏈? 绾噣鐨凧SON鏂囨湰)
     """
-    # 1. 提取 <think>...</think> 内部的思考过程
+    # 1. 鎻愬彇 <think>...</think> 鍐呴儴鐨勬€濊€冭繃绋?
     think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
     thought_process = think_match.group(1).strip() if think_match else "No internal thought process detected (Direct Output)."
     
-    # 2. 移除 <think> 标签，只保留剩下的 JSON 部分
+    # 2. 绉婚櫎 <think> 鏍囩锛屽彧淇濈暀鍓╀笅鐨?JSON 閮ㄥ垎
     json_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    # 清理 Markdown 代码块标记
+    # 娓呯悊 Markdown 浠ｇ爜鍧楁爣璁?
     json_text = re.sub(r'```json', '', json_text)
     json_text = re.sub(r'```', '', json_text).strip()
     
@@ -365,15 +1665,15 @@ def parse_deepseek_output(text):
 
 def extract_json_from_text(text):
     """
-    从文本中提取第一个合法的 JSON 对象
-    支持前后有多余文本、markdown、解释性内容
+    浠庢枃鏈腑鎻愬彇绗竴涓悎娉曠殑 JSON 瀵硅薄
+    鏀寔鍓嶅悗鏈夊浣欐枃鏈€乵arkdown銆佽В閲婃€у唴瀹?
     
     Args:
-        text: 原始文本
+        text: 鍘熷鏂囨湰
     Returns:
-        json_str: 提取的 JSON 字符串，如果未找到返回 None
+        json_str: 鎻愬彇鐨?JSON 瀛楃涓诧紝濡傛灉鏈壘鍒拌繑鍥?None
     """
-    # 策略 1: 查找 { ... } 包裹的内容
+    # 绛栫暐 1: 鏌ユ壘 { ... } 鍖呰９鐨勫唴瀹?
     brace_count = 0
     start_idx = -1
     
@@ -385,18 +1685,18 @@ def extract_json_from_text(text):
         elif char == '}':
             brace_count -= 1
             if brace_count == 0 and start_idx != -1:
-                # 找到完整的 JSON 对象
+                # 鎵惧埌瀹屾暣鐨?JSON 瀵硅薄
                 json_candidate = text[start_idx:i+1]
                 try:
-                    # 验证是否为合法 JSON
+                    # 楠岃瘉鏄惁涓哄悎娉?JSON
                     json.loads(json_candidate)
                     return json_candidate
                 except Exception as e:
-                    # 继续查找下一个
+                    # 缁х画鏌ユ壘涓嬩竴涓?
                     start_idx = -1
                     continue
     
-    # 策略 2: 使用正则表达式查找
+    # 绛栫暐 2: 浣跨敤姝ｅ垯琛ㄨ揪寮忔煡鎵?
     json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
     matches = re.finditer(json_pattern, text, re.DOTALL)
     for match in matches:
@@ -411,13 +1711,13 @@ def extract_json_from_text(text):
 
 def self_repair_json(raw_output, model):
     """
-    自修复：将原始输出喂回模型，要求其只输出合法 JSON
+    鑷慨澶嶏細灏嗗師濮嬭緭鍑哄杺鍥炴ā鍨嬶紝瑕佹眰鍏跺彧杈撳嚭鍚堟硶 JSON
     
     Args:
-        raw_output: 原始模型输出
-        model: 模型名称
+        raw_output: 鍘熷妯″瀷杈撳嚭
+        model: 妯″瀷鍚嶇О
     Returns:
-        repaired_json_str: 修复后的 JSON 字符串，如果失败返回 None
+        repaired_json_str: 淇鍚庣殑 JSON 瀛楃涓诧紝濡傛灉澶辫触杩斿洖 None
     """
     repair_prompt = f"""
 The following output contains a JSON object but may have extra text or formatting issues.
@@ -433,14 +1733,14 @@ Output ONLY the JSON:
         response = ollama.chat(
             model=model, 
             messages=[{'role': 'user', 'content': repair_prompt}],
-            options={"num_ctx": 4096, "temperature": 0}  # 低温度确保确定性输出
+            options={"num_ctx": 4096, "temperature": 0}  # 浣庢俯搴︾‘淇濈‘瀹氭€ц緭鍑?
         )
         repaired_text = response['message']['content'].strip()
         
-        # 尝试提取 JSON
+        # 灏濊瘯鎻愬彇 JSON
         json_str = extract_json_from_text(repaired_text)
         if json_str:
-            # 验证是否合法
+            # 楠岃瘉鏄惁鍚堟硶
             json.loads(json_str)
             return json_str
     except Exception as e:
@@ -450,25 +1750,25 @@ Output ONLY the JSON:
 
 def robust_json_parse(raw_content, model, max_retries=1):
     """
-    鲁棒 JSON 解析：提取 + 自修复 + 降级返回
+    椴佹 JSON 瑙ｆ瀽锛氭彁鍙?+ 鑷慨澶?+ 闄嶇骇杩斿洖
     
     Args:
-        raw_content: 模型原始输出
-        model: 模型名称（用于自修复）
-        max_retries: 最大自修复尝试次数
+        raw_content: 妯″瀷鍘熷杈撳嚭
+        model: 妯″瀷鍚嶇О锛堢敤浜庤嚜淇锛?
+        max_retries: 鏈€澶ц嚜淇灏濊瘯娆℃暟
     Returns:
-        dict: 解析后的 JSON 对象，或降级错误结构
+        dict: 瑙ｆ瀽鍚庣殑 JSON 瀵硅薄锛屾垨闄嶇骇閿欒缁撴瀯
     """
-    # 第一步：尝试直接提取 JSON
+    # 绗竴姝ワ細灏濊瘯鐩存帴鎻愬彇 JSON
     json_str = extract_json_from_text(raw_content)
     
     if json_str:
         try:
             return json.loads(json_str)
         except json.JSONDecodeError as e:
-            pass  # 继续尝试自修复
+            pass  # 缁х画灏濊瘯鑷慨澶?
     
-    # 第二步：自修复
+    # 绗簩姝ワ細鑷慨澶?
     for attempt in range(max_retries):
         repaired_json_str = self_repair_json(raw_content, model)
         if repaired_json_str:
@@ -477,7 +1777,7 @@ def robust_json_parse(raw_content, model, max_retries=1):
             except json.JSONDecodeError:
                 continue
     
-    # 第三步：降级返回
+    # 绗笁姝ワ細闄嶇骇杩斿洖
     return {
         "status": "error",
         "reason": "Failed to parse JSON after extraction and self-repair attempts",
@@ -486,7 +1786,7 @@ def robust_json_parse(raw_content, model, max_retries=1):
         "_parse_error": True
     }
 
-# ================= 2. 基础功能函数 =================
+# ================= 2. 鍩虹鍔熻兘鍑芥暟 =================
 
 def save_to_memory(summary, impact_score, advice):
     if impact_score < 5: return 
@@ -518,39 +1818,39 @@ def send_notification(title, msg):
             log_error(f"send_notification error: {str(e)}")
             pass
 
-# ================= 2.5. Signal Scoreboard 系统 =================
+# ================= 2.5. Signal Scoreboard 绯荤粺 =================
 
 def get_asset_ticker(asset_name):
     """
-    从资产名称获取 ticker
+    浠庤祫浜у悕绉拌幏鍙?ticker
     Args:
-        asset_name: 如 "CNY/CAD", "Oil", "NVDA"
+        asset_name: 濡?"CNY/CAD", "Oil", "NVDA"
     Returns:
-        ticker: yfinance ticker 或 None
+        ticker: yfinance ticker 鎴?None
     """
-    # 处理货币对
+    # 澶勭悊璐у竵瀵?
     if '/' in asset_name:
         parts = asset_name.split('/')
         base, quote = parts[0].strip(), parts[1].strip()
         
-        # 查找对应的 ticker
+        # 鏌ユ壘瀵瑰簲鐨?ticker
         for name, info in ASSETS_DB.items():
             if base in name:
                 return info['ticker']
         
-        # 如果是外汇对，尝试构造
+        # 濡傛灉鏄姹囧锛屽皾璇曟瀯閫?
         if base != 'USD' and quote == 'USD':
             return f"{base}=X"
         elif base == 'USD' and quote != 'USD':
             return f"{quote}=X"
     
-    # 处理商品
+    # 澶勭悊鍟嗗搧
     if asset_name.lower() in ['oil', 'crude oil', 'crude']:
         return "CL=F"
     if asset_name.lower() in ['gold', 'xau']:
         return "GC=F"
     
-    # 处理个股（直接返回）
+    # 澶勭悊涓偂锛堢洿鎺ヨ繑鍥烇級
     if asset_name.isupper() and len(asset_name) <= 5:
         return asset_name
     
@@ -558,11 +1858,11 @@ def get_asset_ticker(asset_name):
 
 def get_current_price(ticker):
     """
-    获取当前价格
+    鑾峰彇褰撳墠浠锋牸
     Args:
         ticker: yfinance ticker
     Returns:
-        price: float 或 None
+        price: float 鎴?None
     """
     try:
         t = yf.Ticker(ticker)
@@ -576,23 +1876,23 @@ def get_current_price(ticker):
 
 def record_signal(asset, direction, confidence, predictions_dict, news_sources):
     """
-    记录交易信号
+    璁板綍浜ゆ槗淇″彿
     Args:
-        asset: 资产名称
+        asset: 璧勪骇鍚嶇О
         direction: Bullish/Bearish/Neutral
-        confidence: 信心分数 (0-10)
-        predictions_dict: 完整的 predictions 字典
-        news_sources: 新闻来源列表
+        confidence: 淇″績鍒嗘暟 (0-10)
+        predictions_dict: 瀹屾暣鐨?predictions 瀛楀吀
+        news_sources: 鏂伴椈鏉ユ簮鍒楄〃
     """
     try:
         signal_id = str(uuid.uuid4())
         timestamp = datetime.now().isoformat()
         
-        # 获取 ticker 和当前价格
+        # 鑾峰彇 ticker 鍜屽綋鍓嶄环鏍?
         ticker = get_asset_ticker(asset)
         current_price = get_current_price(ticker) if ticker else None
         
-        # 确定主题
+        # 纭畾涓婚
         theme = "UNKNOWN"
         if '/' in asset:
             theme = "FX"
@@ -601,10 +1901,10 @@ def record_signal(asset, direction, confidence, predictions_dict, news_sources):
         elif ticker and len(asset) <= 5 and asset.isupper():
             theme = "STOCK"
         
-        # 提取新闻来源
+        # 鎻愬彇鏂伴椈鏉ユ簮
         sources = list(set([src for src in news_sources if src]))
         
-        # 构造元数据
+        # 鏋勯€犲厓鏁版嵁
         metadata = {
             "signal_id": signal_id,
             "timestamp": timestamp,
@@ -614,9 +1914,9 @@ def record_signal(asset, direction, confidence, predictions_dict, news_sources):
             "confidence": float(confidence),
             "theme": theme,
             "initial_price": float(current_price) if current_price else 0.0,
-            "sources": ",".join(sources[:3]),  # 最多3个来源
+            "sources": ",".join(sources[:3]),  # 鏈€澶?涓潵婧?
             "status": "PENDING",  # PENDING / VERIFIED
-            # 回填字段（初始为空）
+            # 鍥炲～瀛楁锛堝垵濮嬩负绌猴級
             "price_1h": 0.0,
             "price_4h": 0.0,
             "price_1d": 0.0,
@@ -631,7 +1931,7 @@ def record_signal(asset, direction, confidence, predictions_dict, news_sources):
             "return_1w": 0.0
         }
         
-        # 存储到 ChromaDB
+        # 瀛樺偍鍒?ChromaDB
         signals_collection.add(
             documents=[json.dumps(predictions_dict)],
             metadatas=[metadata],
@@ -652,7 +1952,7 @@ def extract_llm_topic_sentiment(news, macro_data, lang_mode):
         return None
 
     model_name = str(RUNTIME_SETTINGS.get("llm_topic_model", LOCAL_MODEL))
-    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "中文" else "OUTPUT LANGUAGE: ENGLISH"
+    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "涓枃" else "OUTPUT LANGUAGE: ENGLISH"
     headlines = "\n".join([f"- [{item.get('source', 'Unknown')}] {item.get('title', '')}" for item in news[:20]])
 
     prompt = f"""
@@ -846,11 +2146,11 @@ def record_llm_topic_signals(payload, news_sources):
 
 def backfill_signal_results():
     """
-    回填信号结果
-    检查所有 PENDING 信号，如果时间到了就回填价格和结果
+    鍥炲～淇″彿缁撴灉
+    妫€鏌ユ墍鏈?PENDING 淇″彿锛屽鏋滄椂闂村埌浜嗗氨鍥炲～浠锋牸鍜岀粨鏋?
     """
     try:
-        # 获取所有 PENDING 信号
+        # 鑾峰彇鎵€鏈?PENDING 淇″彿
         results = signals_collection.get(
             where={"status": "PENDING"}
         )
@@ -872,12 +2172,12 @@ def backfill_signal_results():
             if ticker == "UNKNOWN" or initial_price == 0.0:
                 continue
             
-            # 计算时间差
-            time_diff = (now - signal_time).total_seconds() / 3600  # 小时
+            # 璁＄畻鏃堕棿宸?
+            time_diff = (now - signal_time).total_seconds() / 3600  # 灏忔椂
             
             updated = False
             
-            # 回填 1h
+            # 鍥炲～ 1h
             if time_diff >= 1 and metadata['price_1h'] == 0.0:
                 price_1h = get_historical_price(ticker, signal_time + timedelta(hours=1))
                 if price_1h:
@@ -886,7 +2186,7 @@ def backfill_signal_results():
                     metadata['correct_1h'] = check_direction(direction, metadata['return_1h'])
                     updated = True
             
-            # 回填 4h
+            # 鍥炲～ 4h
             if time_diff >= 4 and metadata['price_4h'] == 0.0:
                 price_4h = get_historical_price(ticker, signal_time + timedelta(hours=4))
                 if price_4h:
@@ -895,7 +2195,7 @@ def backfill_signal_results():
                     metadata['correct_4h'] = check_direction(direction, metadata['return_4h'])
                     updated = True
             
-            # 回填 1d
+            # 鍥炲～ 1d
             if time_diff >= 24 and metadata['price_1d'] == 0.0:
                 price_1d = get_historical_price(ticker, signal_time + timedelta(days=1))
                 if price_1d:
@@ -904,17 +2204,17 @@ def backfill_signal_results():
                     metadata['correct_1d'] = check_direction(direction, metadata['return_1d'])
                     updated = True
             
-            # 回填 1w
+            # 鍥炲～ 1w
             if time_diff >= 168 and metadata['price_1w'] == 0.0:
                 price_1w = get_historical_price(ticker, signal_time + timedelta(weeks=1))
                 if price_1w:
                     metadata['price_1w'] = price_1w
                     metadata['return_1w'] = (price_1w - initial_price) / initial_price * 100
                     metadata['correct_1w'] = check_direction(direction, metadata['return_1w'])
-                    metadata['status'] = "VERIFIED"  # 全部回填完成
+                    metadata['status'] = "VERIFIED"  # 鍏ㄩ儴鍥炲～瀹屾垚
                     updated = True
             
-            # 更新元数据
+            # 鏇存柊鍏冩暟鎹?
             if updated:
                 signals_collection.update(
                     ids=[signal_id],
@@ -929,17 +2229,17 @@ def backfill_signal_results():
 
 def get_historical_price(ticker, target_time):
     """
-    获取历史价格（尽可能接近目标时间）
+    鑾峰彇鍘嗗彶浠锋牸锛堝敖鍙兘鎺ヨ繎鐩爣鏃堕棿锛?
     """
     try:
         t = yf.Ticker(ticker)
-        # 获取目标时间前后1天的数据
+        # 鑾峰彇鐩爣鏃堕棿鍓嶅悗1澶╃殑鏁版嵁
         start = target_time - timedelta(days=1)
         end = target_time + timedelta(days=1)
         hist = t.history(start=start, end=end, interval="1h")
         
         if not hist.empty:
-            # 找到最接近目标时间的价格
+            # 鎵惧埌鏈€鎺ヨ繎鐩爣鏃堕棿鐨勪环鏍?
             closest_idx = (hist.index - target_time).abs().argmin()
             return float(hist['Close'].iloc[closest_idx])
     except Exception as e:
@@ -949,10 +2249,10 @@ def get_historical_price(ticker, target_time):
 
 def check_direction(predicted_direction, actual_return):
     """
-    检查方向是否正确
+    妫€鏌ユ柟鍚戞槸鍚︽纭?
     Args:
         predicted_direction: Bullish/Bearish/Neutral
-        actual_return: 实际收益率 (%)
+        actual_return: 瀹為檯鏀剁泭鐜?(%)
     Returns:
         "CORRECT" / "WRONG" / "NEUTRAL"
     """
@@ -966,10 +2266,10 @@ def check_direction(predicted_direction, actual_return):
     
     return "UNKNOWN"
 
-# ================= 2.6. Early-Warning 风险评分系统 =================
+# ================= 2.6. Early-Warning 椋庨櫓璇勫垎绯荤粺 =================
 
 def calculate_rsi(ticker, period=14):
-    """计算 RSI 指标"""
+    """璁＄畻 RSI 鎸囨爣"""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="3mo")
@@ -988,7 +2288,7 @@ def calculate_rsi(ticker, period=14):
         return None
 
 def calculate_ma(ticker, period=20):
-    """计算移动平均线"""
+    """Calculate moving average."""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="3mo")
@@ -1000,7 +2300,7 @@ def calculate_ma(ticker, period=20):
         return None
 
 def calculate_atr(ticker, period=14):
-    """计算 ATR (Average True Range)"""
+    """璁＄畻 ATR (Average True Range)"""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="3mo")
@@ -1019,7 +2319,7 @@ def calculate_atr(ticker, period=14):
         return None
 
 def get_price_change(ticker, period="1w"):
-    """获取价格变化百分比"""
+    """Get price change percentage."""
     try:
         t = yf.Ticker(ticker)
         if period == "1w":
@@ -1042,7 +2342,7 @@ def get_price_change(ticker, period="1w"):
         return 0.0
 
 def calculate_gap(ticker):
-    """计算跳空缺口"""
+    """璁＄畻璺崇┖缂哄彛"""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="5d")
@@ -1058,7 +2358,7 @@ def calculate_gap(ticker):
         return 0.0
 
 def get_current_volume(ticker):
-    """获取当前成交量"""
+    """Get current volume."""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="1d")
@@ -1070,42 +2370,42 @@ def get_current_volume(ticker):
         return 0
 
 def get_avg_volume(ticker, period=20):
-    """获取平均成交量"""
+    """Get average volume."""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="1mo")
         if hist.empty or len(hist) < period:
-            return 1  # 避免除零
+            return 1  # 閬垮厤闄ら浂
         return int(hist['Volume'].rolling(window=period).mean().iloc[-1])
     except Exception as e:
         log_error(f"get_avg_volume error for {ticker}: {str(e)}")
         return 1
 
 def count_keyword_mentions(keywords, news_list):
-    """统计关键词在新闻中的出现次数"""
+    """缁熻鍏抽敭璇嶅湪鏂伴椈涓殑鍑虹幇娆℃暟"""
     count = 0
     for news_item in news_list:
         title = news_item.get('title', '').lower()
         for keyword in keywords:
             if keyword.lower() in title:
                 count += 1
-                break  # 每条新闻只计数一次
+                break  # 姣忔潯鏂伴椈鍙鏁颁竴娆?
     return count
 
 def calculate_macro_chain_score(asset_name, asset_config, recent_news):
     """
-    计算宏观链条分 (0-25)
-    基于美元指数、利率、相关性
+    璁＄畻瀹忚閾炬潯鍒?(0-25)
+    鍩轰簬缇庡厓鎸囨暟銆佸埄鐜囥€佺浉鍏虫€?
     """
     score = 0
     evidence = []
     
     try:
-        # 1. 美元指数影响 (0-10分)
-        dxy_change = get_price_change("DX-Y.NYB", period="1w")  # 美元指数
+        # 1. 缇庡厓鎸囨暟褰卞搷 (0-10鍒?
+        dxy_change = get_price_change("DX-Y.NYB", period="1w")  # 缇庡厓鎸囨暟
         dxy_correlation = asset_config['correlations'].get('DXY', 0)
         
-        if abs(dxy_correlation) > 0.5:  # 强相关
+        if abs(dxy_correlation) > 0.5:  # 寮虹浉鍏?
             if (dxy_correlation < 0 and dxy_change > 2) or (dxy_correlation > 0 and dxy_change < -2):
                 score += 8
                 evidence.append({
@@ -1123,8 +2423,8 @@ def calculate_macro_chain_score(asset_name, asset_config, recent_news):
                     "interpretation": f"Moderate USD movement, correlation: {dxy_correlation:.2f}"
                 })
         
-        # 2. 利率影响 (0-10分)
-        tnx_change = get_price_change("^TNX", period="1w")  # 10年期国债
+        # 2. 鍒╃巼褰卞搷 (0-10鍒?
+        tnx_change = get_price_change("^TNX", period="1w")  # 10骞存湡鍥藉€?
         tnx_correlation = asset_config['correlations'].get('^TNX', 0)
         
         if abs(tnx_correlation) > 0.3:
@@ -1137,8 +2437,8 @@ def calculate_macro_chain_score(asset_name, asset_config, recent_news):
                     "interpretation": f"Rate {'rise' if tnx_change > 0 else 'fall'} {'negative' if tnx_correlation < 0 else 'positive'} for {asset_name}"
                 })
         
-        # 3. 新闻中的宏观提及 (0-5分)
-        macro_keywords = ["Fed", "interest rate", "dollar", "USD", "inflation", "央行", "利率"]
+        # 3. 鏂伴椈涓殑瀹忚鎻愬強 (0-5鍒?
+        macro_keywords = ["Fed", "interest rate", "dollar", "USD", "inflation", "澶", "鍒╃巼"]
         news_mentions = count_keyword_mentions(macro_keywords, recent_news)
         
         if news_mentions >= 3:
@@ -1168,18 +2468,18 @@ def calculate_macro_chain_score(asset_name, asset_config, recent_news):
 
 def calculate_crowding_score(ticker):
     """
-    计算拥挤度分 (0-25)
-    基于 RSI、价格偏离均线、情绪
+    璁＄畻鎷ユ尋搴﹀垎 (0-25)
+    鍩轰簬 RSI銆佷环鏍煎亸绂诲潎绾裤€佹儏缁?
     """
     score = 0
     evidence = []
     
     try:
-        # 1. RSI 超买/超卖 (0-12分)
+        # 1. RSI 瓒呬拱/瓒呭崠 (0-12鍒?
         rsi = calculate_rsi(ticker, period=14)
         
         if rsi is not None:
-            if rsi > 70:  # 超买
+            if rsi > 70:  # 瓒呬拱
                 score += min((rsi - 70) / 3, 12)
                 evidence.append({
                     "type": "price",
@@ -1187,7 +2487,7 @@ def calculate_crowding_score(ticker):
                     "value": f"{rsi:.1f}",
                     "interpretation": "Overbought - potential reversal risk"
                 })
-            elif rsi < 30:  # 超卖
+            elif rsi < 30:  # 瓒呭崠
                 score += min((30 - rsi) / 3, 12)
                 evidence.append({
                     "type": "price",
@@ -1204,7 +2504,7 @@ def calculate_crowding_score(ticker):
                     "interpretation": "Moderate momentum"
                 })
         
-        # 2. 价格偏离均线 (0-10分)
+        # 2. 浠锋牸鍋忕鍧囩嚎 (0-10鍒?
         price = get_current_price(ticker)
         ma20 = calculate_ma(ticker, period=20)
         
@@ -1228,7 +2528,7 @@ def calculate_crowding_score(ticker):
                     "interpretation": "Moderate deviation from MA20"
                 })
         
-        # 3. 成交量异常 (0-3分)
+        # 3. 鎴愪氦閲忓紓甯?(0-3鍒?
         current_volume = get_current_volume(ticker)
         avg_volume = get_avg_volume(ticker, period=20)
         
@@ -1254,21 +2554,21 @@ def calculate_crowding_score(ticker):
 
 def calculate_microstructure_score(ticker):
     """
-    计算微结构分 (0-25)
-    基于波动率、跳空、成交量
+    璁＄畻寰粨鏋勫垎 (0-25)
+    鍩轰簬娉㈠姩鐜囥€佽烦绌恒€佹垚浜ら噺
     """
     score = 0
     evidence = []
     
     try:
-        # 1. 波动率骤增 (0-12分)
+        # 1. 娉㈠姩鐜囬澧?(0-12鍒?
         current_atr = calculate_atr(ticker, period=14)
         avg_atr = calculate_atr(ticker, period=50)
         
         if current_atr and avg_atr and avg_atr > 0:
             atr_ratio = current_atr / avg_atr
             
-            if atr_ratio > 1.5:  # 波动率上升50%+
+            if atr_ratio > 1.5:  # 娉㈠姩鐜囦笂鍗?0%+
                 score += min((atr_ratio - 1) * 6, 12)
                 evidence.append({
                     "type": "price",
@@ -1285,10 +2585,10 @@ def calculate_microstructure_score(ticker):
                     "interpretation": "Elevated volatility"
                 })
         
-        # 2. 跳空缺口 (0-8分)
+        # 2. 璺崇┖缂哄彛 (0-8鍒?
         gap = calculate_gap(ticker)
         
-        if abs(gap) > 2:  # 跳空超过2%
+        if abs(gap) > 2:  # 璺崇┖瓒呰繃2%
             score += min(abs(gap), 8)
             evidence.append({
                 "type": "price",
@@ -1305,14 +2605,14 @@ def calculate_microstructure_score(ticker):
                 "interpretation": "Small gap detected"
             })
         
-        # 3. 成交量异常 (0-5分)
+        # 3. 鎴愪氦閲忓紓甯?(0-5鍒?
         current_volume = get_current_volume(ticker)
         avg_volume = get_avg_volume(ticker, period=20)
         
         if current_volume > 0 and avg_volume > 0:
             volume_ratio = current_volume / avg_volume
             
-            if volume_ratio > 2:  # 成交量翻倍
+            if volume_ratio > 2:  # 鎴愪氦閲忕炕鍊?
                 score += min((volume_ratio - 1) * 2.5, 5)
                 evidence.append({
                     "type": "price",
@@ -1331,21 +2631,21 @@ def calculate_microstructure_score(ticker):
 
 def calculate_event_risk_score(recent_news):
     """
-    计算事件风险分 (0-25)
-    基于新闻关键词匹配
+    璁＄畻浜嬩欢椋庨櫓鍒?(0-25)
+    鍩轰簬鏂伴椈鍏抽敭璇嶅尮閰?
     """
     score = 0
     evidence = []
     
     try:
-        # 定义事件风险关键词
+        # 瀹氫箟浜嬩欢椋庨櫓鍏抽敭璇?
         event_keywords = {
-            "central_bank": ["Fed", "ECB", "央行", "interest rate", "monetary policy", "Powell", "Yellen"],
-            "policy": ["tariff", "sanction", "regulation", "policy", "law", "trade war", "关税"],
-            "geopolitical": ["war", "conflict", "election", "crisis", "tension", "战争", "冲突"]
+            "central_bank": ["Fed", "ECB", "澶", "interest rate", "monetary policy", "Powell", "Yellen"],
+            "policy": ["tariff", "sanction", "regulation", "policy", "law", "trade war", "鍏崇◣"],
+            "geopolitical": ["war", "conflict", "election", "crisis", "tension", "鎴樹簤", "鍐茬獊"]
         }
         
-        # 1. 央行事件 (0-10分)
+        # 1. 澶浜嬩欢 (0-10鍒?
         cb_mentions = count_keyword_mentions(event_keywords["central_bank"], recent_news)
         if cb_mentions >= 3:
             score += 10
@@ -1364,7 +2664,7 @@ def calculate_event_risk_score(recent_news):
                 "interpretation": "Central bank mentions detected"
             })
         
-        # 2. 政策风险 (0-8分)
+        # 2. 鏀跨瓥椋庨櫓 (0-8鍒?
         policy_mentions = count_keyword_mentions(event_keywords["policy"], recent_news)
         if policy_mentions >= 3:
             score += 8
@@ -1383,7 +2683,7 @@ def calculate_event_risk_score(recent_news):
                 "interpretation": "Policy risk mentions"
             })
         
-        # 3. 地缘政治 (0-7分)
+        # 3. 鍦扮紭鏀挎不 (0-7鍒?
         geo_mentions = count_keyword_mentions(event_keywords["geopolitical"], recent_news)
         if geo_mentions >= 3:
             score += 7
@@ -1412,7 +2712,7 @@ def calculate_event_risk_score(recent_news):
 
 def calculate_early_warning_score(asset_name, recent_news):
     """
-    计算综合 Early-Warning 风险分数
+    璁＄畻缁煎悎 Early-Warning 椋庨櫓鍒嗘暟
     Returns:
         dict: {
             "asset": str,
@@ -1438,16 +2738,16 @@ def calculate_early_warning_score(asset_name, recent_news):
     asset_config = WATCHLIST[asset_name]
     ticker = asset_config['ticker']
     
-    # 计算四个子分数
+    # 璁＄畻鍥涗釜瀛愬垎鏁?
     macro_score, macro_evidence = calculate_macro_chain_score(asset_name, asset_config, recent_news)
     crowding_score, crowding_evidence = calculate_crowding_score(ticker)
     micro_score, micro_evidence = calculate_microstructure_score(ticker)
     event_score, event_evidence = calculate_event_risk_score(recent_news)
     
-    # 综合分数
+    # 缁煎悎鍒嗘暟
     total_score = macro_score + crowding_score + micro_score + event_score
     
-    # 风险等级
+    # 椋庨櫓绛夌骇
     if total_score >= 76:
         risk_level = "CRITICAL"
     elif total_score >= 51:
@@ -1457,7 +2757,7 @@ def calculate_early_warning_score(asset_name, recent_news):
     else:
         risk_level = "LOW"
     
-    # 告警触发器
+    # 鍛婅瑙﹀彂鍣?
     alert_triggers = []
     if total_score > 60:
         alert_triggers.append(f"Total risk score > 60 ({risk_level})")
@@ -1470,15 +2770,15 @@ def calculate_early_warning_score(asset_name, recent_news):
     if event_score > 15:
         alert_triggers.append(f"Event risk score > 15 ({event_score})")
     
-    # 建议
+    # 寤鸿
     if risk_level == "CRITICAL":
-        recommendation = "🔴 CRITICAL: Multiple risk factors at extreme levels. Consider reducing exposure significantly or hedging."
+        recommendation = "馃敶 CRITICAL: Multiple risk factors at extreme levels. Consider reducing exposure significantly or hedging."
     elif risk_level == "HIGH":
-        recommendation = "🟠 CAUTION: Elevated risk across multiple dimensions. Monitor closely and consider risk management."
+        recommendation = "馃煚 CAUTION: Elevated risk across multiple dimensions. Monitor closely and consider risk management."
     elif risk_level == "MEDIUM":
-        recommendation = "🟡 WATCH: Some risk factors elevated. Stay alert to developments."
+        recommendation = "馃煛 WATCH: Some risk factors elevated. Stay alert to developments."
     else:
-        recommendation = "🟢 NORMAL: Risk levels within normal range. Continue monitoring."
+        recommendation = "馃煝 NORMAL: Risk levels within normal range. Continue monitoring."
     
     return {
         "asset": asset_name,
@@ -1497,23 +2797,23 @@ def calculate_early_warning_score(asset_name, recent_news):
 
 def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
     """
-    获取信号统计（升级版 - 支持交易级分类）
+    鑾峰彇淇″彿缁熻锛堝崌绾х増 - 鏀寔浜ゆ槗绾у垎绫伙級
     Args:
-        theme: 主题过滤 (FX/MACRO/STOCK/None)
-        asset: 资产过滤 (None 表示全部)
-        timeframe: 时间框架 (1h/4h/1d/1w)
+        theme: 涓婚杩囨护 (FX/MACRO/STOCK/None)
+        asset: 璧勪骇杩囨护 (None 琛ㄧず鍏ㄩ儴)
+        timeframe: 鏃堕棿妗嗘灦 (1h/4h/1d/1w)
     Returns:
-        dict: 统计数据（包含交易级指标）
+        dict: 缁熻鏁版嵁锛堝寘鍚氦鏄撶骇鎸囨爣锛?
     """
     try:
-        # 构造查询条件
+        # 鏋勯€犳煡璇㈡潯浠?
         where_clause = {}
         if theme:
             where_clause["theme"] = theme
         if asset:
             where_clause["asset"] = asset
         
-        # 获取信号
+        # 鑾峰彇淇″彿
         if where_clause:
             results = signals_collection.get(where=where_clause)
         else:
@@ -1540,7 +2840,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
                 "timestamps": []
             }
         
-        # 提取对应时间框架的数据
+        # 鎻愬彇瀵瑰簲鏃堕棿妗嗘灦鐨勬暟鎹?
         correct_field = f"correct_{timeframe}"
         return_field = f"return_{timeframe}"
         
@@ -1578,10 +2878,10 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             accuracy = correct_count / total_verified * 100
             avg_return = sum(returns) / len(returns) if returns else 0.0
             
-            # 累计收益
+            # 绱鏀剁泭
             cumulative_return = sum(returns)
             
-            # 最大回撤计算
+            # 鏈€澶у洖鎾よ绠?
             cumulative_curve = []
             running_sum = 0
             for r in returns:
@@ -1598,7 +2898,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
                     if drawdown > max_drawdown:
                         max_drawdown = drawdown
             
-            # 波动率（收益标准差）
+            # 娉㈠姩鐜囷紙鏀剁泭鏍囧噯宸級
             if len(returns) > 1:
                 mean_return = sum(returns) / len(returns)
                 variance = sum((r - mean_return) ** 2 for r in returns) / (len(returns) - 1)
@@ -1606,7 +2906,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             else:
                 volatility = 0.0
             
-            # 胜率和盈亏比
+            # 鑳滅巼鍜岀泩浜忔瘮
             wins = [r for r in returns if r > 0]
             losses = [r for r in returns if r < 0]
             
@@ -1635,7 +2935,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             "avg_win": avg_win,
             "avg_loss": avg_loss,
             "profit_factor": profit_factor,
-            "returns_list": returns,  # 用于多时间窗口验证
+            "returns_list": returns,  # 鐢ㄤ簬澶氭椂闂寸獥鍙ｉ獙璇?
             "timestamps": timestamps
         }
     except Exception as e:
@@ -1658,30 +2958,30 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
 def classify_trading_performance(stats_dict, theme=None, asset=None, 
                                   transaction_cost=0.1, max_dd_threshold=15.0):
     """
-    交易级性能分类体系（Trading-Grade Performance Classification）
+    浜ゆ槗绾ф€ц兘鍒嗙被浣撶郴锛圱rading-Grade Performance Classification锛?
     
-    这是决定是否允许 real-money execution 的唯一依据
+    杩欐槸鍐冲畾鏄惁鍏佽 real-money execution 鐨勫敮涓€渚濇嵁
     
     Args:
-        stats_dict: 统计数据字典（来自 get_signal_statistics）
-        theme: 主题（用于多时间窗口验证）
-        asset: 资产（用于多时间窗口验证）
-        transaction_cost: 估算交易成本（百分比，默认 0.1%）
-        max_dd_threshold: 最大回撤阈值（百分比，默认 15%）
+        stats_dict: 缁熻鏁版嵁瀛楀吀锛堟潵鑷?get_signal_statistics锛?
+        theme: 涓婚锛堢敤浜庡鏃堕棿绐楀彛楠岃瘉锛?
+        asset: 璧勪骇锛堢敤浜庡鏃堕棿绐楀彛楠岃瘉锛?
+        transaction_cost: 浼扮畻浜ゆ槗鎴愭湰锛堢櫨鍒嗘瘮锛岄粯璁?0.1%锛?
+        max_dd_threshold: 鏈€澶у洖鎾ら槇鍊硷紙鐧惧垎姣旓紝榛樿 15%锛?
     
     Returns:
         dict: {
-            "classification_v2": str,  # 新交易级分类
-            "classification_v1": str,  # 原分类（仅供参考）
-            "decision_allowed": bool,  # 是否允许实盘交易
-            "reason_summary": str,     # 人类可读的原因
-            "risk_warnings": list,     # 风险警告列表
-            "net_expected_value": float,  # 净期望值
-            "multi_timeframe_validated": bool  # 多时间窗口验证
+            "classification_v2": str,  # 鏂颁氦鏄撶骇鍒嗙被
+            "classification_v1": str,  # 鍘熷垎绫伙紙浠呬緵鍙傝€冿級
+            "decision_allowed": bool,  # 鏄惁鍏佽瀹炵洏浜ゆ槗
+            "reason_summary": str,     # 浜虹被鍙鐨勫師鍥?
+            "risk_warnings": list,     # 椋庨櫓璀﹀憡鍒楄〃
+            "net_expected_value": float,  # 鍑€鏈熸湜鍊?
+            "multi_timeframe_validated": bool  # 澶氭椂闂寸獥鍙ｉ獙璇?
         }
     """
     
-    # 提取关键指标
+    # 鎻愬彇鍏抽敭鎸囨爣
     trades_count = stats_dict.get('sample_size', 0)
     accuracy = stats_dict.get('accuracy', 0.0)
     avg_return = stats_dict.get('avg_return', 0.0)
@@ -1691,10 +2991,10 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
     win_rate = stats_dict.get('win_rate', 0.0)
     profit_factor = stats_dict.get('profit_factor', 0.0)
     
-    # 计算净期望值
+    # 璁＄畻鍑€鏈熸湜鍊?
     net_expected_value = avg_return - transaction_cost
     
-    # 初始化返回值
+    # 鍒濆鍖栬繑鍥炲€?
     classification_v2 = ""
     classification_v1 = ""
     decision_allowed = False
@@ -1702,7 +3002,7 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
     risk_warnings = []
     multi_timeframe_validated = False
     
-    # ========== 第一步：V1 分类（原分类，仅供参考）==========
+    # ========== 绗竴姝ワ細V1 鍒嗙被锛堝師鍒嗙被锛屼粎渚涘弬鑰冿級==========
     if trades_count == 0:
         classification_v1 = "No Data"
     elif accuracy > 55 and avg_return > 0:
@@ -1714,13 +3014,13 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
     else:
         classification_v1 = "No Edge (V1)"
     
-    # ========== 第二步：最低可评估门槛 ==========
+    # ========== 绗簩姝ワ細鏈€浣庡彲璇勪及闂ㄦ ==========
     if trades_count < 30:
-        classification_v2 = "🟤 Insufficient Data"
+        classification_v2 = "馃煠 Insufficient Data"
         decision_allowed = False
-        reason_summary = f"样本数不足（{trades_count}/30）。需要至少 30 个已验证信号才能进行可靠评估。"
-        risk_warnings.append("⚠️ 样本量过小，任何统计结论都不可靠")
-        risk_warnings.append("⚠️ 禁止用于实盘交易")
+        reason_summary = f"Insufficient verified sample size ({trades_count}/30). Need at least 30 verified signals for reliable evaluation."
+        risk_warnings.append("鈿狅笍 鏍锋湰閲忚繃灏忥紝浠讳綍缁熻缁撹閮戒笉鍙潬")
+        risk_warnings.append("鈿狅笍 绂佹鐢ㄤ簬瀹炵洏浜ゆ槗")
         
         return {
             "classification_v2": classification_v2,
@@ -1732,8 +3032,8 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
             "multi_timeframe_validated": False
         }
     
-    # ========== 第三步：多时间窗口验证 ==========
-    # 检查至少 2 个时间窗口的 net_expected_value 是否为正
+    # ========== 绗笁姝ワ細澶氭椂闂寸獥鍙ｉ獙璇?==========
+    # 妫€鏌ヨ嚦灏?2 涓椂闂寸獥鍙ｇ殑 net_expected_value 鏄惁涓烘
     if theme or asset:
         timeframes_to_check = ["1h", "4h", "1d", "1w"]
         positive_timeframes = []
@@ -1743,139 +3043,137 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
             tf_net_ev = tf_stats.get('avg_return', 0.0) - transaction_cost
             tf_sample = tf_stats.get('sample_size', 0)
             
-            if tf_sample >= 10 and tf_net_ev > 0:  # 至少 10 个样本且为正
+            if tf_sample >= 10 and tf_net_ev > 0:  # 鑷冲皯 10 涓牱鏈笖涓烘
                 positive_timeframes.append(tf)
         
         multi_timeframe_validated = len(positive_timeframes) >= 2
     else:
-        # 无法验证多时间窗口（未指定 theme/asset）
+        # 鏃犳硶楠岃瘉澶氭椂闂寸獥鍙ｏ紙鏈寚瀹?theme/asset锛?
         multi_timeframe_validated = False
     
-    # ========== 第四步：交易级分类 ==========
+    # ========== 绗洓姝ワ細浜ゆ槗绾у垎绫?==========
     
-    # 🟢 Tradable Edge（允许实盘）
+    # 馃煝 Tradable Edge锛堝厑璁稿疄鐩橈級
     if (trades_count >= 50 and 
         net_expected_value > 0 and 
         max_drawdown <= max_dd_threshold and
         multi_timeframe_validated):
         
-        classification_v2 = "🟢 Tradable Edge"
+        classification_v2 = "馃煝 Tradable Edge"
         decision_allowed = True
         reason_summary = (
-            f"✅ 满足所有交易级标准：\n"
-            f"• 样本数充足（{trades_count} ≥ 50）\n"
-            f"• 净期望值为正（{net_expected_value:.2f}% > 0）\n"
-            f"• 回撤可控（{max_drawdown:.2f}% ≤ {max_dd_threshold}%）\n"
-            f"• 多时间窗口验证通过\n"
-            f"→ 允许进入实盘交易"
+            f"All tradable criteria passed:\n"
+            f"- Sample size sufficient ({trades_count} >= 50)\n"
+            f"- Net expected value positive ({net_expected_value:.2f}% > 0)\n"
+            f"- Drawdown controlled ({max_drawdown:.2f}% <= {max_dd_threshold}%)\n"
+            f"- Multi-timeframe validation passed\n"
+            f"=> Eligible for live trading"
         )
         
-        # 即使允许交易，也要给出风险提示
+        # 鍗充娇鍏佽浜ゆ槗锛屼篃瑕佺粰鍑洪闄╂彁绀?
         if profit_factor < 1.5:
-            risk_warnings.append(f"⚠️ Profit Factor 较低（{profit_factor:.2f}），建议谨慎控制仓位")
+            risk_warnings.append(f"Profit factor is modest ({profit_factor:.2f}); use conservative sizing.")
         if volatility > 2.0:
-            risk_warnings.append(f"⚠️ 收益波动较大（{volatility:.2f}%），注意风险管理")
+            risk_warnings.append(f"Return volatility is elevated ({volatility:.2f}%); tighten risk controls.")
     
-    # 🟡 Directional Signal（方向参考信号）
+    # 馃煛 Directional Signal锛堟柟鍚戝弬鑰冧俊鍙凤級
     elif (accuracy >= 58 and abs(net_expected_value) < 0.2):
-        classification_v2 = "🟡 Directional Signal"
+        classification_v2 = "馃煛 Directional Signal"
         decision_allowed = False
         reason_summary = (
-            f"方向准确率较高（{accuracy:.1f}%），但净期望值接近零（{net_expected_value:.2f}%）。\n"
-            f"交易成本侵蚀了大部分收益。\n"
-            f"→ 仅允许用于：仓位调整、风险确认、多信号共识过滤\n"
-            f"→ 禁止单独触发交易"
+            f"Directional accuracy is decent ({accuracy:.1f}%), but net edge is near zero ({net_expected_value:.2f}%).\n"
+            f"Transaction costs consume most of the gross edge.\n"
+            f"=> Use only for position adjustment, risk confirmation, and multi-signal filtering.\n"
+            f"=> Do not use as a standalone trading trigger."
         )
-        risk_warnings.append("⚠️ 不允许单独用于实盘交易")
-        risk_warnings.append("✓ 可作为辅助信号使用")
+        risk_warnings.append("Do not use this signal as a standalone live-trading trigger.")
+        risk_warnings.append("Can be used as an auxiliary confirmation signal.")
     
     elif (avg_return > 0 and net_expected_value <= 0):
-        classification_v2 = "🟡 Directional Signal"
+        classification_v2 = "馃煛 Directional Signal"
         decision_allowed = False
         reason_summary = (
-            f"平均收益为正（{avg_return:.2f}%），但被交易成本明显侵蚀。\n"
-            f"净期望值：{net_expected_value:.2f}%\n"
-            f"→ 仅允许用于辅助决策，禁止单独交易"
+            f"Average return is positive ({avg_return:.2f}%), but transaction costs dominate.\n"
+            f"Net expected value: {net_expected_value:.2f}%\n"
+            f"=> Use only as auxiliary decision support, not standalone execution."
         )
-        risk_warnings.append("⚠️ 交易成本过高，侵蚀收益")
-        risk_warnings.append("⚠️ 不允许单独用于实盘交易")
+        risk_warnings.append("Transaction costs are too high relative to edge.")
+        risk_warnings.append("Do not use this signal as a standalone live-trading trigger.")
     
-    # 🟠 Unstable / Regime-Dependent（不稳定或依赖行情）
+    # 馃煚 Unstable / Regime-Dependent锛堜笉绋冲畾鎴栦緷璧栬鎯咃級
     elif (net_expected_value > 0 and 
           (trades_count < 50 or max_drawdown > max_dd_threshold or not multi_timeframe_validated)):
         
-        classification_v2 = "🟠 Unstable / Regime-Dependent"
+        classification_v2 = "馃煚 Unstable / Regime-Dependent"
         decision_allowed = False
         
         reasons = []
         if trades_count < 50:
-            reasons.append(f"样本量接近下限（{trades_count}/50）")
+            reasons.append(f"Sample size is near the minimum ({trades_count}/50)")
         if max_drawdown > max_dd_threshold:
-            reasons.append(f"回撤过大（{max_drawdown:.2f}% > {max_dd_threshold}%）")
+            reasons.append(f"Drawdown too high ({max_drawdown:.2f}% > {max_dd_threshold}%)")
         if not multi_timeframe_validated:
-            reasons.append("未通过多时间窗口验证")
-        
+            reasons.append("Multi-timeframe validation failed")
+
         reason_summary = (
-            f"净期望值为正（{net_expected_value:.2f}%），但存在以下问题：\n" +
-            "\n".join(f"• {r}" for r in reasons) +
-            f"\n→ 标记为「观察中」\n"
-            f"→ 不允许自动交易\n"
-            f"→ 必须等待更多数据或行情切换验证"
+            f"Net expected value is positive ({net_expected_value:.2f}%), but key stability issues remain:\n" +
+            "\n".join(f"- {r}" for r in reasons) +
+            f"\n=> Marked as observation-only\n"
+            f"=> Auto trading is not allowed\n"
+            f"=> Wait for more data or regime re-validation"
         )
-        risk_warnings.append("⚠️ 系统不稳定，禁止实盘交易")
-        risk_warnings.append("✓ 继续观察，积累更多数据")
-    
-    # 处理 Lucky Streak（重点修正）
+        risk_warnings.append("System stability is insufficient; live trading is not allowed.")
+        risk_warnings.append("Continue monitoring and accumulate more samples.")
+
+    # Handle Lucky Streak (revised)
     elif (accuracy <= 55 and avg_return > 0):
-        # Lucky Streak 不再作为独立正向分类
-        # 检查是否有非对称收益结构证据
         avg_win = stats_dict.get('avg_win', 0.0)
         avg_loss = stats_dict.get('avg_loss', 0.0)
-        
-        # 非对称收益：平均盈利 > 2 * 平均亏损（绝对值）
+
         has_fat_tail = avg_win > 2 * abs(avg_loss) if avg_loss != 0 else False
-        
+
         if has_fat_tail and profit_factor > 2.0:
-            classification_v2 = "🟠 Unstable / Regime-Dependent"
+            classification_v2 = "Unstable / Regime-Dependent"
             reason_summary = (
-                f"准确率较低（{accuracy:.1f}%），但存在非对称收益结构：\n"
-                f"• 平均盈利：{avg_win:.2f}%\n"
-                f"• 平均亏损：{avg_loss:.2f}%\n"
-                f"• Profit Factor：{profit_factor:.2f}\n"
-                f"→ 可能是 fat-tail payoff 策略\n"
-                f"→ 需要更多数据验证，暂不允许交易"
+                f"Accuracy is low ({accuracy:.1f}%), but payoff looks asymmetric:\n"
+                f"- Avg win: {avg_win:.2f}%\n"
+                f"- Avg loss: {avg_loss:.2f}%\n"
+                f"- Profit factor: {profit_factor:.2f}\n"
+                f"=> Possible fat-tail payoff profile\n"
+                f"=> More validation data required before trading"
             )
-            risk_warnings.append("⚠️ 低准确率 + 高盈亏比，需验证是否可持续")
+            risk_warnings.append("Low hit-rate with high payoff ratio needs further validation.")
         else:
-            classification_v2 = "🔴 No Edge"
+            classification_v2 = "No Edge"
             reason_summary = (
-                f"准确率低（{accuracy:.1f}%），收益为正但无非对称结构证据。\n"
-                f"大概率是运气（Lucky Streak）。\n"
-                f"→ 永久禁止用于交易"
+                f"Accuracy is low ({accuracy:.1f}%), positive returns likely from noise.\n"
+                f"Likely a lucky streak without structural edge.\n"
+                f"=> Not tradable"
             )
-            risk_warnings.append("🚫 疑似运气成分，禁止交易")
-        
+            risk_warnings.append("Likely luck-driven performance; trading is disallowed.")
+
+        decision_allowed = False
         decision_allowed = False
     
-    # 🔴 No Edge（无优势）
+    # 馃敶 No Edge锛堟棤浼樺娍锛?
     else:
-        classification_v2 = "🔴 No Edge"
+        classification_v2 = "馃敶 No Edge"
         decision_allowed = False
         
         reasons = []
         if net_expected_value <= 0:
-            reasons.append(f"净期望值为负或零（{net_expected_value:.2f}%）")
-        if max_drawdown > max_dd_threshold * 1.5:  # 严重超标
-            reasons.append(f"回撤严重超标（{max_drawdown:.2f}%）")
+            reasons.append(f"Net expected value is non-positive ({net_expected_value:.2f}%)")
+        if max_drawdown > max_dd_threshold * 1.5:  # 涓ラ噸瓒呮爣
+            reasons.append(f"Drawdown exceeds severe threshold ({max_drawdown:.2f}%)")
         if accuracy < 45 and avg_return <= 0:
-            reasons.append(f"准确率和收益均无统计意义")
+            reasons.append("Accuracy and returns do not show statistical edge")
         
         reason_summary = (
-            "系统无交易优势：\n" +
-            "\n".join(f"• {r}" for r in reasons) +
-            f"\n→ 永久禁止用于交易（除非策略逻辑发生实质性变化）"
+            "No tradeable edge detected:\n" +
+            "\n".join(f"- {r}" for r in reasons) +
+            f"\n=> Trading should remain disabled unless strategy logic materially changes"
         )
-        risk_warnings.append("🚫 无交易价值，禁止使用")
+        risk_warnings.append("No tradeable edge. Keep trading disabled.")
     
     return {
         "classification_v2": classification_v2,
@@ -1900,19 +3198,19 @@ def get_full_market_context():
     return data
 
 def normalize_title(title):
-    """归一化标题用于去重：小写 + 去标点 + 去多余空格"""
+    """Normalize title for de-duplication."""
     import string
-    # 转小写
+    # 杞皬鍐?
     normalized = title.lower()
-    # 移除标点
+    # 绉婚櫎鏍囩偣
     normalized = normalized.translate(str.maketrans('', '', string.punctuation))
-    # 去除多余空格
+    # 鍘婚櫎澶氫綑绌烘牸
     normalized = ' '.join(normalized.split())
     return normalized
 
 def get_rss_news():
     """
-    返回结构化新闻列表
+    杩斿洖缁撴瀯鍖栨柊闂诲垪琛?
     Returns:
         List[Dict]: [{"source": str, "title": str, "published": str|None, "link": str}]
     """
@@ -1926,26 +3224,26 @@ def get_rss_news():
             src_count = 0
             
             for e in f.entries:
-                if src_count >= 2:  # 每个源最多2条
+                if src_count >= 2:  # 姣忎釜婧愭渶澶?鏉?
                     break
                 
-                # 提取字段
+                # 鎻愬彇瀛楁
                 title = e.get('title', '').strip()
                 link = e.get('link', '').strip()
                 
                 if not title or not link:
                     continue
                 
-                # 去重逻辑 1: 链接完全相同
+                # 鍘婚噸閫昏緫 1: 閾炬帴瀹屽叏鐩稿悓
                 if link in seen_links:
                     continue
                 
-                # 去重逻辑 2: 标题归一化后相同
+                # 鍘婚噸閫昏緫 2: 鏍囬褰掍竴鍖栧悗鐩稿悓
                 normalized_title = normalize_title(title)
                 if normalized_title in seen_titles:
                     continue
                 
-                # 提取发布时间
+                # 鎻愬彇鍙戝竷鏃堕棿
                 published = None
                 if hasattr(e, 'published_parsed') and e.published_parsed:
                     try:
@@ -1958,7 +3256,7 @@ def get_rss_news():
                     except Exception as e:
                         pass
                 
-                # 添加结构化新闻
+                # 娣诲姞缁撴瀯鍖栨柊闂?
                 news.append({
                     "source": src,
                     "title": title,
@@ -1974,7 +3272,7 @@ def get_rss_news():
             log_error(f"get_rss_news error for {src}: {str(e)}")
             continue
     
-    return news[:8]  # 总数上限
+    return news[:8]  # 鎬绘暟涓婇檺
 
 def get_stock_news(ticker_symbol):
     try:
@@ -2034,17 +3332,17 @@ def get_cross_rate(asset_a, asset_b):
     v1, v2 = get_val(asset_a), get_val(asset_b)
     return v1/v2 if v1 and v2 else None
 
-# ================= 3. Evidence 验证函数 =================
+# ================= 3. Evidence 楠岃瘉鍑芥暟 =================
 
 def validate_evidence(evidence_list, input_news):
     """
-    验证 AI 返回的 evidence 是否引用了真实的输入新闻
+    楠岃瘉 AI 杩斿洖鐨?evidence 鏄惁寮曠敤浜嗙湡瀹炵殑杈撳叆鏂伴椈
     Args:
-        evidence_list: AI 返回的 evidence 数组
-        input_news: 结构化新闻列表 List[Dict] with keys: source, title, published, link
+        evidence_list: AI 杩斿洖鐨?evidence 鏁扮粍
+        input_news: 缁撴瀯鍖栨柊闂诲垪琛?List[Dict] with keys: source, title, published, link
     Returns:
-        validated_evidence: 验证后的 evidence 列表（无效的标记 _invalid）
-        valid_count: 有效证据数量
+        validated_evidence: 楠岃瘉鍚庣殑 evidence 鍒楄〃锛堟棤鏁堢殑鏍囪 _invalid锛?
+        valid_count: 鏈夋晥璇佹嵁鏁伴噺
     """
     validated = []
     valid_count = 0
@@ -2053,10 +3351,10 @@ def validate_evidence(evidence_list, input_news):
         headline = ev.get('headline', '').strip()
         is_valid = False
         
-        # 检查 headline 是否存在于任何输入新闻的 title 中（子串匹配）
+        # 妫€鏌?headline 鏄惁瀛樺湪浜庝换浣曡緭鍏ユ柊闂荤殑 title 涓紙瀛愪覆鍖归厤锛?
         for news_item in input_news:
             news_title = news_item.get('title', '')
-            # 双向子串匹配
+            # 鍙屽悜瀛愪覆鍖归厤
             if headline.lower() in news_title.lower() or news_title.lower() in headline.lower():
                 is_valid = True
                 break
@@ -2071,17 +3369,17 @@ def validate_evidence(evidence_list, input_news):
     
     return validated, valid_count
 
-# ================= 4. AI 分析核心 (DeepSeek Logic with Evidence) =================
+# ================= 4. AI 鍒嗘瀽鏍稿績 (DeepSeek Logic with Evidence) =================
 
 def analyze_all(news, user_pairs, macro_data, lang_mode):
     if not news: return {"status": "no_update"}
     
-    # 将结构化新闻转换为文本用于 prompt
+    # 灏嗙粨鏋勫寲鏂伴椈杞崲涓烘枃鏈敤浜?prompt
     headlines = " ".join([f"[{item['source']}] {item['title']}" for item in news])
     history = recall_history(headlines)
-    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "中文" else "OUTPUT LANGUAGE: ENGLISH"
+    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "涓枃" else "OUTPUT LANGUAGE: ENGLISH"
 
-    # 【核心改进】注入 MACRO_LOGIC_KNOWLEDGE + 强制 evidence 输出
+    # 銆愭牳蹇冩敼杩涖€戞敞鍏?MACRO_LOGIC_KNOWLEDGE + 寮哄埗 evidence 杈撳嚭
     prompt = f"""
     You are a Financial Logic Engine. {lang_instruction}
     
@@ -2124,35 +3422,35 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
     """
     
     try:
-        # 增加 num_ctx 防止思考过程太长被截断
+        # 澧炲姞 num_ctx 闃叉鎬濊€冭繃绋嬪お闀胯鎴柇
         response = ollama.chat(model=LOCAL_MODEL, messages=[{'role': 'user', 'content': prompt}], options={"num_ctx": 8192})
         raw_content = response['message']['content']
         
-        # 【鲁棒解析】使用 robust_json_parse 替代直接 json.loads
+        # 銆愰瞾妫掕В鏋愩€戜娇鐢?robust_json_parse 鏇夸唬鐩存帴 json.loads
         thought, json_text = parse_deepseek_output(raw_content)
         
-        # 尝试鲁棒解析
+        # 灏濊瘯椴佹瑙ｆ瀽
         res = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
         
-        # 如果解析失败（返回降级结构），直接返回
+        # 濡傛灉瑙ｆ瀽澶辫触锛堣繑鍥為檷绾х粨鏋勶級锛岀洿鎺ヨ繑鍥?
         if res.get('_parse_error'):
             res['thought_process'] = thought
             return res
         
-        # 解析成功，继续处理
+        # 瑙ｆ瀽鎴愬姛锛岀户缁鐞?
         res['thought_process'] = thought
         
-        # 【新增】验证 evidence 字段（传入结构化新闻）
+        # 銆愭柊澧炪€戦獙璇?evidence 瀛楁锛堜紶鍏ョ粨鏋勫寲鏂伴椈锛?
         evidence = res.get('evidence', [])
         validated_evidence, valid_count = validate_evidence(evidence, news)
         res['evidence'] = validated_evidence
         res['_valid_evidence_count'] = valid_count
         
-        # 【新增】证据不足降级策略
+        # 銆愭柊澧炪€戣瘉鎹笉瓒抽檷绾х瓥鐣?
         if valid_count == 0 and res.get('status') == 'alert':
             res['_evidence_warning'] = True
             original_advice = res.get('advice', '')
-            res['advice'] = f"{original_advice}\n\n⚠️ WARNING: No valid evidence found. Predictions may be unreliable. Please verify independently."
+            res['advice'] = f"{original_advice}\n\n鈿狅笍 WARNING: No valid evidence found. Predictions may be unreliable. Please verify independently."
 
         # Optional LLM topic sentiment extraction and storage
         news_sources = [item.get('source') for item in news]
@@ -2164,22 +3462,40 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
                 res['_topic_signals_recorded'] = recorded_topic_count
             else:
                 res['_topic_signals_recorded'] = 0
+
+        # Optional industry-news pipeline (separate collection; does not alter macro pipeline behavior).
+        try:
+            industry_runtime = run_industry_news_pipeline_runtime(
+                config_path=os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
+            )
+            if isinstance(industry_runtime, dict):
+                res['_industry_news_status'] = industry_runtime.get("status")
+                if industry_runtime.get("status") == "ok":
+                    result_obj = industry_runtime.get("result", {})
+                    write_info = result_obj.get("write_info", {}) if isinstance(result_obj, dict) else {}
+                    res['_industry_news_written'] = int(write_info.get("written", 0) or 0)
+                else:
+                    res['_industry_news_written'] = 0
+        except Exception as e:
+            log_error(f"[INDUSTRY_NEWS] runtime pipeline failed: {e}")
+            res['_industry_news_status'] = "error"
+            res['_industry_news_written'] = 0
         
-        # 【新增】记录交易信号
+        # 銆愭柊澧炪€戣褰曚氦鏄撲俊鍙?
         if res.get("status") == "alert" and res.get("predictions"):
             predictions = res.get("predictions", {})
             impact_score = res.get("impact_score", 0)
             
-            # 为每个预测记录信号
+            # 涓烘瘡涓娴嬭褰曚俊鍙?
             for asset, prediction_text in predictions.items():
-                # 提取方向
+                # 鎻愬彇鏂瑰悜
                 direction = "Neutral"
                 if "Bullish" in prediction_text or "bullish" in prediction_text or "↑" in prediction_text:
                     direction = "Bullish"
                 elif "Bearish" in prediction_text or "bearish" in prediction_text or "↓" in prediction_text:
                     direction = "Bearish"
                 
-                # 记录信号
+                # 璁板綍淇″彿
                 record_signal(
                     asset=asset,
                     direction=direction,
@@ -2192,7 +3508,7 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
             save_to_memory(res.get("summary"), res.get("impact_score", 0), res.get("advice"))
         return res
     except Exception as e: 
-        # 最终兜底：返回降级结构
+        # 鏈€缁堝厹搴曪細杩斿洖闄嶇骇缁撴瀯
         return {
             "status": "error",
             "reason": f"Unexpected error: {str(e)}",
@@ -2202,7 +3518,7 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
         }
 
 def analyze_single_stock(ticker, news, lang_mode):
-    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "中文" else "OUTPUT LANGUAGE: ENGLISH"
+    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "涓枃" else "OUTPUT LANGUAGE: ENGLISH"
     news_str = " ".join(news)
     
     prompt = f"""
@@ -2226,10 +3542,10 @@ def analyze_single_stock(ticker, news, lang_mode):
         raw_content = response['message']['content']
         thought, json_text = parse_deepseek_output(raw_content)
         
-        # 【鲁棒解析】使用 robust_json_parse
+        # 銆愰瞾妫掕В鏋愩€戜娇鐢?robust_json_parse
         res = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
         
-        # 如果解析失败，返回降级结构
+        # 濡傛灉瑙ｆ瀽澶辫触锛岃繑鍥為檷绾х粨鏋?
         if res.get('_parse_error'):
             return {
                 "sentiment": "AI Error",
@@ -2243,7 +3559,7 @@ def analyze_single_stock(ticker, news, lang_mode):
     except Exception as e:
         return {"sentiment": "AI Error", "reason": f"Parse Error: {str(e)}", "key_risk": "N/A"}
 
-# ================= 4. UI 界面 =================
+# ================= 4. UI 鐣岄潰 =================
 
 
 
@@ -3114,9 +4430,17 @@ def render_portfolio_monitor():
         if auto_refresh and not hasattr(st, "fragment"):
             st.info("Auto refresh requires Streamlit fragment support. Use Refresh data if unavailable.")
         _render_data_panel()
-st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", page_icon="🦁")
+_industry_cli_code = _run_industry_news_cli_if_requested()
+if _industry_cli_code is not None:
+    raise SystemExit(_industry_cli_code)
 
-st.sidebar.header("⚙️ Settings")
+_taxonomy_cli_code = _run_taxonomy_cli_if_requested()
+if _taxonomy_cli_code is not None:
+    raise SystemExit(_taxonomy_cli_code)
+
+st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", page_icon="馃")
+
+st.sidebar.header("鈿欙笍 Settings")
 st.sidebar.caption(f"Brain: {LOCAL_MODEL}")
 
 page_options = ["\U0001F4E1 Global Macro Signals", "\U0001F4BC Portfolio Monitor"]
@@ -3129,11 +4453,11 @@ page_choice = st.sidebar.selectbox(
     key="page",
 )
 
-# 新增：展示宏观规则库
-with st.sidebar.expander("📚 Macro Rules Library"):
+# 鏂板锛氬睍绀哄畯瑙傝鍒欏簱
+with st.sidebar.expander("馃摎 Macro Rules Library"):
     st.text(MACRO_LOGIC_KNOWLEDGE)
 
-lang_mode = st.sidebar.radio("Language", ["中文", "English"], index=0)
+lang_mode = st.sidebar.radio("Language", ["涓枃", "English"], index=0)
 refresh_label = st.sidebar.selectbox("Refresh Rate", list(REFRESH_OPTIONS.keys()), index=0)
 refresh_sec = REFRESH_OPTIONS[refresh_label]
 enable_toast = st.sidebar.checkbox("Desktop Notify", value=True)
@@ -3145,13 +4469,13 @@ if page_choice == "\U0001F4BC Portfolio Monitor":
     render_portfolio_monitor()
     st.stop()
 
-st.title("🦁 GlobalWatch: DeepSeek-R1 推理版")
-st.caption("🚀 Powered by Chain-of-Thought Reasoning")
+st.title("GlobalWatch: DeepSeek-R1 Reasoning Edition")
+st.caption("馃殌 Powered by Chain-of-Thought Reasoning")
 st.divider()
 
-tab_macro, tab_stock, tab_scoreboard, tab_warning = st.tabs(["🌍 宏观/外汇 (Macro/FX)", "🇺🇸 美股透视 (US Stocks)", "📊 Signal Scoreboard", "🚨 Early-Warning"])
+tab_macro, tab_stock, tab_scoreboard, tab_warning = st.tabs(["馃實 瀹忚/澶栨眹 (Macro/FX)", "馃嚭馃嚫 缇庤偂閫忚 (US Stocks)", "馃搳 Signal Scoreboard", "馃毃 Early-Warning"])
 
-# === TAB 1: 宏观外汇 ===
+# === TAB 1: 瀹忚澶栨眹 ===
 with tab_macro:
     cols = st.columns(4)
     macro = get_full_market_context()
@@ -3168,7 +4492,7 @@ with tab_macro:
             r1 = get_cross_rate(b1, q1)
             if r1: 
                 st.metric(f"{b1.split()[0]}/{q1.split()[0]}", f"{r1:,.4f}")
-                if b1 != "USD (美元)": plot_candle_chart(ASSETS_DB[b1]['ticker'], b1)
+                if b1 != "USD (缇庡厓)": plot_candle_chart(ASSETS_DB[b1]['ticker'], b1)
                 user_pairs.append(f"{b1.split()[0]}/{q1.split()[0]}")
 
     with c2:
@@ -3189,8 +4513,8 @@ with tab_macro:
     delta = (datetime.now() - st.session_state['last_run']).total_seconds()
     remain = max(0, refresh_sec - delta) if refresh_sec > 0 else 0
     
-    if st.button("🚀 Deep Reason Analysis") or (refresh_sec > 0 and remain == 0 and auto_run):
-        with st.status("🧠 DeepSeek is thinking...", expanded=True) as s:
+    if st.button("馃殌 Deep Reason Analysis") or (refresh_sec > 0 and remain == 0 and auto_run):
+        with st.status("馃 DeepSeek is thinking...", expanded=True) as s:
             news = get_rss_news()
             res = analyze_all(news, user_pairs, macro, lang_mode)
             
@@ -3206,15 +4530,15 @@ with tab_macro:
     if 'res' in st.session_state:
         res = st.session_state['res']
         
-        # === 新增：解析错误处理 ===
+        # === 鏂板锛氳В鏋愰敊璇鐞?===
         if res.get('_parse_error'):
-            st.error("🚨 AI Output Parsing Error")
+            st.error("馃毃 AI Output Parsing Error")
             st.markdown(f"**Reason**: {res.get('reason', 'Unknown error')}")
             
-            with st.expander("🔍 Raw Output (Debug)", expanded=False):
+            with st.expander("馃攳 Raw Output (Debug)", expanded=False):
                 st.code(res.get('raw_output', 'No output available'), language="text")
             
-            st.warning("⚠️ The AI failed to generate valid JSON output. This may be due to:")
+            st.warning("鈿狅笍 The AI failed to generate valid JSON output. This may be due to:")
             st.markdown("""
             - Model output format issues
             - Context length exceeded
@@ -3226,31 +4550,31 @@ with tab_macro:
             - Check Ollama logs for errors
             """)
             
-            # 仍然显示思维过程（如果有）
+            # 浠嶇劧鏄剧ず鎬濈淮杩囩▼锛堝鏋滄湁锛?
             if res.get('thought_process'):
-                with st.expander("🧠 DeepSeek 的思维过程 (Click to expand)", expanded=False):
+                with st.expander("馃 DeepSeek 鐨勬€濈淮杩囩▼ (Click to expand)", expanded=False):
                     st.markdown(res.get('thought_process', 'No thoughts recorded.'))
         # ================================
         
-        # === V3.0 新增：展示思维链 ===
+        # === V3.0 鏂板锛氬睍绀烘€濈淮閾?===
         elif res.get("status") != "error":
-            with st.expander("🧠 DeepSeek 的思维过程 (Click to expand)", expanded=False):
+            with st.expander("馃 DeepSeek 鐨勬€濈淮杩囩▼ (Click to expand)", expanded=False):
                 st.markdown(res.get('thought_process', 'No thoughts recorded.'))
         # ==========================
 
         if res.get("status") == "alert":
-            st.error(f"🚨 ALERT (Score: {res.get('impact_score')})")
+            st.error(f"馃毃 ALERT (Score: {res.get('impact_score')})")
             st.markdown(f"**Event**: {res.get('summary')}")
             
-            # === 新增：Evidence Chain 展示 ===
+            # === 鏂板锛欵vidence Chain 灞曠ず ===
             evidence = res.get('evidence', [])
             valid_count = res.get('_valid_evidence_count', 0)
             
             if evidence:
-                with st.expander(f"📋 Evidence Chain ({valid_count}/{len(evidence)} valid)", expanded=True):
+                with st.expander(f"馃搵 Evidence Chain ({valid_count}/{len(evidence)} valid)", expanded=True):
                     for idx, ev in enumerate(evidence, 1):
                         is_invalid = ev.get('_invalid', False)
-                        icon = "⚠️" if is_invalid else "✅"
+                        icon = "WARN" if is_invalid else "OK"
                         
                         st.markdown(f"**{icon} Evidence {idx}**")
                         st.markdown(f"- **Source**: {ev.get('source', 'Unknown')}")
@@ -3262,54 +4586,54 @@ with tab_macro:
                         st.divider()
             
             if res.get('_evidence_warning'):
-                st.warning("⚠️ No valid evidence found. AI predictions may be unreliable.")
+                st.warning("鈿狅笍 No valid evidence found. AI predictions may be unreliable.")
             # ================================
             
             col_p, col_a = st.columns(2)
             col_p.write(res.get("predictions"))
             col_a.warning(res.get("advice"))
         else:
-            st.success("✅ Market is Stable")
+            st.success("鉁?Market is Stable")
             st.caption(res.get("advice"))
         
-        with st.expander("📰 News Source"):
+        with st.expander("馃摪 News Source"):
             news_list = st.session_state.get('news', [])
             if news_list:
                 for idx, news_item in enumerate(news_list, 1):
-                    # 结构化新闻展示
+                    # 缁撴瀯鍖栨柊闂诲睍绀?
                     source = news_item.get('source', 'Unknown')
                     title = news_item.get('title', 'N/A')
                     published = news_item.get('published', None)
                     link = news_item.get('link', '')
                     
-                    # 格式化时间显示
+                    # 鏍煎紡鍖栨椂闂存樉绀?
                     time_str = ""
                     if published:
                         try:
-                            # 转换为更友好的格式
+                            # 杞崲涓烘洿鍙嬪ソ鐨勬牸寮?
                             from datetime import datetime
                             dt = datetime.fromisoformat(published.replace('Z', '+00:00'))
-                            time_str = f"🕒 {dt.strftime('%Y-%m-%d %H:%M UTC')}"
+                            time_str = f"馃晵 {dt.strftime('%Y-%m-%d %H:%M UTC')}"
                         except Exception as e:
-                            time_str = f"🕒 {published}"
+                            time_str = f"馃晵 {published}"
                     
-                    # 显示新闻
+                    # 鏄剧ず鏂伴椈
                     st.markdown(f"**{idx}. [{source}]** {title}")
                     if time_str:
                         st.caption(time_str)
                     if link:
-                        st.markdown(f"[🔗 Read More]({link})")
+                        st.markdown(f"[馃敆 Read More]({link})")
                     st.divider()
             else:
                 st.caption("No news available")
 
-# === TAB 2: 美股个股分析 ===
+# === TAB 2: 缇庤偂涓偂鍒嗘瀽 ===
 with tab_stock:
-    st.header("🇺🇸 US Stock Deep Dive")
+    st.header("馃嚭馃嚫 US Stock Deep Dive")
     c_in, c_go = st.columns([3, 1])
     ticker = c_in.text_input("Ticker", value="NVDA").upper()
     
-    if c_go.button("🔍 Analyze"):
+    if c_go.button("馃攳 Analyze"):
         with st.spinner(f"Reasoning about {ticker}..."):
             try:
                 stock = yf.Ticker(ticker)
@@ -3327,8 +4651,8 @@ with tab_stock:
                     
                     analysis = analyze_single_stock(ticker, stock_news, lang_mode)
                     
-                    # === V3.0 新增：展示个股思维链 ===
-                    with st.expander("🧠 AI Thought Process (Stock)", expanded=True):
+                    # === V3.0 鏂板锛氬睍绀轰釜鑲℃€濈淮閾?===
+                    with st.expander("馃 AI Thought Process (Stock)", expanded=True):
                         st.markdown(analysis.get('thought_process', 'No thoughts.'))
                     
                     sentiment = analysis.get("sentiment", "Neutral")
@@ -3349,16 +4673,16 @@ with tab_stock:
 
 # === TAB 3: Signal Scoreboard ===
 with tab_scoreboard:
-    st.header("📊 Signal Scoreboard - Performance Tracking")
+    st.header("馃搳 Signal Scoreboard - Performance Tracking")
     st.caption("Track the accuracy and profitability of AI predictions over time")
     
-    # 回填按钮
+    # 鍥炲～鎸夐挳
     col_refresh, col_info = st.columns([1, 3])
-    if col_refresh.button("🔄 Update Results"):
+    if col_refresh.button("馃攧 Update Results"):
         with st.spinner("Backfilling signal results..."):
             updated = backfill_signal_results()
             if updated:
-                st.success(f"✅ Updated {updated} signals")
+                st.success(f"鉁?Updated {updated} signals")
             else:
                 st.info("No signals to update")
             st.rerun()
@@ -3367,7 +4691,7 @@ with tab_scoreboard:
     
     st.divider()
     
-    # 过滤器
+    # 杩囨护鍣?
     col_theme, col_timeframe = st.columns(2)
     theme_filter = col_theme.selectbox(
         "Theme Filter",
@@ -3382,11 +4706,11 @@ with tab_scoreboard:
     
     theme = None if theme_filter == "All" else theme_filter
     
-    # 获取统计数据
+    # 鑾峰彇缁熻鏁版嵁
     stats = get_signal_statistics(theme=theme, timeframe=timeframe)
     
-    # 显示关键指标
-    st.subheader("📈 Key Metrics")
+    # 鏄剧ず鍏抽敭鎸囨爣
+    st.subheader("馃搱 Key Metrics")
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -3402,9 +4726,9 @@ with tab_scoreboard:
         help=f"Signals with {timeframe} results available"
     )
     
-    # 准确率颜色
+    # 鍑嗙‘鐜囬鑹?
     accuracy = stats['accuracy']
-    accuracy_delta = accuracy - 50  # 相对于随机猜测
+    accuracy_delta = accuracy - 50  # 鐩稿浜庨殢鏈虹寽娴?
     col3.metric(
         "Accuracy",
         f"{accuracy:.1f}%",
@@ -3412,7 +4736,7 @@ with tab_scoreboard:
         delta_color="normal" if accuracy_delta > 0 else "inverse"
     )
     
-    # 平均收益颜色
+    # 骞冲潎鏀剁泭棰滆壊
     avg_return = stats['avg_return']
     col4.metric(
         "Avg Return",
@@ -3423,151 +4747,151 @@ with tab_scoreboard:
     
     st.divider()
     
-    # ========== 新增：交易级性能分类 ==========
-    st.subheader("🎯 Trading-Grade Performance Classification")
-    st.caption("⚠️ 这是决定是否允许 real-money execution 的唯一依据")
+    # ========== 鏂板锛氫氦鏄撶骇鎬ц兘鍒嗙被 ==========
+    st.subheader("馃幆 Trading-Grade Performance Classification")
+    st.caption("鈿狅笍 杩欐槸鍐冲畾鏄惁鍏佽 real-money execution 鐨勫敮涓€渚濇嵁")
     
-    # 获取交易级分类
+    # 鑾峰彇浜ゆ槗绾у垎绫?
     classification = classify_trading_performance(
         stats, 
         theme=theme, 
-        asset=None,  # 可以改为特定资产
-        transaction_cost=0.1,  # 0.1% 交易成本
-        max_dd_threshold=15.0  # 15% 最大回撤阈值
+        asset=None,  # 鍙互鏀逛负鐗瑰畾璧勪骇
+        transaction_cost=0.1,  # 0.1% 浜ゆ槗鎴愭湰
+        max_dd_threshold=15.0  # 15% 鏈€澶у洖鎾ら槇鍊?
     )
     
-    # 显示分类结果
+    # 鏄剧ず鍒嗙被缁撴灉
     col_class, col_decision = st.columns([2, 1])
     
     with col_class:
-        # 分类标签
+        # 鍒嗙被鏍囩
         class_v2 = classification['classification_v2']
         
-        # 根据分类设置颜色
-        if "🟢" in class_v2:
+        # 鏍规嵁鍒嗙被璁剧疆棰滆壊
+        if "馃煝" in class_v2:
             st.success(f"### {class_v2}")
-        elif "🟡" in class_v2:
+        elif "馃煛" in class_v2:
             st.warning(f"### {class_v2}")
-        elif "🟠" in class_v2:
+        elif "馃煚" in class_v2:
             st.warning(f"### {class_v2}")
-        elif "🔴" in class_v2:
+        elif "馃敶" in class_v2:
             st.error(f"### {class_v2}")
         else:
             st.info(f"### {class_v2}")
     
     with col_decision:
-        # 交易决策
+        # 浜ゆ槗鍐崇瓥
         if classification['decision_allowed']:
-            st.success("### ✅ TRADABLE")
-            st.caption("允许实盘交易")
+            st.success("### 鉁?TRADABLE")
+            st.caption("鍏佽瀹炵洏浜ゆ槗")
         else:
-            st.error("### 🚫 NOT TRADABLE")
-            st.caption("禁止实盘交易")
+            st.error("### 馃毇 NOT TRADABLE")
+            st.caption("绂佹瀹炵洏浜ゆ槗")
     
-    # 显示详细原因
-    with st.expander("📋 Classification Details", expanded=True):
-        st.markdown("**原因说明：**")
+    # 鏄剧ず璇︾粏鍘熷洜
+    with st.expander("馃搵 Classification Details", expanded=True):
+        st.markdown("**鍘熷洜璇存槑锛?*")
         st.info(classification['reason_summary'])
         
-        # 风险警告
+        # 椋庨櫓璀﹀憡
         if classification['risk_warnings']:
-            st.markdown("**风险警告：**")
+            st.markdown("**椋庨櫓璀﹀憡锛?*")
             for warning in classification['risk_warnings']:
                 st.markdown(f"- {warning}")
         
-        # 关键指标
-        st.markdown("**关键指标：**")
+        # 鍏抽敭鎸囨爣
+        st.markdown("**鍏抽敭鎸囨爣锛?*")
         col_i1, col_i2, col_i3 = st.columns(3)
         
         col_i1.metric(
             "Net Expected Value",
             f"{classification['net_expected_value']:.2f}%",
-            help="平均收益 - 交易成本"
+            help="骞冲潎鏀剁泭 - 浜ゆ槗鎴愭湰"
         )
         
         col_i2.metric(
             "Max Drawdown",
             f"{stats['max_drawdown']:.2f}%",
-            help="最大回撤"
+            help="Maximum historical drawdown."
         )
         
         col_i3.metric(
             "Multi-TF Validated",
-            "✅ Yes" if classification['multi_timeframe_validated'] else "❌ No",
-            help="是否通过多时间窗口验证"
+            "Yes" if classification['multi_timeframe_validated'] else "No",
+            help="Whether multi-timeframe validation passed."
         )
     
-    # V1 分类（仅供参考）
-    with st.expander("📊 V1 Classification (Reference Only)", expanded=False):
-        st.caption("⚠️ 以下分类仅供分析参考，不可用于交易决策")
+    # V1 鍒嗙被锛堜粎渚涘弬鑰冿級
+    with st.expander("V1 Classification (Reference Only)", expanded=False):
+        st.caption("Reference-only diagnostic labels. Do not use for standalone trading decisions.")
         st.markdown(f"**V1 Classification**: {classification['classification_v1']}")
         
-        st.markdown("**V1 分类说明：**")
+        st.markdown("**V1 classification guide**")
         if "Positive Edge" in classification['classification_v1']:
-            st.success("✅ **Positive Edge (V1)**: 高准确率 + 正收益")
+            st.success("Positive Edge (V1): high accuracy with positive returns.")
         elif "High Accuracy" in classification['classification_v1']:
-            st.warning("⚠️ **High Accuracy, Low Returns (V1)**: 方向对但收益小")
+            st.warning("High Accuracy, Low Returns (V1): directionally right but low payoff.")
         elif "Lucky Streak" in classification['classification_v1']:
-            st.info("ℹ️ **Lucky Streak (V1)**: 低准确率但正收益（可能是运气）")
+            st.info("Lucky Streak (V1): low accuracy with positive return, likely noise.")
         elif "No Edge" in classification['classification_v1']:
-            st.error("❌ **No Edge (V1)**: 低准确率 + 负收益")
+            st.error("No Edge (V1): low accuracy with negative returns.")
         else:
             st.info("No data")
     
     st.divider()
     
-    # 增强的统计指标
-    st.subheader("📊 Enhanced Statistics")
+    # 澧炲己鐨勭粺璁℃寚鏍?
+    st.subheader("Enhanced Statistics")
     
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     
     col_s1.metric(
         "Cumulative Return",
         f"{stats['cumulative_return']:+.2f}%",
-        help="所有信号的累计收益"
+        help="Cumulative return across evaluated signals."
     )
     
     col_s2.metric(
         "Win Rate",
         f"{stats['win_rate']:.1f}%",
-        help="盈利信号占比"
+        help="Percentage of profitable signals."
     )
     
     col_s3.metric(
         "Profit Factor",
         f"{stats['profit_factor']:.2f}",
-        help="总盈利 / 总亏损"
+        help="Total gains divided by total losses."
     )
     
     col_s4.metric(
         "Volatility",
         f"{stats['volatility']:.2f}%",
-        help="收益标准差"
+        help="Standard deviation of signal returns."
     )
     
-    # 盈亏分布
+    # 鐩堜簭鍒嗗竷
     col_w, col_l = st.columns(2)
     
     with col_w:
         st.metric(
             "Avg Win",
             f"{stats['avg_win']:+.2f}%",
-            help="平均盈利"
+            help="骞冲潎鐩堝埄"
         )
     
     with col_l:
         st.metric(
             "Avg Loss",
             f"{stats['avg_loss']:+.2f}%",
-            help="平均亏损"
+            help="骞冲潎浜忔崯"
         )
     
     st.divider()
     
-    # 统计显著性警告
+    # 缁熻鏄捐憲鎬ц鍛?
     if not stats['statistical_significance']:
         st.warning(f"""
-        ⚠️ **Statistical Significance Warning**
+        鈿狅笍 **Statistical Significance Warning**
         
         Sample size: {stats['sample_size']} (minimum 30 required)
         
@@ -3575,15 +4899,15 @@ with tab_scoreboard:
         Continue running analyses to build a larger dataset.
         """)
     else:
-        st.success(f"✅ Sample size: {stats['sample_size']} - Statistically significant")
+        st.success(f"鉁?Sample size: {stats['sample_size']} - Statistically significant")
     
     st.divider()
     
-    # 最近信号
-    st.subheader("🕐 Recent Signals")
+    # 鏈€杩戜俊鍙?
+    st.subheader("馃晲 Recent Signals")
     
     try:
-        # 获取最近10条信号
+        # 鑾峰彇鏈€杩?0鏉′俊鍙?
         recent_results = signals_collection.get(
             limit=10,
             where={"theme": theme} if theme else None
@@ -3615,8 +4939,8 @@ with tab_scoreboard:
     
     st.divider()
     
-    # 使用说明
-    with st.expander("ℹ️ How to Use Signal Scoreboard (V2 - Trading-Grade)"):
+    # 浣跨敤璇存槑
+    with st.expander("鈩癸笍 How to Use Signal Scoreboard (V2 - Trading-Grade)"):
         st.markdown("""
         ### Signal Tracking System
         
@@ -3625,101 +4949,101 @@ with tab_scoreboard:
         - Initial price is captured at the time of prediction
         
         **Result Backfilling**:
-        - Click "🔄 Update Results" to check and update signal outcomes
+        - Click "馃攧 Update Results" to check and update signal outcomes
         - System checks if enough time has passed (1h/4h/1d/1w)
         - Fetches actual prices and calculates returns
         
         ---
         
-        ### 🎯 Trading-Grade Performance Classification (V2)
+        ### 馃幆 Trading-Grade Performance Classification (V2)
         
-        **这是决定是否允许 real-money execution 的唯一依据**
+        **杩欐槸鍐冲畾鏄惁鍏佽 real-money execution 鐨勫敮涓€渚濇嵁**
         
-        #### 分类体系：
+        #### 鍒嗙被浣撶郴锛?
         
-        **🟢 Tradable Edge（允许实盘）**
-        - 样本数 ≥ 50
-        - 净期望值 > 0（扣除交易成本后）
-        - 最大回撤 ≤ 15%
-        - 至少 2 个时间窗口验证通过
-        - **→ 只有此分类允许实盘交易**
+        **馃煝 Tradable Edge锛堝厑璁稿疄鐩橈級**
+        - 鏍锋湰鏁?鈮?50
+        - 鍑€鏈熸湜鍊?> 0锛堟墸闄や氦鏄撴垚鏈悗锛?
+        - 鏈€澶у洖鎾?鈮?15%
+        - 鑷冲皯 2 涓椂闂寸獥鍙ｉ獙璇侀€氳繃
+        - **鈫?鍙湁姝ゅ垎绫诲厑璁稿疄鐩樹氦鏄?*
         
-        **🟡 Directional Signal（方向参考）**
-        - 准确率 ≥ 58% 但净期望值 ≈ 0
-        - 或收益被交易成本侵蚀
-        - **→ 仅用于：仓位调整、风险确认、多信号过滤**
-        - **→ 禁止单独触发交易**
+        **馃煛 Directional Signal锛堟柟鍚戝弬鑰冿級**
+        - 鍑嗙‘鐜?鈮?58% 浣嗗噣鏈熸湜鍊?鈮?0
+        - 鎴栨敹鐩婅浜ゆ槗鎴愭湰渚佃殌
+        - **鈫?浠呯敤浜庯細浠撲綅璋冩暣銆侀闄╃‘璁ゃ€佸淇″彿杩囨护**
+        - **鈫?绂佹鍗曠嫭瑙﹀彂浜ゆ槗**
         
-        **🟠 Unstable / Regime-Dependent（不稳定）**
-        - 净期望值 > 0
-        - 但样本量不足 或 回撤过大 或 未通过多时间窗口验证
-        - **→ 标记为「观察中」**
-        - **→ 禁止自动交易**
-        - **→ 需要更多数据验证**
+        **馃煚 Unstable / Regime-Dependent锛堜笉绋冲畾锛?*
+        - 鍑€鏈熸湜鍊?> 0
+        - 浣嗘牱鏈噺涓嶈冻 鎴?鍥炴挙杩囧ぇ 鎴?鏈€氳繃澶氭椂闂寸獥鍙ｉ獙璇?
+        - **鈫?鏍囪涓恒€岃瀵熶腑銆?*
+        - **鈫?绂佹鑷姩浜ゆ槗**
+        - **鈫?闇€瑕佹洿澶氭暟鎹獙璇?*
         
-        **🔴 No Edge（无优势）**
-        - 净期望值 ≤ 0
-        - 或回撤严重超标
-        - 或准确率和收益均无意义
-        - **→ 永久禁止交易**
+        **馃敶 No Edge锛堟棤浼樺娍锛?*
+        - 鍑€鏈熸湜鍊?鈮?0
+        - 鎴栧洖鎾や弗閲嶈秴鏍?
+        - 鎴栧噯纭巼鍜屾敹鐩婂潎鏃犳剰涔?
+        - **鈫?姘镐箙绂佹浜ゆ槗**
         
-        **🟤 Insufficient Data（数据不足）**
-        - 样本数 < 30
-        - **→ 任何结论都不可靠**
-        - **→ 禁止交易**
+        **馃煠 Insufficient Data锛堟暟鎹笉瓒筹級**
+        - 鏍锋湰鏁?< 30
+        - **鈫?浠讳綍缁撹閮戒笉鍙潬**
+        - **鈫?绂佹浜ゆ槗**
         
         ---
         
-        #### Lucky Streak 的处理（重要）：
+        #### Lucky Streak 鐨勫鐞嗭紙閲嶈锛夛細
         
-        - 原 V1 的 "Lucky Streak"（低准确率 + 正收益）不再作为正向分类
-        - 一律并入 🟠 Unstable 或 🔴 No Edge
-        - **除非**存在明确的非对称收益结构（fat-tail payoff）：
-          - 平均盈利 > 2 × 平均亏损（绝对值）
+        - 鍘?V1 鐨?"Lucky Streak"锛堜綆鍑嗙‘鐜?+ 姝ｆ敹鐩婏級涓嶅啀浣滀负姝ｅ悜鍒嗙被
+        - 涓€寰嬪苟鍏?馃煚 Unstable 鎴?馃敶 No Edge
+        - **闄ら潪**瀛樺湪鏄庣‘鐨勯潪瀵圭О鏀剁泭缁撴瀯锛坒at-tail payoff锛夛細
+          - 骞冲潎鐩堝埄 > 2 脳 骞冲潎浜忔崯锛堢粷瀵瑰€硷級
           - Profit Factor > 2.0
         
         ---
         
-        #### 关键指标说明：
+        #### 鍏抽敭鎸囨爣璇存槑锛?
         
-        - **Net Expected Value**: 平均收益 - 交易成本（默认 0.1%）
-        - **Max Drawdown**: 从峰值到谷底的最大跌幅
-        - **Profit Factor**: 总盈利 / 总亏损（> 1 为盈利）
-        - **Win Rate**: 盈利信号占比
-        - **Volatility**: 收益标准差（波动性）
-        - **Multi-TF Validated**: 是否在多个时间窗口都为正
-        
-        ---
-        
-        #### V1 vs V2 分类：
-        
-        - **V1 分类**（旧版）：仅供分析参考，不可用于交易决策
-        - **V2 分类**（新版）：交易级标准，是实盘交易的唯一依据
+        - **Net Expected Value**: 骞冲潎鏀剁泭 - 浜ゆ槗鎴愭湰锛堥粯璁?0.1%锛?
+        - **Max Drawdown**: 浠庡嘲鍊煎埌璋峰簳鐨勬渶澶ц穼骞?
+        - **Profit Factor**: 鎬荤泩鍒?/ 鎬讳簭鎹燂紙> 1 涓虹泩鍒╋級
+        - **Win Rate**: 鐩堝埄淇″彿鍗犳瘮
+        - **Volatility**: 鏀剁泭鏍囧噯宸紙娉㈠姩鎬э級
+        - **Multi-TF Validated**: 鏄惁鍦ㄥ涓椂闂寸獥鍙ｉ兘涓烘
         
         ---
         
-        ### ⚠️ 重要原则
+        #### V1 vs V2 鍒嗙被锛?
         
-        1. **样本数不足时，系统会主动拒绝**
-           - 即使看起来"很准"，样本 < 30 也不允许交易
-        
-        2. **清楚区分「分析上有意思」vs「可以用真钱」**
-           - 分析上有意思 → V1 分类
-           - 可以用真钱 → 只有 V2 的 🟢 Tradable Edge
-        
-        3. **Real-money execution 只接受 Tradable Edge**
-           - 其他所有分类都禁止实盘交易
-           - 没有例外
+        - **V1 鍒嗙被**锛堟棫鐗堬級锛氫粎渚涘垎鏋愬弬鑰冿紝涓嶅彲鐢ㄤ簬浜ゆ槗鍐崇瓥
+        - **V2 鍒嗙被**锛堟柊鐗堬級锛氫氦鏄撶骇鏍囧噯锛屾槸瀹炵洏浜ゆ槗鐨勫敮涓€渚濇嵁
         
         ---
         
-        ### 📊 使用建议
+        ### 鈿狅笍 閲嶈鍘熷垯
         
-        1. **定期回填结果**：每天点击 "🔄 Update Results"
-        2. **关注分类变化**：从 Unstable → Tradable Edge 需要时间
-        3. **多时间窗口验证**：切换不同 timeframe 查看一致性
-        4. **风险管理**：即使是 Tradable Edge，也要控制仓位
-        5. **持续监控**：市场环境变化可能导致分类降级
+        1. **鏍锋湰鏁颁笉瓒虫椂锛岀郴缁熶細涓诲姩鎷掔粷**
+           - 鍗充娇鐪嬭捣鏉?寰堝噯"锛屾牱鏈?< 30 涔熶笉鍏佽浜ゆ槗
+        
+        2. **娓呮鍖哄垎銆屽垎鏋愪笂鏈夋剰鎬濄€峷s銆屽彲浠ョ敤鐪熼挶銆?*
+           - 鍒嗘瀽涓婃湁鎰忔€?鈫?V1 鍒嗙被
+           - 鍙互鐢ㄧ湡閽?鈫?鍙湁 V2 鐨?馃煝 Tradable Edge
+        
+        3. **Real-money execution 鍙帴鍙?Tradable Edge**
+           - 鍏朵粬鎵€鏈夊垎绫婚兘绂佹瀹炵洏浜ゆ槗
+           - 娌℃湁渚嬪
+        
+        ---
+        
+        ### 馃搳 浣跨敤寤鸿
+        
+        1. **瀹氭湡鍥炲～缁撴灉**锛氭瘡澶╃偣鍑?"馃攧 Update Results"
+        2. **鍏虫敞鍒嗙被鍙樺寲**锛氫粠 Unstable 鈫?Tradable Edge 闇€瑕佹椂闂?
+        3. **澶氭椂闂寸獥鍙ｉ獙璇?*锛氬垏鎹笉鍚?timeframe 鏌ョ湅涓€鑷存€?
+        4. **椋庨櫓绠＄悊**锛氬嵆浣挎槸 Tradable Edge锛屼篃瑕佹帶鍒朵粨浣?
+        5. **鎸佺画鐩戞帶**锛氬競鍦虹幆澧冨彉鍖栧彲鑳藉鑷村垎绫婚檷绾?
         
         ---
         
@@ -3727,19 +5051,19 @@ with tab_scoreboard:
         - Returns are theoretical (no transaction costs in calculation, but considered in classification)
         - Past performance doesn't guarantee future results
         - Use this data to validate your strategy before risking real money
-        - Only 🟢 Tradable Edge signals are approved for live trading
+        - Only 馃煝 Tradable Edge signals are approved for live trading
         """)
 
 
 # === TAB 4: Early-Warning ===
 with tab_warning:
-    st.header("🚨 Early-Warning Risk Monitor")
+    st.header("馃毃 Early-Warning Risk Monitor")
     st.caption("Universal risk scoring system for monitored assets")
     
     st.divider()
     
-    # 监控列表选择
-    st.subheader("📋 Watchlist")
+    # 鐩戞帶鍒楄〃閫夋嫨
+    st.subheader("馃搵 Watchlist")
     
     col_select, col_analyze = st.columns([3, 1])
     
@@ -3749,37 +5073,37 @@ with tab_warning:
         index=0
     )
     
-    if col_analyze.button("🔍 Calculate Risk Score"):
+    if col_analyze.button("馃攳 Calculate Risk Score"):
         with st.spinner(f"Analyzing risk for {selected_asset}..."):
-            # 获取最新新闻
+            # 鑾峰彇鏈€鏂版柊闂?
             recent_news = st.session_state.get('news', [])
             if not recent_news:
                 recent_news = get_rss_news()
             
-            # 计算风险分数
+            # 璁＄畻椋庨櫓鍒嗘暟
             risk_result = calculate_early_warning_score(selected_asset, recent_news)
             
-            # 存储到 session state
+            # 瀛樺偍鍒?session state
             st.session_state['risk_result'] = risk_result
             st.rerun()
     
     st.divider()
     
-    # 显示风险评分结果
+    # 鏄剧ず椋庨櫓璇勫垎缁撴灉
     if 'risk_result' in st.session_state:
         risk = st.session_state['risk_result']
         
         if 'error' in risk:
             st.error(f"Error: {risk['error']}")
         else:
-            # 风险总览
-            st.subheader(f"📊 Risk Assessment: {risk['asset']}")
+            # 椋庨櫓鎬昏
+            st.subheader(f"馃搳 Risk Assessment: {risk['asset']}")
             
-            # 综合风险分数
+            # 缁煎悎椋庨櫓鍒嗘暟
             total_score = risk['total_risk_score']
             risk_level = risk['risk_level']
             
-            # 风险等级颜色
+            # 椋庨櫓绛夌骇棰滆壊
             level_colors = {
                 "LOW": "green",
                 "MEDIUM": "yellow",
@@ -3788,7 +5112,7 @@ with tab_warning:
             }
             level_color = level_colors.get(risk_level, "gray")
             
-            # 显示综合分数
+            # 鏄剧ず缁煎悎鍒嗘暟
             col_score, col_level = st.columns(2)
             
             col_score.metric(
@@ -3805,41 +5129,41 @@ with tab_warning:
             
             st.divider()
             
-            # 四维子分数
-            st.subheader("📈 Risk Breakdown")
+            # 鍥涚淮瀛愬垎鏁?
+            st.subheader("馃搱 Risk Breakdown")
             
             sub_scores = risk['sub_scores']
             
             col1, col2, col3, col4 = st.columns(4)
             
             col1.metric(
-                "🌐 Macro Chain",
+                "馃寪 Macro Chain",
                 f"{sub_scores['macro_chain']['score']}/25",
                 help="USD/rates/macro environment impact"
             )
             
             col2.metric(
-                "👥 Crowding",
+                "馃懃 Crowding",
                 f"{sub_scores['crowding']['score']}/25",
                 help="Technical overbought/oversold levels"
             )
             
             col3.metric(
-                "📊 Microstructure",
+                "馃搳 Microstructure",
                 f"{sub_scores['microstructure']['score']}/25",
                 help="Volatility/gaps/volume anomalies"
             )
             
             col4.metric(
-                "⚡ Event Risk",
+                "鈿?Event Risk",
                 f"{sub_scores['event_risk']['score']}/25",
                 help="Central bank/policy/geopolitical events"
             )
             
             st.divider()
             
-            # 雷达图
-            st.subheader("🎯 Risk Radar")
+            # 闆疯揪鍥?
+            st.subheader("馃幆 Risk Radar")
             
             categories = ['Macro Chain', 'Crowding', 'Microstructure', 'Event Risk']
             values = [
@@ -3852,7 +5176,7 @@ with tab_warning:
             fig = go.Figure()
             
             fig.add_trace(go.Scatterpolar(
-                r=values + [values[0]],  # 闭合图形
+                r=values + [values[0]],  # 闂悎鍥惧舰
                 theta=categories + [categories[0]],
                 fill='toself',
                 name='Risk Score',
@@ -3874,16 +5198,16 @@ with tab_warning:
             
             st.divider()
             
-            # 证据链展示
-            st.subheader("📋 Evidence Chain")
+            # 璇佹嵁閾惧睍绀?
+            st.subheader("馃搵 Evidence Chain")
             
             # Macro Chain Evidence
-            with st.expander("🌐 Macro Chain Evidence", expanded=True):
+            with st.expander("馃寪 Macro Chain Evidence", expanded=True):
                 macro_evidence = sub_scores['macro_chain']['evidence']
                 if macro_evidence:
                     for idx, ev in enumerate(macro_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"⚠️ {ev.get('message')}")
+                            st.error(f"鈿狅笍 {ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Type**: {ev.get('type', 'N/A')}")
@@ -3899,12 +5223,12 @@ with tab_warning:
                     st.info("No macro chain risks detected")
             
             # Crowding Evidence
-            with st.expander("👥 Crowding Evidence"):
+            with st.expander("馃懃 Crowding Evidence"):
                 crowding_evidence = sub_scores['crowding']['evidence']
                 if crowding_evidence:
                     for idx, ev in enumerate(crowding_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"⚠️ {ev.get('message')}")
+                            st.error(f"鈿狅笍 {ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Indicator**: {ev.get('indicator', 'N/A')}")
@@ -3915,12 +5239,12 @@ with tab_warning:
                     st.info("No crowding risks detected")
             
             # Microstructure Evidence
-            with st.expander("📊 Microstructure Evidence"):
+            with st.expander("馃搳 Microstructure Evidence"):
                 micro_evidence = sub_scores['microstructure']['evidence']
                 if micro_evidence:
                     for idx, ev in enumerate(micro_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"⚠️ {ev.get('message')}")
+                            st.error(f"鈿狅笍 {ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Indicator**: {ev.get('indicator', 'N/A')}")
@@ -3931,12 +5255,12 @@ with tab_warning:
                     st.info("No microstructure risks detected")
             
             # Event Risk Evidence
-            with st.expander("⚡ Event Risk Evidence"):
+            with st.expander("鈿?Event Risk Evidence"):
                 event_evidence = sub_scores['event_risk']['evidence']
                 if event_evidence:
                     for idx, ev in enumerate(event_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"⚠️ {ev.get('message')}")
+                            st.error(f"鈿狅笍 {ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Category**: {ev.get('category', 'N/A')}")
@@ -3948,26 +5272,26 @@ with tab_warning:
             
             st.divider()
             
-            # 告警触发器
+            # 鍛婅瑙﹀彂鍣?
             if risk['alert_triggers']:
-                st.subheader("⚠️ Alert Triggers")
+                st.subheader("鈿狅笍 Alert Triggers")
                 for trigger in risk['alert_triggers']:
-                    st.warning(f"• {trigger}")
+                    st.warning(f"鈥?{trigger}")
             
-            # 建议
-            st.subheader("💡 Recommendation")
+            # 寤鸿
+            st.subheader("馃挕 Recommendation")
             st.info(risk['recommendation'])
             
-            # 时间戳
+            # 鏃堕棿鎴?
             st.caption(f"Analysis Time: {risk['timestamp'][:19]}")
     
     else:
-        st.info("👆 Select an asset and click 'Calculate Risk Score' to begin analysis")
+        st.info("馃憜 Select an asset and click 'Calculate Risk Score' to begin analysis")
     
     st.divider()
     
-    # 使用说明
-    with st.expander("ℹ️ How to Use Early-Warning System"):
+    # 浣跨敤璇存槑
+    with st.expander("鈩癸笍 How to Use Early-Warning System"):
         st.markdown("""
         ### Early-Warning Risk Scoring System
         
@@ -3978,32 +5302,32 @@ with tab_warning:
         
         **Four Risk Dimensions**:
         
-        1. **🌐 Macro Chain (0-25)**:
+        1. **馃寪 Macro Chain (0-25)**:
            - USD strength/weakness impact
            - Interest rate movements
            - Macro news flow
            - Based on correlations with DXY, 10Y yields
         
-        2. **👥 Crowding (0-25)**:
+        2. **馃懃 Crowding (0-25)**:
            - RSI overbought/oversold levels
            - Price deviation from moving averages
            - Volume spikes indicating crowding
         
-        3. **📊 Microstructure (0-25)**:
+        3. **馃搳 Microstructure (0-25)**:
            - Volatility surges (ATR ratio)
            - Price gaps
            - Volume anomalies
         
-        4. **⚡ Event Risk (0-25)**:
+        4. **鈿?Event Risk (0-25)**:
            - Central bank events (Fed, ECB)
            - Policy changes (tariffs, regulations)
            - Geopolitical tensions
         
         **Risk Levels**:
-        - 🟢 **LOW (0-25)**: Normal market environment
-        - 🟡 **MEDIUM (26-50)**: Some factors elevated, monitor
-        - 🟠 **HIGH (51-75)**: Multiple risks, consider caution
-        - 🔴 **CRITICAL (76-100)**: Extreme risk, reduce exposure
+        - 馃煝 **LOW (0-25)**: Normal market environment
+        - 馃煛 **MEDIUM (26-50)**: Some factors elevated, monitor
+        - 馃煚 **HIGH (51-75)**: Multiple risks, consider caution
+        - 馃敶 **CRITICAL (76-100)**: Extreme risk, reduce exposure
         
         **Current Watchlist**:
         - Gold (GC=F)
@@ -4023,6 +5347,8 @@ with tab_warning:
         - Pay attention to evidence - not just the score
         - Act on CRITICAL levels, monitor HIGH levels
         """)
+
+
 
 
 
