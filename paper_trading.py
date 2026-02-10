@@ -1694,6 +1694,7 @@ class PaperTradingEngine:
             snapshot_path = reporting_cfg.get('snapshot_live_path', 'outputs/snapshot_live.json')
             trades_csv_path = reporting_cfg.get('trades_log_path', 'outputs/paper_trades.csv')
             report_dirs = self._resolve_daily_report_dirs()
+            now_local = datetime.now()
 
             stale_ratio = float(
                 self.current_stale_info.get(
@@ -1713,22 +1714,43 @@ class PaperTradingEngine:
                 'stale_info': dict(self.current_stale_info) if isinstance(self.current_stale_info, dict) else {}
             }
 
+            session = daily_reporter.get_market_session_state(now_local, tz_market='America/New_York')
             closed, reason = daily_reporter.is_market_closed(
-                now=datetime.now(),
+                now=now_local,
                 tz=tz_name,
                 snapshot=stale_snapshot,
                 stale_tracker=self.daily_report_stale_tracker
             )
-            if not closed:
-                return
 
-            if ZoneInfo is not None:
-                report_date = datetime.now(ZoneInfo(tz_name)).date().isoformat()
-            else:
-                report_date = datetime.now().date().isoformat()
+            state = str(session.get('state', '')).upper()
+            trading_date = str(session.get('trading_date_et', '')).strip()
+            last_completed_date = str(session.get('last_completed_trading_date_et', '')).strip()
+            close_method = str(reason.get('method', '')).strip().lower() if isinstance(reason, dict) else ''
+            is_time_close = bool(closed and close_method == 'time')
+            is_stale_close = bool(closed and close_method == 'stale_streak' and state == 'OPEN')
+
+            trigger_mode = 'backfill_last_completed'
+            report_date = last_completed_date
+            if is_time_close:
+                report_date = trading_date or last_completed_date
+                trigger_mode = 'post_close_time'
+            elif is_stale_close:
+                report_date = trading_date or last_completed_date
+                trigger_mode = 'open_stale_streak'
+
+            if not report_date:
+                return
 
             if self.latest_daily_report_date == report_date:
                 return
+
+            if trigger_mode == 'backfill_last_completed' and state in ('PRE_OPEN', 'OPEN', 'WEEKEND', 'POST_CLOSE'):
+                # Before close confirmation, only backfill the last completed trading day.
+                pass
+            else:
+                # Defensive fallback: if state is unexpected and close is not confirmed, skip.
+                if not is_time_close and not is_stale_close and state not in ('PRE_OPEN', 'OPEN', 'WEEKEND', 'POST_CLOSE'):
+                    return
 
             report = daily_reporter.generate_daily_report(
                 date=report_date,
@@ -1750,8 +1772,11 @@ class PaperTradingEngine:
             report['market_close'] = {
                 'closed': True,
                 'reason': {
-                    'method': reason.get('method', 'unknown'),
-                    'details': reason
+                    'method': trigger_mode,
+                    'details': {
+                        'session': session,
+                        'close_check': reason,
+                    },
                 }
             }
             wrote_paths = daily_reporter.write_daily_report(report, report_dirs)

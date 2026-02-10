@@ -233,6 +233,74 @@ def _is_weekday(dt: datetime) -> bool:
     return dt.weekday() < 5
 
 
+def _previous_trading_day(day: date_cls) -> date_cls:
+    out = day - timedelta(days=1)
+    while out.weekday() >= 5:
+        out -= timedelta(days=1)
+    return out
+
+
+def _next_trading_day(day: date_cls) -> date_cls:
+    out = day + timedelta(days=1)
+    while out.weekday() >= 5:
+        out += timedelta(days=1)
+    return out
+
+
+def get_market_session_state(
+    now_dt: Any,
+    tz_market: str = MARKET_TZ,
+    open_time_et: time = time(9, 30),
+    close_time_et: time = time(16, 0),
+    open_grace_min: int = 15,
+    close_grace_min: int = 10,
+) -> Dict[str, Any]:
+    """Return market session state in ET and completed-trading-day pointers."""
+    market_tz = _coerce_zone(tz_market)
+    now_parsed = _parse_datetime(now_dt, tz_market) or datetime.now(market_tz)
+    now_et = now_parsed.astimezone(market_tz)
+    today = now_et.date()
+
+    open_dt = datetime.combine(today, open_time_et, tzinfo=market_tz)
+    close_dt = datetime.combine(today, close_time_et, tzinfo=market_tz)
+    open_grace_dt = open_dt + timedelta(minutes=max(0, int(open_grace_min)))
+    close_grace_dt = close_dt + timedelta(minutes=max(0, int(close_grace_min)))
+
+    if today.weekday() >= 5:
+        state = "WEEKEND"
+        trading_date = _next_trading_day(today)
+        last_completed = _previous_trading_day(trading_date)
+    elif now_et < open_dt:
+        state = "PRE_OPEN"
+        trading_date = today
+        last_completed = _previous_trading_day(today)
+    elif now_et < close_dt:
+        state = "OPEN"
+        trading_date = today
+        last_completed = _previous_trading_day(today)
+    else:
+        state = "POST_CLOSE"
+        trading_date = today
+        if now_et >= close_grace_dt:
+            last_completed = today
+        else:
+            last_completed = _previous_trading_day(today)
+
+    return {
+        "state": state,
+        "now_et": now_et.isoformat(),
+        "trading_date_et": trading_date.isoformat(),
+        "last_completed_trading_date_et": last_completed.isoformat(),
+        "open_time_et": open_dt.isoformat(),
+        "close_time_et": close_dt.isoformat(),
+        "open_grace_min": int(max(0, int(open_grace_min))),
+        "close_grace_min": int(max(0, int(close_grace_min))),
+        "open_grace_passed": bool(now_et >= open_grace_dt) if state == "OPEN" else False,
+        "close_grace_passed": bool(now_et >= close_grace_dt) if state == "POST_CLOSE" else False,
+        "is_trading_day": bool(today.weekday() < 5),
+    }
+
+
 def is_market_closed(
     now: Any,
     tz: str,
@@ -242,54 +310,68 @@ def is_market_closed(
     """Return (closed, reason) by time rule or stale streak rule."""
     local_tz = _coerce_zone(tz)
     now_dt = _parse_datetime(now, tz) or datetime.now(local_tz)
-    now_et = now_dt.astimezone(_coerce_zone(MARKET_TZ))
-
-    close_time = time(16, 10)
-    if _is_weekday(now_et) and now_et.time() >= close_time:
-        return True, {
-            "method": "time",
-            "now_et": now_et.isoformat(),
-            "close_et": "16:10",
-            "details": {
-                "weekday": now_et.weekday(),
-                "trading_day": True,
-            },
-        }
+    session = get_market_session_state(now_dt, tz_market=MARKET_TZ)
 
     tracker = stale_tracker if isinstance(stale_tracker, dict) else {}
     ratio_threshold = float(max(0.0, min(1.0, _as_float(tracker.get("ratio_threshold"), 0.8))))
     streak_threshold = int(max(1, _as_float(tracker.get("threshold"), 3)))
     stale_ratio, observe_count = _extract_stale_signal(snapshot)
-    stale_hit = bool(stale_ratio >= ratio_threshold and observe_count >= 0)
+    stale_allowed = bool(session.get("state") == "OPEN" and session.get("open_grace_passed"))
+    stale_hit = bool(stale_allowed and stale_ratio >= ratio_threshold and observe_count >= 0)
     streak_now = int(_as_float(tracker.get("streak"), 0))
-    streak_now = streak_now + 1 if stale_hit else 0
+    if stale_hit:
+        streak_now += 1
+    elif stale_allowed:
+        streak_now = 0
+    else:
+        # PRE_OPEN / POST_CLOSE / WEEKEND should never accumulate stale streak.
+        streak_now = 0
     tracker["streak"] = streak_now
     tracker["threshold"] = streak_threshold
     tracker["ratio_threshold"] = ratio_threshold
     tracker["last_ratio"] = stale_ratio
     tracker["last_observe_count"] = observe_count
     tracker["updated_at"] = now_dt.isoformat()
+    tracker["session_state"] = session.get("state")
+    tracker["stale_allowed"] = stale_allowed
 
-    if _is_weekday(now_et) and stale_hit and streak_now >= streak_threshold:
+    if bool(session.get("state") == "POST_CLOSE" and session.get("close_grace_passed")):
         return True, {
-            "method": "stale_streak",
-            "stale_ratio": stale_ratio,
-            "streak": streak_now,
-            "threshold": streak_threshold,
+            "method": "time",
             "details": {
+                "session": session,
+                "stale_ratio": stale_ratio,
+                "streak": streak_now,
+                "threshold": streak_threshold,
                 "ratio_threshold": ratio_threshold,
                 "observe_count": observe_count,
-                "now_et": now_et.isoformat(),
+            },
+        }
+
+    if stale_hit and streak_now >= streak_threshold:
+        return True, {
+            "method": "stale_streak",
+            "details": {
+                "session": session,
+                "stale_ratio": stale_ratio,
+                "streak": streak_now,
+                "threshold": streak_threshold,
+                "ratio_threshold": ratio_threshold,
+                "observe_count": observe_count,
             },
         }
 
     return False, {
-        "method": "open",
-        "now_et": now_et.isoformat(),
-        "close_et": "16:10",
-        "stale_ratio": stale_ratio,
-        "streak": streak_now,
-        "threshold": streak_threshold,
+        "method": "not_closed",
+        "details": {
+            "session": session,
+            "stale_ratio": stale_ratio,
+            "streak": streak_now,
+            "threshold": streak_threshold,
+            "ratio_threshold": ratio_threshold,
+            "stale_allowed": stale_allowed,
+            "observe_count": observe_count,
+        },
     }
 
 
@@ -1161,12 +1243,55 @@ def _run_smoke_from_cli(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_session_smoke_tests() -> int:
+    """Lightweight logic-only tests for market session + close gating."""
+    et_tz = _coerce_zone(MARKET_TZ)
+    snap = {"stale_ratio": 1.0, "observe_count": 10}
+
+    # case1: PRE_OPEN must not be closed by stale, and streak must reset.
+    tracker1 = {"streak": 10, "ratio_threshold": 0.8, "threshold": 3}
+    now1 = datetime(2026, 2, 10, 5, 0, tzinfo=et_tz)  # Tue 05:00 ET
+    session1 = get_market_session_state(now1)
+    closed1, reason1 = is_market_closed(now=now1, tz=DEFAULT_TZ, snapshot=snap, stale_tracker=tracker1)
+    assert session1.get("state") == "PRE_OPEN"
+    assert not bool(closed1)
+    assert int(_as_float(tracker1.get("streak"), -1)) == 0
+    assert str(session1.get("trading_date_et")) == "2026-02-10"
+    assert str(session1.get("last_completed_trading_date_et")) == "2026-02-09"
+
+    # case2: OPEN (+ open grace passed) may close by stale streak.
+    tracker2 = {"streak": 2, "ratio_threshold": 0.8, "threshold": 3}
+    now2 = datetime(2026, 2, 10, 10, 30, tzinfo=et_tz)  # Tue 10:30 ET
+    session2 = get_market_session_state(now2)
+    closed2, reason2 = is_market_closed(now=now2, tz=DEFAULT_TZ, snapshot=snap, stale_tracker=tracker2)
+    assert session2.get("state") == "OPEN"
+    assert bool(session2.get("open_grace_passed"))
+    assert bool(closed2)
+    assert str(reason2.get("method", "")).lower() == "stale_streak"
+
+    # case3: POST_CLOSE (+ close grace passed) closes by time.
+    tracker3 = {"streak": 0, "ratio_threshold": 0.8, "threshold": 3}
+    now3 = datetime(2026, 2, 10, 16, 15, tzinfo=et_tz)  # Tue 16:15 ET
+    session3 = get_market_session_state(now3)
+    closed3, reason3 = is_market_closed(now=now3, tz=DEFAULT_TZ, snapshot=snap, stale_tracker=tracker3)
+    assert session3.get("state") == "POST_CLOSE"
+    assert bool(session3.get("close_grace_passed"))
+    assert bool(closed3)
+    assert str(reason3.get("method", "")).lower() == "time"
+
+    print("SESSION_SMOKE_OK")
+    return 0
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Daily reporter utility (safe smoke mode).")
     parser.add_argument("--smoke", action="store_true", help="Run smoke test in a temporary directory.")
+    parser.add_argument("--smoke-session", action="store_true", help="Run session/close logic smoke tests.")
     parser.add_argument("--date", type=str, default=None, help="Report date (YYYY-MM-DD).")
     parser.add_argument("--snapshot", type=str, default=None, help="Snapshot json path.")
     parser.add_argument("--trades", type=str, default=None, help="Trades csv path.")
     parser.add_argument("--tz", type=str, default=DEFAULT_TZ, help="Timezone name.")
     _args = parser.parse_args()
+    if _args.smoke_session:
+        sys.exit(_run_session_smoke_tests())
     sys.exit(_run_smoke_from_cli(_args))
