@@ -50,6 +50,10 @@ except Exception as e:
             "now_utc": now_fallback.isoformat(),
             "trading_date_et": now_fallback.date().isoformat(),
             "last_completed_trading_date_et": now_fallback.date().isoformat(),
+            "open_time_et": str(open_time_et),
+            "close_time_et": str(close_time_et),
+            "is_weekend": False,
+            "is_holiday": False,
             "open_grace_passed": True,
             "close_grace_passed": False,
             "open_grace_min": int(open_grace_min),
@@ -1836,6 +1840,8 @@ class PaperTradingEngine:
         try:
             snapshot = self._build_post_rebalance_snapshot()
             self.write_live_snapshot(snapshot, source=f"post_rebalance:{source}")
+            # Keep text summary aligned with the same post-rebalance snapshot payload.
+            self.generate_live_summary(snapshot_override=snapshot)
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
             print(f"[SNAPSHOT] Post-rebalance live snapshot written (cycle={self.current_cycle}, trades={int(trades_count)}, path={live_snapshot_path}, source={source})")
         except Exception as e:
@@ -1887,12 +1893,75 @@ class PaperTradingEngine:
         session.setdefault('close_grace_min', int(close_grace_min))
         allowed = bool(is_market_open_for_trading(session))
         state = str(session.get('state', 'UNKNOWN')).upper()
+        open_grace_passed = bool(session.get('open_grace_passed', False))
+        close_grace_passed = bool(session.get('close_grace_passed', False))
+        is_weekend = bool(state == 'WEEKEND')
+        is_holiday = bool(session.get('is_holiday', False))
+        if is_holiday:
+            reason_detail = 'holiday'
+        elif state != 'OPEN':
+            reason_detail = f"state_{state.lower()}"
+        elif not open_grace_passed:
+            reason_detail = 'open_grace_not_passed'
+        else:
+            reason_detail = 'allowed'
         reason = 'market_open' if allowed else 'market_closed_gate'
+        now_utc = now_val.astimezone(timezone.utc) if isinstance(now_val, datetime) else self._now()
+        now_local = now_utc.astimezone() if isinstance(now_utc, datetime) else now_utc
+        now_et_parsed = self._parse_datetime_utc_safe(session.get('now_et'))
+        checkpoint_raw = None
+        checkpoint_age_seconds = None
+        if isinstance(self.portfolio_snapshots, list) and self.portfolio_snapshots:
+            last_snapshot = self.portfolio_snapshots[-1]
+            if isinstance(last_snapshot, dict):
+                checkpoint_raw = last_snapshot.get('timestamp')
+        checkpoint_dt = self._parse_datetime_utc_safe(checkpoint_raw)
+        if isinstance(checkpoint_dt, datetime) and isinstance(now_utc, datetime):
+            try:
+                checkpoint_age_seconds = round((now_utc - checkpoint_dt).total_seconds(), 3)
+            except Exception:
+                checkpoint_age_seconds = None
+        within_grace = bool(state == 'OPEN' and not open_grace_passed)
+        open_grace_seconds = int(max(0, int(open_grace_min)) * 60)
+        close_grace_seconds = int(max(0, int(close_grace_min)) * 60)
         gate = {
             'allowed': bool(allowed),
             'reason': reason,
+            'reason_detail': reason_detail,
             'session_state': state,
+            'open_grace_passed': open_grace_passed,
+            'close_grace_passed': close_grace_passed,
+            'within_grace': within_grace,
+            'is_weekend': is_weekend,
+            'is_holiday': is_holiday,
+            'open_grace_seconds': open_grace_seconds,
+            'close_grace_seconds': close_grace_seconds,
+            'now_utc': now_utc.isoformat() if isinstance(now_utc, datetime) else str(now_utc),
+            'now_local': now_local.isoformat() if isinstance(now_local, datetime) else str(now_local),
+            'now_tz': str(getattr(now_local, 'tzinfo', None)),
+            'now_et': str(session.get('now_et')),
+            'market_open_time': str(session.get('open_time_et') or open_time_et),
+            'market_close_time': str(session.get('close_time_et') or close_time_et),
+            'market_tz': tz_market,
+            'holiday_calendar': 'none',
+            'checkpoint_ts': str(checkpoint_raw) if checkpoint_raw is not None else None,
+            'checkpoint_age_seconds': checkpoint_age_seconds,
+            'timebase_mismatch_seconds': (
+                round((now_utc - now_et_parsed).total_seconds(), 3)
+                if isinstance(now_utc, datetime) and isinstance(now_et_parsed, datetime) else None
+            ),
         }
+
+        print(
+            "[GATE_DEBUG] "
+            f"reason={reason} detail={reason_detail} session={state} "
+            f"now={gate.get('now_local')} now_tz={gate.get('now_tz')} now_utc={gate.get('now_utc')} now_et={gate.get('now_et')} "
+            f"market_open_time={gate.get('market_open_time')} market_close_time={gate.get('market_close_time')} "
+            f"grace_seconds=open:{open_grace_seconds},close:{close_grace_seconds} "
+            f"within_grace={within_grace} open_grace_passed={open_grace_passed} close_grace_passed={close_grace_passed} "
+            f"is_weekend={is_weekend} is_holiday={is_holiday} checkpoint_ts={gate.get('checkpoint_ts')} "
+            f"checkpoint_age_seconds={checkpoint_age_seconds} timebase_mismatch_seconds={gate.get('timebase_mismatch_seconds')}"
+        )
 
         self.current_market_session = dict(session) if isinstance(session, dict) else {}
         self.current_rebalance_gate = dict(gate)
@@ -2217,6 +2286,23 @@ class PaperTradingEngine:
         if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+
+    def _parse_datetime_utc_safe(self, value):
+        """Best-effort parse of datetime-like values into timezone-aware UTC datetime."""
+        if isinstance(value, datetime):
+            return self._coerce_datetime_utc(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.endswith('Z'):
+                text = text[:-1] + '+00:00'
+            try:
+                parsed = datetime.fromisoformat(text)
+            except Exception:
+                return None
+            return self._coerce_datetime_utc(parsed)
+        return None
 
     def to_yahoo_symbol(self, ticker):
         """Return provider symbol for Yahoo/yfinance without unsafe ticker rewrites."""
@@ -5677,7 +5763,8 @@ class PaperTradingEngine:
             if isinstance(self.current_risk_check_info, dict):
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
-            print(f"[GATE] Rebalance skipped: market_closed_gate (session={session_state})")
+            gate_detail = str((gate or {}).get('reason_detail', 'unknown'))
+            print(f"[GATE] Rebalance skipped: market_closed_gate (session={session_state}, detail={gate_detail})")
             self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_market_closed_gate")
             return []
 
@@ -7212,13 +7299,15 @@ class PaperTradingEngine:
         print(f"[OK] Trades updated: {trades_path}")
         import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
 
-    def generate_live_summary(self):
+    def generate_live_summary(self, snapshot_override=None):
         """def generate_live_summary: docstring omitted (was garbled/non-ASCII)."""
-        if not self.portfolio_snapshots:
+        if isinstance(snapshot_override, dict):
+            final_snapshot = snapshot_override
+        elif self.portfolio_snapshots:
+            final_snapshot = self.portfolio_snapshots[-1]
+        else:
             return
-        
-        final_snapshot = self.portfolio_snapshots[-1]
-        
+
         summary_path = self.config['reporting']['summary_report_path'].replace('.txt', '_live.txt')
         
         with open(summary_path, 'w', encoding='utf-8') as f:
@@ -8250,6 +8339,15 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
         isinstance(probe_now_et, datetime) and isinstance(probe_now_utc, datetime) and probe_now_utc.hour == 12 and probe_now_et.hour == 7,
         "market_session converts UTC time to ET correctly (12:00 UTC -> 07:00 ET)",
     )
+
+    # Unit-style gate check: 09:35 ET with open_grace=5min should be tradable.
+    engine._debug_session_override = None
+    engine.config.setdefault("reporting", {})["market_open_grace_min"] = 5
+    now_holder["value"] = datetime(2026, 2, 10, 14, 35, 0, tzinfo=timezone.utc)  # 09:35 ET (winter)
+    live_session_935, live_gate_935 = engine._refresh_market_session_state(engine._now())
+    _check("GATE-1A", str((live_session_935 or {}).get("state", "")).upper() == "OPEN", "09:35 ET is OPEN session")
+    _check("GATE-1B", bool((live_gate_935 or {}).get("allowed", False)), "09:35 ET after grace is not blocked by market gate")
+    _check("GATE-1C", str((live_gate_935 or {}).get("reason_detail", "")) == "allowed", "gate reason_detail is explicit when tradable")
 
     # CASE-1 PRE_OPEN
     now_holder["value"] = datetime(2026, 2, 10, 5, 0, 0)

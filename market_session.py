@@ -139,6 +139,9 @@ def get_market_session_state(
         "last_completed_trading_date_et": last_completed.isoformat(),
         "open_time_et": open_dt.isoformat(),
         "close_time_et": close_dt.isoformat(),
+        "is_weekend": bool(state == "WEEKEND"),
+        # Holiday calendar integration is not enabled in this lightweight helper.
+        "is_holiday": False,
         "open_grace_min": int(max(0, int(open_grace_min))),
         "close_grace_min": int(max(0, int(close_grace_min))),
         "open_grace_passed": bool(now_et >= open_grace_dt) if state == "OPEN" else False,
