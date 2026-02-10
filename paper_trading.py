@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import uuid
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -13,6 +14,19 @@ import matplotlib
 matplotlib.use('Agg')  # NOTE: comment omitted (was garbled/non-ASCII).
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
+
+try:
+    import daily_reporter
+    DAILY_REPORTER_AVAILABLE = True
+except Exception as e:
+    daily_reporter = None  # type: ignore
+    DAILY_REPORTER_AVAILABLE = False
+    print(f"[WARN] daily_reporter unavailable: {e}")
 
 # ChromaDB for macro signals
 try:
@@ -754,6 +768,10 @@ class PaperTradingEngine:
         """def __init__: docstring omitted (was garbled/non-ASCII)."""
         self.config = self.load_config(config_path)
         self.validate_config()
+        reporting_cfg = self.config.get('reporting', {})
+        self.account_id = str(reporting_cfg.get('account_id', 'paper_main') or 'paper_main').strip()
+        self.runtime_env = str(reporting_cfg.get('env', 'live') or 'live').strip().lower()
+        self.session_id = str(os.environ.get('GW_SESSION_ID') or uuid.uuid4().hex)
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.cash = self.config['initial_cash_usd']
@@ -815,6 +833,12 @@ class PaperTradingEngine:
         self.current_macro_reused = False
         self.score_history_by_ticker = {}
         self.hot_momentum_streaks = {}
+        self.daily_report_stale_tracker = {
+            'streak': 0,
+            'ratio_threshold': float(self.config.get('reporting', {}).get('daily_report_stale_ratio_threshold', 0.8)),
+            'threshold': int(self.config.get('reporting', {}).get('daily_report_stale_streak_threshold', 3))
+        }
+        self.latest_daily_report_date = None
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.macro_risk_score_history = []  # NOTE: comment omitted (was garbled/non-ASCII).
@@ -979,6 +1003,15 @@ class PaperTradingEngine:
         reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
         reporting_config.setdefault('snapshot_live_path', 'outputs/snapshot_live.json')
         reporting_config.setdefault('trade_history_path', 'outputs/trade_history.jsonl')
+        reporting_config.setdefault('account_id', 'paper_main')
+        reporting_config.setdefault('env', 'live')
+        reporting_config.setdefault('daily_report_tz', 'America/Vancouver')
+        reporting_config.setdefault('daily_report_dirs', [
+            'outputs/Daily Report',
+            r'C:\Users\kyosh\Desktop\Project\News\outputs\Daily Report'
+        ])
+        reporting_config.setdefault('daily_report_stale_ratio_threshold', 0.8)
+        reporting_config.setdefault('daily_report_stale_streak_threshold', 3)
         
         return config
     
@@ -1458,6 +1491,9 @@ class PaperTradingEngine:
 
         payload = {
             'timestamp': snapshot.get('timestamp', datetime.now().isoformat()),
+            'account_id': self.account_id,
+            'session_id': self.session_id,
+            'env': self.runtime_env,
             'cycle': int(snapshot.get('cycle', self.current_cycle)),
             'status': snapshot.get('status', self.status),
             'total_equity': total_equity,
@@ -1602,6 +1638,129 @@ class PaperTradingEngine:
             print(f"[SNAPSHOT] Post-rebalance live snapshot written (cycle={self.current_cycle}, trades={int(trades_count)}, path={live_snapshot_path}, source={source})")
         except Exception as e:
             print(f"[WARN] Post-rebalance live snapshot refresh failed: {e}")
+
+    def _resolve_daily_report_dirs(self):
+        """Resolve and deduplicate Daily Report output directories."""
+        reporting_cfg = self.config.get('reporting', {})
+        raw_dirs = reporting_cfg.get('daily_report_dirs', ['outputs/Daily Report'])
+        if isinstance(raw_dirs, str):
+            raw_dirs = [raw_dirs]
+        resolved = []
+        seen = set()
+        for path in raw_dirs:
+            if not path:
+                continue
+            full = os.path.abspath(str(path))
+            key = full.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(full)
+        if not resolved:
+            resolved = [os.path.abspath('outputs/Daily Report')]
+        return resolved
+
+    def _update_live_snapshot_daily_report_ref(self, report_date, report_path):
+        """Attach latest Daily Report pointer into snapshot_live.json for UI."""
+        try:
+            snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
+            if not os.path.exists(snapshot_path):
+                return
+            with open(snapshot_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return
+
+            payload['latest_daily_report_date'] = str(report_date)
+            payload['latest_daily_report_path'] = str(report_path)
+
+            folder = os.path.dirname(snapshot_path) or '.'
+            os.makedirs(folder, exist_ok=True)
+            tmp_path = snapshot_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, snapshot_path)
+        except Exception as e:
+            print(f"[WARN] Failed to update snapshot daily report pointer: {e}")
+
+    def _maybe_generate_daily_report(self):
+        """Generate Daily Report after market close. Never raises."""
+        if not DAILY_REPORTER_AVAILABLE or daily_reporter is None:
+            return
+
+        try:
+            reporting_cfg = self.config.get('reporting', {})
+            tz_name = str(reporting_cfg.get('daily_report_tz', 'America/Vancouver'))
+            snapshot_path = reporting_cfg.get('snapshot_live_path', 'outputs/snapshot_live.json')
+            trades_csv_path = reporting_cfg.get('trades_log_path', 'outputs/paper_trades.csv')
+            report_dirs = self._resolve_daily_report_dirs()
+
+            stale_ratio = float(
+                self.current_stale_info.get(
+                    'stale_ratio_candidates',
+                    self.current_stale_info.get('stale_ratio', 0.0)
+                ) or 0.0
+            )
+            observe_count = int(
+                self.current_stale_info.get(
+                    'stale_candidate_count',
+                    self.current_stale_info.get('stale_count', 0)
+                ) or 0
+            )
+            stale_snapshot = {
+                'stale_ratio': stale_ratio,
+                'observe_count': observe_count,
+                'stale_info': dict(self.current_stale_info) if isinstance(self.current_stale_info, dict) else {}
+            }
+
+            closed, reason = daily_reporter.is_market_closed(
+                now=datetime.now(),
+                tz=tz_name,
+                snapshot=stale_snapshot,
+                stale_tracker=self.daily_report_stale_tracker
+            )
+            if not closed:
+                return
+
+            if ZoneInfo is not None:
+                report_date = datetime.now(ZoneInfo(tz_name)).date().isoformat()
+            else:
+                report_date = datetime.now().date().isoformat()
+
+            if self.latest_daily_report_date == report_date:
+                return
+
+            report = daily_reporter.generate_daily_report(
+                date=report_date,
+                snapshot_path=snapshot_path,
+                trades_csv_path=trades_csv_path,
+                report_dirs=report_dirs,
+                tz=tz_name
+            )
+            if not isinstance(report, dict):
+                return
+
+            if report.get('_already_exists'):
+                self.latest_daily_report_date = report_date
+                existing_path = report.get('_existing_path')
+                if existing_path:
+                    self._update_live_snapshot_daily_report_ref(report_date, existing_path)
+                return
+
+            report['market_close'] = {
+                'closed': True,
+                'reason': {
+                    'method': reason.get('method', 'unknown'),
+                    'details': reason
+                }
+            }
+            wrote_paths = daily_reporter.write_daily_report(report, report_dirs)
+            if wrote_paths:
+                self.latest_daily_report_date = report_date
+                self._update_live_snapshot_daily_report_ref(report_date, wrote_paths[0])
+                print(f"[DAILY REPORT] Generated {report_date} -> {wrote_paths[0]}")
+        except Exception as e:
+            print(f"[WARN] Daily report generation skipped due to error: {e}")
 
     def save_trade_history_jsonl(self):
         """Write trade history JSONL for Streamlit portfolio monitor."""
@@ -5262,16 +5421,34 @@ class PaperTradingEngine:
             if trade_context['regime_state'] in ('risk_off', 'risk_off_forced'):
                 decision_trace.append('risk_off_de-risk')
             decision_trace.extend(alloc_trace)
+
+            equity_reference = float(total_equity) if total_equity > 0 else 0.0
+            old_position_value = float(trade.get('current_value', current_qty * price) or 0.0)
+            new_position_value = max(0.0, old_position_value - proceeds)
+            if equity_reference > 0:
+                old_weight = float(old_position_value / equity_reference)
+                new_weight = float(new_position_value / equity_reference)
+            else:
+                old_weight = 0.0
+                new_weight = 0.0
+            weight_change = float(new_weight - old_weight)
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
                 'timestamp': datetime.now().isoformat(),
+                'account_id': self.account_id,
+                'session_id': self.session_id,
+                'env': self.runtime_env,
                 'cycle': self.current_cycle,
                 'ticker': ticker,
                 'side': 'SELL',
                 'quantity': sell_qty,
                 'price': price,
                 'notional': proceeds,
+                'equity_reference': equity_reference,
+                'old_weight': old_weight,
+                'new_weight': new_weight,
+                'weight_change': weight_change,
                 'cost': cost,
                 'cost_est': self.estimate_trade_cost(ticker, 'SELL', proceeds, adv_notional=None),
                 'cost_est_total': 0.0,
@@ -5366,16 +5543,34 @@ class PaperTradingEngine:
             if total_required >= cash_before_trade * 0.99:
                 decision_trace.append('cash_limited')
             decision_trace.extend(alloc_trace)
+
+            equity_reference = float(total_equity) if total_equity > 0 else 0.0
+            old_position_value = float(trade.get('current_value', old_qty * price) or 0.0)
+            new_position_value = max(0.0, old_position_value + required_cash)
+            if equity_reference > 0:
+                old_weight = float(old_position_value / equity_reference)
+                new_weight = float(new_position_value / equity_reference)
+            else:
+                old_weight = 0.0
+                new_weight = 0.0
+            weight_change = float(new_weight - old_weight)
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
                 'timestamp': datetime.now().isoformat(),
+                'account_id': self.account_id,
+                'session_id': self.session_id,
+                'env': self.runtime_env,
                 'cycle': self.current_cycle,
                 'ticker': ticker,
                 'side': 'BUY',
                 'quantity': buy_qty,
                 'price': price,
                 'notional': required_cash,
+                'equity_reference': equity_reference,
+                'old_weight': old_weight,
+                'new_weight': new_weight,
+                'weight_change': weight_change,
                 'cost': cost,
                 'cost_est': self.estimate_trade_cost(ticker, 'BUY', required_cash, adv_notional=None),
                 'cost_est_total': 0.0,
@@ -5722,13 +5917,31 @@ class PaperTradingEngine:
             if turnover_capped:
                 decision_trace.append(f'turnover_cap_scale_{turnover_scale:.2%}')
 
+            equity_reference = float(total_equity) if total_equity > 0 else 0.0
+            old_position_value = float(h.get('value', old_qty * h['price']) or 0.0)
+            new_position_value = max(0.0, old_position_value - proceeds)
+            if equity_reference > 0:
+                old_weight = float(old_position_value / equity_reference)
+                new_weight = float(new_position_value / equity_reference)
+            else:
+                old_weight = 0.0
+                new_weight = 0.0
+            weight_change = float(new_weight - old_weight)
+
             trades.append({
                 'timestamp': now.isoformat(),
+                'account_id': self.account_id,
+                'session_id': self.session_id,
+                'env': self.runtime_env,
                 'ticker': h['ticker'],
                 'side': 'SELL',
                 'quantity': sell_qty,
                 'price': h['price'],
                 'notional': proceeds,
+                'equity_reference': equity_reference,
+                'old_weight': old_weight,
+                'new_weight': new_weight,
+                'weight_change': weight_change,
                 'cost': cost,
                 'cost_est': self.estimate_trade_cost(h['ticker'], 'SELL', proceeds, adv_notional=None),
                 'cost_est_total': 0.0,
@@ -6426,6 +6639,7 @@ class PaperTradingEngine:
         try:
             while datetime.now() < self.end_time:
                 self.run_cycle()
+                self._maybe_generate_daily_report()
                 
                 sleep_seconds = self.config['rebalance_minutes'] * 60
                 
@@ -6447,6 +6661,7 @@ class PaperTradingEngine:
             print("Final Snapshot")
             print(f"{'='*60}")
             self.run_cycle()
+            self._maybe_generate_daily_report()
             
             self.status = "COMPLETED"
             

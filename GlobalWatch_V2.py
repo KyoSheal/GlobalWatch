@@ -14,6 +14,11 @@ import uuid
 import urllib.parse
 import os
 
+try:
+    import daily_reporter
+except Exception:
+    daily_reporter = None  # type: ignore
+
 # === 0. 基础设置 ===
 try:
     from plyer import notification
@@ -2503,7 +2508,45 @@ def render_portfolio_monitor():
 
         return _cached_trades(path, int(refresh_nonce))
 
-    data_container = st.empty()
+    def load_daily_reports_index(path, interval_seconds, refresh_nonce):
+        ttl_seconds = max(1, int(interval_seconds))
+
+        @st.cache_data(ttl=ttl_seconds, show_spinner=False)
+        def _cached_index(index_file, nonce):
+            payload = _safe_read_json(index_file)
+            reports = payload.get("reports", []) if isinstance(payload, dict) else []
+            if not isinstance(reports, list):
+                reports = []
+            reports_clean = [r for r in reports if isinstance(r, dict)]
+            reports_clean.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+            return {"reports": reports_clean}
+
+        return _cached_index(path, int(refresh_nonce))
+
+    def load_daily_reports_by_paths(paths, interval_seconds, refresh_nonce):
+        ttl_seconds = max(1, int(interval_seconds))
+        path_payload = json.dumps(list(paths or []), ensure_ascii=False)
+
+        @st.cache_data(ttl=ttl_seconds, show_spinner=False)
+        def _cached_reports(paths_json, nonce):
+            try:
+                path_list = json.loads(paths_json)
+            except Exception:
+                path_list = []
+            if not isinstance(path_list, list):
+                path_list = []
+
+            reports = []
+            for p in path_list:
+                if not isinstance(p, str) or not p.strip():
+                    continue
+                payload = _safe_read_json(p)
+                if isinstance(payload, dict) and payload.get("date"):
+                    reports.append(payload)
+            reports.sort(key=lambda x: str(x.get("date", "")))
+            return reports
+
+        return _cached_reports(path_payload, int(refresh_nonce))
 
     def _render_data_panel():
         interval_seconds = int(st.session_state.get("pm_auto_refresh_interval", 1200))
@@ -2512,13 +2555,23 @@ def render_portfolio_monitor():
         snapshot = load_snapshot(snapshot_path, interval_seconds, refresh_nonce)
         summary_text = load_summary(summary_path, interval_seconds, refresh_nonce)
         trades = load_trade_history(trades_path, interval_seconds, refresh_nonce)
+        daily_reports_index = load_daily_reports_index(
+            os.path.join("outputs", "Daily Report", "daily_reports_index.json"),
+            interval_seconds,
+            refresh_nonce,
+        )
+        daily_report_entries = daily_reports_index.get("reports", []) if isinstance(daily_reports_index, dict) else []
 
         if not isinstance(snapshot, dict):
             snapshot = {}
         if not isinstance(trades, list):
             trades = []
+        if not isinstance(daily_report_entries, list):
+            daily_report_entries = []
 
-        with data_container.container():
+        # Create container inside the render call so fragment-owned widgets
+        # are not written into a container created outside fragment context.
+        with st.container():
             total_equity = _to_float(snapshot.get("total_equity", snapshot.get("equity", 0.0)))
             cash = _to_float(snapshot.get("cash", 0.0))
             positions_value = _to_float(snapshot.get("positions_value", max(0.0, total_equity - cash)))
@@ -2561,16 +2614,38 @@ def render_portfolio_monitor():
                     amount = _to_float(
                         trade.get("cost", trade.get("notional", trade.get("amount", trade.get("desired_trade_value", 0.0))))
                     )
-                    if "weight_change" in trade:
-                        weight_change = _to_float(trade.get("weight_change", 0.0))
+                    weight_change = None
+                    raw_weight_change = trade.get("weight_change")
+                    if raw_weight_change not in (None, ""):
+                        weight_change = _to_float(raw_weight_change)
                     else:
-                        old_weight = _to_float(
-                            trade.get("old_target_weight", trade.get("current_weight", trade.get("old_weight", 0.0)))
+                        old_weight_raw = trade.get(
+                            "old_target_weight",
+                            trade.get("current_weight", trade.get("old_weight", None)),
                         )
-                        new_weight = _to_float(
-                            trade.get("new_target_weight", trade.get("target_weight", trade.get("new_weight", 0.0)))
+                        new_weight_raw = trade.get(
+                            "new_target_weight",
+                            trade.get("target_weight", trade.get("new_weight", None)),
                         )
-                        weight_change = new_weight - old_weight
+                        if old_weight_raw not in (None, "") or new_weight_raw not in (None, ""):
+                            old_weight = _to_float(old_weight_raw)
+                            new_weight = _to_float(new_weight_raw)
+                            if abs(old_weight) > 1e-12 or abs(new_weight) > 1e-12:
+                                weight_change = new_weight - old_weight
+
+                    if weight_change is None:
+                        equity_reference = _to_float(
+                            trade.get("equity_reference", trade.get("equity_before_trade", 0.0))
+                        )
+                        if equity_reference <= 0 and total_equity > 0:
+                            equity_reference = total_equity
+                        notional = _to_float(
+                            trade.get("notional", trade.get("amount", trade.get("desired_trade_value", 0.0)))
+                        )
+                        side_upper = side.upper()
+                        if equity_reference > 0 and abs(notional) > 0 and side_upper in ("BUY", "SELL"):
+                            signed_notional = abs(notional) if side_upper == "BUY" else -abs(notional)
+                            weight_change = signed_notional / equity_reference
 
                     trade_rows.append(
                         {
@@ -2578,7 +2653,7 @@ def render_portfolio_monitor():
                             "ticker": ticker,
                             "side": side,
                             "amount": amount,
-                            "weight_change": weight_change,
+                            "weight_change": weight_change if weight_change is not None else "N/A",
                         }
                     )
 
@@ -2589,6 +2664,129 @@ def render_portfolio_monitor():
                     st.dataframe(trade_df, width="stretch", hide_index=True)
             else:
                 st.info("No trade history found in outputs/trade_history.jsonl")
+
+            st.subheader("Reports / Statistics")
+            window_defs = [
+                ("今日 (1D)", 1),
+                ("3 天 (3D)", 3),
+                ("1 周 (7D)", 7),
+                ("1 个月 (30D)", 30),
+                ("3 个月 (90D)", 90),
+                ("半年 (180D)", 180),
+                ("1 年 (365D)", 365),
+            ]
+            if not daily_report_entries:
+                st.info("No Daily Report index found in outputs/Daily Report/daily_reports_index.json")
+            else:
+                tabs = st.tabs([x[0] for x in window_defs])
+                for tab, (_label, window_days) in zip(tabs, window_defs):
+                    with tab:
+                        if len(daily_report_entries) < window_days:
+                            st.info("时间不足")
+                            continue
+
+                        selected_entries = daily_report_entries[:window_days]
+                        selected_paths = []
+                        for entry in selected_entries:
+                            path = str(entry.get("path", "")).strip()
+                            if path:
+                                selected_paths.append(path)
+                        reports = load_daily_reports_by_paths(selected_paths, interval_seconds, refresh_nonce)
+                        if len(reports) < window_days:
+                            st.info("时间不足")
+                            continue
+
+                        if daily_reporter is None:
+                            st.info("时间不足")
+                            continue
+
+                        try:
+                            agg = daily_reporter.aggregate_reports(reports, window_days)
+                        except Exception:
+                            agg = {"status": "insufficient"}
+
+                        if not isinstance(agg, dict) or agg.get("status") != "ok":
+                            st.info("时间不足")
+                            continue
+
+                        agg_quality = str(agg.get("data_quality", "ok")).strip().lower()
+                        if agg_quality == "inconsistent":
+                            st.warning("数据不一致")
+                            issues = agg.get("issues", [])
+                            if isinstance(issues, list) and issues:
+                                for issue in issues[:3]:
+                                    st.caption(f"- {issue}")
+                            continue
+
+                        metrics = agg.get("metrics", {}) if isinstance(agg.get("metrics"), dict) else {}
+                        buy_notional = _to_float(metrics.get("buy_notional"), 0.0)
+                        sell_notional = _to_float(metrics.get("sell_notional"), 0.0)
+                        net_flow = _to_float(metrics.get("net_flow"), 0.0)
+                        trades_count = int(_to_float(metrics.get("trade_count"), 0.0))
+                        pnl_value = metrics.get("pnl")
+                        pnl_pct_value = metrics.get("pnl_pct")
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Buy Notional", f"${buy_notional:,.2f}")
+                        m2.metric("Sell Notional", f"${sell_notional:,.2f}")
+                        m3.metric("Net Flow", f"${net_flow:,.2f}")
+                        m4.metric("Trade Count", f"{trades_count}")
+
+                        pnl_text = "N/A" if pnl_value is None else f"${_to_float(pnl_value):,.2f}"
+                        pnl_pct_text = "N/A" if pnl_pct_value is None else f"{_to_float(pnl_pct_value):.2f}%"
+                        p1, p2, p3 = st.columns([1, 1, 2])
+                        p1.metric("PnL", pnl_text)
+                        p2.metric("PnL %", pnl_pct_text)
+                        p3.caption(
+                            f"Range: {agg.get('from', 'N/A')} -> {agg.get('to', 'N/A')} | "
+                            f"Reports: {int(_to_float(agg.get('report_count'), 0.0))}"
+                        )
+
+                        st.markdown("**Top Risky Tickers**")
+                        risky_rows = []
+                        risky_list = agg.get("top_risky_tickers", []) if isinstance(agg.get("top_risky_tickers"), list) else []
+                        for item in risky_list:
+                            if not isinstance(item, dict):
+                                continue
+                            risky_rows.append(
+                                {
+                                    "ticker": str(item.get("ticker", "")),
+                                    "count": int(_to_float(item.get("count"), 0.0)),
+                                    "avg_score": _to_float(item.get("avg_score"), 0.0),
+                                }
+                            )
+                        if risky_rows:
+                            st.dataframe(pd.DataFrame(risky_rows), width="stretch", hide_index=True)
+                        else:
+                            st.caption("No risky ticker statistics.")
+
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown("**Long-term Conviction**")
+                            long_rows = agg.get("long_term_stats", []) if isinstance(agg.get("long_term_stats"), list) else []
+                            if long_rows:
+                                for row in long_rows[:5]:
+                                    if not isinstance(row, dict):
+                                        continue
+                                    st.markdown(
+                                        f"- `{row.get('ticker', '')}` x{int(_to_float(row.get('count'), 0.0))}: "
+                                        f"{row.get('last_why', '')}"
+                                    )
+                            else:
+                                st.caption("No long-term conviction entries.")
+                        with c2:
+                            st.markdown("**Short-term Conviction**")
+                            short_rows = agg.get("short_term_stats", []) if isinstance(agg.get("short_term_stats"), list) else []
+                            if short_rows:
+                                for row in short_rows[:5]:
+                                    if not isinstance(row, dict):
+                                        continue
+                                    st.markdown(
+                                        f"- `{row.get('ticker', '')}` x{int(_to_float(row.get('count'), 0.0))}: "
+                                        f"{row.get('last_why', '')}"
+                                    )
+                            else:
+                                st.caption("No short-term conviction entries.")
 
             st.subheader("Theme Summary")
             last_macro = snapshot.get("last_macro", {})
