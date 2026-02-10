@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import uuid
+import argparse
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -2796,6 +2797,8 @@ class PaperTradingEngine:
                         dropped.append(drop_item)
                         if isinstance(trade_id, str):
                             dropped_map[trade_id] = drop_item
+                        # Budget overflow: stop allocating further trades this cycle.
+                        remaining_budget = 0.0
                         continue
 
                     scale = float(remaining_budget / notional) if notional > 0 else 0.0
@@ -2817,6 +2820,8 @@ class PaperTradingEngine:
                         dropped.append(drop_item)
                         if isinstance(trade_id, str):
                             dropped_map[trade_id] = drop_item
+                        # Overflow trade cannot be filled: halt and drop all remaining.
+                        remaining_budget = 0.0
                         continue
 
                     scaled_cost_est = self.estimate_trade_cost(
@@ -2863,7 +2868,8 @@ class PaperTradingEngine:
                     scaled.append(scale_item)
                     if isinstance(trade_id, str):
                         scaled_map[trade_id] = scale_item
-                    remaining_budget -= new_notional
+                    # Scale one last trade to remaining budget, then stop allocation.
+                    remaining_budget = 0.0
                     used += new_notional
                 return used
 
@@ -5176,6 +5182,7 @@ class PaperTradingEngine:
                 'current_value': current_value,
                 'target_value': target_value,
                 'desired_trade_value': desired_trade_value,
+                'delta_weight': (desired_trade_value / total_equity) if total_equity > 0 else 0.0,
                 'price': price,
                 'age': age,
                 'status': status,
@@ -5299,11 +5306,13 @@ class PaperTradingEngine:
         max_turnover_pct = execution_config.get('max_turnover_pct_per_rebalance', 0.20)
         turnover_limit = total_equity * max_turnover_pct
         
+        planner_enabled = bool(planner_cfg.get('enable_trade_planner', False))
         turnover_scale = 1.0
         turnover_capped = False
+        planned_after_planner = float(turnover_notional_pre)
         
         print(f"\n[TURNOVER] Planned(pre): ${turnover_notional_pre:,.2f}, Limit: ${turnover_limit:,.2f} ({max_turnover_pct:.1%})")
-        if bool(planner_cfg.get('enable_trade_planner', False)):
+        if planner_enabled:
             try:
                 planned_trades, planner_meta = self.apply_trade_planner(
                     planned_trades,
@@ -5315,12 +5324,13 @@ class PaperTradingEngine:
                 if isinstance(self.current_risk_check_info, dict):
                     self.current_risk_check_info['trade_planner'] = dict(planner_meta)
 
-                planned_after = sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict))
-                turnover_scale = (planned_after / turnover_notional_pre) if turnover_notional_pre > 0 else 1.0
-                turnover_capped = planned_after + 1e-9 < turnover_notional_pre
+                planned_after_planner = float(
+                    sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict))
+                )
                 print(
-                    f"[PLANNER] enabled=true turnover_limit=${planner_meta.get('turnover_limit', 0.0):,.2f} "
-                    f"used_total=${planner_meta.get('turnover_used_total', 0.0):,.2f} "
+                    f"[PLANNER] enabled=true used_total=${planner_meta.get('turnover_used_total', 0.0):,.2f}/"
+                    f"limit=${planner_meta.get('turnover_limit', 0.0):,.2f} "
+                    f"forced={planner_meta.get('num_forced', 0)} normal={planner_meta.get('num_normal', 0)} "
                     f"dropped={planner_meta.get('num_dropped', 0)} "
                     f"scaled={len(planner_meta.get('scaled', [])) if isinstance(planner_meta.get('scaled', []), list) else 0} "
                     f"status={planner_meta.get('status')}"
@@ -5342,8 +5352,9 @@ class PaperTradingEngine:
                 }
                 if isinstance(self.current_risk_check_info, dict):
                     self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
-                turnover_scale = 1.0
-                turnover_capped = False
+                planned_after_planner = float(
+                    sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict))
+                )
         else:
             # NOTE: comment omitted (was garbled/non-ASCII).
             if turnover_notional_pre > turnover_limit:
@@ -5369,6 +5380,9 @@ class PaperTradingEngine:
                 # NOTE: comment omitted (was garbled/non-ASCII).
                 actual_turnover_scaled = sum(abs(t['desired_trade_value']) for t in planned_trades)
                 print(f"[TURNOVER CAP] Planned(after scaling): ${actual_turnover_scaled:,.2f}")
+            planned_after_planner = float(
+                sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict))
+            )
 
             self.current_planner_info = {
                 'enabled': False,
@@ -5385,6 +5399,92 @@ class PaperTradingEngine:
             }
             if isinstance(self.current_risk_check_info, dict):
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
+
+        # Second min-notional filter after planner/cap to avoid wasting budget on tiny trades.
+        post_planner_dropped_trades = []
+        if planned_trades:
+            filtered_trades = []
+            for trade in planned_trades:
+                if not isinstance(trade, dict):
+                    continue
+                desired_abs = abs(float(trade.get('desired_trade_value', 0.0) or 0.0))
+                if desired_abs + 1e-12 < float(min_notional):
+                    post_planner_dropped_trades.append({
+                        'trade': trade,
+                        'desired_abs': float(desired_abs),
+                    })
+                    print(f"[SKIP] {trade.get('ticker', '')} post-planner notional ${desired_abs:.2f} < min ${min_notional}")
+                    continue
+                filtered_trades.append(trade)
+            planned_trades = filtered_trades
+
+        if planner_enabled and isinstance(self.current_planner_info, dict) and post_planner_dropped_trades:
+            planner_meta_ref = self.current_planner_info
+            max_audit_items = int(max(1, planner_cfg.get('max_audit_items', 20)))
+            dropped_list = planner_meta_ref.get('dropped', [])
+            if not isinstance(dropped_list, list):
+                dropped_list = []
+            existing_keys = set()
+            for item in dropped_list:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get('trade_id', '')).strip()
+                if key:
+                    existing_keys.add(key)
+
+            drop_increase = 0
+            for item in post_planner_dropped_trades:
+                tr = item.get('trade', {})
+                if not isinstance(tr, dict):
+                    continue
+                desired_abs = float(item.get('desired_abs', 0.0) or 0.0)
+                trade_id = str(tr.get('_planner_trade_id', '')).strip()
+                if not trade_id:
+                    trade_id = (
+                        f"{str(tr.get('ticker', '')).upper().strip()}:"
+                        f"{str(tr.get('side', '')).upper().strip()}:"
+                        f"{round(desired_abs, 2)}:post_min"
+                )
+                if trade_id in existing_keys:
+                    continue
+                existing_keys.add(trade_id)
+                drop_increase += 1
+                if len(dropped_list) < max_audit_items:
+                    dropped_list.append({
+                        'ticker': str(tr.get('ticker', '')),
+                        'side': str(tr.get('side', '')),
+                        'reason': 'min_notional_post_planner',
+                        'adv_clipped': bool(tr.get('adv_clipped', False)),
+                        'adv_participation': tr.get('adv_participation'),
+                        'planner_score': tr.get('planner_score'),
+                        'planner_benefit': tr.get('planner_benefit'),
+                        'planner_cost_dollars': tr.get('planner_cost_dollars'),
+                        'planner_cost_weight': tr.get('planner_cost_weight'),
+                        'trade_id': trade_id,
+                        'old_notional': desired_abs,
+                    })
+            planner_meta_ref['dropped'] = dropped_list[:max_audit_items]
+            planner_meta_ref['num_dropped'] = int(max(0, int(planner_meta_ref.get('num_dropped', 0) or 0)) + drop_increase)
+            forced_after = float(sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if bool(t.get('is_forced', False))))
+            total_after = float(sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades))
+            planner_meta_ref['turnover_used_forced'] = forced_after
+            planner_meta_ref['turnover_used_normal'] = max(0.0, total_after - forced_after)
+            planner_meta_ref['turnover_used_total'] = total_after
+            planner_meta_ref['num_forced'] = int(sum(1 for t in planned_trades if bool(t.get('is_forced', False))))
+            planner_meta_ref['num_normal'] = int(sum(1 for t in planned_trades if not bool(t.get('is_forced', False))))
+            if isinstance(self.current_risk_check_info, dict):
+                self.current_risk_check_info['trade_planner'] = dict(planner_meta_ref)
+
+        planned_after_exec_input = float(
+            sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict))
+        )
+        turnover_scale = (planned_after_exec_input / turnover_notional_pre) if turnover_notional_pre > 0 else 1.0
+        turnover_capped = planned_after_exec_input + 1e-9 < turnover_notional_pre
+        if planner_enabled:
+            print(
+                f"[TURNOVER] planned_after_planner=${planned_after_planner:,.2f}, "
+                f"planned_after_min_filter=${planned_after_exec_input:,.2f}"
+            )
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_turnover_info = {
@@ -5631,6 +5731,12 @@ class PaperTradingEngine:
         if turnover_capped and turnover_notional_post > turnover_limit + 1e-6:
             print(f"[WARN] turnover_notional_post ${turnover_notional_post:,.2f} > limit ${turnover_limit:,.2f}")
 
+        planner_enabled_flag = bool((self.current_planner_info or {}).get('enabled', False)) if isinstance(self.current_planner_info, dict) else False
+        planner_status_val = (self.current_planner_info or {}).get('status') if isinstance(self.current_planner_info, dict) else None
+        planner_turnover_limit_val = (self.current_planner_info or {}).get('turnover_limit') if isinstance(self.current_planner_info, dict) else None
+        planner_turnover_used_total_val = (self.current_planner_info or {}).get('turnover_used_total') if isinstance(self.current_planner_info, dict) else None
+        planner_num_dropped_val = (self.current_planner_info or {}).get('num_dropped') if isinstance(self.current_planner_info, dict) else None
+
         for trade in trades:
             trade_cost_est = trade.get('cost_est') if isinstance(trade.get('cost_est'), dict) else {}
             trade_cost_total = float(trade_cost_est.get('total', 0.0) or 0.0)
@@ -5652,6 +5758,11 @@ class PaperTradingEngine:
             trade['fill_reason'] = trade_context.get('fill_reason', '')
             trade['fill_remaining_end'] = trade_context.get('fill_remaining_end', trade_context.get('remaining_gap', 0.0))
             trade['capped_assets'] = ';'.join(trade_context.get('capped_assets', [])) if trade_context.get('capped_assets') else ''
+            trade['planner_enabled'] = bool(planner_enabled_flag)
+            trade['planner_status'] = planner_status_val
+            trade['planner_turnover_limit'] = planner_turnover_limit_val
+            trade['planner_turnover_used_total'] = planner_turnover_used_total_val
+            trade['planner_num_dropped'] = planner_num_dropped_val
 
         cost_summary = {
             'enabled': bool(cost_cfg.get('enabled', False)),
@@ -6016,6 +6127,11 @@ class PaperTradingEngine:
             t['turnover_notional_post'] = turnover_notional_post
             trade_cost_est = t.get('cost_est') if isinstance(t.get('cost_est'), dict) else {}
             t['cost_est_total'] = float(trade_cost_est.get('total', 0.0) or 0.0)
+            t['planner_enabled'] = bool((self.current_planner_info or {}).get('enabled', False))
+            t['planner_status'] = (self.current_planner_info or {}).get('status')
+            t['planner_turnover_limit'] = (self.current_planner_info or {}).get('turnover_limit')
+            t['planner_turnover_used_total'] = (self.current_planner_info or {}).get('turnover_used_total')
+            t['planner_num_dropped'] = (self.current_planner_info or {}).get('num_dropped')
             try:
                 cost_summary['total'] += float(trade_cost_est.get('total', 0.0) or 0.0)
                 cost_summary['fee'] += float(trade_cost_est.get('fee', 0.0) or 0.0)
@@ -6918,17 +7034,167 @@ class PaperTradingEngine:
         print(f"{'='*60}\n")
 
 
+def debug_run_planner_once(config_path: str = "paper_config.json", turnover_limit: float | None = None):
+    """Run a deterministic planner dry-run without market data dependencies."""
+    cfg = {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f) if f else {}
+    except Exception as e:
+        print(f"[DEBUG PLANNER] Failed to load config {config_path}: {e}")
+        cfg = {}
+
+    trade_planner_cfg = cfg.get("trade_planner", {}) if isinstance(cfg, dict) else {}
+    execution_cfg = cfg.get("execution", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(trade_planner_cfg, dict):
+        trade_planner_cfg = {}
+    if not isinstance(execution_cfg, dict):
+        execution_cfg = {}
+
+    equity = float(trade_planner_cfg.get("debug_equity", cfg.get("initial_cash_usd", 30000.0) if isinstance(cfg, dict) else 30000.0) or 30000.0)
+    max_turnover_pct = float(execution_cfg.get("max_turnover_pct_per_rebalance", 0.20) or 0.20)
+    budget = float(turnover_limit if turnover_limit is not None else (equity * max_turnover_pct))
+    budget = max(0.0, budget)
+
+    allow_partial_fill = bool(trade_planner_cfg.get("allow_partial_fill", True))
+    min_trade_notional = float(trade_planner_cfg.get("min_trade_notional", 5.0) or 5.0)
+    enable_cost_sensitive_ranking = bool(trade_planner_cfg.get("enable_cost_sensitive_ranking", False))
+
+    synthetic = [
+        {"ticker": "AAA", "side": "SELL", "desired_trade_value": 260.0, "is_forced": True, "priority": "forced", "planner_score": 0.60},
+        {"ticker": "BBB", "side": "SELL", "desired_trade_value": 180.0, "is_forced": True, "priority": "forced", "planner_score": 0.55},
+        {"ticker": "CCC", "side": "BUY", "desired_trade_value": 240.0, "is_forced": False, "priority": "normal", "planner_score": 0.90},
+        {"ticker": "DDD", "side": "BUY", "desired_trade_value": 170.0, "is_forced": False, "priority": "normal", "planner_score": 0.85},
+        {"ticker": "EEE", "side": "BUY", "desired_trade_value": 140.0, "is_forced": False, "priority": "normal", "planner_score": 0.40},
+        {"ticker": "FFF", "side": "SELL", "desired_trade_value": 120.0, "is_forced": False, "priority": "normal", "planner_score": 0.75},
+        {"ticker": "GGG", "side": "BUY", "desired_trade_value": 110.0, "is_forced": False, "priority": "normal", "planner_score": 0.70},
+        {"ticker": "HHH", "side": "SELL", "desired_trade_value": 95.0, "is_forced": False, "priority": "normal", "planner_score": 0.65},
+        {"ticker": "III", "side": "BUY", "desired_trade_value": 80.0, "is_forced": False, "priority": "normal", "planner_score": 0.50},
+        {"ticker": "JJJ", "side": "BUY", "desired_trade_value": 60.0, "is_forced": False, "priority": "normal", "planner_score": 0.45},
+    ]
+    for t in synthetic:
+        t["delta_weight"] = (float(t["desired_trade_value"]) / equity) if equity > 0 else 0.0
+
+    pre_notional = float(sum(abs(float(t.get("desired_trade_value", 0.0) or 0.0)) for t in synthetic))
+    forced = [dict(t) for t in synthetic if bool(t.get("is_forced", False)) or str(t.get("priority", "")).lower() == "forced"]
+    normal = [dict(t) for t in synthetic if t not in forced]
+
+    forced.sort(key=lambda x: (-abs(float(x.get("desired_trade_value", 0.0) or 0.0)), str(x.get("ticker", ""))))
+    if enable_cost_sensitive_ranking:
+        normal.sort(
+            key=lambda x: (
+                -float(x.get("planner_score", 0.0) or 0.0),
+                -abs(float(x.get("desired_trade_value", 0.0) or 0.0)),
+                str(x.get("ticker", "")),
+            )
+        )
+    else:
+        normal.sort(key=lambda x: (-abs(float(x.get("desired_trade_value", 0.0) or 0.0)), str(x.get("ticker", ""))))
+
+    queue = forced + normal
+    chosen = []
+    dropped = []
+    scaled = []
+    remaining = float(budget)
+
+    for item in queue:
+        notional = abs(float(item.get("desired_trade_value", 0.0) or 0.0))
+        if remaining <= 1e-12:
+            dropped.append({"ticker": item.get("ticker"), "side": item.get("side"), "reason": "over_budget"})
+            continue
+        if notional <= remaining + 1e-12:
+            chosen.append(dict(item))
+            remaining -= notional
+            continue
+
+        if allow_partial_fill and remaining >= min_trade_notional:
+            scale = float(remaining / notional) if notional > 0 else 0.0
+            partial = dict(item)
+            partial["desired_trade_value"] = float(remaining)
+            chosen.append(partial)
+            scaled.append(
+                {
+                    "ticker": item.get("ticker"),
+                    "side": item.get("side"),
+                    "old_notional": float(notional),
+                    "new_notional": float(remaining),
+                    "scale": float(scale),
+                    "reason": "budget_scale",
+                }
+            )
+            remaining = 0.0
+        else:
+            reason = "over_budget_partial_below_min" if allow_partial_fill else "over_budget"
+            dropped.append({"ticker": item.get("ticker"), "side": item.get("side"), "reason": reason})
+            remaining = 0.0
+
+    used_total = float(sum(abs(float(t.get("desired_trade_value", 0.0) or 0.0)) for t in chosen))
+    print("[DEBUG PLANNER] deterministic dry-run (no market data)")
+    print(
+        f"[DEBUG PLANNER] pre_notional=${pre_notional:,.2f} limit=${budget:,.2f} "
+        f"used=${used_total:,.2f} keep={len(chosen)} dropped={len(dropped)} scaled={len(scaled)}"
+    )
+    print(
+        f"[DEBUG PLANNER] rank_mode={'planner_score' if enable_cost_sensitive_ranking else 'notional'} "
+        f"allow_partial_fill={str(bool(allow_partial_fill)).lower()} min_trade_notional={min_trade_notional:.2f}"
+    )
+    print("[DEBUG PLANNER] chosen:")
+    for t in chosen:
+        print(
+            "  - "
+            + json.dumps(
+                {
+                    "ticker": t.get("ticker"),
+                    "side": t.get("side"),
+                    "notional": round(float(t.get("desired_trade_value", 0.0) or 0.0), 4),
+                    "forced": bool(t.get("is_forced", False)),
+                    "planner_score": t.get("planner_score"),
+                },
+                ensure_ascii=False,
+            )
+        )
+    print("[DEBUG PLANNER] dropped:")
+    for d in dropped:
+        print("  - " + json.dumps(d, ensure_ascii=False))
+    print("[DEBUG PLANNER] scaled:")
+    for s in scaled:
+        print("  - " + json.dumps(s, ensure_ascii=False))
+
+    return {
+        "pre_notional": pre_notional,
+        "limit": budget,
+        "used_total": used_total,
+        "chosen": chosen,
+        "dropped": dropped,
+        "scaled": scaled,
+    }
+
+
 def main():
     """def main: docstring omitted (was garbled/non-ASCII)."""
-    import sys
-    
-    config_path = 'paper_config.json'
-    
-    if len(sys.argv) > 1:
-        config_path = sys.argv[1]
-    
+    parser = argparse.ArgumentParser(description="Paper trading engine")
+    parser.add_argument("config_path", nargs="?", default="paper_config.json", help="Path to config JSON.")
+    parser.add_argument(
+        "--debug-planner-once",
+        action="store_true",
+        help="Run deterministic planner dry-run once and exit (no market data required).",
+    )
+    parser.add_argument(
+        "--debug-turnover-limit",
+        type=float,
+        default=None,
+        help="Optional absolute turnover limit for planner dry-run.",
+    )
+    args = parser.parse_args()
+
+    debug_env = str(os.environ.get("GW_DEBUG_PLANNER_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
+    if bool(args.debug_planner_once or debug_env):
+        debug_run_planner_once(args.config_path, turnover_limit=args.debug_turnover_limit)
+        return
+
+    config_path = args.config_path
     print(f"Loading config: {config_path}")
-    
+
     engine = PaperTradingEngine(config_path)
     engine.run()
 

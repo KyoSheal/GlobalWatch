@@ -429,8 +429,8 @@
     }
   },
   "trade_planner": {
-    "enabled": false,
-    "enable_trade_planner": false,
+    "enabled": true,
+    "enable_trade_planner": true,
     "planner_debug_log": false,
     "allow_partial_fill": true,
     "min_trade_notional": 5.0,
