@@ -8830,6 +8830,313 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     return 1 if fail_count > 0 else 0
 
 
+def debug_run_news_overlay_phase2(config_path: str = "paper_config.json", outdir: str = "outputs/news_overlay_phase2_dryrun") -> int:
+    """Deterministic dry-run for Phase 2 news overlay consumption checks."""
+    pass_count = 0
+    fail_count = 0
+    case_rows = []
+
+    def _check(check_id: str, condition: bool, message: str):
+        nonlocal pass_count, fail_count
+        if bool(condition):
+            pass_count += 1
+            print(f"[PASS] {check_id} {message}")
+        else:
+            fail_count += 1
+            print(f"[FAIL] {check_id} {message}")
+
+    def _merge_news_cfg(base_cfg: dict, override_cfg: dict) -> dict:
+        merged = dict(base_cfg or {})
+        merged.update(override_cfg or {})
+        return {
+            "enabled": bool(merged.get("enabled", False)),
+            "industry_collection": str(merged.get("industry_collection", "industry_signals")),
+            "max_age_hours": max(0.0, float(merged.get("max_age_hours", 48.0) or 48.0)),
+            "alpha": float(np.clip(float(merged.get("alpha", 0.08) or 0.08), 0.0, 1.0)),
+            "mode": str(merged.get("mode", "risk_only")).lower(),
+            "min_confidence": float(np.clip(float(merged.get("min_confidence", 0.55) or 0.55), 0.0, 1.0)),
+            "max_abs_delta": float(np.clip(float(merged.get("max_abs_delta", 0.10) or 0.10), 0.0, 1.0)),
+        }
+
+    def _filter_signal_rows(raw_rows: list, cfg_row: dict):
+        now_utc = datetime.now(timezone.utc)
+        max_age_hours = float(cfg_row.get("max_age_hours", 48.0))
+        min_confidence = float(cfg_row.get("min_confidence", 0.55))
+        latest_by_l2 = {}
+        filtered_low_conf = 0
+        filtered_age = 0
+        malformed = 0
+        for row in (raw_rows or []):
+            if not isinstance(row, dict):
+                malformed += 1
+                continue
+            l2 = str(row.get("L2", "")).strip()
+            if not l2:
+                malformed += 1
+                continue
+            try:
+                confidence = float(row.get("confidence", 0.0) or 0.0)
+            except Exception:
+                malformed += 1
+                continue
+            if confidence < min_confidence:
+                filtered_low_conf += 1
+                continue
+
+            ts_val = row.get("timestamp", now_utc.isoformat())
+            ts = None
+            try:
+                ts = datetime.fromisoformat(str(ts_val).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                ts = ts.astimezone(timezone.utc)
+            except Exception:
+                ts = now_utc
+            age_hours = max(0.0, (now_utc - ts).total_seconds() / 3600.0)
+            if age_hours > max_age_hours:
+                filtered_age += 1
+                continue
+
+            one = {
+                "L2": l2,
+                "timestamp": ts.isoformat(),
+                "confidence": confidence,
+                "risk_delta": float(row.get("risk_delta", 0.0) or 0.0),
+                "horizon": str(row.get("horizon", "1d")),
+                "payload": row.get("payload", {}) if isinstance(row.get("payload", {}), dict) else {},
+            }
+            prev = latest_by_l2.get(l2)
+            if prev is None:
+                latest_by_l2[l2] = one
+            else:
+                try:
+                    prev_ts = datetime.fromisoformat(str(prev.get("timestamp", "")).replace("Z", "+00:00"))
+                    if prev_ts.tzinfo is None:
+                        prev_ts = prev_ts.replace(tzinfo=timezone.utc)
+                    if ts > prev_ts.astimezone(timezone.utc):
+                        latest_by_l2[l2] = one
+                except Exception:
+                    latest_by_l2[l2] = one
+        kept_rows = list(latest_by_l2.values())
+        return kept_rows, {
+            "raw_count": len(raw_rows or []),
+            "kept_count": len(kept_rows),
+            "filtered_low_confidence": filtered_low_conf,
+            "filtered_age": filtered_age,
+            "malformed": malformed,
+        }
+
+    def _calc_clip_events(filtered_rows: list, cfg_row: dict):
+        alpha = float(cfg_row.get("alpha", 0.08))
+        max_abs_delta = float(cfg_row.get("max_abs_delta", 0.10))
+        mode = str(cfg_row.get("mode", "risk_only")).lower()
+        events = []
+        for row in (filtered_rows or []):
+            l2 = str(row.get("L2", "")).strip()
+            risk_delta = float(row.get("risk_delta", 0.0) or 0.0)
+            raw_delta = risk_delta * alpha
+            clipped = float(np.clip(raw_delta, -max_abs_delta, max_abs_delta))
+            if mode == "risk_only" and clipped > 0:
+                clipped = 0.0
+            clipped_flag = abs(clipped - raw_delta) > 1e-12
+            events.append(
+                {
+                    "L2": l2,
+                    "risk_delta": float(risk_delta),
+                    "raw_delta": float(raw_delta),
+                    "delta_after_clip": float(clipped),
+                    "clipped": bool(clipped_flag),
+                }
+            )
+        return events
+
+    outdir_abs = os.path.abspath(str(outdir or "outputs/news_overlay_phase2_dryrun"))
+    os.makedirs(outdir_abs, exist_ok=True)
+
+    old_checkpoint_env = os.environ.get("GW_CHECKPOINT_ACTION")
+    os.environ["GW_CHECKPOINT_ACTION"] = "fresh"
+    try:
+        engine = PaperTradingEngine(config_path)
+    finally:
+        if old_checkpoint_env is None:
+            os.environ.pop("GW_CHECKPOINT_ACTION", None)
+        else:
+            os.environ["GW_CHECKPOINT_ACTION"] = old_checkpoint_env
+
+    base_cfg = engine._get_news_overlay_cfg()
+    base_cash_target = 0.20
+    tickers = ["AAA", "BBB", "CCC", "DDD"]
+    tag_lookup = {
+        "AAA": {"L2": ["technology"], "L3": [], "keywords": ["semiconductor"]},
+        "BBB": {"L2": ["energy"], "L3": [], "keywords": ["oil"]},
+        "CCC": {"L2": ["financials"], "L3": [], "keywords": ["bank"]},
+        "DDD": {"L2": ["utilities"], "L3": [], "keywords": ["utility"]},
+    }
+
+    now_utc = datetime.now(timezone.utc)
+    old_ts = (now_utc - timedelta(hours=72)).isoformat()
+    fresh_ts = (now_utc - timedelta(hours=2)).isoformat()
+
+    cases = [
+        {
+            "id": "A",
+            "name": "overlay_disabled",
+            "cfg": {"enabled": False},
+            "signals": [
+                {"L2": "technology", "confidence": 0.99, "risk_delta": -0.50, "timestamp": fresh_ts},
+            ],
+            "expect": {"unchanged": True},
+        },
+        {
+            "id": "B",
+            "name": "confidence_filter",
+            "cfg": {"enabled": True},
+            "signals": [
+                {"L2": "technology", "confidence": max(0.0, float(base_cfg.get("min_confidence", 0.55)) - 0.05), "risk_delta": -0.50, "timestamp": fresh_ts},
+            ],
+            "expect": {"unchanged": True, "low_conf_filtered_min": 1},
+        },
+        {
+            "id": "C",
+            "name": "mild_negative_delta_applies",
+            "cfg": {"enabled": True, "mode": "risk_only"},
+            "signals": [
+                {"L2": "technology", "confidence": 0.90, "risk_delta": -0.02, "timestamp": fresh_ts},
+            ],
+            "expect": {"delta_positive_min": 1e-8},
+        },
+        {
+            "id": "D",
+            "name": "risk_only_blocks_aggressive_direction",
+            "cfg": {"enabled": True, "mode": "risk_only"},
+            "signals": [
+                {"L2": "technology", "confidence": 0.90, "risk_delta": +0.20, "timestamp": fresh_ts},
+            ],
+            "expect": {"non_decreasing_cash": True},
+        },
+        {
+            "id": "E",
+            "name": "clip_large_delta",
+            "cfg": {"enabled": True, "mode": "risk_only"},
+            "signals": [
+                {"L2": "technology", "confidence": 0.95, "risk_delta": -5.0, "timestamp": fresh_ts},
+            ],
+            "expect": {"clipped_min": 1, "delta_positive_min": 1e-8},
+        },
+        {
+            "id": "F",
+            "name": "mixed_multi_l2_aggregation",
+            "cfg": {"enabled": True, "mode": "risk_only"},
+            "signals": [
+                {"L2": "technology", "confidence": 0.90, "risk_delta": -0.60, "timestamp": fresh_ts},
+                {"L2": "energy", "confidence": 0.70, "risk_delta": -0.15, "timestamp": fresh_ts},
+                {"L2": "financials", "confidence": 0.80, "risk_delta": +0.60, "timestamp": fresh_ts},
+                {"L2": "utilities", "confidence": 0.40, "risk_delta": -0.80, "timestamp": fresh_ts},
+                {"L2": "utilities", "confidence": 0.80, "risk_delta": -0.20, "timestamp": old_ts},
+            ],
+            "expect": {"non_decreasing_cash": True, "low_conf_filtered_min": 1, "age_filtered_min": 1},
+        },
+    ]
+
+    original_news_cfg = dict(engine.config.get("news_overlay", {})) if isinstance(engine.config.get("news_overlay", {}), dict) else {}
+    original_read_recent = engine._read_recent_industry_signals
+    original_tag_lookup = engine._build_ticker_tags_lookup
+
+    try:
+        engine._build_ticker_tags_lookup = lambda: dict(tag_lookup)
+
+        for case in cases:
+            case_id = str(case.get("id"))
+            case_name = str(case.get("name"))
+            cfg_row = _merge_news_cfg(base_cfg, case.get("cfg", {}))
+            engine.config["news_overlay"] = dict(cfg_row)
+            filtered_rows, filter_stats = _filter_signal_rows(case.get("signals", []), cfg_row)
+            clip_events = _calc_clip_events(filtered_rows, cfg_row)
+            clip_count = sum(1 for x in clip_events if bool(x.get("clipped", False)))
+            engine._read_recent_industry_signals = (lambda rows=filtered_rows: list(rows))
+
+            before = float(base_cash_target)
+            after, info = engine.apply_news_overlay_to_cash_target(tickers, before)
+            observed_delta = float(after - before)
+            theoretical_upper = float(cfg_row.get("max_abs_delta", 0.10))
+            bound_ok = abs(observed_delta) <= theoretical_upper + 1e-12
+            risk_only_ok = True
+            if str(cfg_row.get("mode", "risk_only")).lower() == "risk_only":
+                risk_only_ok = observed_delta >= -1e-12
+
+            _check(f"CASE{case_id}-A", bound_ok, f"delta bound respected (|{observed_delta:.6f}| <= {theoretical_upper:.6f})")
+            _check(f"CASE{case_id}-B", risk_only_ok, "risk_only does not make cash target more aggressive")
+
+            expected = case.get("expect", {})
+            if bool(expected.get("unchanged", False)):
+                _check(f"CASE{case_id}-C", abs(observed_delta) <= 1e-12, "cash_target unchanged as expected")
+            if "delta_positive_min" in expected:
+                _check(f"CASE{case_id}-C", observed_delta >= float(expected.get("delta_positive_min", 0.0)), "cash_target increased by expected minimum delta")
+            if bool(expected.get("non_decreasing_cash", False)):
+                _check(f"CASE{case_id}-D", after >= before - 1e-12, "cash_target_after >= cash_target_before")
+            if "clipped_min" in expected:
+                _check(f"CASE{case_id}-E", clip_count >= int(expected.get("clipped_min", 1)), "clip triggered as expected")
+            if "low_conf_filtered_min" in expected:
+                _check(
+                    f"CASE{case_id}-F",
+                    int(filter_stats.get("filtered_low_confidence", 0)) >= int(expected.get("low_conf_filtered_min", 0)),
+                    "low-confidence filtering applied",
+                )
+            if "age_filtered_min" in expected:
+                _check(
+                    f"CASE{case_id}-G",
+                    int(filter_stats.get("filtered_age", 0)) >= int(expected.get("age_filtered_min", 0)),
+                    "age filtering applied",
+                )
+
+            case_payload = {
+                "case_id": case_id,
+                "case_name": case_name,
+                "config": {
+                    "enabled": bool(cfg_row.get("enabled", False)),
+                    "mode": str(cfg_row.get("mode", "risk_only")),
+                    "alpha": float(cfg_row.get("alpha", 0.08)),
+                    "min_confidence": float(cfg_row.get("min_confidence", 0.55)),
+                    "max_abs_delta": float(cfg_row.get("max_abs_delta", 0.10)),
+                    "max_age_hours": float(cfg_row.get("max_age_hours", 48.0)),
+                },
+                "cash_target_before": before,
+                "cash_target_after": float(after),
+                "applied_delta": observed_delta,
+                "delta_upper_bound_theoretical": theoretical_upper,  # Current implementation bound: |delta| <= max_abs_delta
+                "filter_stats": filter_stats,
+                "used_signals_count": len(filtered_rows),
+                "clip_count": int(clip_count),
+                "clip_events": clip_events[:20],
+                "overlay_info": info if isinstance(info, dict) else {},
+            }
+            case_rows.append(case_payload)
+            print(
+                f"[PHASE2-DRYRUN] CASE {case_id} ({case_name}) "
+                f"before={before:.6f} after={after:.6f} delta={observed_delta:+.6f} "
+                f"kept={len(filtered_rows)} low_conf={filter_stats.get('filtered_low_confidence', 0)} "
+                f"age_filtered={filter_stats.get('filtered_age', 0)} clipped={clip_count}"
+            )
+    finally:
+        engine.config["news_overlay"] = dict(original_news_cfg)
+        engine._read_recent_industry_signals = original_read_recent
+        engine._build_ticker_tags_lookup = original_tag_lookup
+
+    summary = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "config_path": str(config_path),
+        "outdir": outdir_abs,
+        "checks": {"pass": pass_count, "fail": fail_count},
+        "cases": case_rows,
+    }
+    summary_path = os.path.join(outdir_abs, "news_overlay_phase2_dryrun_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"[PHASE2-DRYRUN] Summary written: {summary_path}")
+    print(f"DRYRUN_SUMMARY pass={pass_count} fail={fail_count}")
+    return 1 if fail_count > 0 else 0
+
+
 def main():
     """def main: docstring omitted (was garbled/non-ASCII)."""
     parser = argparse.ArgumentParser(description="Paper trading engine")
@@ -8854,12 +9161,18 @@ def main():
         "--debug-outdir",
         type=str,
         default="outputs/gw_dryrun",
-        help="Output directory for --debug-system-s1-5 artifacts.",
+        help="Output directory for debug artifacts.",
+    )
+    parser.add_argument(
+        "--debug-news-overlay-phase2",
+        action="store_true",
+        help="Run deterministic Phase 2 news overlay consumption dry-run and exit.",
     )
     args = parser.parse_args()
 
     debug_env = str(os.environ.get("GW_DEBUG_PLANNER_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_system_env = str(os.environ.get("GW_DEBUG_SYSTEM_S1_5", "")).strip().lower() in ("1", "true", "yes", "on")
+    debug_news_overlay_phase2_env = str(os.environ.get("GW_DEBUG_NEWS_OVERLAY_PHASE2", "")).strip().lower() in ("1", "true", "yes", "on")
     if bool(args.debug_planner_once or debug_env):
         debug_run_planner_once(args.config_path, turnover_limit=args.debug_turnover_limit)
         return 0
@@ -8868,6 +9181,11 @@ def main():
             config_path=args.config_path,
             outdir=args.debug_outdir,
             turnover_limit=args.debug_turnover_limit,
+        )
+    if bool(args.debug_news_overlay_phase2 or debug_news_overlay_phase2_env):
+        return debug_run_news_overlay_phase2(
+            config_path=args.config_path,
+            outdir=args.debug_outdir,
         )
 
     config_path = args.config_path

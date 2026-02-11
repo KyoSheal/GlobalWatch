@@ -589,22 +589,22 @@
     "cooldown_cycles": 2
   },
   "news_overlay": {
-    "enabled": false,
+    "enabled": true,
     "industry_collection": "industry_signals",
-    "max_age_hours": 48,
-    "alpha": 0.08,
+    "max_age_hours": 24,
+    "alpha": 0.03,
     "mode": "risk_only",
-    "min_confidence": 0.55,
-    "max_abs_delta": 0.10
+    "min_confidence": 0.65,
+    "max_abs_delta": 0.05
   },
   "news_sources": {
     "market_rss_enabled": true,
-    "ticker_rss_enabled": true,
+    "ticker_rss_enabled": false,
     "industry_rss_enabled": true,
     "timeout_seconds": 8,
     "retries": 1,
-    "max_per_l2": 8,
-    "max_total": 60,
+    "max_per_l2": 4,
+    "max_total": 30,
     "max_portfolio_tickers": 20,
     "max_candidate_tickers": 20,
     "market_rss_feeds": {

@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -30,57 +30,57 @@ try:
 except Exception:
     daily_reporter = None  # type: ignore
 
-# === 0. 鍩虹璁剧疆 ===
+# === 0. Base Setup ===
 try:
     from plyer import notification
     TOAST_AVAILABLE = True
 except ImportError:
     TOAST_AVAILABLE = False
 
-# === 0.1. 鏃ュ織宸ュ叿鍑芥暟 ===
+# === 0.1. Logging Helpers ===
 def log_error(message):
     """
-    璁板綍閿欒鍒版枃浠跺拰鎺у埗鍙?
+    Write error messages to file and console safely.
     Args:
-        message: 閿欒娑堟伅
+        message: Error message string.
     """
     try:
-        # 纭繚 outputs 鐩綍瀛樺湪
+        # Ensure outputs directory exists
         os.makedirs("outputs", exist_ok=True)
         
-        # 鍐欏叆鏃ュ織鏂囦欢
+        # Append to error log file
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_entry = f"[{timestamp}] {message}\n"
         
         with open("outputs/error.log", "a", encoding="utf-8") as f:
             f.write(log_entry)
     except Exception as e:
-        # 鏃ュ織鏈韩澶辫触涔熶笉鑳藉穿婧?
+        # Logging itself should never crash the app
         print(f"Logging failed: {e}")
 
 def safe_format_number(value, decimals=2, default="N/A"):
     """
-    瀹夊叏鏍煎紡鍖栨暟瀛楋紝澶勭悊 None/NaN/inf
+    Safely format numeric values and handle None/NaN/inf.
     Args:
-        value: 鏁板€?
-        decimals: 灏忔暟浣嶆暟
-        default: 榛樿鍊硷紙褰撴棤娉曟牸寮忓寲鏃讹級
+        value: numeric value
+        decimals: decimal precision
+        default: fallback text when value is invalid
     Returns:
-        鏍煎紡鍖栧悗鐨勫瓧绗︿覆
+        Formatted number string
     """
     try:
         if value is None:
             return default
         if pd.isna(value) or not pd.api.types.is_number(value):
             return default
-        if not (-1e10 < value < 1e10):  # 妫€鏌?inf
+        if not (-1e10 < value < 1e10):  # inf guard
             return default
         return f"{value:,.{decimals}f}"
     except Exception as e:
         log_error(f"safe_format_number error: {str(e)}")
         return default
 
-# 【关键修改】切换为推理模型 (请确保终端已运行 ollama pull gemma3:12)
+# Model configuration (ensure `ollama pull gemma3:12` is available)
 LOCAL_MODEL = "gemma3:12" 
 # Temperature range: 0.1 ~ 0.3 (configured in ollama.chat calls)
 TEMPERATURE = 0.2  # Default temperature for model calls
@@ -109,10 +109,10 @@ signals_collection = _NoopCollection()
 
 if CHROMADB_IMPORTED:
     try:
-        # 鍒濆鍖栬蹇嗗簱
+        # 
         chroma_client = chromadb.PersistentClient(path="./memory_db")
         collection = chroma_client.get_or_create_collection(name="market_events")
-        # 鍒濆鍖栦俊鍙疯拷韪暟鎹簱
+        # 
         signals_collection = chroma_client.get_or_create_collection(name="trading_signals")
         CHROMA_AVAILABLE = True
         print("[CHROMA] PersistentClient ready: ./memory_db")
@@ -124,7 +124,7 @@ else:
     CHROMA_INIT_ERROR = "chromadb import failed"
     print("[WARN] Chroma disabled: chromadb package not available")
 
-# 瀹忚閫昏緫搴?
+# Macro reasoning knowledge injected into prompts
 MACRO_LOGIC_KNOWLEDGE = """
 GLOBAL MACRO RULES:
 1. CAD (Loonie) is a Petro-currency. Oil UP -> CAD Stronger.
@@ -133,7 +133,7 @@ GLOBAL MACRO RULES:
 4. TECH STOCKS (e.g. NVDA) are sensitive to Interest Rates & AI hype.
 """
 
-# Early-Warning 鐩戞帶鍒楄〃閰嶇疆
+# Early-Warning 
 WATCHLIST = {
     "Gold": {
         "ticker": "GC=F",
@@ -158,14 +158,14 @@ WATCHLIST = {
 }
 
 ASSETS_DB = {
-    "USD (缇庡厓)": {"ticker": "USD", "type": "fiat_base"},
-    "CNY (浜烘皯甯?": {"ticker": "CNY=X", "type": "fiat_quote"}, 
-    "CAD (鍔犲竵)": {"ticker": "CAD=X", "type": "fiat_quote"},
-    "GBP (鑻遍晳)": {"ticker": "GBP=X", "type": "fiat_quote"},
-    "JPY (鏃ュ厓)": {"ticker": "JPY=X", "type": "fiat_quote"},
-    "Gold (榛勯噾)": {"ticker": "GC=F", "type": "commodity"},  
-    "Crude Oil (鍘熸补)": {"ticker": "CL=F", "type": "commodity"},
-    "Bitcoin (姣旂壒甯?": {"ticker": "BTC-USD", "type": "crypto"}
+    "USD (US Dollar)": {"ticker": "USD", "type": "fiat_base"},
+    "CNY (Chinese Yuan)": {"ticker": "CNY=X", "type": "fiat_quote"},
+    "CAD (Canadian Dollar)": {"ticker": "CAD=X", "type": "fiat_quote"},
+    "GBP (British Pound)": {"ticker": "GBP=X", "type": "fiat_quote"},
+    "JPY (Japanese Yen)": {"ticker": "JPY=X", "type": "fiat_quote"},
+    "Gold (Futures)": {"ticker": "GC=F", "type": "commodity"},
+    "Crude Oil (Futures)": {"ticker": "CL=F", "type": "commodity"},
+    "Bitcoin (Spot)": {"ticker": "BTC-USD", "type": "crypto"},
 }
 
 MACRO_ANCHORS = {"Crude Oil": "CL=F", "Gold": "GC=F"}
@@ -176,9 +176,9 @@ RSS_FEEDS = {
     "BBC": "http://feeds.bbci.co.uk/news/business/rss.xml"
 }
 
-REFRESH_OPTIONS = {"鎵嬪姩": 0, "5 鍒嗛挓": 300, "10 鍒嗛挓": 600, "30 鍒嗛挓": 1800}
+REFRESH_OPTIONS = {"Manual": 0, "5 min": 300, "10 min": 600, "30 min": 1800}
 
-# ================= 1. 娣卞害瑙ｆ瀽鍑芥暟 (V3.0 鏂板) =================
+# ================= 1.  (V3.0 ) =================
 
 def load_paper_runtime_settings():
     """Load optional runtime settings from paper_config.json."""
@@ -1648,16 +1648,16 @@ def query_ollama(model, prompt, num_ctx=8192, temperature=None):
 
 def parse_deepseek_output(text):
     """
-    涓撻棬瑙ｆ瀽 DeepSeek-R1 鐨勮緭鍑?
-    杩斿洖: (鎬濊€冭繃绋嬫枃鏈? 绾噣鐨凧SON鏂囨湰)
+     DeepSeek-R1 ?
+    : (? SON)
     """
-    # 1. 鎻愬彇 <think>...</think> 鍐呴儴鐨勬€濊€冭繃绋?
+    # 1.  <think>...</think> ?
     think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
     thought_process = think_match.group(1).strip() if think_match else "No internal thought process detected (Direct Output)."
     
-    # 2. 绉婚櫎 <think> 鏍囩锛屽彧淇濈暀鍓╀笅鐨?JSON 閮ㄥ垎
+    # 2.  <think> ?JSON 
     json_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    # 娓呯悊 Markdown 浠ｇ爜鍧楁爣璁?
+    #  Markdown ?
     json_text = re.sub(r'```json', '', json_text)
     json_text = re.sub(r'```', '', json_text).strip()
     
@@ -1665,15 +1665,15 @@ def parse_deepseek_output(text):
 
 def extract_json_from_text(text):
     """
-    浠庢枃鏈腑鎻愬彇绗竴涓悎娉曠殑 JSON 瀵硅薄
-    鏀寔鍓嶅悗鏈夊浣欐枃鏈€乵arkdown銆佽В閲婃€у唴瀹?
+     JSON 
+    arkdown?
     
     Args:
-        text: 鍘熷鏂囨湰
+        text: 
     Returns:
-        json_str: 鎻愬彇鐨?JSON 瀛楃涓诧紝濡傛灉鏈壘鍒拌繑鍥?None
+        json_str: ?JSON ?None
     """
-    # 绛栫暐 1: 鏌ユ壘 { ... } 鍖呰９鐨勫唴瀹?
+    #  1:  { ... } ?
     brace_count = 0
     start_idx = -1
     
@@ -1685,18 +1685,18 @@ def extract_json_from_text(text):
         elif char == '}':
             brace_count -= 1
             if brace_count == 0 and start_idx != -1:
-                # 鎵惧埌瀹屾暣鐨?JSON 瀵硅薄
+                # ?JSON 
                 json_candidate = text[start_idx:i+1]
                 try:
-                    # 楠岃瘉鏄惁涓哄悎娉?JSON
+                    # ?JSON
                     json.loads(json_candidate)
                     return json_candidate
                 except Exception as e:
-                    # 缁х画鏌ユ壘涓嬩竴涓?
+                    # ?
                     start_idx = -1
                     continue
     
-    # 绛栫暐 2: 浣跨敤姝ｅ垯琛ㄨ揪寮忔煡鎵?
+    #  2: ?
     json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
     matches = re.finditer(json_pattern, text, re.DOTALL)
     for match in matches:
@@ -1711,13 +1711,13 @@ def extract_json_from_text(text):
 
 def self_repair_json(raw_output, model):
     """
-    鑷慨澶嶏細灏嗗師濮嬭緭鍑哄杺鍥炴ā鍨嬶紝瑕佹眰鍏跺彧杈撳嚭鍚堟硶 JSON
+     JSON
     
     Args:
-        raw_output: 鍘熷妯″瀷杈撳嚭
-        model: 妯″瀷鍚嶇О
+        raw_output: 
+        model: 
     Returns:
-        repaired_json_str: 淇鍚庣殑 JSON 瀛楃涓诧紝濡傛灉澶辫触杩斿洖 None
+        repaired_json_str:  JSON  None
     """
     repair_prompt = f"""
 The following output contains a JSON object but may have extra text or formatting issues.
@@ -1733,14 +1733,14 @@ Output ONLY the JSON:
         response = ollama.chat(
             model=model, 
             messages=[{'role': 'user', 'content': repair_prompt}],
-            options={"num_ctx": 4096, "temperature": 0}  # 浣庢俯搴︾‘淇濈‘瀹氭€ц緭鍑?
+            options={"num_ctx": 4096, "temperature": 0}  # ?
         )
         repaired_text = response['message']['content'].strip()
         
-        # 灏濊瘯鎻愬彇 JSON
+        #  JSON
         json_str = extract_json_from_text(repaired_text)
         if json_str:
-            # 楠岃瘉鏄惁鍚堟硶
+            # 
             json.loads(json_str)
             return json_str
     except Exception as e:
@@ -1750,25 +1750,25 @@ Output ONLY the JSON:
 
 def robust_json_parse(raw_content, model, max_retries=1):
     """
-    椴佹 JSON 瑙ｆ瀽锛氭彁鍙?+ 鑷慨澶?+ 闄嶇骇杩斿洖
+     JSON ?+ ?+ 
     
     Args:
-        raw_content: 妯″瀷鍘熷杈撳嚭
-        model: 妯″瀷鍚嶇О锛堢敤浜庤嚜淇锛?
-        max_retries: 鏈€澶ц嚜淇灏濊瘯娆℃暟
+        raw_content: 
+        model: ?
+        max_retries: 
     Returns:
-        dict: 瑙ｆ瀽鍚庣殑 JSON 瀵硅薄锛屾垨闄嶇骇閿欒缁撴瀯
+        dict:  JSON 
     """
-    # 绗竴姝ワ細灏濊瘯鐩存帴鎻愬彇 JSON
+    #  JSON
     json_str = extract_json_from_text(raw_content)
     
     if json_str:
         try:
             return json.loads(json_str)
         except json.JSONDecodeError as e:
-            pass  # 缁х画灏濊瘯鑷慨澶?
+            pass  # ?
     
-    # 绗簩姝ワ細鑷慨澶?
+    # ?
     for attempt in range(max_retries):
         repaired_json_str = self_repair_json(raw_content, model)
         if repaired_json_str:
@@ -1777,7 +1777,7 @@ def robust_json_parse(raw_content, model, max_retries=1):
             except json.JSONDecodeError:
                 continue
     
-    # 绗笁姝ワ細闄嶇骇杩斿洖
+    # 
     return {
         "status": "error",
         "reason": "Failed to parse JSON after extraction and self-repair attempts",
@@ -1786,7 +1786,7 @@ def robust_json_parse(raw_content, model, max_retries=1):
         "_parse_error": True
     }
 
-# ================= 2. 鍩虹鍔熻兘鍑芥暟 =================
+# ================= 2.  =================
 
 def save_to_memory(summary, impact_score, advice):
     if impact_score < 5: return 
@@ -1818,39 +1818,39 @@ def send_notification(title, msg):
             log_error(f"send_notification error: {str(e)}")
             pass
 
-# ================= 2.5. Signal Scoreboard 绯荤粺 =================
+# ================= 2.5. Signal Scoreboard  =================
 
 def get_asset_ticker(asset_name):
     """
-    浠庤祫浜у悕绉拌幏鍙?ticker
+    ?ticker
     Args:
-        asset_name: 濡?"CNY/CAD", "Oil", "NVDA"
+        asset_name: ?"CNY/CAD", "Oil", "NVDA"
     Returns:
-        ticker: yfinance ticker 鎴?None
+        ticker: yfinance ticker ?None
     """
-    # 澶勭悊璐у竵瀵?
+    # ?
     if '/' in asset_name:
         parts = asset_name.split('/')
         base, quote = parts[0].strip(), parts[1].strip()
         
-        # 鏌ユ壘瀵瑰簲鐨?ticker
+        # ?ticker
         for name, info in ASSETS_DB.items():
             if base in name:
                 return info['ticker']
         
-        # 濡傛灉鏄姹囧锛屽皾璇曟瀯閫?
+        # ?
         if base != 'USD' and quote == 'USD':
             return f"{base}=X"
         elif base == 'USD' and quote != 'USD':
             return f"{quote}=X"
     
-    # 澶勭悊鍟嗗搧
+    # 
     if asset_name.lower() in ['oil', 'crude oil', 'crude']:
         return "CL=F"
     if asset_name.lower() in ['gold', 'xau']:
         return "GC=F"
     
-    # 澶勭悊涓偂锛堢洿鎺ヨ繑鍥烇級
+    # 
     if asset_name.isupper() and len(asset_name) <= 5:
         return asset_name
     
@@ -1858,11 +1858,11 @@ def get_asset_ticker(asset_name):
 
 def get_current_price(ticker):
     """
-    鑾峰彇褰撳墠浠锋牸
+    
     Args:
         ticker: yfinance ticker
     Returns:
-        price: float 鎴?None
+        price: float ?None
     """
     try:
         t = yf.Ticker(ticker)
@@ -1876,23 +1876,23 @@ def get_current_price(ticker):
 
 def record_signal(asset, direction, confidence, predictions_dict, news_sources):
     """
-    璁板綍浜ゆ槗淇″彿
+    
     Args:
-        asset: 璧勪骇鍚嶇О
+        asset: 
         direction: Bullish/Bearish/Neutral
-        confidence: 淇″績鍒嗘暟 (0-10)
-        predictions_dict: 瀹屾暣鐨?predictions 瀛楀吀
-        news_sources: 鏂伴椈鏉ユ簮鍒楄〃
+        confidence:  (0-10)
+        predictions_dict: ?predictions 
+        news_sources: 
     """
     try:
         signal_id = str(uuid.uuid4())
         timestamp = datetime.now().isoformat()
         
-        # 鑾峰彇 ticker 鍜屽綋鍓嶄环鏍?
+        #  ticker ?
         ticker = get_asset_ticker(asset)
         current_price = get_current_price(ticker) if ticker else None
         
-        # 纭畾涓婚
+        # 
         theme = "UNKNOWN"
         if '/' in asset:
             theme = "FX"
@@ -1901,10 +1901,10 @@ def record_signal(asset, direction, confidence, predictions_dict, news_sources):
         elif ticker and len(asset) <= 5 and asset.isupper():
             theme = "STOCK"
         
-        # 鎻愬彇鏂伴椈鏉ユ簮
+        # 
         sources = list(set([src for src in news_sources if src]))
         
-        # 鏋勯€犲厓鏁版嵁
+        # 
         metadata = {
             "signal_id": signal_id,
             "timestamp": timestamp,
@@ -1914,9 +1914,9 @@ def record_signal(asset, direction, confidence, predictions_dict, news_sources):
             "confidence": float(confidence),
             "theme": theme,
             "initial_price": float(current_price) if current_price else 0.0,
-            "sources": ",".join(sources[:3]),  # 鏈€澶?涓潵婧?
+            "sources": ",".join(sources[:3]),  # ??
             "status": "PENDING",  # PENDING / VERIFIED
-            # 鍥炲～瀛楁锛堝垵濮嬩负绌猴級
+            # 
             "price_1h": 0.0,
             "price_4h": 0.0,
             "price_1d": 0.0,
@@ -1931,7 +1931,7 @@ def record_signal(asset, direction, confidence, predictions_dict, news_sources):
             "return_1w": 0.0
         }
         
-        # 瀛樺偍鍒?ChromaDB
+        # ?ChromaDB
         signals_collection.add(
             documents=[json.dumps(predictions_dict)],
             metadatas=[metadata],
@@ -1952,7 +1952,7 @@ def extract_llm_topic_sentiment(news, macro_data, lang_mode):
         return None
 
     model_name = str(RUNTIME_SETTINGS.get("llm_topic_model", LOCAL_MODEL))
-    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "涓枃" else "OUTPUT LANGUAGE: ENGLISH"
+    lang_instruction = "OUTPUT LANGUAGE: ENGLISH"
     headlines = "\n".join([f"- [{item.get('source', 'Unknown')}] {item.get('title', '')}" for item in news[:20]])
 
     prompt = f"""
@@ -2146,11 +2146,11 @@ def record_llm_topic_signals(payload, news_sources):
 
 def backfill_signal_results():
     """
-    鍥炲～淇″彿缁撴灉
-    妫€鏌ユ墍鏈?PENDING 淇″彿锛屽鏋滄椂闂村埌浜嗗氨鍥炲～浠锋牸鍜岀粨鏋?
+    
+    ?PENDING ?
     """
     try:
-        # 鑾峰彇鎵€鏈?PENDING 淇″彿
+        # ?PENDING 
         results = signals_collection.get(
             where={"status": "PENDING"}
         )
@@ -2172,12 +2172,12 @@ def backfill_signal_results():
             if ticker == "UNKNOWN" or initial_price == 0.0:
                 continue
             
-            # 璁＄畻鏃堕棿宸?
-            time_diff = (now - signal_time).total_seconds() / 3600  # 灏忔椂
+            # ?
+            time_diff = (now - signal_time).total_seconds() / 3600  # 
             
             updated = False
             
-            # 鍥炲～ 1h
+            #  1h
             if time_diff >= 1 and metadata['price_1h'] == 0.0:
                 price_1h = get_historical_price(ticker, signal_time + timedelta(hours=1))
                 if price_1h:
@@ -2186,7 +2186,7 @@ def backfill_signal_results():
                     metadata['correct_1h'] = check_direction(direction, metadata['return_1h'])
                     updated = True
             
-            # 鍥炲～ 4h
+            #  4h
             if time_diff >= 4 and metadata['price_4h'] == 0.0:
                 price_4h = get_historical_price(ticker, signal_time + timedelta(hours=4))
                 if price_4h:
@@ -2195,7 +2195,7 @@ def backfill_signal_results():
                     metadata['correct_4h'] = check_direction(direction, metadata['return_4h'])
                     updated = True
             
-            # 鍥炲～ 1d
+            #  1d
             if time_diff >= 24 and metadata['price_1d'] == 0.0:
                 price_1d = get_historical_price(ticker, signal_time + timedelta(days=1))
                 if price_1d:
@@ -2204,17 +2204,17 @@ def backfill_signal_results():
                     metadata['correct_1d'] = check_direction(direction, metadata['return_1d'])
                     updated = True
             
-            # 鍥炲～ 1w
+            #  1w
             if time_diff >= 168 and metadata['price_1w'] == 0.0:
                 price_1w = get_historical_price(ticker, signal_time + timedelta(weeks=1))
                 if price_1w:
                     metadata['price_1w'] = price_1w
                     metadata['return_1w'] = (price_1w - initial_price) / initial_price * 100
                     metadata['correct_1w'] = check_direction(direction, metadata['return_1w'])
-                    metadata['status'] = "VERIFIED"  # 鍏ㄩ儴鍥炲～瀹屾垚
+                    metadata['status'] = "VERIFIED"  # 
                     updated = True
             
-            # 鏇存柊鍏冩暟鎹?
+            # ?
             if updated:
                 signals_collection.update(
                     ids=[signal_id],
@@ -2229,17 +2229,17 @@ def backfill_signal_results():
 
 def get_historical_price(ticker, target_time):
     """
-    鑾峰彇鍘嗗彶浠锋牸锛堝敖鍙兘鎺ヨ繎鐩爣鏃堕棿锛?
+    ?
     """
     try:
         t = yf.Ticker(ticker)
-        # 鑾峰彇鐩爣鏃堕棿鍓嶅悗1澶╃殑鏁版嵁
+        # 1
         start = target_time - timedelta(days=1)
         end = target_time + timedelta(days=1)
         hist = t.history(start=start, end=end, interval="1h")
         
         if not hist.empty:
-            # 鎵惧埌鏈€鎺ヨ繎鐩爣鏃堕棿鐨勪环鏍?
+            # ?
             closest_idx = (hist.index - target_time).abs().argmin()
             return float(hist['Close'].iloc[closest_idx])
     except Exception as e:
@@ -2249,10 +2249,10 @@ def get_historical_price(ticker, target_time):
 
 def check_direction(predicted_direction, actual_return):
     """
-    妫€鏌ユ柟鍚戞槸鍚︽纭?
+    ?
     Args:
         predicted_direction: Bullish/Bearish/Neutral
-        actual_return: 瀹為檯鏀剁泭鐜?(%)
+        actual_return: ?(%)
     Returns:
         "CORRECT" / "WRONG" / "NEUTRAL"
     """
@@ -2266,10 +2266,10 @@ def check_direction(predicted_direction, actual_return):
     
     return "UNKNOWN"
 
-# ================= 2.6. Early-Warning 椋庨櫓璇勫垎绯荤粺 =================
+# ================= 2.6. Early-Warning  =================
 
 def calculate_rsi(ticker, period=14):
-    """璁＄畻 RSI 鎸囨爣"""
+    """ RSI """
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="3mo")
@@ -2300,7 +2300,7 @@ def calculate_ma(ticker, period=20):
         return None
 
 def calculate_atr(ticker, period=14):
-    """璁＄畻 ATR (Average True Range)"""
+    """ ATR (Average True Range)"""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="3mo")
@@ -2342,7 +2342,7 @@ def get_price_change(ticker, period="1w"):
         return 0.0
 
 def calculate_gap(ticker):
-    """璁＄畻璺崇┖缂哄彛"""
+    """"""
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="5d")
@@ -2375,37 +2375,37 @@ def get_avg_volume(ticker, period=20):
         t = yf.Ticker(ticker)
         hist = t.history(period="1mo")
         if hist.empty or len(hist) < period:
-            return 1  # 閬垮厤闄ら浂
+            return 1  # 
         return int(hist['Volume'].rolling(window=period).mean().iloc[-1])
     except Exception as e:
         log_error(f"get_avg_volume error for {ticker}: {str(e)}")
         return 1
 
 def count_keyword_mentions(keywords, news_list):
-    """缁熻鍏抽敭璇嶅湪鏂伴椈涓殑鍑虹幇娆℃暟"""
+    """"""
     count = 0
     for news_item in news_list:
         title = news_item.get('title', '').lower()
         for keyword in keywords:
             if keyword.lower() in title:
                 count += 1
-                break  # 姣忔潯鏂伴椈鍙鏁颁竴娆?
+                break  # ?
     return count
 
 def calculate_macro_chain_score(asset_name, asset_config, recent_news):
     """
-    璁＄畻瀹忚閾炬潯鍒?(0-25)
-    鍩轰簬缇庡厓鎸囨暟銆佸埄鐜囥€佺浉鍏虫€?
+    ?(0-25)
+    ?
     """
     score = 0
     evidence = []
     
     try:
-        # 1. 缇庡厓鎸囨暟褰卞搷 (0-10鍒?
-        dxy_change = get_price_change("DX-Y.NYB", period="1w")  # 缇庡厓鎸囨暟
+        # 1.  (0-10?
+        dxy_change = get_price_change("DX-Y.NYB", period="1w")  # 
         dxy_correlation = asset_config['correlations'].get('DXY', 0)
         
-        if abs(dxy_correlation) > 0.5:  # 寮虹浉鍏?
+        if abs(dxy_correlation) > 0.5:  # ?
             if (dxy_correlation < 0 and dxy_change > 2) or (dxy_correlation > 0 and dxy_change < -2):
                 score += 8
                 evidence.append({
@@ -2423,8 +2423,8 @@ def calculate_macro_chain_score(asset_name, asset_config, recent_news):
                     "interpretation": f"Moderate USD movement, correlation: {dxy_correlation:.2f}"
                 })
         
-        # 2. 鍒╃巼褰卞搷 (0-10鍒?
-        tnx_change = get_price_change("^TNX", period="1w")  # 10骞存湡鍥藉€?
+        # 2.  (0-10?
+        tnx_change = get_price_change("^TNX", period="1w")  # 10?
         tnx_correlation = asset_config['correlations'].get('^TNX', 0)
         
         if abs(tnx_correlation) > 0.3:
@@ -2437,8 +2437,8 @@ def calculate_macro_chain_score(asset_name, asset_config, recent_news):
                     "interpretation": f"Rate {'rise' if tnx_change > 0 else 'fall'} {'negative' if tnx_correlation < 0 else 'positive'} for {asset_name}"
                 })
         
-        # 3. 鏂伴椈涓殑瀹忚鎻愬強 (0-5鍒?
-        macro_keywords = ["Fed", "interest rate", "dollar", "USD", "inflation", "澶", "鍒╃巼"]
+        # 3.  (0-5?
+        macro_keywords = ["Fed", "interest rate", "dollar", "USD", "inflation", "", ""]
         news_mentions = count_keyword_mentions(macro_keywords, recent_news)
         
         if news_mentions >= 3:
@@ -2468,18 +2468,18 @@ def calculate_macro_chain_score(asset_name, asset_config, recent_news):
 
 def calculate_crowding_score(ticker):
     """
-    璁＄畻鎷ユ尋搴﹀垎 (0-25)
-    鍩轰簬 RSI銆佷环鏍煎亸绂诲潎绾裤€佹儏缁?
+     (0-25)
+     RSI?
     """
     score = 0
     evidence = []
     
     try:
-        # 1. RSI 瓒呬拱/瓒呭崠 (0-12鍒?
+        # 1. RSI / (0-12?
         rsi = calculate_rsi(ticker, period=14)
         
         if rsi is not None:
-            if rsi > 70:  # 瓒呬拱
+            if rsi > 70:  # 
                 score += min((rsi - 70) / 3, 12)
                 evidence.append({
                     "type": "price",
@@ -2487,7 +2487,7 @@ def calculate_crowding_score(ticker):
                     "value": f"{rsi:.1f}",
                     "interpretation": "Overbought - potential reversal risk"
                 })
-            elif rsi < 30:  # 瓒呭崠
+            elif rsi < 30:  # 
                 score += min((30 - rsi) / 3, 12)
                 evidence.append({
                     "type": "price",
@@ -2504,7 +2504,7 @@ def calculate_crowding_score(ticker):
                     "interpretation": "Moderate momentum"
                 })
         
-        # 2. 浠锋牸鍋忕鍧囩嚎 (0-10鍒?
+        # 2.  (0-10?
         price = get_current_price(ticker)
         ma20 = calculate_ma(ticker, period=20)
         
@@ -2528,7 +2528,7 @@ def calculate_crowding_score(ticker):
                     "interpretation": "Moderate deviation from MA20"
                 })
         
-        # 3. 鎴愪氦閲忓紓甯?(0-3鍒?
+        # 3. ?(0-3?
         current_volume = get_current_volume(ticker)
         avg_volume = get_avg_volume(ticker, period=20)
         
@@ -2554,21 +2554,21 @@ def calculate_crowding_score(ticker):
 
 def calculate_microstructure_score(ticker):
     """
-    璁＄畻寰粨鏋勫垎 (0-25)
-    鍩轰簬娉㈠姩鐜囥€佽烦绌恒€佹垚浜ら噺
+     (0-25)
+    
     """
     score = 0
     evidence = []
     
     try:
-        # 1. 娉㈠姩鐜囬澧?(0-12鍒?
+        # 1. ?(0-12?
         current_atr = calculate_atr(ticker, period=14)
         avg_atr = calculate_atr(ticker, period=50)
         
         if current_atr and avg_atr and avg_atr > 0:
             atr_ratio = current_atr / avg_atr
             
-            if atr_ratio > 1.5:  # 娉㈠姩鐜囦笂鍗?0%+
+            if atr_ratio > 1.5:  # ?0%+
                 score += min((atr_ratio - 1) * 6, 12)
                 evidence.append({
                     "type": "price",
@@ -2585,10 +2585,10 @@ def calculate_microstructure_score(ticker):
                     "interpretation": "Elevated volatility"
                 })
         
-        # 2. 璺崇┖缂哄彛 (0-8鍒?
+        # 2.  (0-8?
         gap = calculate_gap(ticker)
         
-        if abs(gap) > 2:  # 璺崇┖瓒呰繃2%
+        if abs(gap) > 2:  # 2%
             score += min(abs(gap), 8)
             evidence.append({
                 "type": "price",
@@ -2605,14 +2605,14 @@ def calculate_microstructure_score(ticker):
                 "interpretation": "Small gap detected"
             })
         
-        # 3. 鎴愪氦閲忓紓甯?(0-5鍒?
+        # 3. ?(0-5?
         current_volume = get_current_volume(ticker)
         avg_volume = get_avg_volume(ticker, period=20)
         
         if current_volume > 0 and avg_volume > 0:
             volume_ratio = current_volume / avg_volume
             
-            if volume_ratio > 2:  # 鎴愪氦閲忕炕鍊?
+            if volume_ratio > 2:  # ?
                 score += min((volume_ratio - 1) * 2.5, 5)
                 evidence.append({
                     "type": "price",
@@ -2631,21 +2631,21 @@ def calculate_microstructure_score(ticker):
 
 def calculate_event_risk_score(recent_news):
     """
-    璁＄畻浜嬩欢椋庨櫓鍒?(0-25)
-    鍩轰簬鏂伴椈鍏抽敭璇嶅尮閰?
+    ?(0-25)
+    ?
     """
     score = 0
     evidence = []
     
     try:
-        # 瀹氫箟浜嬩欢椋庨櫓鍏抽敭璇?
+        # ?
         event_keywords = {
-            "central_bank": ["Fed", "ECB", "澶", "interest rate", "monetary policy", "Powell", "Yellen"],
-            "policy": ["tariff", "sanction", "regulation", "policy", "law", "trade war", "鍏崇◣"],
-            "geopolitical": ["war", "conflict", "election", "crisis", "tension", "鎴樹簤", "鍐茬獊"]
+            "central_bank": ["Fed", "ECB", "", "interest rate", "monetary policy", "Powell", "Yellen"],
+            "policy": ["tariff", "sanction", "regulation", "policy", "law", "trade war", ""],
+            "geopolitical": ["war", "conflict", "election", "crisis", "tension", "", ""]
         }
         
-        # 1. 澶浜嬩欢 (0-10鍒?
+        # 1.  (0-10?
         cb_mentions = count_keyword_mentions(event_keywords["central_bank"], recent_news)
         if cb_mentions >= 3:
             score += 10
@@ -2664,7 +2664,7 @@ def calculate_event_risk_score(recent_news):
                 "interpretation": "Central bank mentions detected"
             })
         
-        # 2. 鏀跨瓥椋庨櫓 (0-8鍒?
+        # 2.  (0-8?
         policy_mentions = count_keyword_mentions(event_keywords["policy"], recent_news)
         if policy_mentions >= 3:
             score += 8
@@ -2683,7 +2683,7 @@ def calculate_event_risk_score(recent_news):
                 "interpretation": "Policy risk mentions"
             })
         
-        # 3. 鍦扮紭鏀挎不 (0-7鍒?
+        # 3.  (0-7?
         geo_mentions = count_keyword_mentions(event_keywords["geopolitical"], recent_news)
         if geo_mentions >= 3:
             score += 7
@@ -2712,7 +2712,7 @@ def calculate_event_risk_score(recent_news):
 
 def calculate_early_warning_score(asset_name, recent_news):
     """
-    璁＄畻缁煎悎 Early-Warning 椋庨櫓鍒嗘暟
+     Early-Warning 
     Returns:
         dict: {
             "asset": str,
@@ -2738,16 +2738,16 @@ def calculate_early_warning_score(asset_name, recent_news):
     asset_config = WATCHLIST[asset_name]
     ticker = asset_config['ticker']
     
-    # 璁＄畻鍥涗釜瀛愬垎鏁?
+    # ?
     macro_score, macro_evidence = calculate_macro_chain_score(asset_name, asset_config, recent_news)
     crowding_score, crowding_evidence = calculate_crowding_score(ticker)
     micro_score, micro_evidence = calculate_microstructure_score(ticker)
     event_score, event_evidence = calculate_event_risk_score(recent_news)
     
-    # 缁煎悎鍒嗘暟
+    # 
     total_score = macro_score + crowding_score + micro_score + event_score
     
-    # 椋庨櫓绛夌骇
+    # 
     if total_score >= 76:
         risk_level = "CRITICAL"
     elif total_score >= 51:
@@ -2757,7 +2757,7 @@ def calculate_early_warning_score(asset_name, recent_news):
     else:
         risk_level = "LOW"
     
-    # 鍛婅瑙﹀彂鍣?
+    # ?
     alert_triggers = []
     if total_score > 60:
         alert_triggers.append(f"Total risk score > 60 ({risk_level})")
@@ -2770,15 +2770,15 @@ def calculate_early_warning_score(asset_name, recent_news):
     if event_score > 15:
         alert_triggers.append(f"Event risk score > 15 ({event_score})")
     
-    # 寤鸿
+    # 
     if risk_level == "CRITICAL":
-        recommendation = "馃敶 CRITICAL: Multiple risk factors at extreme levels. Consider reducing exposure significantly or hedging."
+        recommendation = " CRITICAL: Multiple risk factors at extreme levels. Consider reducing exposure significantly or hedging."
     elif risk_level == "HIGH":
-        recommendation = "馃煚 CAUTION: Elevated risk across multiple dimensions. Monitor closely and consider risk management."
+        recommendation = " CAUTION: Elevated risk across multiple dimensions. Monitor closely and consider risk management."
     elif risk_level == "MEDIUM":
-        recommendation = "馃煛 WATCH: Some risk factors elevated. Stay alert to developments."
+        recommendation = " WATCH: Some risk factors elevated. Stay alert to developments."
     else:
-        recommendation = "馃煝 NORMAL: Risk levels within normal range. Continue monitoring."
+        recommendation = " NORMAL: Risk levels within normal range. Continue monitoring."
     
     return {
         "asset": asset_name,
@@ -2797,23 +2797,23 @@ def calculate_early_warning_score(asset_name, recent_news):
 
 def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
     """
-    鑾峰彇淇″彿缁熻锛堝崌绾х増 - 鏀寔浜ゆ槗绾у垎绫伙級
+     - 
     Args:
-        theme: 涓婚杩囨护 (FX/MACRO/STOCK/None)
-        asset: 璧勪骇杩囨护 (None 琛ㄧず鍏ㄩ儴)
-        timeframe: 鏃堕棿妗嗘灦 (1h/4h/1d/1w)
+        theme:  (FX/MACRO/STOCK/None)
+        asset:  (None )
+        timeframe:  (1h/4h/1d/1w)
     Returns:
-        dict: 缁熻鏁版嵁锛堝寘鍚氦鏄撶骇鎸囨爣锛?
+        dict: ?
     """
     try:
-        # 鏋勯€犳煡璇㈡潯浠?
+        # ?
         where_clause = {}
         if theme:
             where_clause["theme"] = theme
         if asset:
             where_clause["asset"] = asset
         
-        # 鑾峰彇淇″彿
+        # 
         if where_clause:
             results = signals_collection.get(where=where_clause)
         else:
@@ -2840,7 +2840,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
                 "timestamps": []
             }
         
-        # 鎻愬彇瀵瑰簲鏃堕棿妗嗘灦鐨勬暟鎹?
+        # ?
         correct_field = f"correct_{timeframe}"
         return_field = f"return_{timeframe}"
         
@@ -2878,10 +2878,10 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             accuracy = correct_count / total_verified * 100
             avg_return = sum(returns) / len(returns) if returns else 0.0
             
-            # 绱鏀剁泭
+            # 
             cumulative_return = sum(returns)
             
-            # 鏈€澶у洖鎾よ绠?
+            # ?
             cumulative_curve = []
             running_sum = 0
             for r in returns:
@@ -2898,7 +2898,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
                     if drawdown > max_drawdown:
                         max_drawdown = drawdown
             
-            # 娉㈠姩鐜囷紙鏀剁泭鏍囧噯宸級
+            # 
             if len(returns) > 1:
                 mean_return = sum(returns) / len(returns)
                 variance = sum((r - mean_return) ** 2 for r in returns) / (len(returns) - 1)
@@ -2906,7 +2906,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             else:
                 volatility = 0.0
             
-            # 鑳滅巼鍜岀泩浜忔瘮
+            # 
             wins = [r for r in returns if r > 0]
             losses = [r for r in returns if r < 0]
             
@@ -2935,7 +2935,7 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
             "avg_win": avg_win,
             "avg_loss": avg_loss,
             "profit_factor": profit_factor,
-            "returns_list": returns,  # 鐢ㄤ簬澶氭椂闂寸獥鍙ｉ獙璇?
+            "returns_list": returns,  # ?
             "timestamps": timestamps
         }
     except Exception as e:
@@ -2958,30 +2958,30 @@ def get_signal_statistics(theme=None, asset=None, timeframe="1d"):
 def classify_trading_performance(stats_dict, theme=None, asset=None, 
                                   transaction_cost=0.1, max_dd_threshold=15.0):
     """
-    浜ゆ槗绾ф€ц兘鍒嗙被浣撶郴锛圱rading-Grade Performance Classification锛?
+    rading-Grade Performance Classification?
     
-    杩欐槸鍐冲畾鏄惁鍏佽 real-money execution 鐨勫敮涓€渚濇嵁
+     real-money execution 
     
     Args:
-        stats_dict: 缁熻鏁版嵁瀛楀吀锛堟潵鑷?get_signal_statistics锛?
-        theme: 涓婚锛堢敤浜庡鏃堕棿绐楀彛楠岃瘉锛?
-        asset: 璧勪骇锛堢敤浜庡鏃堕棿绐楀彛楠岃瘉锛?
-        transaction_cost: 浼扮畻浜ゆ槗鎴愭湰锛堢櫨鍒嗘瘮锛岄粯璁?0.1%锛?
-        max_dd_threshold: 鏈€澶у洖鎾ら槇鍊硷紙鐧惧垎姣旓紝榛樿 15%锛?
+        stats_dict: ?get_signal_statistics?
+        theme: ?
+        asset: ?
+        transaction_cost: ?0.1%?
+        max_dd_threshold:  15%?
     
     Returns:
         dict: {
-            "classification_v2": str,  # 鏂颁氦鏄撶骇鍒嗙被
-            "classification_v1": str,  # 鍘熷垎绫伙紙浠呬緵鍙傝€冿級
-            "decision_allowed": bool,  # 鏄惁鍏佽瀹炵洏浜ゆ槗
-            "reason_summary": str,     # 浜虹被鍙鐨勫師鍥?
-            "risk_warnings": list,     # 椋庨櫓璀﹀憡鍒楄〃
-            "net_expected_value": float,  # 鍑€鏈熸湜鍊?
-            "multi_timeframe_validated": bool  # 澶氭椂闂寸獥鍙ｉ獙璇?
+            "classification_v2": str,  # 
+            "classification_v1": str,  # 
+            "decision_allowed": bool,  # 
+            "reason_summary": str,     # ?
+            "risk_warnings": list,     # 
+            "net_expected_value": float,  # ?
+            "multi_timeframe_validated": bool  # ?
         }
     """
     
-    # 鎻愬彇鍏抽敭鎸囨爣
+    # 
     trades_count = stats_dict.get('sample_size', 0)
     accuracy = stats_dict.get('accuracy', 0.0)
     avg_return = stats_dict.get('avg_return', 0.0)
@@ -2991,10 +2991,10 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
     win_rate = stats_dict.get('win_rate', 0.0)
     profit_factor = stats_dict.get('profit_factor', 0.0)
     
-    # 璁＄畻鍑€鏈熸湜鍊?
+    # ?
     net_expected_value = avg_return - transaction_cost
     
-    # 鍒濆鍖栬繑鍥炲€?
+    # ?
     classification_v2 = ""
     classification_v1 = ""
     decision_allowed = False
@@ -3002,7 +3002,7 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
     risk_warnings = []
     multi_timeframe_validated = False
     
-    # ========== 绗竴姝ワ細V1 鍒嗙被锛堝師鍒嗙被锛屼粎渚涘弬鑰冿級==========
+    # ========== V1 ==========
     if trades_count == 0:
         classification_v1 = "No Data"
     elif accuracy > 55 and avg_return > 0:
@@ -3014,13 +3014,13 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
     else:
         classification_v1 = "No Edge (V1)"
     
-    # ========== 绗簩姝ワ細鏈€浣庡彲璇勪及闂ㄦ ==========
+    # ==========  ==========
     if trades_count < 30:
-        classification_v2 = "馃煠 Insufficient Data"
+        classification_v2 = " Insufficient Data"
         decision_allowed = False
         reason_summary = f"Insufficient verified sample size ({trades_count}/30). Need at least 30 verified signals for reliable evaluation."
-        risk_warnings.append("鈿狅笍 鏍锋湰閲忚繃灏忥紝浠讳綍缁熻缁撹閮戒笉鍙潬")
-        risk_warnings.append("鈿狅笍 绂佹鐢ㄤ簬瀹炵洏浜ゆ槗")
+        risk_warnings.append(" ")
+        risk_warnings.append(" ")
         
         return {
             "classification_v2": classification_v2,
@@ -3032,8 +3032,8 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
             "multi_timeframe_validated": False
         }
     
-    # ========== 绗笁姝ワ細澶氭椂闂寸獥鍙ｉ獙璇?==========
-    # 妫€鏌ヨ嚦灏?2 涓椂闂寸獥鍙ｇ殑 net_expected_value 鏄惁涓烘
+    # ========== ?==========
+    # ?2  net_expected_value 
     if theme or asset:
         timeframes_to_check = ["1h", "4h", "1d", "1w"]
         positive_timeframes = []
@@ -3043,23 +3043,23 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
             tf_net_ev = tf_stats.get('avg_return', 0.0) - transaction_cost
             tf_sample = tf_stats.get('sample_size', 0)
             
-            if tf_sample >= 10 and tf_net_ev > 0:  # 鑷冲皯 10 涓牱鏈笖涓烘
+            if tf_sample >= 10 and tf_net_ev > 0:  #  10 
                 positive_timeframes.append(tf)
         
         multi_timeframe_validated = len(positive_timeframes) >= 2
     else:
-        # 鏃犳硶楠岃瘉澶氭椂闂寸獥鍙ｏ紙鏈寚瀹?theme/asset锛?
+        # ?theme/asset?
         multi_timeframe_validated = False
     
-    # ========== 绗洓姝ワ細浜ゆ槗绾у垎绫?==========
+    # ========== ?==========
     
-    # 馃煝 Tradable Edge锛堝厑璁稿疄鐩橈級
+    #  Tradable Edge
     if (trades_count >= 50 and 
         net_expected_value > 0 and 
         max_drawdown <= max_dd_threshold and
         multi_timeframe_validated):
         
-        classification_v2 = "馃煝 Tradable Edge"
+        classification_v2 = " Tradable Edge"
         decision_allowed = True
         reason_summary = (
             f"All tradable criteria passed:\n"
@@ -3070,15 +3070,15 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
             f"=> Eligible for live trading"
         )
         
-        # 鍗充娇鍏佽浜ゆ槗锛屼篃瑕佺粰鍑洪闄╂彁绀?
+        # ?
         if profit_factor < 1.5:
             risk_warnings.append(f"Profit factor is modest ({profit_factor:.2f}); use conservative sizing.")
         if volatility > 2.0:
             risk_warnings.append(f"Return volatility is elevated ({volatility:.2f}%); tighten risk controls.")
     
-    # 馃煛 Directional Signal锛堟柟鍚戝弬鑰冧俊鍙凤級
+    #  Directional Signal
     elif (accuracy >= 58 and abs(net_expected_value) < 0.2):
-        classification_v2 = "馃煛 Directional Signal"
+        classification_v2 = " Directional Signal"
         decision_allowed = False
         reason_summary = (
             f"Directional accuracy is decent ({accuracy:.1f}%), but net edge is near zero ({net_expected_value:.2f}%).\n"
@@ -3090,7 +3090,7 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
         risk_warnings.append("Can be used as an auxiliary confirmation signal.")
     
     elif (avg_return > 0 and net_expected_value <= 0):
-        classification_v2 = "馃煛 Directional Signal"
+        classification_v2 = " Directional Signal"
         decision_allowed = False
         reason_summary = (
             f"Average return is positive ({avg_return:.2f}%), but transaction costs dominate.\n"
@@ -3100,11 +3100,11 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
         risk_warnings.append("Transaction costs are too high relative to edge.")
         risk_warnings.append("Do not use this signal as a standalone live-trading trigger.")
     
-    # 馃煚 Unstable / Regime-Dependent锛堜笉绋冲畾鎴栦緷璧栬鎯咃級
+    #  Unstable / Regime-Dependent
     elif (net_expected_value > 0 and 
           (trades_count < 50 or max_drawdown > max_dd_threshold or not multi_timeframe_validated)):
         
-        classification_v2 = "馃煚 Unstable / Regime-Dependent"
+        classification_v2 = " Unstable / Regime-Dependent"
         decision_allowed = False
         
         reasons = []
@@ -3155,15 +3155,15 @@ def classify_trading_performance(stats_dict, theme=None, asset=None,
         decision_allowed = False
         decision_allowed = False
     
-    # 馃敶 No Edge锛堟棤浼樺娍锛?
+    #  No Edge?
     else:
-        classification_v2 = "馃敶 No Edge"
+        classification_v2 = " No Edge"
         decision_allowed = False
         
         reasons = []
         if net_expected_value <= 0:
             reasons.append(f"Net expected value is non-positive ({net_expected_value:.2f}%)")
-        if max_drawdown > max_dd_threshold * 1.5:  # 涓ラ噸瓒呮爣
+        if max_drawdown > max_dd_threshold * 1.5:  # 
             reasons.append(f"Drawdown exceeds severe threshold ({max_drawdown:.2f}%)")
         if accuracy < 45 and avg_return <= 0:
             reasons.append("Accuracy and returns do not show statistical edge")
@@ -3200,17 +3200,17 @@ def get_full_market_context():
 def normalize_title(title):
     """Normalize title for de-duplication."""
     import string
-    # 杞皬鍐?
+    # ?
     normalized = title.lower()
-    # 绉婚櫎鏍囩偣
+    # 
     normalized = normalized.translate(str.maketrans('', '', string.punctuation))
-    # 鍘婚櫎澶氫綑绌烘牸
+    # 
     normalized = ' '.join(normalized.split())
     return normalized
 
 def get_rss_news():
     """
-    杩斿洖缁撴瀯鍖栨柊闂诲垪琛?
+    ?
     Returns:
         List[Dict]: [{"source": str, "title": str, "published": str|None, "link": str}]
     """
@@ -3224,26 +3224,26 @@ def get_rss_news():
             src_count = 0
             
             for e in f.entries:
-                if src_count >= 2:  # 姣忎釜婧愭渶澶?鏉?
+                if src_count >= 2:  # ??
                     break
                 
-                # 鎻愬彇瀛楁
+                # 
                 title = e.get('title', '').strip()
                 link = e.get('link', '').strip()
                 
                 if not title or not link:
                     continue
                 
-                # 鍘婚噸閫昏緫 1: 閾炬帴瀹屽叏鐩稿悓
+                #  1: 
                 if link in seen_links:
                     continue
                 
-                # 鍘婚噸閫昏緫 2: 鏍囬褰掍竴鍖栧悗鐩稿悓
+                #  2: 
                 normalized_title = normalize_title(title)
                 if normalized_title in seen_titles:
                     continue
                 
-                # 鎻愬彇鍙戝竷鏃堕棿
+                # 
                 published = None
                 if hasattr(e, 'published_parsed') and e.published_parsed:
                     try:
@@ -3256,7 +3256,7 @@ def get_rss_news():
                     except Exception as e:
                         pass
                 
-                # 娣诲姞缁撴瀯鍖栨柊闂?
+                # ?
                 news.append({
                     "source": src,
                     "title": title,
@@ -3272,7 +3272,7 @@ def get_rss_news():
             log_error(f"get_rss_news error for {src}: {str(e)}")
             continue
     
-    return news[:8]  # 鎬绘暟涓婇檺
+    return news[:8]  # 
 
 def get_stock_news(ticker_symbol):
     try:
@@ -3332,17 +3332,17 @@ def get_cross_rate(asset_a, asset_b):
     v1, v2 = get_val(asset_a), get_val(asset_b)
     return v1/v2 if v1 and v2 else None
 
-# ================= 3. Evidence 楠岃瘉鍑芥暟 =================
+# ================= 3. Evidence  =================
 
 def validate_evidence(evidence_list, input_news):
     """
-    楠岃瘉 AI 杩斿洖鐨?evidence 鏄惁寮曠敤浜嗙湡瀹炵殑杈撳叆鏂伴椈
+     AI ?evidence 
     Args:
-        evidence_list: AI 杩斿洖鐨?evidence 鏁扮粍
-        input_news: 缁撴瀯鍖栨柊闂诲垪琛?List[Dict] with keys: source, title, published, link
+        evidence_list: AI ?evidence 
+        input_news: ?List[Dict] with keys: source, title, published, link
     Returns:
-        validated_evidence: 楠岃瘉鍚庣殑 evidence 鍒楄〃锛堟棤鏁堢殑鏍囪 _invalid锛?
-        valid_count: 鏈夋晥璇佹嵁鏁伴噺
+        validated_evidence:  evidence  _invalid?
+        valid_count: 
     """
     validated = []
     valid_count = 0
@@ -3351,10 +3351,10 @@ def validate_evidence(evidence_list, input_news):
         headline = ev.get('headline', '').strip()
         is_valid = False
         
-        # 妫€鏌?headline 鏄惁瀛樺湪浜庝换浣曡緭鍏ユ柊闂荤殑 title 涓紙瀛愪覆鍖归厤锛?
+        # ?headline  title ?
         for news_item in input_news:
             news_title = news_item.get('title', '')
-            # 鍙屽悜瀛愪覆鍖归厤
+            # 
             if headline.lower() in news_title.lower() or news_title.lower() in headline.lower():
                 is_valid = True
                 break
@@ -3369,17 +3369,17 @@ def validate_evidence(evidence_list, input_news):
     
     return validated, valid_count
 
-# ================= 4. AI 鍒嗘瀽鏍稿績 (DeepSeek Logic with Evidence) =================
+# ================= 4. AI  (DeepSeek Logic with Evidence) =================
 
 def analyze_all(news, user_pairs, macro_data, lang_mode):
     if not news: return {"status": "no_update"}
     
-    # 灏嗙粨鏋勫寲鏂伴椈杞崲涓烘枃鏈敤浜?prompt
+    # ?prompt
     headlines = " ".join([f"[{item['source']}] {item['title']}" for item in news])
     history = recall_history(headlines)
-    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "涓枃" else "OUTPUT LANGUAGE: ENGLISH"
+    lang_instruction = "OUTPUT LANGUAGE: ENGLISH"
 
-    # 銆愭牳蹇冩敼杩涖€戞敞鍏?MACRO_LOGIC_KNOWLEDGE + 寮哄埗 evidence 杈撳嚭
+    # ?MACRO_LOGIC_KNOWLEDGE +  evidence 
     prompt = f"""
     You are a Financial Logic Engine. {lang_instruction}
     
@@ -3422,35 +3422,35 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
     """
     
     try:
-        # 澧炲姞 num_ctx 闃叉鎬濊€冭繃绋嬪お闀胯鎴柇
+        #  num_ctx 
         response = ollama.chat(model=LOCAL_MODEL, messages=[{'role': 'user', 'content': prompt}], options={"num_ctx": 8192})
         raw_content = response['message']['content']
         
-        # 銆愰瞾妫掕В鏋愩€戜娇鐢?robust_json_parse 鏇夸唬鐩存帴 json.loads
+        # ?robust_json_parse  json.loads
         thought, json_text = parse_deepseek_output(raw_content)
         
-        # 灏濊瘯椴佹瑙ｆ瀽
+        # 
         res = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
         
-        # 濡傛灉瑙ｆ瀽澶辫触锛堣繑鍥為檷绾х粨鏋勶級锛岀洿鎺ヨ繑鍥?
+        # ?
         if res.get('_parse_error'):
             res['thought_process'] = thought
             return res
         
-        # 瑙ｆ瀽鎴愬姛锛岀户缁鐞?
+        # ?
         res['thought_process'] = thought
         
-        # 銆愭柊澧炪€戦獙璇?evidence 瀛楁锛堜紶鍏ョ粨鏋勫寲鏂伴椈锛?
+        # ?evidence ?
         evidence = res.get('evidence', [])
         validated_evidence, valid_count = validate_evidence(evidence, news)
         res['evidence'] = validated_evidence
         res['_valid_evidence_count'] = valid_count
         
-        # 銆愭柊澧炪€戣瘉鎹笉瓒抽檷绾х瓥鐣?
+        # ?
         if valid_count == 0 and res.get('status') == 'alert':
             res['_evidence_warning'] = True
             original_advice = res.get('advice', '')
-            res['advice'] = f"{original_advice}\n\n鈿狅笍 WARNING: No valid evidence found. Predictions may be unreliable. Please verify independently."
+            res['advice'] = f"{original_advice}\n\n WARNING: No valid evidence found. Predictions may be unreliable. Please verify independently."
 
         # Optional LLM topic sentiment extraction and storage
         news_sources = [item.get('source') for item in news]
@@ -3481,21 +3481,21 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
             res['_industry_news_status'] = "error"
             res['_industry_news_written'] = 0
         
-        # 銆愭柊澧炪€戣褰曚氦鏄撲俊鍙?
+        # ?
         if res.get("status") == "alert" and res.get("predictions"):
             predictions = res.get("predictions", {})
             impact_score = res.get("impact_score", 0)
             
-            # 涓烘瘡涓娴嬭褰曚俊鍙?
+            # ?
             for asset, prediction_text in predictions.items():
-                # 鎻愬彇鏂瑰悜
+                # 
                 direction = "Neutral"
-                if "Bullish" in prediction_text or "bullish" in prediction_text or "↑" in prediction_text:
+                if "Bullish" in prediction_text or "bullish" in prediction_text:
                     direction = "Bullish"
-                elif "Bearish" in prediction_text or "bearish" in prediction_text or "↓" in prediction_text:
+                elif "Bearish" in prediction_text or "bearish" in prediction_text:
                     direction = "Bearish"
                 
-                # 璁板綍淇″彿
+                # 
                 record_signal(
                     asset=asset,
                     direction=direction,
@@ -3508,7 +3508,7 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
             save_to_memory(res.get("summary"), res.get("impact_score", 0), res.get("advice"))
         return res
     except Exception as e: 
-        # 鏈€缁堝厹搴曪細杩斿洖闄嶇骇缁撴瀯
+        # 
         return {
             "status": "error",
             "reason": f"Unexpected error: {str(e)}",
@@ -3518,7 +3518,7 @@ def analyze_all(news, user_pairs, macro_data, lang_mode):
         }
 
 def analyze_single_stock(ticker, news, lang_mode):
-    lang_instruction = "OUTPUT LANGUAGE: CHINESE (Simplified)" if lang_mode == "涓枃" else "OUTPUT LANGUAGE: ENGLISH"
+    lang_instruction = "OUTPUT LANGUAGE: ENGLISH"
     news_str = " ".join(news)
     
     prompt = f"""
@@ -3542,10 +3542,10 @@ def analyze_single_stock(ticker, news, lang_mode):
         raw_content = response['message']['content']
         thought, json_text = parse_deepseek_output(raw_content)
         
-        # 銆愰瞾妫掕В鏋愩€戜娇鐢?robust_json_parse
+        # ?robust_json_parse
         res = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
         
-        # 濡傛灉瑙ｆ瀽澶辫触锛岃繑鍥為檷绾х粨鏋?
+        # ?
         if res.get('_parse_error'):
             return {
                 "sentiment": "AI Error",
@@ -3559,7 +3559,7 @@ def analyze_single_stock(ticker, news, lang_mode):
     except Exception as e:
         return {"sentiment": "AI Error", "reason": f"Parse Error: {str(e)}", "key_risk": "N/A"}
 
-# ================= 4. UI 鐣岄潰 =================
+# ================= 4. UI  =================
 
 
 
@@ -4438,9 +4438,9 @@ _taxonomy_cli_code = _run_taxonomy_cli_if_requested()
 if _taxonomy_cli_code is not None:
     raise SystemExit(_taxonomy_cli_code)
 
-st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", page_icon="馃")
+st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", page_icon=":satellite:")
 
-st.sidebar.header("鈿欙笍 Settings")
+st.sidebar.header("Settings")
 st.sidebar.caption(f"Brain: {LOCAL_MODEL}")
 
 page_options = ["\U0001F4E1 Global Macro Signals", "\U0001F4BC Portfolio Monitor"]
@@ -4453,11 +4453,11 @@ page_choice = st.sidebar.selectbox(
     key="page",
 )
 
-# 鏂板锛氬睍绀哄畯瑙傝鍒欏簱
-with st.sidebar.expander("馃摎 Macro Rules Library"):
+# Macro rules reference
+with st.sidebar.expander("Macro Rules Library"):
     st.text(MACRO_LOGIC_KNOWLEDGE)
 
-lang_mode = st.sidebar.radio("Language", ["涓枃", "English"], index=0)
+lang_mode = st.sidebar.radio("Language", ["English"], index=0)
 refresh_label = st.sidebar.selectbox("Refresh Rate", list(REFRESH_OPTIONS.keys()), index=0)
 refresh_sec = REFRESH_OPTIONS[refresh_label]
 enable_toast = st.sidebar.checkbox("Desktop Notify", value=True)
@@ -4470,12 +4470,12 @@ if page_choice == "\U0001F4BC Portfolio Monitor":
     st.stop()
 
 st.title("GlobalWatch: DeepSeek-R1 Reasoning Edition")
-st.caption("馃殌 Powered by Chain-of-Thought Reasoning")
+st.caption("Powered by Chain-of-Thought Reasoning")
 st.divider()
 
-tab_macro, tab_stock, tab_scoreboard, tab_warning = st.tabs(["馃實 瀹忚/澶栨眹 (Macro/FX)", "馃嚭馃嚫 缇庤偂閫忚 (US Stocks)", "馃搳 Signal Scoreboard", "馃毃 Early-Warning"])
+tab_macro, tab_stock, tab_scoreboard, tab_warning = st.tabs(["Macro / FX", "US Stocks", "Signal Scoreboard", "Early-Warning"])
 
-# === TAB 1: 瀹忚澶栨眹 ===
+# === TAB 1: Macro / FX ===
 with tab_macro:
     cols = st.columns(4)
     macro = get_full_market_context()
@@ -4492,7 +4492,7 @@ with tab_macro:
             r1 = get_cross_rate(b1, q1)
             if r1: 
                 st.metric(f"{b1.split()[0]}/{q1.split()[0]}", f"{r1:,.4f}")
-                if b1 != "USD (缇庡厓)": plot_candle_chart(ASSETS_DB[b1]['ticker'], b1)
+                if b1 != "USD (US Dollar)": plot_candle_chart(ASSETS_DB[b1]['ticker'], b1)
                 user_pairs.append(f"{b1.split()[0]}/{q1.split()[0]}")
 
     with c2:
@@ -4513,8 +4513,8 @@ with tab_macro:
     delta = (datetime.now() - st.session_state['last_run']).total_seconds()
     remain = max(0, refresh_sec - delta) if refresh_sec > 0 else 0
     
-    if st.button("馃殌 Deep Reason Analysis") or (refresh_sec > 0 and remain == 0 and auto_run):
-        with st.status("馃 DeepSeek is thinking...", expanded=True) as s:
+    if st.button("Run Deep Reason Analysis") or (refresh_sec > 0 and remain == 0 and auto_run):
+        with st.status("DeepSeek is thinking...", expanded=True) as s:
             news = get_rss_news()
             res = analyze_all(news, user_pairs, macro, lang_mode)
             
@@ -4530,15 +4530,15 @@ with tab_macro:
     if 'res' in st.session_state:
         res = st.session_state['res']
         
-        # === 鏂板锛氳В鏋愰敊璇鐞?===
+        # Parse error handling
         if res.get('_parse_error'):
-            st.error("馃毃 AI Output Parsing Error")
+            st.error("AI Output Parsing Error")
             st.markdown(f"**Reason**: {res.get('reason', 'Unknown error')}")
             
-            with st.expander("馃攳 Raw Output (Debug)", expanded=False):
+            with st.expander("Raw Output (Debug)", expanded=False):
                 st.code(res.get('raw_output', 'No output available'), language="text")
             
-            st.warning("鈿狅笍 The AI failed to generate valid JSON output. This may be due to:")
+            st.warning("The AI failed to generate valid JSON output. This may be due to:")
             st.markdown("""
             - Model output format issues
             - Context length exceeded
@@ -4550,28 +4550,28 @@ with tab_macro:
             - Check Ollama logs for errors
             """)
             
-            # 浠嶇劧鏄剧ず鎬濈淮杩囩▼锛堝鏋滄湁锛?
+            # Optional thought process rendering
             if res.get('thought_process'):
-                with st.expander("馃 DeepSeek 鐨勬€濈淮杩囩▼ (Click to expand)", expanded=False):
+                with st.expander("DeepSeek Thought Process (Click to expand)", expanded=False):
                     st.markdown(res.get('thought_process', 'No thoughts recorded.'))
         # ================================
         
-        # === V3.0 鏂板锛氬睍绀烘€濈淮閾?===
+        # V3 thought process rendering
         elif res.get("status") != "error":
-            with st.expander("馃 DeepSeek 鐨勬€濈淮杩囩▼ (Click to expand)", expanded=False):
+            with st.expander("DeepSeek Thought Process (Click to expand)", expanded=False):
                 st.markdown(res.get('thought_process', 'No thoughts recorded.'))
         # ==========================
 
         if res.get("status") == "alert":
-            st.error(f"馃毃 ALERT (Score: {res.get('impact_score')})")
+            st.error(f"ALERT (Score: {res.get('impact_score')})")
             st.markdown(f"**Event**: {res.get('summary')}")
             
-            # === 鏂板锛欵vidence Chain 灞曠ず ===
+            # Evidence chain
             evidence = res.get('evidence', [])
             valid_count = res.get('_valid_evidence_count', 0)
             
             if evidence:
-                with st.expander(f"馃搵 Evidence Chain ({valid_count}/{len(evidence)} valid)", expanded=True):
+                with st.expander(f"Evidence Chain ({valid_count}/{len(evidence)} valid)", expanded=True):
                     for idx, ev in enumerate(evidence, 1):
                         is_invalid = ev.get('_invalid', False)
                         icon = "WARN" if is_invalid else "OK"
@@ -4586,54 +4586,54 @@ with tab_macro:
                         st.divider()
             
             if res.get('_evidence_warning'):
-                st.warning("鈿狅笍 No valid evidence found. AI predictions may be unreliable.")
+                st.warning("No valid evidence found. AI predictions may be unreliable.")
             # ================================
             
             col_p, col_a = st.columns(2)
             col_p.write(res.get("predictions"))
             col_a.warning(res.get("advice"))
         else:
-            st.success("鉁?Market is Stable")
+            st.success("Market is Stable")
             st.caption(res.get("advice"))
         
-        with st.expander("馃摪 News Source"):
+        with st.expander("News Sources"):
             news_list = st.session_state.get('news', [])
             if news_list:
                 for idx, news_item in enumerate(news_list, 1):
-                    # 缁撴瀯鍖栨柊闂诲睍绀?
+                    # Structured news rendering
                     source = news_item.get('source', 'Unknown')
                     title = news_item.get('title', 'N/A')
                     published = news_item.get('published', None)
                     link = news_item.get('link', '')
                     
-                    # 鏍煎紡鍖栨椂闂存樉绀?
+                    # Timestamp rendering
                     time_str = ""
                     if published:
                         try:
-                            # 杞崲涓烘洿鍙嬪ソ鐨勬牸寮?
+                            # Human-readable UTC time
                             from datetime import datetime
                             dt = datetime.fromisoformat(published.replace('Z', '+00:00'))
-                            time_str = f"馃晵 {dt.strftime('%Y-%m-%d %H:%M UTC')}"
+                            time_str = f" {dt.strftime('%Y-%m-%d %H:%M UTC')}"
                         except Exception as e:
-                            time_str = f"馃晵 {published}"
+                            time_str = f" {published}"
                     
-                    # 鏄剧ず鏂伴椈
+                    # Render one news item
                     st.markdown(f"**{idx}. [{source}]** {title}")
                     if time_str:
                         st.caption(time_str)
                     if link:
-                        st.markdown(f"[馃敆 Read More]({link})")
+                        st.markdown(f"[Read More]({link})")
                     st.divider()
             else:
                 st.caption("No news available")
 
-# === TAB 2: 缇庤偂涓偂鍒嗘瀽 ===
+# === TAB 2: Stock Analysis ===
 with tab_stock:
-    st.header("馃嚭馃嚫 US Stock Deep Dive")
+    st.header("US Stock Deep Dive")
     c_in, c_go = st.columns([3, 1])
     ticker = c_in.text_input("Ticker", value="NVDA").upper()
     
-    if c_go.button("馃攳 Analyze"):
+    if c_go.button("Analyze"):
         with st.spinner(f"Reasoning about {ticker}..."):
             try:
                 stock = yf.Ticker(ticker)
@@ -4651,8 +4651,8 @@ with tab_stock:
                     
                     analysis = analyze_single_stock(ticker, stock_news, lang_mode)
                     
-                    # === V3.0 鏂板锛氬睍绀轰釜鑲℃€濈淮閾?===
-                    with st.expander("馃 AI Thought Process (Stock)", expanded=True):
+                    # V3 thought process rendering
+                    with st.expander(" AI Thought Process (Stock)", expanded=True):
                         st.markdown(analysis.get('thought_process', 'No thoughts.'))
                     
                     sentiment = analysis.get("sentiment", "Neutral")
@@ -4673,16 +4673,16 @@ with tab_stock:
 
 # === TAB 3: Signal Scoreboard ===
 with tab_scoreboard:
-    st.header("馃搳 Signal Scoreboard - Performance Tracking")
+    st.header("Signal Scoreboard - Performance Tracking")
     st.caption("Track the accuracy and profitability of AI predictions over time")
     
-    # 鍥炲～鎸夐挳
+    # 
     col_refresh, col_info = st.columns([1, 3])
-    if col_refresh.button("馃攧 Update Results"):
+    if col_refresh.button(" Update Results"):
         with st.spinner("Backfilling signal results..."):
             updated = backfill_signal_results()
             if updated:
-                st.success(f"鉁?Updated {updated} signals")
+                st.success(f"Updated {updated} signals")
             else:
                 st.info("No signals to update")
             st.rerun()
@@ -4691,7 +4691,7 @@ with tab_scoreboard:
     
     st.divider()
     
-    # 杩囨护鍣?
+    # ?
     col_theme, col_timeframe = st.columns(2)
     theme_filter = col_theme.selectbox(
         "Theme Filter",
@@ -4706,11 +4706,11 @@ with tab_scoreboard:
     
     theme = None if theme_filter == "All" else theme_filter
     
-    # 鑾峰彇缁熻鏁版嵁
+    # 
     stats = get_signal_statistics(theme=theme, timeframe=timeframe)
     
-    # 鏄剧ず鍏抽敭鎸囨爣
-    st.subheader("馃搱 Key Metrics")
+    # 
+    st.subheader(" Key Metrics")
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -4726,9 +4726,9 @@ with tab_scoreboard:
         help=f"Signals with {timeframe} results available"
     )
     
-    # 鍑嗙‘鐜囬鑹?
+    # ?
     accuracy = stats['accuracy']
-    accuracy_delta = accuracy - 50  # 鐩稿浜庨殢鏈虹寽娴?
+    accuracy_delta = accuracy - 50  # ?
     col3.metric(
         "Accuracy",
         f"{accuracy:.1f}%",
@@ -4736,7 +4736,7 @@ with tab_scoreboard:
         delta_color="normal" if accuracy_delta > 0 else "inverse"
     )
     
-    # 骞冲潎鏀剁泭棰滆壊
+    # 
     avg_return = stats['avg_return']
     col4.metric(
         "Avg Return",
@@ -4747,66 +4747,66 @@ with tab_scoreboard:
     
     st.divider()
     
-    # ========== 鏂板锛氫氦鏄撶骇鎬ц兘鍒嗙被 ==========
-    st.subheader("馃幆 Trading-Grade Performance Classification")
-    st.caption("鈿狅笍 杩欐槸鍐冲畾鏄惁鍏佽 real-money execution 鐨勫敮涓€渚濇嵁")
+    # ==========  ==========
+    st.subheader(" Trading-Grade Performance Classification")
+    st.caption("  real-money execution ")
     
-    # 鑾峰彇浜ゆ槗绾у垎绫?
+    # ?
     classification = classify_trading_performance(
         stats, 
         theme=theme, 
-        asset=None,  # 鍙互鏀逛负鐗瑰畾璧勪骇
-        transaction_cost=0.1,  # 0.1% 浜ゆ槗鎴愭湰
-        max_dd_threshold=15.0  # 15% 鏈€澶у洖鎾ら槇鍊?
+        asset=None,  # 
+        transaction_cost=0.1,  # 0.1% 
+        max_dd_threshold=15.0  # 15% ?
     )
     
-    # 鏄剧ず鍒嗙被缁撴灉
+    # 
     col_class, col_decision = st.columns([2, 1])
     
     with col_class:
-        # 鍒嗙被鏍囩
+        # 
         class_v2 = classification['classification_v2']
         
-        # 鏍规嵁鍒嗙被璁剧疆棰滆壊
-        if "馃煝" in class_v2:
+        # 
+        if "" in class_v2:
             st.success(f"### {class_v2}")
-        elif "馃煛" in class_v2:
+        elif "" in class_v2:
             st.warning(f"### {class_v2}")
-        elif "馃煚" in class_v2:
+        elif "" in class_v2:
             st.warning(f"### {class_v2}")
-        elif "馃敶" in class_v2:
+        elif "" in class_v2:
             st.error(f"### {class_v2}")
         else:
             st.info(f"### {class_v2}")
     
     with col_decision:
-        # 浜ゆ槗鍐崇瓥
+        # 
         if classification['decision_allowed']:
-            st.success("### 鉁?TRADABLE")
-            st.caption("鍏佽瀹炵洏浜ゆ槗")
+            st.success("### TRADABLE")
+            st.caption("")
         else:
-            st.error("### 馃毇 NOT TRADABLE")
-            st.caption("绂佹瀹炵洏浜ゆ槗")
+            st.error("###  NOT TRADABLE")
+            st.caption("")
     
-    # 鏄剧ず璇︾粏鍘熷洜
-    with st.expander("馃搵 Classification Details", expanded=True):
-        st.markdown("**鍘熷洜璇存槑锛?*")
+    # 
+    with st.expander(" Classification Details", expanded=True):
+        st.markdown("**?*")
         st.info(classification['reason_summary'])
         
-        # 椋庨櫓璀﹀憡
+        # 
         if classification['risk_warnings']:
-            st.markdown("**椋庨櫓璀﹀憡锛?*")
+            st.markdown("**?*")
             for warning in classification['risk_warnings']:
                 st.markdown(f"- {warning}")
         
-        # 鍏抽敭鎸囨爣
-        st.markdown("**鍏抽敭鎸囨爣锛?*")
+        # 
+        st.markdown("**?*")
         col_i1, col_i2, col_i3 = st.columns(3)
         
         col_i1.metric(
             "Net Expected Value",
             f"{classification['net_expected_value']:.2f}%",
-            help="骞冲潎鏀剁泭 - 浜ゆ槗鎴愭湰"
+            help=" - "
         )
         
         col_i2.metric(
@@ -4821,7 +4821,7 @@ with tab_scoreboard:
             help="Whether multi-timeframe validation passed."
         )
     
-    # V1 鍒嗙被锛堜粎渚涘弬鑰冿級
+    # V1 
     with st.expander("V1 Classification (Reference Only)", expanded=False):
         st.caption("Reference-only diagnostic labels. Do not use for standalone trading decisions.")
         st.markdown(f"**V1 Classification**: {classification['classification_v1']}")
@@ -4840,7 +4840,7 @@ with tab_scoreboard:
     
     st.divider()
     
-    # 澧炲己鐨勭粺璁℃寚鏍?
+    # ?
     st.subheader("Enhanced Statistics")
     
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
@@ -4869,29 +4869,29 @@ with tab_scoreboard:
         help="Standard deviation of signal returns."
     )
     
-    # 鐩堜簭鍒嗗竷
+    # 
     col_w, col_l = st.columns(2)
     
     with col_w:
         st.metric(
             "Avg Win",
             f"{stats['avg_win']:+.2f}%",
-            help="骞冲潎鐩堝埄"
+            help=""
         )
     
     with col_l:
         st.metric(
             "Avg Loss",
             f"{stats['avg_loss']:+.2f}%",
-            help="骞冲潎浜忔崯"
+            help=""
         )
     
     st.divider()
     
-    # 缁熻鏄捐憲鎬ц鍛?
+    # ?
     if not stats['statistical_significance']:
         st.warning(f"""
-        鈿狅笍 **Statistical Significance Warning**
+         **Statistical Significance Warning**
         
         Sample size: {stats['sample_size']} (minimum 30 required)
         
@@ -4899,15 +4899,15 @@ with tab_scoreboard:
         Continue running analyses to build a larger dataset.
         """)
     else:
-        st.success(f"鉁?Sample size: {stats['sample_size']} - Statistically significant")
+        st.success(f"Sample size: {stats['sample_size']} - Statistically significant")
     
     st.divider()
     
-    # 鏈€杩戜俊鍙?
-    st.subheader("馃晲 Recent Signals")
+    # ?
+    st.subheader(" Recent Signals")
     
     try:
-        # 鑾峰彇鏈€杩?0鏉′俊鍙?
+        # ?0?
         recent_results = signals_collection.get(
             limit=10,
             where={"theme": theme} if theme else None
@@ -4939,131 +4939,55 @@ with tab_scoreboard:
     
     st.divider()
     
-    # 浣跨敤璇存槑
-    with st.expander("鈩癸笍 How to Use Signal Scoreboard (V2 - Trading-Grade)"):
+    with st.expander("How to Use Signal Scoreboard (V2 - Trading-Grade)"):
         st.markdown("""
-        ### Signal Tracking System
-        
-        **Automatic Recording**:
-        - Every time you run an analysis, predictions are automatically recorded
-        - Initial price is captured at the time of prediction
-        
-        **Result Backfilling**:
-        - Click "馃攧 Update Results" to check and update signal outcomes
-        - System checks if enough time has passed (1h/4h/1d/1w)
-        - Fetches actual prices and calculates returns
-        
-        ---
-        
-        ### 馃幆 Trading-Grade Performance Classification (V2)
-        
-        **杩欐槸鍐冲畾鏄惁鍏佽 real-money execution 鐨勫敮涓€渚濇嵁**
-        
-        #### 鍒嗙被浣撶郴锛?
-        
-        **馃煝 Tradable Edge锛堝厑璁稿疄鐩橈級**
-        - 鏍锋湰鏁?鈮?50
-        - 鍑€鏈熸湜鍊?> 0锛堟墸闄や氦鏄撴垚鏈悗锛?
-        - 鏈€澶у洖鎾?鈮?15%
-        - 鑷冲皯 2 涓椂闂寸獥鍙ｉ獙璇侀€氳繃
-        - **鈫?鍙湁姝ゅ垎绫诲厑璁稿疄鐩樹氦鏄?*
-        
-        **馃煛 Directional Signal锛堟柟鍚戝弬鑰冿級**
-        - 鍑嗙‘鐜?鈮?58% 浣嗗噣鏈熸湜鍊?鈮?0
-        - 鎴栨敹鐩婅浜ゆ槗鎴愭湰渚佃殌
-        - **鈫?浠呯敤浜庯細浠撲綅璋冩暣銆侀闄╃‘璁ゃ€佸淇″彿杩囨护**
-        - **鈫?绂佹鍗曠嫭瑙﹀彂浜ゆ槗**
-        
-        **馃煚 Unstable / Regime-Dependent锛堜笉绋冲畾锛?*
-        - 鍑€鏈熸湜鍊?> 0
-        - 浣嗘牱鏈噺涓嶈冻 鎴?鍥炴挙杩囧ぇ 鎴?鏈€氳繃澶氭椂闂寸獥鍙ｉ獙璇?
-        - **鈫?鏍囪涓恒€岃瀵熶腑銆?*
-        - **鈫?绂佹鑷姩浜ゆ槗**
-        - **鈫?闇€瑕佹洿澶氭暟鎹獙璇?*
-        
-        **馃敶 No Edge锛堟棤浼樺娍锛?*
-        - 鍑€鏈熸湜鍊?鈮?0
-        - 鎴栧洖鎾や弗閲嶈秴鏍?
-        - 鎴栧噯纭巼鍜屾敹鐩婂潎鏃犳剰涔?
-        - **鈫?姘镐箙绂佹浜ゆ槗**
-        
-        **馃煠 Insufficient Data锛堟暟鎹笉瓒筹級**
-        - 鏍锋湰鏁?< 30
-        - **鈫?浠讳綍缁撹閮戒笉鍙潬**
-        - **鈫?绂佹浜ゆ槗**
-        
-        ---
-        
-        #### Lucky Streak 鐨勫鐞嗭紙閲嶈锛夛細
-        
-        - 鍘?V1 鐨?"Lucky Streak"锛堜綆鍑嗙‘鐜?+ 姝ｆ敹鐩婏級涓嶅啀浣滀负姝ｅ悜鍒嗙被
-        - 涓€寰嬪苟鍏?馃煚 Unstable 鎴?馃敶 No Edge
-        - **闄ら潪**瀛樺湪鏄庣‘鐨勯潪瀵圭О鏀剁泭缁撴瀯锛坒at-tail payoff锛夛細
-          - 骞冲潎鐩堝埄 > 2 脳 骞冲潎浜忔崯锛堢粷瀵瑰€硷級
-          - Profit Factor > 2.0
-        
-        ---
-        
-        #### 鍏抽敭鎸囨爣璇存槑锛?
-        
-        - **Net Expected Value**: 骞冲潎鏀剁泭 - 浜ゆ槗鎴愭湰锛堥粯璁?0.1%锛?
-        - **Max Drawdown**: 浠庡嘲鍊煎埌璋峰簳鐨勬渶澶ц穼骞?
-        - **Profit Factor**: 鎬荤泩鍒?/ 鎬讳簭鎹燂紙> 1 涓虹泩鍒╋級
-        - **Win Rate**: 鐩堝埄淇″彿鍗犳瘮
-        - **Volatility**: 鏀剁泭鏍囧噯宸紙娉㈠姩鎬э級
-        - **Multi-TF Validated**: 鏄惁鍦ㄥ涓椂闂寸獥鍙ｉ兘涓烘
-        
-        ---
-        
-        #### V1 vs V2 鍒嗙被锛?
-        
-        - **V1 鍒嗙被**锛堟棫鐗堬級锛氫粎渚涘垎鏋愬弬鑰冿紝涓嶅彲鐢ㄤ簬浜ゆ槗鍐崇瓥
-        - **V2 鍒嗙被**锛堟柊鐗堬級锛氫氦鏄撶骇鏍囧噯锛屾槸瀹炵洏浜ゆ槗鐨勫敮涓€渚濇嵁
-        
-        ---
-        
-        ### 鈿狅笍 閲嶈鍘熷垯
-        
-        1. **鏍锋湰鏁颁笉瓒虫椂锛岀郴缁熶細涓诲姩鎷掔粷**
-           - 鍗充娇鐪嬭捣鏉?寰堝噯"锛屾牱鏈?< 30 涔熶笉鍏佽浜ゆ槗
-        
-        2. **娓呮鍖哄垎銆屽垎鏋愪笂鏈夋剰鎬濄€峷s銆屽彲浠ョ敤鐪熼挶銆?*
-           - 鍒嗘瀽涓婃湁鎰忔€?鈫?V1 鍒嗙被
-           - 鍙互鐢ㄧ湡閽?鈫?鍙湁 V2 鐨?馃煝 Tradable Edge
-        
-        3. **Real-money execution 鍙帴鍙?Tradable Edge**
-           - 鍏朵粬鎵€鏈夊垎绫婚兘绂佹瀹炵洏浜ゆ槗
-           - 娌℃湁渚嬪
-        
-        ---
-        
-        ### 馃搳 浣跨敤寤鸿
-        
-        1. **瀹氭湡鍥炲～缁撴灉**锛氭瘡澶╃偣鍑?"馃攧 Update Results"
-        2. **鍏虫敞鍒嗙被鍙樺寲**锛氫粠 Unstable 鈫?Tradable Edge 闇€瑕佹椂闂?
-        3. **澶氭椂闂寸獥鍙ｉ獙璇?*锛氬垏鎹笉鍚?timeframe 鏌ョ湅涓€鑷存€?
-        4. **椋庨櫓绠＄悊**锛氬嵆浣挎槸 Tradable Edge锛屼篃瑕佹帶鍒朵粨浣?
-        5. **鎸佺画鐩戞帶**锛氬競鍦虹幆澧冨彉鍖栧彲鑳藉鑷村垎绫婚檷绾?
-        
-        ---
-        
-        **Important Notes**:
-        - Returns are theoretical (no transaction costs in calculation, but considered in classification)
-        - Past performance doesn't guarantee future results
-        - Use this data to validate your strategy before risking real money
-        - Only 馃煝 Tradable Edge signals are approved for live trading
+        ### Signal Tracking Overview
+
+        **Automatic Recording**
+        - Each analysis run records predicted direction and confidence.
+        - Entry price is stored at signal generation time.
+
+        **Result Backfill**
+        - Click **Update Results** to backfill 1h / 4h / 1d / 1w outcomes.
+        - The system fetches realized prices and computes return accuracy.
+
+        ### Trading-Grade Classification (V2)
+
+        **Tradable Edge**
+        - Sufficient sample size
+        - Positive net expected value after transaction cost
+        - Controlled drawdown
+        - Multi-timeframe consistency
+
+        **Directional Signal**
+        - Useful directional bias, but not robust enough for standalone execution.
+
+        **Unstable / Regime-Dependent**
+        - Performance depends on market regime or has weak consistency.
+
+        **No Edge**
+        - No stable predictive advantage.
+
+        **Insufficient Data**
+        - Sample size is too small for reliable conclusions.
+
+        ### Practical Guidance
+        - Use V2 classification as the execution gate.
+        - Re-check results regularly as market regime changes.
+        - Combine with risk controls and portfolio-level constraints.
+        - Past performance does not guarantee future results.
         """)
 
 
 # === TAB 4: Early-Warning ===
 with tab_warning:
-    st.header("馃毃 Early-Warning Risk Monitor")
+    st.header("Early-Warning Risk Monitor")
     st.caption("Universal risk scoring system for monitored assets")
     
     st.divider()
     
-    # 鐩戞帶鍒楄〃閫夋嫨
-    st.subheader("馃搵 Watchlist")
+    # 
+    st.subheader("Watchlist")
     
     col_select, col_analyze = st.columns([3, 1])
     
@@ -5073,37 +4997,37 @@ with tab_warning:
         index=0
     )
     
-    if col_analyze.button("馃攳 Calculate Risk Score"):
+    if col_analyze.button("Calculate Risk Score"):
         with st.spinner(f"Analyzing risk for {selected_asset}..."):
-            # 鑾峰彇鏈€鏂版柊闂?
+            # ?
             recent_news = st.session_state.get('news', [])
             if not recent_news:
                 recent_news = get_rss_news()
             
-            # 璁＄畻椋庨櫓鍒嗘暟
+            # 
             risk_result = calculate_early_warning_score(selected_asset, recent_news)
             
-            # 瀛樺偍鍒?session state
+            # ?session state
             st.session_state['risk_result'] = risk_result
             st.rerun()
     
     st.divider()
     
-    # 鏄剧ず椋庨櫓璇勫垎缁撴灉
+    # 
     if 'risk_result' in st.session_state:
         risk = st.session_state['risk_result']
         
         if 'error' in risk:
             st.error(f"Error: {risk['error']}")
         else:
-            # 椋庨櫓鎬昏
-            st.subheader(f"馃搳 Risk Assessment: {risk['asset']}")
+            # 
+            st.subheader(f"Risk Assessment: {risk['asset']}")
             
-            # 缁煎悎椋庨櫓鍒嗘暟
+            # 
             total_score = risk['total_risk_score']
             risk_level = risk['risk_level']
             
-            # 椋庨櫓绛夌骇棰滆壊
+            # 
             level_colors = {
                 "LOW": "green",
                 "MEDIUM": "yellow",
@@ -5112,7 +5036,7 @@ with tab_warning:
             }
             level_color = level_colors.get(risk_level, "gray")
             
-            # 鏄剧ず缁煎悎鍒嗘暟
+            # 
             col_score, col_level = st.columns(2)
             
             col_score.metric(
@@ -5129,41 +5053,41 @@ with tab_warning:
             
             st.divider()
             
-            # 鍥涚淮瀛愬垎鏁?
-            st.subheader("馃搱 Risk Breakdown")
+            # ?
+            st.subheader("Risk Breakdown")
             
             sub_scores = risk['sub_scores']
             
             col1, col2, col3, col4 = st.columns(4)
             
             col1.metric(
-                "馃寪 Macro Chain",
+                "Macro Chain",
                 f"{sub_scores['macro_chain']['score']}/25",
                 help="USD/rates/macro environment impact"
             )
             
             col2.metric(
-                "馃懃 Crowding",
+                "Crowding",
                 f"{sub_scores['crowding']['score']}/25",
                 help="Technical overbought/oversold levels"
             )
             
             col3.metric(
-                "馃搳 Microstructure",
+                "Microstructure",
                 f"{sub_scores['microstructure']['score']}/25",
                 help="Volatility/gaps/volume anomalies"
             )
             
             col4.metric(
-                "鈿?Event Risk",
+                "Event Risk",
                 f"{sub_scores['event_risk']['score']}/25",
                 help="Central bank/policy/geopolitical events"
             )
             
             st.divider()
             
-            # 闆疯揪鍥?
-            st.subheader("馃幆 Risk Radar")
+            # ?
+            st.subheader("Risk Radar")
             
             categories = ['Macro Chain', 'Crowding', 'Microstructure', 'Event Risk']
             values = [
@@ -5176,7 +5100,7 @@ with tab_warning:
             fig = go.Figure()
             
             fig.add_trace(go.Scatterpolar(
-                r=values + [values[0]],  # 闂悎鍥惧舰
+                r=values + [values[0]],  # 
                 theta=categories + [categories[0]],
                 fill='toself',
                 name='Risk Score',
@@ -5198,16 +5122,16 @@ with tab_warning:
             
             st.divider()
             
-            # 璇佹嵁閾惧睍绀?
-            st.subheader("馃搵 Evidence Chain")
+            # ?
+            st.subheader("Evidence Chain")
             
             # Macro Chain Evidence
-            with st.expander("馃寪 Macro Chain Evidence", expanded=True):
+            with st.expander("Macro Chain Evidence", expanded=True):
                 macro_evidence = sub_scores['macro_chain']['evidence']
                 if macro_evidence:
                     for idx, ev in enumerate(macro_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"鈿狅笍 {ev.get('message')}")
+                            st.error(f"{ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Type**: {ev.get('type', 'N/A')}")
@@ -5223,12 +5147,12 @@ with tab_warning:
                     st.info("No macro chain risks detected")
             
             # Crowding Evidence
-            with st.expander("馃懃 Crowding Evidence"):
+            with st.expander("Crowding Evidence"):
                 crowding_evidence = sub_scores['crowding']['evidence']
                 if crowding_evidence:
                     for idx, ev in enumerate(crowding_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"鈿狅笍 {ev.get('message')}")
+                            st.error(f"{ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Indicator**: {ev.get('indicator', 'N/A')}")
@@ -5239,12 +5163,12 @@ with tab_warning:
                     st.info("No crowding risks detected")
             
             # Microstructure Evidence
-            with st.expander("馃搳 Microstructure Evidence"):
+            with st.expander("Microstructure Evidence"):
                 micro_evidence = sub_scores['microstructure']['evidence']
                 if micro_evidence:
                     for idx, ev in enumerate(micro_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"鈿狅笍 {ev.get('message')}")
+                            st.error(f"{ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Indicator**: {ev.get('indicator', 'N/A')}")
@@ -5255,12 +5179,12 @@ with tab_warning:
                     st.info("No microstructure risks detected")
             
             # Event Risk Evidence
-            with st.expander("鈿?Event Risk Evidence"):
+            with st.expander("Event Risk Evidence"):
                 event_evidence = sub_scores['event_risk']['evidence']
                 if event_evidence:
                     for idx, ev in enumerate(event_evidence, 1):
                         if ev.get('type') == 'error':
-                            st.error(f"鈿狅笍 {ev.get('message')}")
+                            st.error(f"{ev.get('message')}")
                         else:
                             st.markdown(f"**Evidence {idx}**")
                             st.markdown(f"- **Category**: {ev.get('category', 'N/A')}")
@@ -5272,26 +5196,26 @@ with tab_warning:
             
             st.divider()
             
-            # 鍛婅瑙﹀彂鍣?
+            # ?
             if risk['alert_triggers']:
-                st.subheader("鈿狅笍 Alert Triggers")
+                st.subheader("Alert Triggers")
                 for trigger in risk['alert_triggers']:
-                    st.warning(f"鈥?{trigger}")
+                    st.warning(f"- {trigger}")
             
-            # 寤鸿
-            st.subheader("馃挕 Recommendation")
+            # 
+            st.subheader("Recommendation")
             st.info(risk['recommendation'])
             
-            # 鏃堕棿鎴?
+            # ?
             st.caption(f"Analysis Time: {risk['timestamp'][:19]}")
     
     else:
-        st.info("馃憜 Select an asset and click 'Calculate Risk Score' to begin analysis")
+        st.info("Select an asset and click 'Calculate Risk Score' to begin analysis")
     
     st.divider()
     
-    # 浣跨敤璇存槑
-    with st.expander("鈩癸笍 How to Use Early-Warning System"):
+    # 
+    with st.expander("How to Use Early-Warning System"):
         st.markdown("""
         ### Early-Warning Risk Scoring System
         
@@ -5302,32 +5226,32 @@ with tab_warning:
         
         **Four Risk Dimensions**:
         
-        1. **馃寪 Macro Chain (0-25)**:
+        1. **Macro Chain (0-25)**:
            - USD strength/weakness impact
            - Interest rate movements
            - Macro news flow
            - Based on correlations with DXY, 10Y yields
         
-        2. **馃懃 Crowding (0-25)**:
+        2. **Crowding (0-25)**:
            - RSI overbought/oversold levels
            - Price deviation from moving averages
            - Volume spikes indicating crowding
         
-        3. **馃搳 Microstructure (0-25)**:
+        3. **Microstructure (0-25)**:
            - Volatility surges (ATR ratio)
            - Price gaps
            - Volume anomalies
         
-        4. **鈿?Event Risk (0-25)**:
+        4. **Event Risk (0-25)**:
            - Central bank events (Fed, ECB)
            - Policy changes (tariffs, regulations)
            - Geopolitical tensions
         
         **Risk Levels**:
-        - 馃煝 **LOW (0-25)**: Normal market environment
-        - 馃煛 **MEDIUM (26-50)**: Some factors elevated, monitor
-        - 馃煚 **HIGH (51-75)**: Multiple risks, consider caution
-        - 馃敶 **CRITICAL (76-100)**: Extreme risk, reduce exposure
+        - **LOW (0-25)**: Normal market environment
+        - **MEDIUM (26-50)**: Some factors elevated, monitor
+        - **HIGH (51-75)**: Multiple risks, consider caution
+        - **CRITICAL (76-100)**: Extreme risk, reduce exposure
         
         **Current Watchlist**:
         - Gold (GC=F)
