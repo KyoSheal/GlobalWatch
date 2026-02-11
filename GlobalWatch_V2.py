@@ -4036,8 +4036,13 @@ def render_portfolio_monitor():
 
                     trade_df = pd.DataFrame(trade_rows)
                     if not trade_df.empty:
-                        trade_df["time_sort"] = pd.to_datetime(trade_df["time"], errors="coerce")
-                        trade_df = trade_df.sort_values("time_sort", ascending=False).drop(columns=["time_sort"])
+                        trade_df["time_sort"] = pd.to_datetime(trade_df["time"], errors="coerce", utc=True)
+                        if trade_df["time_sort"].notna().any():
+                            trade_df = trade_df.sort_values("time_sort", ascending=False)
+                        else:
+                            # If timestamps are not parseable, keep UI newest-first by reversing read order.
+                            trade_df = trade_df.iloc[::-1]
+                        trade_df = trade_df.drop(columns=["time_sort"])
                         st.dataframe(trade_df, width="stretch", hide_index=True)
                 else:
                     st.info("No trade history found in outputs/trade_history.jsonl")
