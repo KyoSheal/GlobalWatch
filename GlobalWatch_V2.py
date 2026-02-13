@@ -11,7 +11,7 @@ import time
 import json
 import re
 import hashlib
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -6426,6 +6426,29 @@ def _safe_read_jsonl(path, limit=5000):
         return rows
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def read_jsonl_tail(path, max_lines=5000):
+    rows = deque(maxlen=max(1, int(max_lines)))
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = str(line).strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+        return list(rows)
+    except Exception as e:
+        log_error(f"read_jsonl_tail error for {path}: {str(e)}")
+        return []
+
+
 def _to_float(value, default=0.0):
     try:
         if value is None:
@@ -6615,6 +6638,12 @@ def render_portfolio_monitor():
         "pm_y_dtick": 0.0,
         "pm_y_bounds_initialized": False,
         "pm_hide_off_hours": True,
+        "pm_telemetry_rows": 20,
+        "pm_telemetry_show_events": False,
+        "pm_telemetry_level": "ALL",
+        "pm_telemetry_cycle_filter": False,
+        "pm_telemetry_cycle_min": 0,
+        "pm_telemetry_cycle_max": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -6833,6 +6862,226 @@ def render_portfolio_monitor():
             if snap_ts:
                 st.caption(f"Snapshot timestamp: {snap_ts}")
             st.caption(f"Run: {run_id_short} | schema: {schema_text} | cycle: {cycle_text}")
+
+            with st.expander("Diagnostics / Telemetry", expanded=False):
+                diag_col1, diag_col2, diag_col3, diag_col4 = st.columns(4)
+                diag_col1.slider("Recent N", min_value=10, max_value=200, key="pm_telemetry_rows")
+                diag_col2.checkbox("Show events", key="pm_telemetry_show_events")
+                diag_col3.selectbox("Level", ["ALL", "INFO", "WARN", "ERROR"], key="pm_telemetry_level")
+                diag_col4.checkbox("Cycle range", key="pm_telemetry_cycle_filter")
+
+                config_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
+                cfg_obj = _safe_read_json(config_path)
+                reporting_cfg = cfg_obj.get("reporting", {}) if isinstance(cfg_obj, dict) else {}
+                if not isinstance(reporting_cfg, dict):
+                    reporting_cfg = {}
+                out_dir = str(reporting_cfg.get("out_dir", "outputs")).strip() or "outputs"
+                metrics_path = os.path.join(out_dir, "telemetry", "metrics.jsonl")
+                events_path = os.path.join(out_dir, "telemetry", "events.jsonl")
+                rows_limit = int(st.session_state.get("pm_telemetry_rows", 20))
+                level_filter = str(st.session_state.get("pm_telemetry_level", "ALL")).upper()
+
+                def _safe_int(value, default=None):
+                    try:
+                        if value is None or value == "":
+                            return default
+                        return int(value)
+                    except Exception:
+                        return default
+
+                def _extract_cycle_id(row):
+                    if not isinstance(row, dict):
+                        return None
+                    cyc = _safe_int(row.get("cycle_id"), None)
+                    if cyc is not None:
+                        return cyc
+                    payload = row.get("payload")
+                    if isinstance(payload, dict):
+                        cyc = _safe_int(payload.get("cycle_id"), None)
+                        if cyc is not None:
+                            return cyc
+                    return _safe_int(row.get("cycle"), None)
+
+                def _extract_payload(row):
+                    payload = row.get("payload")
+                    if isinstance(payload, dict):
+                        return payload
+                    return {}
+
+                def _apply_common_filters(rows):
+                    filtered = [r for r in rows if isinstance(r, dict)]
+                    if run_id_text:
+                        filtered = [r for r in filtered if str(r.get("run_id", "")).strip() == run_id_text]
+                    if level_filter != "ALL":
+                        filtered = [r for r in filtered if str(r.get("level", "INFO")).upper() == level_filter]
+                    if bool(st.session_state.get("pm_telemetry_cycle_filter", False)):
+                        cycles = [c for c in (_extract_cycle_id(r) for r in filtered) if c is not None]
+                        if cycles:
+                            min_cycle = int(min(cycles))
+                            max_cycle = int(max(cycles))
+                            if st.session_state.get("pm_telemetry_cycle_min", 0) < min_cycle:
+                                st.session_state["pm_telemetry_cycle_min"] = min_cycle
+                            if st.session_state.get("pm_telemetry_cycle_max", 0) < min_cycle:
+                                st.session_state["pm_telemetry_cycle_max"] = max_cycle
+                            cycle_col1, cycle_col2 = st.columns(2)
+                            cycle_col1.number_input(
+                                "Cycle min",
+                                min_value=min_cycle,
+                                max_value=max_cycle,
+                                step=1,
+                                key="pm_telemetry_cycle_min",
+                            )
+                            cycle_col2.number_input(
+                                "Cycle max",
+                                min_value=min_cycle,
+                                max_value=max_cycle,
+                                step=1,
+                                key="pm_telemetry_cycle_max",
+                            )
+                            cycle_min = int(st.session_state.get("pm_telemetry_cycle_min", min_cycle))
+                            cycle_max = int(st.session_state.get("pm_telemetry_cycle_max", max_cycle))
+                            if cycle_max < cycle_min:
+                                cycle_min, cycle_max = cycle_max, cycle_min
+                            filtered = [
+                                r for r in filtered
+                                if (lambda c: c is not None and cycle_min <= c <= cycle_max)(_extract_cycle_id(r))
+                            ]
+                    return filtered
+
+                metrics_rows = read_jsonl_tail(metrics_path, max_lines=5000)
+                metrics_rows = _apply_common_filters(metrics_rows)
+                if not run_id_text:
+                    st.caption("Current snapshot has no run_id; showing all telemetry rows.")
+
+                if not metrics_rows:
+                    st.info("No telemetry yet.")
+                else:
+                    metrics_rows = sorted(
+                        metrics_rows,
+                        key=lambda r: (
+                            str(r.get("ts_utc", "")),
+                            _extract_cycle_id(r) if _extract_cycle_id(r) is not None else -1,
+                        ),
+                    )
+                    metrics_rows = list(reversed(metrics_rows[-rows_limit:]))
+
+                    flat_rows = []
+                    for row in metrics_rows:
+                        payload = _extract_payload(row)
+                        price_stats = payload.get("price_fetch_stats", {}) if isinstance(payload.get("price_fetch_stats"), dict) else {}
+                        price_diag_stats = payload.get("price_diagnostics_summary", {}) if isinstance(payload.get("price_diagnostics_summary"), dict) else {}
+                        overlay_stats = payload.get("news_overlay_stats", {}) if isinstance(payload.get("news_overlay_stats"), dict) else {}
+                        hits = _to_float(price_stats.get("cache_hits"), 0.0)
+                        misses = _to_float(price_stats.get("cache_misses"), 0.0)
+                        denom = hits + misses
+                        hit_rate = (hits / denom * 100.0) if denom > 0 else None
+                        overlay_cash_delta = overlay_stats.get("cash_delta")
+                        if overlay_cash_delta in (None, ""):
+                            overlay_cash_delta = overlay_stats.get("applied_delta")
+                        if overlay_cash_delta in (None, ""):
+                            overlay_cash_delta = overlay_stats.get("applied")
+
+                        flat_rows.append(
+                            {
+                                "ts_utc": str(row.get("ts_utc", ""))[:19],
+                                "cycle_id": _extract_cycle_id(row),
+                                "total_equity": _to_float(payload.get("total_equity", row.get("total_equity", None)), None),
+                                "cash_pct": _to_float(payload.get("cash_pct", row.get("cash_pct", None)), None),
+                                "drawdown": _to_float(payload.get("drawdown", row.get("drawdown", None)), None),
+                                "macro_risk_score": _to_float(payload.get("macro_risk_score", row.get("macro_risk_score", None)), None),
+                                "price_batch_calls": _safe_int(price_stats.get("batch_calls"), None),
+                                "price_hit_rate": hit_rate,
+                                "price_ms": _safe_int(price_stats.get("elapsed_ms"), None),
+                                "price_quality": str(price_diag_stats.get("data_quality_level", "")),
+                                "price_p95_age_s": _to_float(price_diag_stats.get("p95_age_seconds", None), None),
+                                "overlay_cash_delta": _to_float(overlay_cash_delta, None),
+                            }
+                        )
+
+                    st.dataframe(pd.DataFrame(flat_rows), width="stretch", hide_index=True)
+
+                price_diag = snapshot.get("price_diagnostics_summary", {})
+                if isinstance(price_diag, dict) and price_diag:
+                    st.markdown("**Price Diagnostics (Current Snapshot)**")
+                    freshness_counts = price_diag.get("freshness_counts", {})
+                    source_counts = price_diag.get("source_counts", {})
+                    if not isinstance(freshness_counts, dict):
+                        freshness_counts = {}
+                    if not isinstance(source_counts, dict):
+                        source_counts = {}
+                    q1, q2, q3, q4 = st.columns(4)
+                    q1.metric("LIVE", int(_to_float(freshness_counts.get("LIVE", 0), 0.0)))
+                    q2.metric("RECENT", int(_to_float(freshness_counts.get("RECENT", 0), 0.0)))
+                    q3.metric("STALE", int(_to_float(freshness_counts.get("STALE", 0), 0.0)))
+                    q4.metric("MISSING", int(_to_float(freshness_counts.get("MISSING", 0), 0.0)))
+                    data_quality_level = str(price_diag.get("data_quality_level", "OK") or "OK").upper()
+                    p95_age_seconds = _to_float(price_diag.get("p95_age_seconds", None), None)
+                    st.caption(
+                        f"n_tickers={int(_to_float(price_diag.get('n_tickers', 0), 0.0))} | "
+                        f"quality={data_quality_level} | "
+                        f"tz_ok_false={int(_to_float(price_diag.get('tz_ok_false', 0), 0.0))} | "
+                        f"p95_age_seconds={p95_age_seconds} | "
+                        f"max_age_seconds={_to_float(price_diag.get('max_age_seconds', None), None)}"
+                    )
+                    if source_counts:
+                        source_df = pd.DataFrame(
+                            [{"source": str(k), "count": int(_to_float(v, 0.0))} for k, v in source_counts.items()]
+                        ).sort_values("count", ascending=False)
+                        st.dataframe(source_df, width="stretch", hide_index=True)
+                    stale_list = price_diag.get("stale_by_age", [])
+                    if not isinstance(stale_list, list) or not stale_list:
+                        stale_list = price_diag.get("stale_tickers", [])
+                    if isinstance(stale_list, list) and stale_list:
+                        st.caption("stale_by_age (top 10)")
+                        st.dataframe(pd.DataFrame(stale_list), width="stretch", hide_index=True)
+                    missing_list = price_diag.get("missing_tickers", [])
+                    if isinstance(missing_list, list) and missing_list:
+                        st.caption("missing_tickers (top 10)")
+                        st.dataframe(pd.DataFrame(missing_list), width="stretch", hide_index=True)
+                    tz_bad_list = price_diag.get("tz_bad_tickers", [])
+                    if isinstance(tz_bad_list, list) and tz_bad_list:
+                        st.caption("tz_bad_tickers (top 10)")
+                        st.dataframe(pd.DataFrame({"ticker": tz_bad_list[:10]}), width="stretch", hide_index=True)
+
+                if bool(st.session_state.get("pm_telemetry_show_events", False)):
+                    events_rows = read_jsonl_tail(events_path, max_lines=5000)
+                    events_rows = _apply_common_filters(events_rows)
+                    if not events_rows:
+                        st.info("No events telemetry yet.")
+                    else:
+                        events_rows = sorted(
+                            events_rows,
+                            key=lambda r: (
+                                str(r.get("ts_utc", "")),
+                                _extract_cycle_id(r) if _extract_cycle_id(r) is not None else -1,
+                            ),
+                        )
+                        events_rows = list(reversed(events_rows[-max(rows_limit, 50):]))
+
+                        event_table_rows = []
+                        for row in events_rows:
+                            event_table_rows.append(
+                                {
+                                    "ts_utc": str(row.get("ts_utc", ""))[:19],
+                                    "cycle_id": _extract_cycle_id(row),
+                                    "event": str(row.get("event", "")),
+                                    "status": str(row.get("status", "")),
+                                    "duration_ms": _to_float(row.get("duration_ms", None), None),
+                                    "level": str(row.get("level", "")),
+                                    "message": str(row.get("message", "")),
+                                }
+                            )
+                        st.dataframe(pd.DataFrame(event_table_rows), width="stretch", hide_index=True)
+
+                        with st.expander("Event payload details", expanded=False):
+                            for row in events_rows[:3]:
+                                payload = _extract_payload(row)
+                                if not payload:
+                                    continue
+                                st.markdown(
+                                    f"**{row.get('event', '-') or '-'} | cycle={_extract_cycle_id(row)} | ts={row.get('ts_utc', '-') or '-'}**"
+                                )
+                                st.json(payload)
 
             risk_cfg = snapshot.get("risk_config", {})
             if not isinstance(risk_cfg, dict):

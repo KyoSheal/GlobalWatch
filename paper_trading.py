@@ -9,6 +9,7 @@ import uuid
 import hashlib
 import argparse
 import shutil
+from collections import Counter
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,14 @@ from atomic_io import (
     atomic_write_text as io_atomic_write_text,
 )
 from price_service import PriceService
+try:
+    from telemetry import TelemetryLogger, resolve_telemetry_out_dir
+    TELEMETRY_AVAILABLE = True
+except Exception as e:
+    TelemetryLogger = None  # type: ignore[assignment]
+    resolve_telemetry_out_dir = None  # type: ignore[assignment]
+    TELEMETRY_AVAILABLE = False
+    print(f"[WARN] telemetry unavailable: {e}")
 
 try:
     from zoneinfo import ZoneInfo
@@ -842,6 +851,12 @@ class PaperTradingEngine:
         self.current_cycle = 0
         self.peak_equity = self.cash
         self.status = "READY"  # READY/RUNNING/COMPLETED
+        self.telemetry = None
+        self.telemetry_out_dir = None
+        self.telemetry_enabled = bool(reporting_cfg.get('telemetry_enabled', True))
+        self._last_metrics_cycle_id = None
+        self._last_price_quality_cycle_id = None
+        self._rebind_telemetry_logger()
         self.last_rebalance_time = None  # backward-compatible alias of last successful rebalance time
         self.last_rebalance_attempt_time = None
         self.last_rebalance_success_time = None
@@ -932,6 +947,22 @@ class PaperTradingEngine:
         self.price_cache = {}  # {ticker: (price, timestamp)}
         self.price_cache_duration = 60  # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_price_fetch_stats = {}
+        self.current_price_diagnostics_summary = {
+            "freshness_counts": {"LIVE": 0, "RECENT": 0, "STALE": 0, "MISSING": 0},
+            "source_counts": {},
+            "tz_ok_false": 0,
+            "max_age_seconds": None,
+            "n_tickers": 0,
+            "data_quality_level": "OK",
+            "stale_ratio": 0.0,
+            "missing_ratio": 0.0,
+            "p50_age_seconds": None,
+            "p95_age_seconds": None,
+            "stale_by_age": [],
+            "stale_tickers": [],
+            "missing_tickers": [],
+            "tz_bad_tickers": [],
+        }
 
         # Signal/Macro refresh decoupling state
         execution_config = self.config.get('execution', {})
@@ -967,6 +998,7 @@ class PaperTradingEngine:
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.resume_from_checkpoint()
+        self._rebind_telemetry_logger()
         self.rebuild_position_entry_cycles()
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -988,6 +1020,18 @@ class PaperTradingEngine:
         print(f"   CWD: {os.getcwd()}")
         print(f"   Live Snapshot Path: {self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')}")
         print(f"   Trade History Path: {self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')}")
+        self._telemetry_log_event(
+            "ENGINE_INIT",
+            cycle_id=int(self.current_cycle),
+            status="ok",
+            payload={
+                "schema_version": int(self.schema_version),
+                "session_id": self.session_id,
+                "account_id": self.account_id,
+                "env": self.runtime_env,
+                "telemetry_out_dir": self.telemetry_out_dir,
+            },
+        )
     
     def load_config(self, config_path):
         """def load_config: docstring omitted (was garbled/non-ASCII)."""
@@ -1252,6 +1296,7 @@ class PaperTradingEngine:
             self.run_id = resumed_run_id
             self.schema_version = int(LIVE_SCHEMA_VERSION)
             self.run_started_at = str(last_snapshot.get('run_started_at', self.run_started_at) or self.run_started_at)
+            self._rebind_telemetry_logger()
             
             self.cash = last_snapshot['cash']
             self.current_cycle = last_snapshot['cycle'] + 1  # NOTE: comment omitted (was garbled/non-ASCII).
@@ -1743,6 +1788,10 @@ class PaperTradingEngine:
                 'price_fetch_stats',
                 dict(self.current_price_fetch_stats) if isinstance(self.current_price_fetch_stats, dict) else {}
             ),
+            'price_diagnostics_summary': snapshot.get(
+                'price_diagnostics_summary',
+                dict(self.current_price_diagnostics_summary) if isinstance(self.current_price_diagnostics_summary, dict) else {}
+            ),
             'last_rebalance_attempt_time': snapshot.get('last_rebalance_attempt_time', last_attempt_time),
             'last_rebalance_success_time': snapshot.get('last_rebalance_success_time', last_success_time),
             'stale_count': snapshot.get('stale_count', self.current_stale_info.get('stale_count', 0)),
@@ -1810,6 +1859,427 @@ class PaperTradingEngine:
         rows = list_of_dicts if isinstance(list_of_dicts, list) else []
         io_atomic_write_jsonl(str(path), rows)
 
+    def _rebind_telemetry_logger(self):
+        """(Re)initialize telemetry logger using current run_id/config."""
+        self.telemetry = None
+        self.telemetry_out_dir = None
+        if not getattr(self, "telemetry_enabled", True):
+            return
+        if not TELEMETRY_AVAILABLE or TelemetryLogger is None or not callable(resolve_telemetry_out_dir):
+            return
+        try:
+            telemetry_out_dir = resolve_telemetry_out_dir(self.config if isinstance(self.config, dict) else None)
+            self.telemetry_out_dir = telemetry_out_dir
+            reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+            self.telemetry = TelemetryLogger(
+                out_dir=telemetry_out_dir,
+                run_id=self.run_id,
+                fsync=bool(reporting_cfg.get('telemetry_fsync', False)),
+            )
+        except Exception as e:
+            self.telemetry = None
+            print(f"[WARN] Failed to initialize telemetry logger: {e}")
+
+    def _telemetry_log_event(
+        self,
+        event,
+        *,
+        cycle_id=None,
+        stream="events",
+        level="INFO",
+        message=None,
+        payload=None,
+        duration_ms=None,
+        status=None,
+        error=None,
+    ):
+        """Best-effort telemetry event writer; never interrupts trading flow."""
+        logger = getattr(self, "telemetry", None)
+        if logger is None:
+            return
+        try:
+            cid = int(self.current_cycle if cycle_id is None else cycle_id)
+            logger.log_event(
+                str(event or ""),
+                cycle_id=cid,
+                stream=str(stream or "events"),
+                level=str(level or "INFO"),
+                module="paper_trading",
+                message=message,
+                payload=payload if isinstance(payload, dict) else payload,
+                duration_ms=duration_ms,
+                status=status,
+                error=error,
+            )
+        except Exception:
+            return
+
+    def _telemetry_log_metric(self, name, *, cycle_id=None, value=0, tags=None):
+        """Best-effort telemetry metric writer; never interrupts trading flow."""
+        logger = getattr(self, "telemetry", None)
+        if logger is None:
+            return
+        try:
+            cid = int(self.current_cycle if cycle_id is None else cycle_id)
+            logger.log_metric(
+                str(name or ""),
+                cycle_id=cid,
+                value=value,
+                tags=tags if isinstance(tags, dict) else None,
+            )
+        except Exception:
+            return
+
+    def _summarize_news_overlay_for_metrics(self, payload):
+        """Build compact news overlay stats for cycle metrics payload."""
+        info = payload.get('news_overlay_debug', {}) if isinstance(payload, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        chosen = info.get('chosen_cash_delta_source', {}) if isinstance(info.get('chosen_cash_delta_source'), dict) else {}
+        return {
+            'status': str(info.get('status', 'unknown')),
+            'enabled': bool(info.get('enabled', False)),
+            'applied': float(info.get('applied_cash_delta', 0.0) or 0.0),
+            'cash_target_before': float(info.get('cash_target_before', 0.0) or 0.0),
+            'cash_target_after': float(info.get('cash_target_after', 0.0) or 0.0),
+            'inc': int(info.get('included_rows_count', 0) or 0),
+            'exc_conf': int(info.get('excluded_by_confidence_count', 0) or 0),
+            'exc_age': int(info.get('excluded_by_age_count', 0) or 0),
+            'min_conf': float(info.get('min_confidence', 0.0) or 0.0),
+            'alpha': float(info.get('alpha', 0.0) or 0.0),
+            'max_abs_delta': float(info.get('max_abs_delta', 0.0) or 0.0),
+            'src': str(chosen.get('ticker', info.get('worst_ticker', '')) or ''),
+            'l2_bucket': str(chosen.get('l2', info.get('worst_l2', '')) or ''),
+            'delta': float(chosen.get('delta', info.get('worst_delta', 0.0)) or 0.0),
+        }
+
+    def classify_price_freshness(self, row, now_utc):
+        """Classify one price row into LIVE/RECENT/STALE/MISSING with age diagnostics."""
+        now_ts = self._coerce_datetime_utc(now_utc) or self._now()
+        source = "missing"
+        tz_ok = False
+        bar_interval = None
+        age_seconds = None
+
+        if not isinstance(row, dict):
+            return {
+                "freshness": "MISSING",
+                "age_seconds": None,
+                "source": source,
+                "tz_ok": tz_ok,
+                "bar_interval": bar_interval,
+            }
+
+        source = str(row.get("source", "missing") or "missing")
+        tz_ok = bool(row.get("tz_ok", False))
+        bar_interval = row.get("bar_interval")
+
+        has_price = False
+        try:
+            price_val = row.get("price")
+            if price_val is not None:
+                price_num = float(price_val)
+                has_price = bool(np.isfinite(price_num))
+        except Exception:
+            has_price = False
+
+        parsed_ts = self._parse_datetime_utc_safe(row.get("price_ts"))
+        if parsed_ts is None:
+            parsed_ts = self._parse_datetime_utc_safe(row.get("fetched_at"))
+        if parsed_ts is None:
+            fetched_raw = row.get("fetched_at")
+            if isinstance(fetched_raw, datetime):
+                parsed_ts = self._coerce_datetime_utc(fetched_raw)
+
+        if isinstance(parsed_ts, datetime):
+            age_seconds = max(0.0, float((now_ts - parsed_ts).total_seconds()))
+        else:
+            age_min = row.get("age_min")
+            try:
+                if age_min is not None:
+                    age_num = float(age_min)
+                    if np.isfinite(age_num):
+                        age_seconds = max(0.0, age_num * 60.0)
+            except Exception:
+                age_seconds = None
+
+        if not has_price:
+            freshness = "MISSING"
+        elif age_seconds is None:
+            freshness = "STALE"
+        elif age_seconds < 120.0:
+            freshness = "LIVE"
+        elif age_seconds < 900.0:
+            freshness = "RECENT"
+        else:
+            freshness = "STALE"
+
+        return {
+            "freshness": str(freshness),
+            "age_seconds": age_seconds,
+            "source": source,
+            "tz_ok": tz_ok,
+            "bar_interval": str(bar_interval) if bar_interval not in (None, "") else None,
+        }
+
+    def _build_price_diagnostics_summary(self, payload):
+        """Build compact per-cycle price quality summary from cache/debug rows."""
+        now_utc = self._now()
+        freshness_counts = {"LIVE": 0, "RECENT": 0, "STALE": 0, "MISSING": 0}
+        source_counts = Counter()
+        stale_rows = []
+        missing_tickers = []
+        tz_bad_tickers = []
+        tz_ok_false = 0
+        max_age_seconds = None
+        age_samples = []
+
+        tickers = []
+        seen = set()
+        price_debug = {}
+        if isinstance(payload, dict) and isinstance(payload.get("price_debug"), dict):
+            price_debug = dict(payload.get("price_debug", {}))
+        if isinstance(price_debug, dict):
+            for t in price_debug.keys():
+                t_u = str(t).upper().strip()
+                if t_u and t_u != "CASH" and t_u not in seen:
+                    seen.add(t_u)
+                    tickers.append(t_u)
+
+        positions_detail = payload.get("positions_detail", {}) if isinstance(payload, dict) else {}
+        if isinstance(positions_detail, dict):
+            for t in positions_detail.keys():
+                t_u = str(t).upper().strip()
+                if t_u and t_u != "CASH" and t_u not in seen:
+                    seen.add(t_u)
+                    tickers.append(t_u)
+
+        if isinstance(self.positions, dict):
+            for t in self.positions.keys():
+                t_u = str(t).upper().strip()
+                if t_u and t_u != "CASH" and t_u not in seen:
+                    seen.add(t_u)
+                    tickers.append(t_u)
+
+        service = getattr(self, "price_service", None)
+        for ticker in tickers:
+            row = None
+            if service is not None:
+                try:
+                    cached = service.get_cached(ticker, now_utc=now_utc)
+                except Exception:
+                    cached = None
+                if isinstance(cached, dict):
+                    row = dict(cached)
+
+            if not isinstance(row, dict):
+                dbg = price_debug.get(ticker)
+                if isinstance(dbg, dict):
+                    proxy_price = None if str(dbg.get("status", "")).upper() == "MISSING" else 1.0
+                    row = {
+                        "price": proxy_price,
+                        "price_ts": dbg.get("price_ts"),
+                        "fetched_at": dbg.get("fetched_at", now_utc),
+                        "source": dbg.get("source", "missing"),
+                        "bar_interval": dbg.get("bar_interval"),
+                        "tz_ok": dbg.get("tz_ok", False),
+                        "age_min": dbg.get("age_min"),
+                    }
+                else:
+                    row = {"price": None, "source": "missing"}
+
+            diag = self.classify_price_freshness(row, now_utc=now_utc)
+            freshness = str(diag.get("freshness", "MISSING")).upper()
+            if freshness not in freshness_counts:
+                freshness = "MISSING"
+            freshness_counts[freshness] += 1
+            source = str(diag.get("source", "missing") or "missing")
+            source_counts[source] += 1
+
+            age_seconds = diag.get("age_seconds")
+            try:
+                if age_seconds is not None:
+                    age_num = float(age_seconds)
+                    if np.isfinite(age_num):
+                        age_samples.append(float(age_num))
+                        if max_age_seconds is None or age_num > max_age_seconds:
+                            max_age_seconds = age_num
+            except Exception:
+                pass
+
+            if freshness != "MISSING" and not bool(diag.get("tz_ok", False)):
+                tz_ok_false += 1
+                tz_bad_tickers.append(ticker)
+
+            item = {
+                "ticker": ticker,
+                "source": source,
+                "age_seconds": float(age_seconds) if age_seconds is not None else None,
+                "freshness": freshness,
+                "bar_interval": diag.get("bar_interval"),
+                "tz_ok": bool(diag.get("tz_ok", False)),
+            }
+            if freshness == "STALE":
+                stale_rows.append(item)
+            elif freshness == "MISSING":
+                missing_tickers.append(ticker)
+
+        stale_rows.sort(key=lambda x: float(x.get("age_seconds", -1.0) or -1.0), reverse=True)
+        n_tickers = int(len(tickers))
+        stale_ratio = float(freshness_counts.get("STALE", 0) / n_tickers) if n_tickers > 0 else 0.0
+        missing_ratio = float(freshness_counts.get("MISSING", 0) / n_tickers) if n_tickers > 0 else 0.0
+        if missing_ratio >= 0.2 or tz_ok_false >= 1:
+            data_quality_level = "ERROR"
+        elif stale_ratio >= 0.2 or missing_ratio > 0:
+            data_quality_level = "WARN"
+        else:
+            data_quality_level = "OK"
+
+        p50_age_seconds = None
+        p95_age_seconds = None
+        if age_samples:
+            try:
+                arr = np.array(age_samples, dtype=float)
+                p50_age_seconds = float(np.percentile(arr, 50))
+                p95_age_seconds = float(np.percentile(arr, 95))
+            except Exception:
+                p50_age_seconds = None
+                p95_age_seconds = None
+
+        summary = {
+            "status": "ok",
+            "asof_utc": now_utc.isoformat(),
+            "n_tickers": n_tickers,
+            "freshness_counts": {k: int(v) for k, v in freshness_counts.items()},
+            "source_counts": dict(source_counts),
+            "tz_ok_false": int(tz_ok_false),
+            "data_quality_level": str(data_quality_level),
+            "stale_ratio": float(stale_ratio),
+            "missing_ratio": float(missing_ratio),
+            "p50_age_seconds": float(p50_age_seconds) if p50_age_seconds is not None else None,
+            "p95_age_seconds": float(p95_age_seconds) if p95_age_seconds is not None else None,
+            "max_age_seconds": float(max_age_seconds) if max_age_seconds is not None else None,
+            "stale_by_age": stale_rows[:10],
+            "stale_tickers": [str(row.get("ticker", "")) for row in stale_rows[:10] if str(row.get("ticker", "")).strip()],
+            "missing_tickers": [str(t) for t in missing_tickers[:10] if str(t).strip()],
+            "tz_bad_tickers": [str(t) for t in tz_bad_tickers[:10] if str(t).strip()],
+        }
+        return summary
+
+    def _summarize_price_diagnostics_for_metrics(self, payload):
+        """Keep metrics payload compact by only storing price quality aggregates."""
+        info = payload.get("price_diagnostics_summary", {}) if isinstance(payload, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        freshness = info.get("freshness_counts", {})
+        source_counts = info.get("source_counts", {})
+        if not isinstance(freshness, dict):
+            freshness = {}
+        if not isinstance(source_counts, dict):
+            source_counts = {}
+        p95_raw = info.get("p95_age_seconds", None)
+        try:
+            p95_age_seconds = float(p95_raw) if p95_raw is not None else None
+        except Exception:
+            p95_age_seconds = None
+        return {
+            "n_tickers": int(info.get("n_tickers", 0) or 0),
+            "freshness_counts": {
+                "LIVE": int(freshness.get("LIVE", 0) or 0),
+                "RECENT": int(freshness.get("RECENT", 0) or 0),
+                "STALE": int(freshness.get("STALE", 0) or 0),
+                "MISSING": int(freshness.get("MISSING", 0) or 0),
+            },
+            "source_counts": {str(k): int(v or 0) for k, v in source_counts.items()},
+            "data_quality_level": str(info.get("data_quality_level", "OK")),
+            "stale_ratio": float(info.get("stale_ratio", 0.0) or 0.0),
+            "missing_ratio": float(info.get("missing_ratio", 0.0) or 0.0),
+            "p95_age_seconds": p95_age_seconds,
+            "tz_ok_false": int(info.get("tz_ok_false", 0) or 0),
+            "max_age_seconds": float(info.get("max_age_seconds", 0.0) or 0.0),
+        }
+
+    def _emit_cycle_metrics_once(self, payload, *, source="snapshot"):
+        """Emit one CYCLE_METRICS record per cycle into telemetry metrics stream."""
+        if not isinstance(payload, dict):
+            return
+        cycle_raw = payload.get('cycle_id', payload.get('cycle', self.current_cycle))
+        try:
+            cycle_id = int(cycle_raw)
+        except Exception:
+            cycle_id = int(self.current_cycle)
+        if self._last_metrics_cycle_id == cycle_id:
+            return
+        logger = getattr(self, "telemetry", None)
+        if logger is not None:
+            try:
+                metrics_path = str(getattr(logger, "metrics_path", "") or "")
+                if metrics_path and os.path.exists(metrics_path):
+                    with open(metrics_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            text = str(line or "").strip()
+                            if not text:
+                                continue
+                            try:
+                                row = json.loads(text)
+                            except Exception:
+                                continue
+                            if str(row.get('event', '')) != 'CYCLE_METRICS':
+                                continue
+                            if str(row.get('run_id', '')) != str(self.run_id):
+                                continue
+                            try:
+                                row_cycle = int(row.get('cycle_id', -1))
+                            except Exception:
+                                continue
+                            if row_cycle == cycle_id:
+                                self._last_metrics_cycle_id = cycle_id
+                                return
+            except Exception:
+                pass
+
+        total_equity = float(payload.get('total_equity', payload.get('equity', 0.0)) or 0.0)
+        cash = float(payload.get('cash', 0.0) or 0.0)
+        positions_value = float(payload.get('positions_value', max(0.0, total_equity - cash)) or 0.0)
+        n_positions = 0
+        positions_detail = payload.get('positions_detail')
+        if isinstance(positions_detail, dict):
+            n_positions = len([k for k in positions_detail.keys() if str(k).upper() != 'CASH'])
+        elif isinstance(payload.get('positions'), dict):
+            n_positions = len([k for k in payload.get('positions', {}).keys() if str(k).upper() != 'CASH'])
+
+        metrics_payload = {
+            'schema_version': int(payload.get('schema_version', LIVE_SCHEMA_VERSION) or LIVE_SCHEMA_VERSION),
+            'run_id': str(payload.get('run_id', self.run_id)),
+            'session_id': str(payload.get('session_id', self.session_id)),
+            'cycle_id': int(cycle_id),
+            'ts_utc': str(payload.get('timestamp', self._now().isoformat())),
+            'source': str(source),
+            'total_equity': float(total_equity),
+            'cash': float(cash),
+            'cash_pct': float((cash / total_equity) if total_equity > 0 else 0.0),
+            'positions_value': float(positions_value),
+            'total_return': float(payload.get('total_return', 0.0) or 0.0),
+            'drawdown': float(payload.get('drawdown', 0.0) or 0.0),
+            'n_positions': int(n_positions),
+            'macro_risk_score': float(payload.get('macro_risk_score', 0.0) or 0.0),
+            'regime_state': str(payload.get('regime_state', '')),
+            'trend_score': float(payload.get('trend_score', 0.0) or 0.0),
+            'dynamic_min_cash': float(payload.get('dynamic_min_cash', 0.0) or 0.0),
+            'dynamic_max_weight': float(payload.get('dynamic_max_weight', 0.0) or 0.0),
+            'price_fetch_stats': dict(payload.get('price_fetch_stats', {}) if isinstance(payload.get('price_fetch_stats', {}), dict) else {}),
+            'price_diagnostics_summary': self._summarize_price_diagnostics_for_metrics(payload),
+            'news_overlay_stats': self._summarize_news_overlay_for_metrics(payload),
+        }
+        self._telemetry_log_event(
+            "CYCLE_METRICS",
+            cycle_id=cycle_id,
+            stream="metrics",
+            status="ok",
+            payload=metrics_payload,
+        )
+        self._last_metrics_cycle_id = cycle_id
+
     def write_live_snapshot(self, snapshot, source="unknown"):
         """Write UI-friendly live snapshot to outputs/snapshot_live.json."""
         try:
@@ -1828,9 +2298,45 @@ class PaperTradingEngine:
                     holdings_count = len([k for k, v in self.positions.items() if str(k).upper() != 'CASH' and float(v or 0) > 0])
                 if holdings_count > 0:
                     print(f"[WARN] [PRICE_DEBUG_SAVE] holdings={holdings_count} but price_debug is empty")
+            price_diag_summary = self._build_price_diagnostics_summary(payload)
+            if isinstance(price_diag_summary, dict):
+                payload["price_diagnostics_summary"] = dict(price_diag_summary)
+                self.current_price_diagnostics_summary = dict(price_diag_summary)
             self.atomic_write_json(live_snapshot_path, payload)
+            payload_text = json.dumps(payload, ensure_ascii=False, allow_nan=False) if isinstance(payload, dict) else "{}"
+            cycle_id_for_event = int(payload.get('cycle_id', payload.get('cycle', self.current_cycle)) if isinstance(payload, dict) else self.current_cycle)
+            self._telemetry_log_event(
+                "SNAPSHOT_WRITE",
+                cycle_id=cycle_id_for_event,
+                status="ok",
+                payload={
+                    "path": str(live_snapshot_path),
+                    "source": str(source),
+                    "bytes": len(payload_text.encode("utf-8")),
+                },
+            )
+            if isinstance(price_diag_summary, dict):
+                if self._last_price_quality_cycle_id != cycle_id_for_event:
+                    self._telemetry_log_event(
+                        "PRICE_QUALITY",
+                        cycle_id=cycle_id_for_event,
+                        status=str(price_diag_summary.get("status", "ok")),
+                        payload=dict(price_diag_summary),
+                        stream="events",
+                    )
+                    self._last_price_quality_cycle_id = cycle_id_for_event
+            self._emit_cycle_metrics_once(payload, source=str(source))
         except Exception as e:
             print(f"[WARN] Failed to write live snapshot: {e}")
+            self._telemetry_log_event(
+                "SNAPSHOT_WRITE",
+                cycle_id=int(self.current_cycle),
+                level="ERROR",
+                status="error",
+                message="write_live_snapshot_failed",
+                error=e,
+                payload={"source": str(source)},
+            )
 
     def _build_post_rebalance_snapshot(self):
         """Build a lightweight snapshot from current in-memory state without appending history."""
@@ -1885,6 +2391,7 @@ class PaperTradingEngine:
             'rebalance_skipped_reason': self.current_rebalance_skipped_reason,
             'price_debug': dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {},
             'price_fetch_stats': dict(self.current_price_fetch_stats) if isinstance(self.current_price_fetch_stats, dict) else {},
+            'price_diagnostics_summary': dict(self.current_price_diagnostics_summary) if isinstance(self.current_price_diagnostics_summary, dict) else {},
             'last_rebalance_attempt_time': last_attempt_time,
             'last_rebalance_success_time': last_success_time,
             'regime_state': self.current_regime.get('regime_state', 'neutral'),
@@ -4877,11 +5384,40 @@ class PaperTradingEngine:
                 f"src={src_ticker} l2={src_l2} delta={src_delta:+.3f} "
                 f"cap={float(max_abs_delta):.2f}"
             )
+            self._telemetry_log_event(
+                "NEWS_OVERLAY",
+                cycle_id=int(self.current_cycle),
+                status=str(info.get('status', 'ok')),
+                payload={
+                    "enabled": bool(info.get('enabled', False)),
+                    "mode": str(info.get('mode', 'risk_only')),
+                    "inc": int(info.get('included_rows_count', 0) or 0),
+                    "exc_conf": int(info.get('excluded_by_confidence_count', 0) or 0),
+                    "exc_age": int(info.get('excluded_by_age_count', 0) or 0),
+                    "cash_before": float(base_cash),
+                    "cash_after": float(new_cash),
+                    "applied": float(info.get('applied_cash_delta', 0.0) or 0.0),
+                    "src": str(src_ticker),
+                    "l2_bucket": str(src_l2),
+                    "delta": float(src_delta),
+                    "cap": float(max_abs_delta),
+                    "alpha": float(alpha),
+                    "min_confidence": float(min_confidence),
+                },
+            )
             return new_cash, info
         except Exception as e:
             info['status'] = 'error'
             info['error'] = str(e)
             print(f"[NEWS_OVERLAY] WARN apply failed: {e}")
+            self._telemetry_log_event(
+                "NEWS_OVERLAY",
+                cycle_id=int(self.current_cycle),
+                level="ERROR",
+                status="error",
+                error=e,
+                payload={"enabled": bool(info.get('enabled', False)), "mode": str(info.get('mode', 'risk_only'))},
+            )
             return base_cash, info
 
     def calculate_volume_zscore(self, ticker, lookback_days=60):
@@ -6377,6 +6913,31 @@ class PaperTradingEngine:
             'impact': 0.0,
             'num_trades': 0
         }
+        try:
+            rebalance_targets = []
+            for _t, _w in (target_weights or {}).items():
+                _tu = str(_t).upper()
+                if _tu == 'CASH':
+                    continue
+                try:
+                    _wf = float(_w)
+                except Exception:
+                    continue
+                if _wf > 0:
+                    rebalance_targets.append((_tu, _wf))
+            rebalance_targets.sort(key=lambda x: x[1], reverse=True)
+            self._telemetry_log_event(
+                "REBALANCE_PLAN",
+                cycle_id=int(self.current_cycle),
+                status="start",
+                payload={
+                    "cash_target": float(target_weights.get('CASH', 0.0) if isinstance(target_weights, dict) else 0.0),
+                    "n_targets": int(len(rebalance_targets)),
+                    "top_targets": [{"ticker": t, "weight": float(w)} for t, w in rebalance_targets[:5]],
+                },
+            )
+        except Exception:
+            pass
 
         now_rebalance = self._now()
         session, gate = self._refresh_market_session_state(now_rebalance)
@@ -6421,6 +6982,17 @@ class PaperTradingEngine:
             self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
             gate_detail = str((gate or {}).get('reason_detail', 'unknown'))
             print(f"[GATE] Rebalance skipped: market_closed_gate (session={session_state}, detail={gate_detail})")
+            self._telemetry_log_event(
+                "PRICE_FETCH",
+                cycle_id=int(self.current_cycle),
+                status="skipped",
+                payload={
+                    "status": "skipped",
+                    "reason": "market_closed_gate",
+                    "session_state": str(session_state),
+                    "gate_detail": str(gate_detail),
+                },
+            )
             self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_market_closed_gate")
             return []
 
@@ -6496,9 +7068,35 @@ class PaperTradingEngine:
                         f"missing={len(stats.get('missing', [])) if isinstance(stats.get('missing', []), list) else 0} "
                         f"ms={int(stats.get('elapsed_ms', 0))}"
                     )
+                self._telemetry_log_event(
+                    "PRICE_FETCH",
+                    cycle_id=int(self.current_cycle),
+                    status=str(self.current_price_fetch_stats.get('status', 'ok') if isinstance(self.current_price_fetch_stats, dict) else 'ok'),
+                    payload=dict(self.current_price_fetch_stats) if isinstance(self.current_price_fetch_stats, dict) else {},
+                )
             except Exception as e:
                 self.current_price_fetch_stats = {"status": "error", "error": str(e)}
                 print(f"[WARN] Price prefetch failed: {e}")
+                self._telemetry_log_event(
+                    "PRICE_FETCH",
+                    cycle_id=int(self.current_cycle),
+                    level="ERROR",
+                    status="error",
+                    error=e,
+                    payload={"status": "error"},
+                )
+        else:
+            self.current_price_fetch_stats = {
+                "status": "skipped",
+                "reason": "no_tickers_or_no_price_service",
+                "tickers_in": int(len(prefetch_tickers)),
+            }
+            self._telemetry_log_event(
+                "PRICE_FETCH",
+                cycle_id=int(self.current_cycle),
+                status="skipped",
+                payload=dict(self.current_price_fetch_stats),
+            )
         
         price_info = {}  # {ticker: (price, data_age_minutes, market_status)}
         price_debug_cache = {}
@@ -7067,6 +7665,42 @@ class PaperTradingEngine:
             'turnover_scale': turnover_scale,
             'turnover_capped': turnover_capped
         }
+        try:
+            target_items = []
+            for _t, _w in (target_weights or {}).items():
+                _tu = str(_t).upper()
+                if _tu == 'CASH':
+                    continue
+                try:
+                    _wf = float(_w)
+                except Exception:
+                    continue
+                if _wf > 0:
+                    target_items.append((_tu, _wf))
+            target_items.sort(key=lambda x: x[1], reverse=True)
+            top_targets = [{"ticker": t, "weight": float(w)} for t, w in target_items[:5]]
+            self._telemetry_log_event(
+                "REBALANCE_PLAN",
+                cycle_id=int(self.current_cycle),
+                status="ok",
+                payload={
+                    "cash_target": float(target_weights.get('CASH', 0.0) if isinstance(target_weights, dict) else 0.0),
+                    "n_targets": int(len(target_items)),
+                    "top_targets": top_targets,
+                    "n_trades": int(len(planned_trades)),
+                    "est_turnover": float((turnover_notional_pre / total_equity) if total_equity > 0 else 0.0),
+                    "total_abs_delta": float(turnover_notional_pre),
+                    "constraints": {
+                        "min_notional": float(min_notional),
+                        "turnover_limit": float(turnover_limit),
+                        "turnover_capped": bool(turnover_capped),
+                        "risk_gate_abort": bool(self.current_risk_check_info.get('abort', False) if isinstance(self.current_risk_check_info, dict) else False),
+                        "holding_blocks": int(len(self.current_holding_blocks)),
+                    },
+                },
+            )
+        except Exception:
+            pass
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         trades = []
@@ -7842,6 +8476,8 @@ class PaperTradingEngine:
             'rebalance_gate': dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {},
             'rebalance_skipped_reason': self.current_rebalance_skipped_reason,
             'price_debug': dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {},
+            'price_fetch_stats': dict(self.current_price_fetch_stats) if isinstance(self.current_price_fetch_stats, dict) else {},
+            'price_diagnostics_summary': dict(self.current_price_diagnostics_summary) if isinstance(self.current_price_diagnostics_summary, dict) else {},
             'last_rebalance_attempt_time': last_attempt_time,
             'last_rebalance_success_time': last_success_time,
             # NOTE: comment omitted (was garbled/non-ASCII).
