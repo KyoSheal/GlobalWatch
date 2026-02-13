@@ -993,6 +993,18 @@ def generate_daily_report(
     conviction = _build_conviction_section(report_date, positions_end, trades, history)
 
     generated_at = datetime.now(_coerce_zone(tz)).isoformat()
+    price_fetch_stats = snapshot.get("price_fetch_stats", {})
+    if not isinstance(price_fetch_stats, dict):
+        price_fetch_stats = {}
+    pf_batch_calls = int(_as_float(price_fetch_stats.get("batch_calls"), 0.0))
+    pf_hit = int(_as_float(price_fetch_stats.get("cache_hits"), 0.0))
+    pf_miss = int(_as_float(price_fetch_stats.get("cache_misses"), 0.0))
+    pf_ms = int(_as_float(price_fetch_stats.get("elapsed_ms"), 0.0))
+    price_fetch_summary = (
+        f"PRICE_FETCH: batch_calls={pf_batch_calls}, hit={pf_hit}, miss={pf_miss}, ms={pf_ms}"
+        if price_fetch_stats
+        else None
+    )
     report = {
         "date": date_str,
         "generated_at_local": generated_at,
@@ -1021,6 +1033,8 @@ def generate_daily_report(
             "account_id": snapshot_account_id or None,
             "session_id": snapshot_session_id or None,
             "env": snapshot_env or "live",
+            "price_fetch_stats": price_fetch_stats,
+            "price_fetch_summary": price_fetch_summary,
         },
     }
     return report

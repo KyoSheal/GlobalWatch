@@ -22,6 +22,7 @@ from atomic_io import (
     atomic_write_jsonl as io_atomic_write_jsonl,
     atomic_write_text as io_atomic_write_text,
 )
+from price_service import PriceService
 
 try:
     from zoneinfo import ZoneInfo
@@ -923,9 +924,18 @@ class PaperTradingEngine:
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.price_cache = {}  # {ticker: (price, timestamp)}
         self.price_cache_duration = 60  # NOTE: comment omitted (was garbled/non-ASCII).
+        self.current_price_fetch_stats = {}
 
         # Signal/Macro refresh decoupling state
         execution_config = self.config.get('execution', {})
+        price_ttl_seconds = execution_config.get('price_ttl_seconds', 45)
+        self.price_batch_chunk_size = max(1, int(execution_config.get('price_batch_chunk_size', 50) or 50))
+        self.price_batch_allow_1m_fallback = bool(execution_config.get('price_batch_allow_1m_fallback', True))
+        self.price_service = PriceService(
+            get_yfinance_module=self._get_yfinance_module,
+            symbol_mapper=self._normalize_market_ticker,
+            ttl_seconds=price_ttl_seconds,
+        )
         self.signal_refresh_minutes = execution_config.get('signal_refresh_minutes', 1440)
         self.macro_refresh_minutes = execution_config.get('macro_refresh_minutes', 60)
         self.min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
@@ -1023,6 +1033,9 @@ class PaperTradingEngine:
         execution_config.setdefault('enable_diversity_check', True)
         execution_config.setdefault('max_herfindahl_index', 0.35)
         execution_config.setdefault('portfolio_vol_min_coverage', 0.70)
+        execution_config.setdefault('price_ttl_seconds', 45)
+        execution_config.setdefault('price_batch_chunk_size', 50)
+        execution_config.setdefault('price_batch_allow_1m_fallback', True)
         execution_config.setdefault('max_weight_boost_for_hot', 0.05)
         execution_config.setdefault('hot_zscore_threshold', 1.5)
         execution_config.setdefault('hot_momentum_top_k', 3)
@@ -1699,6 +1712,10 @@ class PaperTradingEngine:
             'rebalance_gate': snapshot.get('rebalance_gate', dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {}),
             'rebalance_skipped_reason': snapshot.get('rebalance_skipped_reason', self.current_rebalance_skipped_reason),
             'price_debug': snapshot.get('price_debug', dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {}),
+            'price_fetch_stats': snapshot.get(
+                'price_fetch_stats',
+                dict(self.current_price_fetch_stats) if isinstance(self.current_price_fetch_stats, dict) else {}
+            ),
             'last_rebalance_attempt_time': snapshot.get('last_rebalance_attempt_time', last_attempt_time),
             'last_rebalance_success_time': snapshot.get('last_rebalance_success_time', last_success_time),
             'stale_count': snapshot.get('stale_count', self.current_stale_info.get('stale_count', 0)),
@@ -1836,6 +1853,7 @@ class PaperTradingEngine:
             'rebalance_gate': dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {},
             'rebalance_skipped_reason': self.current_rebalance_skipped_reason,
             'price_debug': dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {},
+            'price_fetch_stats': dict(self.current_price_fetch_stats) if isinstance(self.current_price_fetch_stats, dict) else {},
             'last_rebalance_attempt_time': last_attempt_time,
             'last_rebalance_success_time': last_success_time,
             'regime_state': self.current_regime.get('regime_state', 'neutral'),
@@ -2521,6 +2539,43 @@ class PaperTradingEngine:
                 return "RECENT"
             return "STALE"
 
+        def _cache_quote(
+            price,
+            *,
+            source,
+            bar_interval,
+            price_ts,
+            tz_ok,
+            notes=None,
+            raw_price_ts=None,
+            raw_tz=None,
+        ):
+            service = getattr(self, "price_service", None)
+            if service is None:
+                return
+            try:
+                if price is None:
+                    return
+                price_f = float(price)
+                if not np.isfinite(price_f):
+                    return
+                service.update_cache(
+                    ticker,
+                    {
+                        "price": price_f,
+                        "price_ts": price_ts if isinstance(price_ts, datetime) else None,
+                        "fetched_at": now_utc,
+                        "source": str(source),
+                        "bar_interval": bar_interval,
+                        "tz_ok": bool(tz_ok),
+                        "notes": str(notes or ""),
+                        "raw_price_ts": raw_price_ts,
+                        "raw_tz": raw_tz,
+                    },
+                )
+            except Exception:
+                return
+
         if ticker == 'CASH':
             return _emit_result(
                 1.0,
@@ -2577,6 +2632,39 @@ class PaperTradingEngine:
                         )
                     print(f"[WARN] Injected price_fetcher returned invalid payload for {ticker}; falling back")
 
+            service = getattr(self, "price_service", None)
+            if service is not None:
+                cached_row = service.get_cached(ticker, now_utc=now_utc)
+                if isinstance(cached_row, dict):
+                    cached_price = cached_row.get("price")
+                    try:
+                        cached_price_f = float(cached_price) if cached_price is not None else None
+                    except Exception:
+                        cached_price_f = None
+                    if cached_price_f is not None and np.isfinite(cached_price_f):
+                        cached_price_ts = cached_row.get("price_ts")
+                        cached_age = (now_utc - now_utc).total_seconds() / 60.0
+                        if isinstance(cached_row.get("fetched_at"), datetime):
+                            cached_age = max(
+                                0.0,
+                                (now_utc - cached_row["fetched_at"]).total_seconds() / 60.0,
+                            )
+                        cached_thresholds = {"live_max_min": 10.0, "recent_max_min": 60.0}
+                        cached_status = _classify_status(cached_age, cached_thresholds)
+                        return _emit_result(
+                            cached_price_f,
+                            cached_age,
+                            cached_status,
+                            source=cached_row.get("source", "cache"),
+                            price_ts=cached_price_ts if isinstance(cached_price_ts, datetime) else None,
+                            tz_ok=bool(cached_row.get("tz_ok", False)),
+                            thresholds=cached_thresholds,
+                            notes=cached_row.get("notes"),
+                            bar_interval=cached_row.get("bar_interval"),
+                            raw_price_ts=cached_row.get("raw_price_ts"),
+                            raw_tz=cached_row.get("raw_tz"),
+                        )
+
             now_et = now_utc.astimezone(pytz.timezone('US/Eastern'))
 
             yf_mod = self._get_yfinance_module()
@@ -2614,6 +2702,17 @@ class PaperTradingEngine:
                     market_status = _classify_status(age_min, thresholds)
                     ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M ET') if isinstance(ts_obj, datetime) else "N/A"
                     print(f"[PRICE] {ticker}: ${price:.2f} (5m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
+                    notes_joined = ';'.join(note_items) if note_items else None
+                    _cache_quote(
+                        price,
+                        source="yfinance_history_5m",
+                        bar_interval="5m",
+                        price_ts=ts_obj,
+                        tz_ok=tz_ok,
+                        notes=notes_joined,
+                        raw_price_ts=raw_ts_str,
+                        raw_tz=raw_tz,
+                    )
                     return _emit_result(
                         price,
                         age_min,
@@ -2622,7 +2721,7 @@ class PaperTradingEngine:
                         price_ts=ts_obj,
                         tz_ok=tz_ok,
                         thresholds=thresholds,
-                        notes=';'.join(note_items) if note_items else None,
+                        notes=notes_joined,
                         bar_interval="5m",
                         raw_price_ts=raw_ts_str,
                         raw_tz=raw_tz,
@@ -2646,6 +2745,17 @@ class PaperTradingEngine:
                     market_status = _classify_status(age_min, thresholds)
                     ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M ET') if isinstance(ts_obj, datetime) else "N/A"
                     print(f"[PRICE] {ticker}: ${price:.2f} (1m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
+                    notes_joined = ';'.join(note_items) if note_items else None
+                    _cache_quote(
+                        price,
+                        source="yfinance_history_1m",
+                        bar_interval="1m",
+                        price_ts=ts_obj,
+                        tz_ok=tz_ok,
+                        notes=notes_joined,
+                        raw_price_ts=raw_ts_str,
+                        raw_tz=raw_tz,
+                    )
                     return _emit_result(
                         price,
                         age_min,
@@ -2654,7 +2764,7 @@ class PaperTradingEngine:
                         price_ts=ts_obj,
                         tz_ok=tz_ok,
                         thresholds=thresholds,
-                        notes=';'.join(note_items) if note_items else None,
+                        notes=notes_joined,
                         bar_interval="1m",
                         raw_price_ts=raw_ts_str,
                         raw_tz=raw_tz,
@@ -2671,6 +2781,16 @@ class PaperTradingEngine:
                         price = float(info[price_field])
                         if price > 0:
                             print(f"[PRICE] {ticker}: ${price:.2f} (from info.{price_field}) STALE (no timestamp)")
+                            _cache_quote(
+                                price,
+                                source="yfinance_info",
+                                bar_interval=None,
+                                price_ts=None,
+                                tz_ok=False,
+                                notes=f"price_field={price_field};no_price_timestamp",
+                                raw_price_ts=None,
+                                raw_tz=None,
+                            )
                             return _emit_result(
                                 price,
                                 99999.0,
@@ -2701,6 +2821,17 @@ class PaperTradingEngine:
                         age_min = 99999.0
                     ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d') if isinstance(ts_obj, datetime) else "N/A"
                     print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {ts_label}, {age_min:.0f}min ago) STALE")
+                    notes_joined = ';'.join(note_items) if note_items else None
+                    _cache_quote(
+                        price,
+                        source="cached_last_close",
+                        bar_interval="1d",
+                        price_ts=ts_obj,
+                        tz_ok=tz_ok,
+                        notes=notes_joined,
+                        raw_price_ts=raw_ts_str,
+                        raw_tz=raw_tz,
+                    )
                     return _emit_result(
                         price,
                         age_min,
@@ -2709,7 +2840,7 @@ class PaperTradingEngine:
                         price_ts=ts_obj,
                         tz_ok=tz_ok,
                         thresholds=default_thresholds,
-                        notes=';'.join(note_items) if note_items else None,
+                        notes=notes_joined,
                         bar_interval="1d",
                         raw_price_ts=raw_ts_str,
                         raw_tz=raw_tz,
@@ -2848,6 +2979,37 @@ class PaperTradingEngine:
             cap = max(1, int(cap_raw))
         except Exception:
             cap = 50
+
+        service = getattr(self, "price_service", None)
+        if service is not None:
+            prefetch_tickers = set()
+            for ticker in self.positions.keys():
+                ticker_u = str(ticker).upper().strip()
+                if ticker_u and ticker_u != 'CASH':
+                    prefetch_tickers.add(ticker_u)
+            if isinstance(candidate_tickers, (list, tuple, set)):
+                for ticker in candidate_tickers:
+                    ticker_u = str(ticker).upper().strip()
+                    if ticker_u and ticker_u != 'CASH':
+                        prefetch_tickers.add(ticker_u)
+            if isinstance(planned_trades, list):
+                for trade in planned_trades:
+                    if not isinstance(trade, dict):
+                        continue
+                    ticker_u = str(trade.get('ticker', '')).upper().strip()
+                    if ticker_u and ticker_u != 'CASH':
+                        prefetch_tickers.add(ticker_u)
+            if prefetch_tickers:
+                try:
+                    self.price_service.prefetch(
+                        prefetch_tickers,
+                        interval="5m",
+                        period="1d",
+                        max_chunk=getattr(self, "price_batch_chunk_size", 50),
+                        allow_1m_fallback=bool(getattr(self, "price_batch_allow_1m_fallback", True)),
+                    )
+                except Exception:
+                    pass
 
         price_debug = self._collect_price_debug(
             relevant_tickers=candidate_tickers,
@@ -6266,6 +6428,41 @@ class PaperTradingEngine:
         stale_policy_cfg = execution_config.get('price_stale_policy', {})
         allow_buy_status = {s.upper() for s in stale_policy_cfg.get('allow_buy', ['LIVE', 'RECENT'])}
         allow_sell_status = {s.upper() for s in stale_policy_cfg.get('allow_sell', ['LIVE', 'RECENT', 'STALE'])}
+        self.current_price_fetch_stats = {}
+
+        prefetch_tickers = set()
+        for ticker in self.positions.keys():
+            ticker_u = str(ticker).upper().strip()
+            if ticker_u and ticker_u != 'CASH':
+                prefetch_tickers.add(ticker_u)
+        for ticker in target_weights.keys():
+            ticker_u = str(ticker).upper().strip()
+            if ticker_u and ticker_u != 'CASH':
+                prefetch_tickers.add(ticker_u)
+        if getattr(self, "price_service", None) is not None and prefetch_tickers:
+            try:
+                stats = self.price_service.prefetch(
+                    prefetch_tickers,
+                    interval="5m",
+                    period="1d",
+                    max_chunk=getattr(self, "price_batch_chunk_size", 50),
+                    allow_1m_fallback=bool(getattr(self, "price_batch_allow_1m_fallback", True)),
+                )
+                self.current_price_fetch_stats = dict(stats) if isinstance(stats, dict) else {}
+                if isinstance(stats, dict):
+                    print(
+                        "[PRICE_FETCH] "
+                        f"n={int(stats.get('tickers_in', len(prefetch_tickers)))} "
+                        f"batch_calls={int(stats.get('batch_calls', 0))} "
+                        f"hit={int(stats.get('cache_hits', 0))} "
+                        f"miss={int(stats.get('cache_misses', 0))} "
+                        f"fetched={int(stats.get('tickers_fetched', 0))} "
+                        f"missing={len(stats.get('missing', [])) if isinstance(stats.get('missing', []), list) else 0} "
+                        f"ms={int(stats.get('elapsed_ms', 0))}"
+                    )
+            except Exception as e:
+                self.current_price_fetch_stats = {"status": "error", "error": str(e)}
+                print(f"[WARN] Price prefetch failed: {e}")
         
         price_info = {}  # {ticker: (price, data_age_minutes, market_status)}
         price_debug_cache = {}
