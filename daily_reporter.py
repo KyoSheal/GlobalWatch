@@ -10,7 +10,7 @@ import sys
 import tempfile
 import argparse
 from datetime import date as date_cls
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from atomic_io import safe_read_json as io_safe_read_json
 
@@ -25,6 +25,7 @@ MARKET_TZ = "America/New_York"
 DEFAULT_MAIN_REPORT_DIR = os.path.join("outputs", "Daily Report")
 DEFAULT_MIRROR_REPORT_DIR = r"C:\Users\kyosh\Desktop\Project\News\outputs\Daily Report"
 INDEX_FILENAME = "daily_reports_index.json"
+REPORT_SCHEMA_VERSION = 1
 
 
 def _norm_text(value: Any) -> str:
@@ -141,6 +142,21 @@ def _safe_read_json(path: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return None
+
+
+def _ensure_report_meta_fields(report: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """Ensure report metadata fields exist; return (patched_report, changed)."""
+    if not isinstance(report, dict):
+        return {}, False
+    patched = dict(report)
+    changed = False
+    if "report_schema_version" not in patched:
+        patched["report_schema_version"] = int(REPORT_SCHEMA_VERSION)
+        changed = True
+    if not str(patched.get("generated_at") or "").strip():
+        patched["generated_at"] = datetime.now(timezone.utc).isoformat()
+        changed = True
+    return patched, changed
 
 
 def _normalize_report_dirs(report_dirs: Optional[List[str]]) -> List[str]:
@@ -956,13 +972,24 @@ def generate_daily_report(
     existing, existing_path = _find_existing_report(date_str, normalized_dirs)
     if existing is not None:
         if _is_existing_report_usable(existing):
-            existing["_already_exists"] = True
-            existing["_existing_path"] = existing_path
-            return existing
+            existing_patched, existing_changed = _ensure_report_meta_fields(existing)
+            if existing_changed and existing_path:
+                try:
+                    _atomic_write_json(existing_path, existing_patched)
+                except Exception:
+                    pass
+            existing_patched["_already_exists"] = True
+            existing_patched["_existing_path"] = existing_path
+            return existing_patched
 
     snapshot = _safe_read_json(snapshot_path) or {}
     snapshot_account_id = _norm_text(snapshot.get("account_id")) or "paper_main"
     snapshot_session_id = _norm_text(snapshot.get("session_id"))
+    snapshot_run_id = _norm_text(snapshot.get("run_id")) or snapshot_session_id
+    snapshot_schema_version = snapshot.get("schema_version")
+    snapshot_cycle_id = snapshot.get("cycle_id")
+    if snapshot_cycle_id in (None, ""):
+        snapshot_cycle_id = snapshot.get("cycle")
     snapshot_env = _norm_text(snapshot.get("env")).lower()
     snapshot_cycle = int(_as_float(snapshot.get("cycle"), 0.0))
     allowed_envs = ["live"]
@@ -1008,6 +1035,9 @@ def generate_daily_report(
     report = {
         "date": date_str,
         "generated_at_local": generated_at,
+        "run_id": snapshot_run_id or None,
+        "schema_version": snapshot_schema_version,
+        "cycle_id": snapshot_cycle_id,
         "market_close": {
             "closed": True,
             "reason": {
@@ -1037,6 +1067,7 @@ def generate_daily_report(
             "price_fetch_summary": price_fetch_summary,
         },
     }
+    report, _ = _ensure_report_meta_fields(report)
     return report
 
 
@@ -1044,6 +1075,7 @@ def write_daily_report(report_dict: Dict[str, Any], report_dirs: List[str]) -> L
     """Write report into all target directories atomically and refresh index."""
     if not isinstance(report_dict, dict):
         return []
+    report_dict, _ = _ensure_report_meta_fields(report_dict)
     date_str = str(report_dict.get("date", "")).strip()
     if not date_str:
         return []

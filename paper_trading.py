@@ -91,6 +91,8 @@ for keyword in REAL_BROKER_KEYWORDS:
     except ImportError:
         pass  # Good, no real broker library
 
+LIVE_SCHEMA_VERSION = 2
+
 
 class MacroSignalAdapter:
     """class MacroSignalAdapter: docstring omitted (was garbled/non-ASCII)."""
@@ -819,6 +821,11 @@ class PaperTradingEngine:
             self.session_id = configured_session_id
         else:
             self.session_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        reporting_run_id = str(reporting_cfg.get('run_id', '') or '').strip()
+        env_run_id = str(os.environ.get('GW_RUN_ID', '') or '').strip()
+        self.run_id = env_run_id or reporting_run_id or self.session_id
+        self.schema_version = int(LIVE_SCHEMA_VERSION)
+        self.run_started_at = self._now().isoformat()
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.cash = self.config['initial_cash_usd']
@@ -976,6 +983,8 @@ class PaperTradingEngine:
         print(f"   Duration: {self.config['duration_hours']} hours")
         print(f"   Rebalance Interval: {self.config['rebalance_minutes']} minutes")
         print(f"   Universe: {len(self.config['universe'])} assets")
+        print(f"   Schema Version: v{self.schema_version}")
+        print(f"   Run ID: {self.run_id}")
         print(f"   CWD: {os.getcwd()}")
         print(f"   Live Snapshot Path: {self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')}")
         print(f"   Trade History Path: {self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')}")
@@ -1233,10 +1242,24 @@ class PaperTradingEngine:
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             last_snapshot = self.portfolio_snapshots[-1]
+            resumed_session_id = str(last_snapshot.get('session_id', self.session_id) or self.session_id)
+            resumed_run_id = str(
+                last_snapshot.get('run_id', '') or
+                last_snapshot.get('session_id', '') or
+                self.run_id
+            )
+            self.session_id = resumed_session_id
+            self.run_id = resumed_run_id
+            self.schema_version = int(LIVE_SCHEMA_VERSION)
+            self.run_started_at = str(last_snapshot.get('run_started_at', self.run_started_at) or self.run_started_at)
             
             self.cash = last_snapshot['cash']
             self.current_cycle = last_snapshot['cycle'] + 1  # NOTE: comment omitted (was garbled/non-ASCII).
             self.status = "RESUMED"
+            print(
+                f"[CHECKPOINT] resume run_id={self.run_id} "
+                f"session_id={self.session_id} next_cycle={self.current_cycle}"
+            )
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             self.positions = {}
@@ -1676,11 +1699,15 @@ class PaperTradingEngine:
 
         payload = {
             'timestamp': snapshot.get('timestamp', self._now().isoformat()),
+            'schema_version': int(LIVE_SCHEMA_VERSION),
             'account_id': self.account_id,
+            'run_id': snapshot.get('run_id', self.run_id),
+            'run_started_at': snapshot.get('run_started_at', self.run_started_at),
             'session_id': self.session_id,
             'config_hash': snapshot.get('config_hash', self.config_hash),
             'env': self.runtime_env,
             'cycle': int(snapshot.get('cycle', self.current_cycle)),
+            'cycle_id': int(snapshot.get('cycle_id', snapshot.get('cycle', self.current_cycle))),
             'status': snapshot.get('status', self.status),
             'total_equity': total_equity,
             'cash': cash,
@@ -1833,11 +1860,15 @@ class PaperTradingEngine:
 
         snapshot = {
             'timestamp': self._now().isoformat(),
+            'schema_version': int(LIVE_SCHEMA_VERSION),
             'account_id': self.account_id,
+            'run_id': self.run_id,
+            'run_started_at': self.run_started_at,
             'session_id': self.session_id,
             'env': self.runtime_env,
             'config_hash': self.config_hash,
             'cycle': self.current_cycle,
+            'cycle_id': int(self.current_cycle),
             'cash': float(self.cash),
             'positions_value': float(positions_value),
             'total_equity': float(total_equity),
@@ -2189,10 +2220,15 @@ class PaperTradingEngine:
             for trade in self.trades_log:
                 trade_clean = _sanitize(trade)
                 if isinstance(trade_clean, dict):
+                    trade_clean.setdefault('schema_version', int(LIVE_SCHEMA_VERSION))
                     trade_clean.setdefault('account_id', self.account_id)
-                    trade_clean.setdefault('session_id', self.session_id)
+                    trade_clean.setdefault('run_id', self.run_id)
+                    if not trade_clean.get('session_id'):
+                        trade_clean['session_id'] = self.session_id
                     trade_clean.setdefault('env', self.runtime_env)
                     trade_clean.setdefault('config_hash', self.config_hash)
+                    trade_clean.setdefault('cycle', int(self.current_cycle))
+                    trade_clean.setdefault('cycle_id', int(trade_clean.get('cycle', self.current_cycle)))
                 trade_rows.append(trade_clean)
             self.atomic_write_jsonl(trade_history_path, trade_rows)
         except Exception as e:
@@ -7097,11 +7133,14 @@ class PaperTradingEngine:
             # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
                 'timestamp': self._now().isoformat(),
+                'schema_version': int(LIVE_SCHEMA_VERSION),
                 'account_id': self.account_id,
+                'run_id': self.run_id,
                 'session_id': self.session_id,
                 'config_hash': self.config_hash,
                 'env': self.runtime_env,
                 'cycle': self.current_cycle,
+                'cycle_id': int(self.current_cycle),
                 'ticker': ticker,
                 'side': 'SELL',
                 'quantity': sell_qty,
@@ -7220,11 +7259,14 @@ class PaperTradingEngine:
             # NOTE: comment omitted (was garbled/non-ASCII).
             trades.append({
                 'timestamp': self._now().isoformat(),
+                'schema_version': int(LIVE_SCHEMA_VERSION),
                 'account_id': self.account_id,
+                'run_id': self.run_id,
                 'session_id': self.session_id,
                 'config_hash': self.config_hash,
                 'env': self.runtime_env,
                 'cycle': self.current_cycle,
+                'cycle_id': int(self.current_cycle),
                 'ticker': ticker,
                 'side': 'BUY',
                 'quantity': buy_qty,
@@ -7605,10 +7647,14 @@ class PaperTradingEngine:
 
             trades.append({
                 'timestamp': now.isoformat(),
+                'schema_version': int(LIVE_SCHEMA_VERSION),
                 'account_id': self.account_id,
+                'run_id': self.run_id,
                 'session_id': self.session_id,
                 'config_hash': self.config_hash,
                 'env': self.runtime_env,
+                'cycle': self.current_cycle,
+                'cycle_id': int(self.current_cycle),
                 'ticker': h['ticker'],
                 'side': 'SELL',
                 'quantity': sell_qty,
@@ -7772,11 +7818,15 @@ class PaperTradingEngine:
         
         snapshot = {
             'timestamp': self._now().isoformat(),
+            'schema_version': int(LIVE_SCHEMA_VERSION),
             'account_id': self.account_id,
+            'run_id': self.run_id,
+            'run_started_at': self.run_started_at,
             'session_id': self.session_id,
             'env': self.runtime_env,
             'config_hash': self.config_hash,
             'cycle': self.current_cycle,
+            'cycle_id': int(self.current_cycle),
             'cash': self.cash,
             'positions_value': positions_value,
             'total_equity': total_equity,

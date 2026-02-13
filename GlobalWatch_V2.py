@@ -6659,7 +6659,12 @@ def render_portfolio_monitor():
         def _cached_snapshot(snapshot_file, nonce, mtime_ns_key, size_key):
             return _safe_read_json(snapshot_file)
 
-        return _cached_snapshot(path, int(refresh_nonce), int(mtime_ns), int(file_size))
+        try:
+            return _cached_snapshot(path, int(refresh_nonce), int(mtime_ns), int(file_size))
+        except KeyError:
+            return _safe_read_json(path)
+        except Exception:
+            return _safe_read_json(path)
 
     def load_summary(path, interval_seconds, refresh_nonce):
         ttl_seconds = 1
@@ -6675,7 +6680,12 @@ def render_portfolio_monitor():
         def _cached_summary(summary_file, nonce, mtime_ns_key, size_key):
             return _safe_read_text(summary_file)
 
-        return _cached_summary(path, int(refresh_nonce), int(mtime_ns), int(file_size))
+        try:
+            return _cached_summary(path, int(refresh_nonce), int(mtime_ns), int(file_size))
+        except KeyError:
+            return _safe_read_text(path)
+        except Exception:
+            return _safe_read_text(path)
 
     def load_trade_history(path, interval_seconds, refresh_nonce):
         ttl_seconds = 1
@@ -6691,7 +6701,12 @@ def render_portfolio_monitor():
         def _cached_trades(trades_file, nonce, mtime_ns_key, size_key):
             return _safe_read_jsonl(trades_file)
 
-        return _cached_trades(path, int(refresh_nonce), int(mtime_ns), int(file_size))
+        try:
+            return _cached_trades(path, int(refresh_nonce), int(mtime_ns), int(file_size))
+        except KeyError:
+            return _safe_read_jsonl(path)
+        except Exception:
+            return _safe_read_jsonl(path)
 
     def load_daily_reports_index(path, interval_seconds, refresh_nonce):
         ttl_seconds = max(1, int(interval_seconds))
@@ -6706,7 +6721,24 @@ def render_portfolio_monitor():
             reports_clean.sort(key=lambda x: str(x.get("date", "")), reverse=True)
             return {"reports": reports_clean}
 
-        return _cached_index(path, int(refresh_nonce))
+        try:
+            return _cached_index(path, int(refresh_nonce))
+        except KeyError:
+            payload = _safe_read_json(path)
+            reports = payload.get("reports", []) if isinstance(payload, dict) else []
+            if not isinstance(reports, list):
+                reports = []
+            reports_clean = [r for r in reports if isinstance(r, dict)]
+            reports_clean.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+            return {"reports": reports_clean}
+        except Exception:
+            payload = _safe_read_json(path)
+            reports = payload.get("reports", []) if isinstance(payload, dict) else []
+            if not isinstance(reports, list):
+                reports = []
+            reports_clean = [r for r in reports if isinstance(r, dict)]
+            reports_clean.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+            return {"reports": reports_clean}
 
     def load_daily_reports_by_paths(paths, interval_seconds, refresh_nonce):
         ttl_seconds = max(1, int(interval_seconds))
@@ -6731,7 +6763,28 @@ def render_portfolio_monitor():
             reports.sort(key=lambda x: str(x.get("date", "")))
             return reports
 
-        return _cached_reports(path_payload, int(refresh_nonce))
+        try:
+            return _cached_reports(path_payload, int(refresh_nonce))
+        except KeyError:
+            reports = []
+            for p in list(paths or []):
+                if not isinstance(p, str) or not p.strip():
+                    continue
+                payload = _safe_read_json(p)
+                if isinstance(payload, dict) and payload.get("date"):
+                    reports.append(payload)
+            reports.sort(key=lambda x: str(x.get("date", "")))
+            return reports
+        except Exception:
+            reports = []
+            for p in list(paths or []):
+                if not isinstance(p, str) or not p.strip():
+                    continue
+                payload = _safe_read_json(p)
+                if isinstance(payload, dict) and payload.get("date"):
+                    reports.append(payload)
+            reports.sort(key=lambda x: str(x.get("date", "")))
+            return reports
 
     def _render_data_panel():
         interval_seconds = int(st.session_state.get("pm_auto_refresh_interval", 60))
@@ -6762,6 +6815,16 @@ def render_portfolio_monitor():
             positions_value = _to_float(snapshot.get("positions_value", max(0.0, total_equity - cash)))
             drawdown = _to_float(snapshot.get("drawdown", 0.0))
 
+            run_id_raw = snapshot.get("run_id") or snapshot.get("session_id")
+            run_id_text = str(run_id_raw).strip() if run_id_raw is not None else ""
+            run_id_short = run_id_text[:8] if run_id_text else "-"
+            schema_raw = snapshot.get("schema_version")
+            schema_text = str(schema_raw).strip() if schema_raw is not None and str(schema_raw).strip() else "-"
+            cycle_raw = snapshot.get("cycle_id")
+            if cycle_raw in (None, ""):
+                cycle_raw = snapshot.get("cycle")
+            cycle_text = str(cycle_raw).strip() if cycle_raw is not None and str(cycle_raw).strip() else "-"
+
             metric_col1, metric_col2, metric_col3 = st.columns(3)
             metric_col1.metric("Total Equity", f"${total_equity:,.2f}")
             metric_col2.metric("Cash", f"${cash:,.2f}")
@@ -6769,6 +6832,7 @@ def render_portfolio_monitor():
             snap_ts = snapshot.get("timestamp")
             if snap_ts:
                 st.caption(f"Snapshot timestamp: {snap_ts}")
+            st.caption(f"Run: {run_id_short} | schema: {schema_text} | cycle: {cycle_text}")
 
             risk_cfg = snapshot.get("risk_config", {})
             if not isinstance(risk_cfg, dict):
