@@ -1057,6 +1057,7 @@ class PaperTradingEngine:
         news_overlay_cfg.setdefault('mode', 'risk_only')
         news_overlay_cfg.setdefault('min_confidence', 0.55)
         news_overlay_cfg.setdefault('max_abs_delta', 0.10)
+        news_overlay_cfg.setdefault('enable_confidence_scaling', True)
         risk_model_config = config.setdefault('risk_model', {})
         risk_model_config.setdefault('enable_cov_diagnostics', True)
         risk_model_config.setdefault('returns_period', '6mo')
@@ -1180,6 +1181,7 @@ class PaperTradingEngine:
         assert str(news_overlay_cfg.get('mode', 'risk_only')).lower() in ('risk_only', 'symmetric'), "news_overlay.mode must be risk_only|symmetric"
         assert 0.0 <= float(news_overlay_cfg.get('min_confidence', 0.55)) <= 1.0, "news_overlay.min_confidence must be in [0,1]"
         assert 0.0 <= float(news_overlay_cfg.get('max_abs_delta', 0.10)) <= 1.0, "news_overlay.max_abs_delta must be in [0,1]"
+        assert isinstance(news_overlay_cfg.get('enable_confidence_scaling', True), bool), "news_overlay.enable_confidence_scaling must be bool"
         
         print("[OK] Safety checks passed: SIMULATION ONLY mode confirmed")
     
@@ -4287,6 +4289,7 @@ class PaperTradingEngine:
             'mode': 'risk_only',
             'min_confidence': 0.55,
             'max_abs_delta': 0.10,
+            'enable_confidence_scaling': True,
         }
         raw = self.config.get('news_overlay', {}) if isinstance(self.config, dict) else {}
         cfg = dict(defaults)
@@ -4302,6 +4305,7 @@ class PaperTradingEngine:
                 cfg['mode'] = 'risk_only'
             cfg['min_confidence'] = float(np.clip(float(cfg.get('min_confidence', 0.55)), 0.0, 1.0))
             cfg['max_abs_delta'] = float(np.clip(float(cfg.get('max_abs_delta', 0.10)), 0.0, 1.0))
+            cfg['enable_confidence_scaling'] = bool(cfg.get('enable_confidence_scaling', True))
         except Exception:
             cfg = dict(defaults)
         return cfg
@@ -4391,8 +4395,6 @@ class PaperTradingEngine:
         metadata_rows = results.get('metadatas', []) if isinstance(results, dict) else []
         document_rows = results.get('documents', []) if isinstance(results, dict) else []
         now_utc = datetime.now(timezone.utc)
-        max_age_hours = float(cfg.get('max_age_hours', 48.0))
-        min_confidence = float(cfg.get('min_confidence', 0.55))
         latest_by_l2 = {}
 
         for idx, meta in enumerate(metadata_rows):
@@ -4400,28 +4402,35 @@ class PaperTradingEngine:
                 continue
             if str(meta.get('scope', '')).lower() != 'industry':
                 continue
-            confidence = float(meta.get('confidence', 0.0) or 0.0)
-            if confidence < min_confidence:
-                continue
             ts = self._parse_iso_datetime(meta.get('timestamp'))
             if ts is None:
-                continue
-            age_hours = (now_utc - ts).total_seconds() / 3600.0
-            if age_hours > max_age_hours:
                 continue
 
             l2 = str(meta.get('L2', '')).strip()
             if not l2:
                 continue
 
+            confidence = float(meta.get('confidence', 0.0) or 0.0)
             risk_delta = float(meta.get('risk_delta', 0.0) or 0.0)
+            age_hours = max(0.0, (now_utc - ts).total_seconds() / 3600.0)
             doc = document_rows[idx] if idx < len(document_rows) else None
+            doc_text = str(doc) if isinstance(doc, str) else ''
             payload = None
             if isinstance(doc, str) and doc.strip():
                 try:
                     payload = json.loads(doc)
                 except Exception:
                     payload = None
+            raw_fields_snapshot = {
+                'metadata_direction': str(meta.get('direction', '') or ''),
+                'metadata_risk_delta': float(meta.get('risk_delta', 0.0) or 0.0),
+                'metadata_confidence': float(meta.get('confidence', 0.0) or 0.0),
+                'metadata_horizon': str(meta.get('horizon', '') or ''),
+                'doc_direction': str((payload or {}).get('direction', '') if isinstance(payload, dict) else ''),
+                'doc_risk_delta': float((payload or {}).get('risk_delta', 0.0) or 0.0) if isinstance(payload, dict) else 0.0,
+                'doc_confidence': float((payload or {}).get('confidence', 0.0) or 0.0) if isinstance(payload, dict) else 0.0,
+                'doc_horizon': str((payload or {}).get('horizon', '') if isinstance(payload, dict) else ''),
+            }
 
             row = {
                 'L2': l2,
@@ -4429,7 +4438,11 @@ class PaperTradingEngine:
                 'confidence': confidence,
                 'risk_delta': risk_delta,
                 'horizon': str(meta.get('horizon', '1d')),
+                'age_hours': age_hours,
                 'payload': payload if isinstance(payload, dict) else {},
+                'raw_metadata': dict(meta),
+                'raw_doc_head_600': doc_text[:600],
+                'raw_fields_snapshot': raw_fields_snapshot,
             }
             prev = latest_by_l2.get(l2)
             if prev is None:
@@ -4448,6 +4461,7 @@ class PaperTradingEngine:
             'status': 'disabled',
             'mode': cfg.get('mode', 'risk_only'),
             'alpha': float(cfg.get('alpha', 0.08)),
+            'enable_confidence_scaling': bool(cfg.get('enable_confidence_scaling', True)),
             'applied_cash_delta': 0.0,
             'worst_l2': None,
             'worst_delta': 0.0,
@@ -4457,6 +4471,15 @@ class PaperTradingEngine:
             'max_abs_delta': float(cfg.get('max_abs_delta', 0.10)),
             'min_confidence': float(cfg.get('min_confidence', 0.55)),
             'max_age_hours': float(cfg.get('max_age_hours', 48.0)),
+            'included_rows_count': 0,
+            'excluded_rows_count': 0,
+            'excluded_by_confidence_count': 0,
+            'excluded_by_age_count': 0,
+            'excluded_by_confidence_sample': [],
+            'l2_delta_map_sample': [],
+            'chosen_cash_delta_source': None,
+            'included_rows_audit': [],
+            'excluded_rows_audit': [],
         }
         base_cash = float(cash_target)
         if not info['enabled']:
@@ -4470,17 +4493,122 @@ class PaperTradingEngine:
 
             alpha = float(cfg.get('alpha', 0.08))
             max_abs_delta = float(cfg.get('max_abs_delta', 0.10))
+            min_confidence = float(cfg.get('min_confidence', 0.55))
+            max_age_hours = float(cfg.get('max_age_hours', 48.0))
             mode = str(cfg.get('mode', 'risk_only')).lower()
+            enable_confidence_scaling = bool(cfg.get('enable_confidence_scaling', True))
             l2_delta_map = {}
+            l2_diag_map = {}
+            excluded_conf_sample = []
+            excluded_conf_count = 0
+            excluded_age_count = 0
+            included_count = 0
             for row in signal_rows:
                 l2 = str(row.get('L2', '')).strip()
                 if not l2:
                     continue
+                confidence = float(row.get('confidence', 0.0) or 0.0)
+                age_hours = float(row.get('age_hours', 0.0) or 0.0)
                 risk_delta = float(row.get('risk_delta', 0.0) or 0.0)
-                delta = float(np.clip(risk_delta * alpha, -max_abs_delta, max_abs_delta))
+                raw_doc_head_600 = str(row.get('raw_doc_head_600', '') or '')[:600]
+                raw_metadata = row.get('raw_metadata', {}) if isinstance(row.get('raw_metadata', {}), dict) else {}
+                raw_fields_snapshot = row.get('raw_fields_snapshot', {}) if isinstance(row.get('raw_fields_snapshot', {}), dict) else {}
+                transform_chain = "industry_signal:risk_delta -> raw=rd*alpha -> (optional)*confidence -> clip(max_abs_delta) -> risk_only_cap"
+                if age_hours > max_age_hours:
+                    excluded_age_count += 1
+                    if len(info['excluded_rows_audit']) < 3:
+                        info['excluded_rows_audit'].append(
+                            {
+                                'L2': l2,
+                                'exclude_reason': 'age',
+                                'age_hours': float(age_hours),
+                                'risk_delta_used_in_overlay': float(risk_delta),
+                                'confidence_used_in_overlay': float(confidence),
+                                'transform_chain': transform_chain,
+                                'raw_doc_head_600': raw_doc_head_600,
+                                'raw_metadata': {
+                                    'timestamp': raw_metadata.get('timestamp'),
+                                    'status': raw_metadata.get('status'),
+                                    'source_count': raw_metadata.get('source_count'),
+                                    'scope': raw_metadata.get('scope'),
+                                    'L2': raw_metadata.get('L2'),
+                                },
+                                'raw_fields_snapshot': raw_fields_snapshot,
+                            }
+                        )
+                    continue
+                if confidence < min_confidence:
+                    excluded_conf_count += 1
+                    if len(excluded_conf_sample) < 5:
+                        excluded_conf_sample.append(
+                            {
+                                'L2': l2,
+                                'confidence': float(confidence),
+                                'risk_delta': float(risk_delta),
+                            }
+                        )
+                    if len(info['excluded_rows_audit']) < 3:
+                        info['excluded_rows_audit'].append(
+                            {
+                                'L2': l2,
+                                'exclude_reason': 'min_confidence',
+                                'age_hours': float(age_hours),
+                                'risk_delta_used_in_overlay': float(risk_delta),
+                                'confidence_used_in_overlay': float(confidence),
+                                'transform_chain': transform_chain,
+                                'raw_doc_head_600': raw_doc_head_600,
+                                'raw_metadata': {
+                                    'timestamp': raw_metadata.get('timestamp'),
+                                    'status': raw_metadata.get('status'),
+                                    'source_count': raw_metadata.get('source_count'),
+                                    'scope': raw_metadata.get('scope'),
+                                    'L2': raw_metadata.get('L2'),
+                                },
+                                'raw_fields_snapshot': raw_fields_snapshot,
+                            }
+                        )
+                    continue
+                raw_delta = float(risk_delta * alpha)
+                if enable_confidence_scaling:
+                    raw_delta = float(raw_delta * confidence)
+                delta = float(np.clip(raw_delta, -max_abs_delta, max_abs_delta))
                 if mode == 'risk_only' and delta > 0:
                     delta = 0.0
                 l2_delta_map[l2] = delta
+                l2_diag_map[l2] = {
+                    'L2': l2,
+                    'risk_delta': float(risk_delta),
+                    'confidence': float(confidence),
+                    'delta': float(delta),
+                }
+                if len(info['included_rows_audit']) < 3:
+                    info['included_rows_audit'].append(
+                        {
+                            'L2': l2,
+                            'age_hours': float(age_hours),
+                            'risk_delta_used_in_overlay': float(risk_delta),
+                            'confidence_used_in_overlay': float(confidence),
+                            'raw_delta_before_clip': float(raw_delta),
+                            'delta_after_clip_and_mode': float(delta),
+                            'transform_chain': transform_chain,
+                            'raw_doc_head_600': raw_doc_head_600,
+                            'raw_metadata': {
+                                'timestamp': raw_metadata.get('timestamp'),
+                                'status': raw_metadata.get('status'),
+                                'source_count': raw_metadata.get('source_count'),
+                                'scope': raw_metadata.get('scope'),
+                                'L2': raw_metadata.get('L2'),
+                            },
+                            'raw_fields_snapshot': raw_fields_snapshot,
+                        }
+                    )
+                included_count += 1
+
+            info['included_rows_count'] = int(included_count)
+            info['excluded_by_confidence_count'] = int(excluded_conf_count)
+            info['excluded_by_age_count'] = int(excluded_age_count)
+            info['excluded_rows_count'] = int(excluded_conf_count + excluded_age_count)
+            info['excluded_by_confidence_sample'] = list(excluded_conf_sample)
 
             if not l2_delta_map:
                 info['status'] = 'filtered_empty'
@@ -4488,6 +4616,7 @@ class PaperTradingEngine:
 
             ticker_tags = self._build_ticker_tags_lookup()
             ticker_deltas = {}
+            ticker_delta_source = {}
             ordered_tickers = []
             for ticker in (tickers or []):
                 t = str(ticker).strip().upper()
@@ -4497,10 +4626,19 @@ class PaperTradingEngine:
             for ticker in ordered_tickers:
                 tags = ticker_tags.get(ticker, {})
                 l2_tags = tags.get('L2', []) if isinstance(tags, dict) else []
-                deltas = [l2_delta_map.get(str(l2), None) for l2 in l2_tags]
-                deltas = [d for d in deltas if d is not None]
-                if deltas:
-                    ticker_deltas[ticker] = float(min(deltas))
+                delta_rows = []
+                for l2 in l2_tags:
+                    one = l2_delta_map.get(str(l2), None)
+                    if one is not None:
+                        delta_rows.append((str(l2), float(one)))
+                if delta_rows:
+                    chosen_l2, chosen_delta = min(delta_rows, key=lambda x: x[1])
+                    ticker_deltas[ticker] = float(chosen_delta)
+                    ticker_delta_source[ticker] = {
+                        'ticker': ticker,
+                        'l2': chosen_l2,
+                        'delta': float(chosen_delta),
+                    }
 
             if not ticker_deltas:
                 info['status'] = 'no_ticker_match'
@@ -4528,14 +4666,23 @@ class PaperTradingEngine:
             info['used_signals'] = len(l2_delta_map)
             info['l2_deltas'] = {k: float(v) for k, v in list(l2_delta_map.items())[:20]}
             info['ticker_deltas'] = {k: float(v) for k, v in list(ticker_deltas.items())[:30]}
+            info['l2_delta_map_sample'] = [dict(v) for v in list(l2_diag_map.values())[:5]]
             info['cash_target_before'] = base_cash
             info['cash_target_after'] = new_cash
             info['worst_ticker'] = worst_ticker
+            info['chosen_cash_delta_source'] = ticker_delta_source.get(worst_ticker)
 
+            chosen_src = info.get('chosen_cash_delta_source') if isinstance(info.get('chosen_cash_delta_source'), dict) else {}
+            src_ticker = str(chosen_src.get('ticker', info.get('worst_ticker', 'NA')))
+            src_l2 = str(chosen_src.get('l2', info.get('worst_l2', 'NA')))
+            src_delta = float(chosen_src.get('delta', info.get('worst_delta', 0.0)) or 0.0)
             print(
-                f"[NEWS_OVERLAY] used={info['used_signals']} worst_L2={info['worst_l2']} "
-                f"risk_delta={info['worst_delta']:+.4f} confidence>={info['min_confidence']:.2f} "
-                f"applied_delta={info['applied_cash_delta']:+.4f}"
+                f"[NEWS_OVERLAY] inc={int(info.get('included_rows_count', 0))} "
+                f"exc_conf={int(info.get('excluded_by_confidence_count', 0))} "
+                f"exc_age={int(info.get('excluded_by_age_count', 0))} "
+                f"cash={float(base_cash):.3f}->{float(new_cash):.3f} "
+                f"src={src_ticker} l2={src_l2} delta={src_delta:+.3f} "
+                f"cap={float(max_abs_delta):.2f}"
             )
             return new_cash, info
         except Exception as e:
@@ -7985,7 +8132,7 @@ class PaperTradingEngine:
         print("="*60)
         print("ENGINE VERSION FINGERPRINT")
         print("="*60)
-        print(f"ENGINE_VERSION: v3.1.2-2026-02-10")
+        print(f"ENGINE_VERSION: v3.2.2-2026-02-13")
         print(f"HAS_MACRO_SMOOTH: {hasattr(self, 'macro_risk_score_history')}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -8856,6 +9003,7 @@ def debug_run_news_overlay_phase2(config_path: str = "paper_config.json", outdir
             "mode": str(merged.get("mode", "risk_only")).lower(),
             "min_confidence": float(np.clip(float(merged.get("min_confidence", 0.55) or 0.55), 0.0, 1.0)),
             "max_abs_delta": float(np.clip(float(merged.get("max_abs_delta", 0.10) or 0.10), 0.0, 1.0)),
+            "enable_confidence_scaling": bool(merged.get("enable_confidence_scaling", True)),
         }
 
     def _filter_signal_rows(raw_rows: list, cfg_row: dict):
@@ -8930,11 +9078,14 @@ def debug_run_news_overlay_phase2(config_path: str = "paper_config.json", outdir
         alpha = float(cfg_row.get("alpha", 0.08))
         max_abs_delta = float(cfg_row.get("max_abs_delta", 0.10))
         mode = str(cfg_row.get("mode", "risk_only")).lower()
+        enable_confidence_scaling = bool(cfg_row.get("enable_confidence_scaling", True))
         events = []
         for row in (filtered_rows or []):
             l2 = str(row.get("L2", "")).strip()
             risk_delta = float(row.get("risk_delta", 0.0) or 0.0)
             raw_delta = risk_delta * alpha
+            if enable_confidence_scaling:
+                raw_delta = raw_delta * float(row.get("confidence", 0.0) or 0.0)
             clipped = float(np.clip(raw_delta, -max_abs_delta, max_abs_delta))
             if mode == "risk_only" and clipped > 0:
                 clipped = 0.0
@@ -9137,6 +9288,455 @@ def debug_run_news_overlay_phase2(config_path: str = "paper_config.json", outdir
     return 1 if fail_count > 0 else 0
 
 
+def debug_run_news_overlay_once(config_path: str = "paper_config.json", outdir: str = "outputs/gw_dryrun") -> int:
+    """Run one deterministic news-overlay debug check without trading."""
+    outdir_abs = os.path.abspath(str(outdir or "outputs/gw_dryrun"))
+    os.makedirs(outdir_abs, exist_ok=True)
+
+    old_checkpoint_env = os.environ.get("GW_CHECKPOINT_ACTION")
+    os.environ["GW_CHECKPOINT_ACTION"] = "fresh"
+    try:
+        engine = PaperTradingEngine(config_path)
+    finally:
+        if old_checkpoint_env is None:
+            os.environ.pop("GW_CHECKPOINT_ACTION", None)
+        else:
+            os.environ["GW_CHECKPOINT_ACTION"] = old_checkpoint_env
+
+    base_cfg = engine._get_news_overlay_cfg()
+    probe_cfg = dict(base_cfg)
+    probe_cfg["enabled"] = True
+    probe_cfg["mode"] = str(base_cfg.get("mode", "risk_only")).lower()
+    probe_cfg["enable_confidence_scaling"] = bool(base_cfg.get("enable_confidence_scaling", True))
+    engine.config["news_overlay"] = dict(probe_cfg)
+
+    def _to_ticker(v):
+        if isinstance(v, dict):
+            cand = v.get("ticker", None)
+            if cand is None:
+                cand = v.get("symbol", None)
+            if cand is None:
+                return ""
+            return str(cand).strip().upper()
+        return str(v).strip().upper()
+
+    universe_tickers = []
+    if isinstance(engine.config.get("universe", []), list):
+        universe_tickers.extend([_to_ticker(x) for x in engine.config.get("universe", []) if _to_ticker(x)])
+    tag_lookup = engine._build_ticker_tags_lookup()
+    if isinstance(tag_lookup, dict):
+        universe_tickers.extend([str(x).strip().upper() for x in tag_lookup.keys() if str(x).strip()])
+    if isinstance(engine.config.get("industry_map", {}), dict):
+        for k, v in engine.config.get("industry_map", {}).items():
+            if isinstance(v, str):
+                t = str(k).strip().upper()
+                if t:
+                    universe_tickers.append(t)
+            elif isinstance(v, (list, tuple, set)):
+                for t_val in v:
+                    t = str(t_val).strip().upper()
+                    if t:
+                        universe_tickers.append(t)
+    probe_tickers = []
+    for t in universe_tickers:
+        if t and t != "CASH" and t not in probe_tickers:
+            probe_tickers.append(t)
+    if not probe_tickers:
+        probe_tickers = ["SPY", "QQQ", "XOM", "XLU", "XLF"]
+    cash_before = 0.20
+
+    cash_after, overlay_info = engine.apply_news_overlay_to_cash_target(
+        probe_tickers,
+        cash_target=cash_before,
+    )
+
+    relaxed_info = None
+    try:
+        included_count = int((overlay_info or {}).get("included_rows_count", 0)) if isinstance(overlay_info, dict) else 0
+    except Exception:
+        included_count = 0
+    if included_count < 2:
+        relaxed_cfg = dict(probe_cfg)
+        relaxed_cfg["min_confidence"] = float(max(0.0, min(float(probe_cfg.get("min_confidence", 0.55)), 0.55)))
+        engine.config["news_overlay"] = dict(relaxed_cfg)
+        _, relaxed_info = engine.apply_news_overlay_to_cash_target(
+            probe_tickers,
+            cash_target=cash_before,
+        )
+        engine.config["news_overlay"] = dict(probe_cfg)
+
+    payload = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "config_path": str(config_path),
+        "news_overlay_cfg_used": {
+            "enabled": bool(probe_cfg.get("enabled", False)),
+            "mode": str(probe_cfg.get("mode", "risk_only")),
+            "alpha": float(probe_cfg.get("alpha", 0.08)),
+            "min_confidence": float(probe_cfg.get("min_confidence", 0.55)),
+            "max_abs_delta": float(probe_cfg.get("max_abs_delta", 0.10)),
+            "enable_confidence_scaling": bool(probe_cfg.get("enable_confidence_scaling", True)),
+        },
+        "cash_target_old": float(cash_before),
+        "cash_target_new": float(cash_after),
+        "overlay_info": overlay_info if isinstance(overlay_info, dict) else {},
+        "probe_tickers_count": len(probe_tickers),
+        "probe_tickers_sample": probe_tickers[:30],
+        "included_rows_source_audit": (overlay_info or {}).get("included_rows_audit", []) if isinstance(overlay_info, dict) else [],
+        "excluded_rows_source_audit": (overlay_info or {}).get("excluded_rows_audit", []) if isinstance(overlay_info, dict) else [],
+        "diagnostic_relaxed_min_confidence": {
+            "enabled": bool(relaxed_info is not None),
+            "min_confidence_used": float(max(0.0, min(float(probe_cfg.get("min_confidence", 0.55)), 0.55))) if relaxed_info is not None else None,
+            "included_rows_source_audit": (relaxed_info or {}).get("included_rows_audit", []) if isinstance(relaxed_info, dict) else [],
+            "excluded_rows_source_audit": (relaxed_info or {}).get("excluded_rows_audit", []) if isinstance(relaxed_info, dict) else [],
+            "included_rows_count": int((relaxed_info or {}).get("included_rows_count", 0)) if isinstance(relaxed_info, dict) else 0,
+            "excluded_rows_count": int((relaxed_info or {}).get("excluded_rows_count", 0)) if isinstance(relaxed_info, dict) else 0,
+        },
+    }
+    summary_path = os.path.join(outdir_abs, "news_overlay_once_debug.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    info = payload.get("overlay_info", {}) if isinstance(payload.get("overlay_info", {}), dict) else {}
+    print(f"[NEWS_OVERLAY_ONCE] Summary written: {summary_path}")
+    print(
+        f"[NEWS_OVERLAY_ONCE] included={int(info.get('included_rows_count', 0))} "
+        f"excluded={int(info.get('excluded_rows_count', 0))} "
+        f"used={int(info.get('used_signals', 0))}"
+    )
+    print(f"[NEWS_OVERLAY_ONCE] chosen_cash_delta_source={info.get('chosen_cash_delta_source')}")
+    print(
+        f"[NEWS_OVERLAY_ONCE] cash_target_old={float(payload.get('cash_target_old', 0.0)):.4f} "
+        f"cash_target_new={float(payload.get('cash_target_new', 0.0)):.4f}"
+    )
+    return 0
+
+
+def _dist_stats(values):
+    vals = [float(x) for x in (values or []) if np.isfinite(float(x))]
+    if not vals:
+        return {"min": None, "p50": None, "p90": None, "max": None, "count": 0}
+    arr = np.array(vals, dtype=float)
+    return {
+        "min": float(np.min(arr)),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(np.max(arr)),
+        "count": int(arr.size),
+    }
+
+
+def _snap_to_choices(value, choices):
+    vals = [float(x) for x in (choices or [])]
+    if not vals:
+        return float(value)
+    return float(min(vals, key=lambda x: abs(float(value) - float(x))))
+
+
+def _safe_clip(value, low, high):
+    return float(np.clip(float(value), float(low), float(high)))
+
+
+def calibrate_news_overlay(
+    config_path: str = "paper_config.json",
+    lookback_hours: float = 72.0,
+    target_cash_delta: float = 0.02,
+    out_path: str = "outputs/news_overlay_calibration.json",
+    max_abs_delta_reco: float = 0.03,
+) -> int:
+    """Calibrate news overlay parameters using historical industry_signals replay."""
+    warnings = []
+    now_utc = datetime.now(timezone.utc)
+    lookback_hours = max(1.0, float(lookback_hours or 72.0))
+    target_cash_delta = max(0.0, float(target_cash_delta or 0.02))
+    max_abs_delta_reco = max(1e-6, float(max_abs_delta_reco or 0.03))
+
+    old_checkpoint_env = os.environ.get("GW_CHECKPOINT_ACTION")
+    os.environ["GW_CHECKPOINT_ACTION"] = "fresh"
+    try:
+        engine = PaperTradingEngine(config_path)
+    finally:
+        if old_checkpoint_env is None:
+            os.environ.pop("GW_CHECKPOINT_ACTION", None)
+        else:
+            os.environ["GW_CHECKPOINT_ACTION"] = old_checkpoint_env
+
+    cfg = engine._get_news_overlay_cfg()
+    mode = str(cfg.get("mode", "risk_only")).lower()
+    enable_confidence_scaling = bool(cfg.get("enable_confidence_scaling", True))
+    min_conf_cfg = float(cfg.get("min_confidence", 0.55))
+    max_age_hours = float(cfg.get("max_age_hours", 48.0))
+    collection_name = str(cfg.get("industry_collection", "industry_signals"))
+    chroma_path = engine.config.get("macro_integration", {}).get("chroma_path", "./memory_db")
+
+    rows = []
+    per_l2_counts = {}
+    recent_24h_counts = {}
+    raw_total = 0
+    if not CHROMADB_AVAILABLE:
+        warnings.append("chromadb_not_available")
+    else:
+        coll = engine._get_industry_signals_collection(collection_name=collection_name, chroma_path=chroma_path)
+        if coll is None:
+            warnings.append("industry_collection_unavailable")
+        else:
+            include = ["metadatas", "documents"]
+            try:
+                try:
+                    res = coll.get(where={"scope": "industry"}, include=include)
+                except Exception:
+                    res = coll.get(include=include)
+            except Exception as e:
+                warnings.append(f"collection_read_failed:{e}")
+                res = {}
+
+            metas = res.get("metadatas", []) if isinstance(res, dict) else []
+            docs = res.get("documents", []) if isinstance(res, dict) else []
+            for idx, meta in enumerate(metas):
+                if not isinstance(meta, dict):
+                    continue
+                raw_total += 1
+                l2 = str(meta.get("L2", "")).strip()
+                if not l2:
+                    continue
+                scope = str(meta.get("scope", "industry")).lower()
+                if scope != "industry":
+                    continue
+                ts = engine._parse_iso_datetime(meta.get("timestamp"))
+                if ts is None:
+                    continue
+                age_hours_from_now = max(0.0, (now_utc - ts).total_seconds() / 3600.0)
+                if age_hours_from_now > lookback_hours:
+                    continue
+
+                doc = docs[idx] if idx < len(docs) else None
+                payload = {}
+                if isinstance(doc, str) and doc.strip():
+                    try:
+                        parsed = json.loads(doc)
+                        if isinstance(parsed, dict):
+                            payload = parsed
+                    except Exception:
+                        payload = {}
+                status = str(meta.get("status", payload.get("status", "ok")) or "ok").lower()
+                if status not in ("ok", "success", ""):
+                    continue
+
+                risk_delta = float(meta.get("risk_delta", payload.get("risk_delta", 0.0)) or 0.0)
+                confidence = float(meta.get("confidence", payload.get("confidence", 0.0)) or 0.0)
+                direction = str(meta.get("direction", payload.get("direction", "")) or "")
+                row = {
+                    "L2": l2,
+                    "timestamp": ts,
+                    "timestamp_iso": ts.isoformat(),
+                    "age_hours": age_hours_from_now,
+                    "direction": direction,
+                    "risk_delta": risk_delta,
+                    "confidence": confidence,
+                }
+                rows.append(row)
+                per_l2_counts[l2] = int(per_l2_counts.get(l2, 0) + 1)
+                if age_hours_from_now <= 24.0:
+                    recent_24h_counts[l2] = int(recent_24h_counts.get(l2, 0) + 1)
+
+    rows.sort(key=lambda x: x.get("timestamp"))
+    rows_active = [r for r in rows if float(r.get("age_hours", 0.0) or 0.0) <= max_age_hours]
+
+    conf_values = [float(r.get("confidence", 0.0) or 0.0) for r in rows_active]
+    rd_values = [float(r.get("risk_delta", 0.0) or 0.0) for r in rows_active]
+    scale_vals = [
+        float(r.get("confidence", 0.0) or 0.0) if enable_confidence_scaling else 1.0
+        for r in rows_active
+    ]
+    eff = [abs(rd_values[i]) * scale_vals[i] for i in range(len(rows_active))]
+    eff_neg = [max(0.0, -rd_values[i]) * scale_vals[i] for i in range(len(rows_active))]
+    eff_pos = [max(0.0, +rd_values[i]) * scale_vals[i] for i in range(len(rows_active))]
+    negative_signal_ratio = float(
+        (sum(1 for x in eff_neg if float(x) > 0.0) / len(rows_active)) if rows_active else 0.0
+    )
+
+    conf_p50 = float(np.percentile(np.array(conf_values, dtype=float), 50)) if conf_values else min_conf_cfg
+    min_conf_choices = [0.45, 0.55, 0.60, 0.65]
+    min_conf_reco = _snap_to_choices(conf_p50, min_conf_choices)
+    candidate_thresholds = [0.55, 0.60, 0.65]
+    coverage_candidates = {}
+    for th in candidate_thresholds:
+        keep = sum(1 for c in conf_values if float(c) >= float(th))
+        coverage_candidates[str(th)] = float((keep / len(conf_values)) if conf_values else 0.0)
+    reco_keep = sum(1 for c in conf_values if float(c) >= float(min_conf_reco))
+    reco_coverage = float((reco_keep / len(conf_values)) if conf_values else 0.0)
+    if reco_coverage < 0.10 and conf_values:
+        warnings.append("recommended_min_confidence_keeps_less_than_10pct")
+
+    rows_reco = [r for r in rows_active if float(r.get("confidence", 0.0) or 0.0) >= float(min_conf_reco)]
+    eff_neg_reco = []
+    eff_reco = []
+    for r in rows_reco:
+        conf_mult = float(r.get("confidence", 0.0) or 0.0) if enable_confidence_scaling else 1.0
+        rd = float(r.get("risk_delta", 0.0) or 0.0)
+        eff_reco.append(abs(rd) * conf_mult)
+        eff_neg_reco.append(max(0.0, -rd) * conf_mult)
+    eff_neg_positive = [x for x in eff_neg_reco if float(x) > 0.0]
+    p90_eff_neg = float(np.percentile(np.array(eff_neg_positive, dtype=float), 90)) if eff_neg_positive else 0.0
+
+    alpha_cap = None
+    alpha_reco = None
+    if len(eff_neg_positive) >= 5 and p90_eff_neg > 0.0:
+        alpha_reco = float(target_cash_delta / p90_eff_neg)
+        alpha_cap = float(max_abs_delta_reco / p90_eff_neg)
+        upper = min(float(alpha_cap), 0.60)
+        if upper < 0.05:
+            alpha_final = upper
+            warnings.append("alpha_upper_bound_below_min_floor")
+        else:
+            alpha_final = _safe_clip(alpha_reco, 0.05, upper)
+    else:
+        warnings.append("No meaningful negative/risk-off signals in lookback; risk_only overlay will be mostly zero.")
+        eff_positive = [x for x in eff_reco if float(x) > 0.0]
+        p90_eff = float(np.percentile(np.array(eff_positive, dtype=float), 90)) if eff_positive else 0.0
+        alpha_reco_abs = float(target_cash_delta / p90_eff) if p90_eff > 0.0 else float(cfg.get("alpha", 0.08))
+        alpha_final = _safe_clip(alpha_reco_abs, 0.05, 0.60)
+        warnings.append("fallback_alpha_based_on_abs_distribution_only")
+        warnings.append("recommend_step5_improve_underweight_generation_or_add_macro_risk_off_prior")
+
+    # Replay simulation over timestamps using latest-per-L2 at each timepoint.
+    replay_points = []
+    if rows_reco:
+        timepoints = sorted({r.get("timestamp") for r in rows_reco if isinstance(r.get("timestamp"), datetime)})
+        l2_set = sorted({str(r.get("L2", "")).strip() for r in rows_reco if str(r.get("L2", "")).strip()})
+        for t_point in timepoints:
+            latest_by_l2 = {}
+            for row in rows_reco:
+                l2 = str(row.get("L2", "")).strip()
+                if not l2:
+                    continue
+                ts = row.get("timestamp")
+                if not isinstance(ts, datetime):
+                    continue
+                if ts > t_point:
+                    continue
+                prev = latest_by_l2.get(l2)
+                if prev is None or ts > prev.get("timestamp"):
+                    latest_by_l2[l2] = row
+
+            l2_deltas = {}
+            for l2 in l2_set:
+                row = latest_by_l2.get(l2)
+                if row is None:
+                    continue
+                age_h = max(0.0, (t_point - row.get("timestamp")).total_seconds() / 3600.0)
+                if age_h > max_age_hours:
+                    continue
+                rd = float(row.get("risk_delta", 0.0) or 0.0)
+                conf = float(row.get("confidence", 0.0) or 0.0)
+                raw = float(rd * alpha_final)
+                if enable_confidence_scaling:
+                    raw = float(raw * conf)
+                delta = float(np.clip(raw, -max_abs_delta_reco, max_abs_delta_reco))
+                if mode == "risk_only" and delta > 0:
+                    delta = 0.0
+                l2_deltas[l2] = delta
+
+            if l2_deltas:
+                worst_l2_delta = float(min(l2_deltas.values()))
+                if mode == "risk_only":
+                    cash_delta = float(abs(min(0.0, worst_l2_delta)))
+                else:
+                    cash_delta = float(abs(worst_l2_delta))
+            else:
+                worst_l2_delta = 0.0
+                cash_delta = 0.0
+            replay_points.append(
+                {
+                    "timestamp": t_point.isoformat(),
+                    "worst_l2_delta": float(worst_l2_delta),
+                    "cash_delta_simulated": float(cash_delta),
+                }
+            )
+
+    replay_cash = [float(p.get("cash_delta_simulated", 0.0) or 0.0) for p in replay_points]
+    replay_nonzero_ratio = float(
+        (sum(1 for x in replay_cash if x > 1e-12) / len(replay_cash)) if replay_cash else 0.0
+    )
+    replay_capped_ratio = float(
+        (sum(1 for x in replay_cash if abs(x - max_abs_delta_reco) <= 1e-12) / len(replay_cash)) if replay_cash else 0.0
+    )
+
+    output = {
+        "generated_at_utc": now_utc.isoformat(),
+        "config_path": str(config_path),
+        "inputs": {
+            "lookback_hours": float(lookback_hours),
+            "target_cash_delta": float(target_cash_delta),
+            "mode": mode,
+            "max_age_hours": float(max_age_hours),
+            "enable_confidence_scaling": bool(enable_confidence_scaling),
+            "collection": collection_name,
+            "chroma_path": str(chroma_path),
+        },
+        "sample_counts": {
+            "raw_total_rows": int(raw_total),
+            "lookback_rows_status_ok": int(len(rows)),
+            "active_rows_after_max_age": int(len(rows_active)),
+            "recent_24h_rows": int(sum(recent_24h_counts.values())),
+            "count_by_l2": dict(sorted(per_l2_counts.items())),
+            "count_by_l2_recent_24h": dict(sorted(recent_24h_counts.items())),
+        },
+        "stats": {
+            "risk_delta": _dist_stats(rd_values),
+            "confidence": _dist_stats(conf_values),
+            "eff": _dist_stats(eff),
+            "eff_neg": _dist_stats(eff_neg),
+            "eff_pos": _dist_stats(eff_pos),
+            "negative_signal_ratio": float(negative_signal_ratio),
+            "min_confidence_candidates_coverage": coverage_candidates,
+            "recommended_min_confidence_coverage": float(reco_coverage),
+            "eff_neg_positive_count_at_recommended_min_confidence": int(len(eff_neg_positive)),
+        },
+        "suggested": {
+            "min_confidence": float(min_conf_reco),
+            "alpha": float(alpha_final),
+            "max_abs_delta": float(max_abs_delta_reco),
+            "enable_confidence_scaling": bool(enable_confidence_scaling),
+            "mode": mode,
+        },
+        "replay": {
+            "points": int(len(replay_points)),
+            "cash_delta_simulated": _dist_stats(replay_cash),
+            "nonzero_ratio": float(replay_nonzero_ratio),
+            "capped_ratio": float(replay_capped_ratio),
+            "points_sample": replay_points[:30],
+        },
+        "warnings": warnings,
+        "debug": {
+            "p90_eff_neg": float(p90_eff_neg),
+            "alpha_reco_raw": float(alpha_reco) if alpha_reco is not None else None,
+            "alpha_cap_from_max_abs": float(alpha_cap) if alpha_cap is not None else None,
+        },
+    }
+
+    out_abs = os.path.abspath(str(out_path or "outputs/news_overlay_calibration.json"))
+    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+    with open(out_abs, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    replay_p90 = output.get("replay", {}).get("cash_delta_simulated", {}).get("p90")
+    print(f"[CALIBRATOR] wrote: {out_abs}")
+    print(f"[CALIBRATOR] negative_signal_ratio={negative_signal_ratio:.4f}")
+    print(
+        f"[CALIBRATOR] suggested min_confidence={float(min_conf_reco):.2f} "
+        f"alpha={float(alpha_final):.4f} max_abs_delta={float(max_abs_delta_reco):.4f} "
+        f"scaling={bool(enable_confidence_scaling)} mode={mode}"
+    )
+    print(
+        f"[CALIBRATOR] replay p90_cash_delta={float(replay_p90 or 0.0):.4f} "
+        f"nonzero_ratio={float(replay_nonzero_ratio):.4f} capped_ratio={float(replay_capped_ratio):.4f}"
+    )
+    if warnings:
+        for w in warnings:
+            print(f"[CALIBRATOR][WARN] {w}")
+    return 0
+
+
 def main():
     """def main: docstring omitted (was garbled/non-ASCII)."""
     parser = argparse.ArgumentParser(description="Paper trading engine")
@@ -9168,11 +9768,46 @@ def main():
         action="store_true",
         help="Run deterministic Phase 2 news overlay consumption dry-run and exit.",
     )
+    parser.add_argument(
+        "--debug-news-overlay-once",
+        action="store_true",
+        help="Run one deterministic news overlay debug check and exit (no trades).",
+    )
+    parser.add_argument(
+        "--calibrate-news-overlay",
+        action="store_true",
+        help="Run news overlay calibrator + replay and exit.",
+    )
+    parser.add_argument(
+        "--lookback-hours",
+        type=float,
+        default=72.0,
+        help="Lookback window in hours for news overlay calibrator.",
+    )
+    parser.add_argument(
+        "--target-cash-delta",
+        type=float,
+        default=0.02,
+        help="Target p90 cash delta for calibrator.",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="outputs/news_overlay_calibration.json",
+        help="Output JSON path for calibrator.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional config path override.",
+    )
     args = parser.parse_args()
 
     debug_env = str(os.environ.get("GW_DEBUG_PLANNER_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_system_env = str(os.environ.get("GW_DEBUG_SYSTEM_S1_5", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_news_overlay_phase2_env = str(os.environ.get("GW_DEBUG_NEWS_OVERLAY_PHASE2", "")).strip().lower() in ("1", "true", "yes", "on")
+    debug_news_overlay_once_env = str(os.environ.get("GW_DEBUG_NEWS_OVERLAY_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
     if bool(args.debug_planner_once or debug_env):
         debug_run_planner_once(args.config_path, turnover_limit=args.debug_turnover_limit)
         return 0
@@ -9182,13 +9817,25 @@ def main():
             outdir=args.debug_outdir,
             turnover_limit=args.debug_turnover_limit,
         )
+    config_path = args.config if isinstance(args.config, str) and args.config.strip() else args.config_path
+
     if bool(args.debug_news_overlay_phase2 or debug_news_overlay_phase2_env):
         return debug_run_news_overlay_phase2(
-            config_path=args.config_path,
+            config_path=config_path,
             outdir=args.debug_outdir,
         )
-
-    config_path = args.config_path
+    if bool(args.debug_news_overlay_once or debug_news_overlay_once_env):
+        return debug_run_news_overlay_once(
+            config_path=config_path,
+            outdir=args.debug_outdir,
+        )
+    if bool(args.calibrate_news_overlay):
+        return calibrate_news_overlay(
+            config_path=config_path,
+            lookback_hours=args.lookback_hours,
+            target_cash_delta=args.target_cash_delta,
+            out_path=args.out,
+        )
     print(f"Loading config: {config_path}")
 
     engine = PaperTradingEngine(config_path)

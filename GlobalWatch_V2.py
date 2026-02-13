@@ -11,6 +11,8 @@ import time
 import json
 import re
 import hashlib
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import uuid
@@ -115,7 +117,7 @@ class _NoopCollection:
 
     def update(self, *args, **kwargs):
         return None
-
+    
     def get(self, *args, **kwargs):
         return {"ids": [], "metadatas": [], "documents": []}
 
@@ -137,7 +139,8 @@ if CHROMADB_IMPORTED:
         # 
         signals_collection = chroma_client.get_or_create_collection(name="trading_signals")
         CHROMA_AVAILABLE = True
-        print("[CHROMA] PersistentClient ready: ./memory_db")
+        if str(os.environ.get("GW_CHROMA_VERBOSE", "0")).strip() in {"1", "true", "TRUE", "yes"}:
+            print("[CHROMA] PersistentClient ready: ./memory_db")
     except Exception as e:
         CHROMA_INIT_ERROR = str(e)
         log_error(f"Chroma initialization failed, using no-op memory: {CHROMA_INIT_ERROR}")
@@ -230,6 +233,326 @@ def load_paper_runtime_settings():
 
 RUNTIME_SETTINGS = load_paper_runtime_settings()
 TOPIC_MEMORY_PATH = "outputs/topic_signal_memory.json"
+
+CANONICAL_INDUSTRY_BUCKETS = [
+    "technology",
+    "energy",
+    "financials",
+    "healthcare",
+    "industrials",
+    "industrials_defense",
+    "consumer",
+    "utilities",
+    "real_estate",
+    "broad_market_etf",
+    "rates_and_gold",
+    "cash_equivalent",
+]
+
+# Baseline expectation is only for sanity-check diagnostics; not used for trading decisions.
+BASELINE_INDUSTRY_EXPECTATION = {
+    "technology": {"direction_label": "overweight", "risk_delta": 0.15, "confidence": 0.60},
+    "energy": {"direction_label": "neutral_to_overweight", "risk_delta": 0.05, "confidence": 0.55},
+    "financials": {"direction_label": "overweight", "risk_delta": 0.10, "confidence": 0.60},
+    "healthcare": {"direction_label": "slight_overweight", "risk_delta": 0.05, "confidence": 0.55},
+    "industrials": {"direction_label": "neutral", "risk_delta": 0.00, "confidence": 0.50},
+    "industrials_defense": {"direction_label": "overweight", "risk_delta": 0.25, "confidence": 0.70},
+    "consumer": {"direction_label": "underweight", "risk_delta": -0.05, "confidence": 0.55},
+    "utilities": {"direction_label": "underweight", "risk_delta": -0.10, "confidence": 0.65},
+    "real_estate": {"direction_label": "underweight", "risk_delta": -0.05, "confidence": 0.60},
+    "broad_market_etf": {"direction_label": "slight_overweight", "risk_delta": 0.05, "confidence": 0.55},
+    "rates_and_gold": {"direction_label": "neutral", "risk_delta": 0.00, "confidence": 0.50},
+    "cash_equivalent": {"direction_label": "slight_overweight", "risk_delta": 0.05, "confidence": 0.55},
+}
+
+
+def _direction_from_delta(value):
+    v = float(_safe_float(value, 0.0))
+    if v > 1e-12:
+        return "overweight"
+    if v < -1e-12:
+        return "underweight"
+    return "neutral"
+
+
+def _normalize_direction_text(value):
+    txt = str(value or "").strip().lower()
+    if txt in {"overweight", "bullish", "positive", "up"}:
+        return "overweight"
+    if txt in {"underweight", "bearish", "negative", "down"}:
+        return "underweight"
+    if txt in {"neutral", "mixed", "flat", ""}:
+        return "neutral"
+    if "underweight" in txt:
+        return "underweight"
+    if "overweight" in txt:
+        return "overweight"
+    return "neutral"
+
+
+def _load_latest_industry_signals_per_bucket(config_path="paper_config.json"):
+    latest = {}
+    rows_out = []
+    meta = {"status": "ok", "error": None, "collection": "industry_signals", "count": 0}
+    try:
+        cfg = _load_json_config(config_path)
+    except Exception as e:
+        meta["status"] = "config_error"
+        meta["error"] = str(e)
+        cfg = {}
+
+    overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
+    collection_name = str(overlay_cfg.get("industry_collection", "industry_signals"))
+    chroma_path = str(cfg.get("macro_integration", {}).get("chroma_path", "./memory_db"))
+    meta["collection"] = collection_name
+    meta["chroma_path"] = chroma_path
+
+    if not CHROMADB_IMPORTED:
+        meta["status"] = "chroma_unavailable"
+        return latest, rows_out, meta
+
+    try:
+        client = chromadb.PersistentClient(path=chroma_path)
+        coll = client.get_or_create_collection(name=collection_name)
+        data = coll.get(include=["metadatas", "documents"])
+        metadatas = data.get("metadatas", []) if isinstance(data, dict) else []
+        documents = data.get("documents", []) if isinstance(data, dict) else []
+        meta["count"] = len(metadatas)
+
+        for idx, md in enumerate(metadatas):
+            if not isinstance(md, dict):
+                continue
+            if str(md.get("scope", "")).lower() != "industry":
+                continue
+
+            l2 = str(md.get("L2", "")).strip()
+            if not l2:
+                continue
+
+            ts_raw = md.get("timestamp")
+            ts = _parse_iso_or_none(ts_raw)
+            if ts is None:
+                continue
+
+            risk_delta = float(np.clip(_safe_float(md.get("risk_delta", 0.0), 0.0), -1.0, 1.0))
+            confidence = float(np.clip(_safe_float(md.get("confidence", 0.0), 0.0), 0.0, 1.0))
+            direction = _direction_from_delta(risk_delta)
+            doc_obj = {}
+
+            doc_text = documents[idx] if idx < len(documents) else None
+            if isinstance(doc_text, str) and doc_text.strip():
+                try:
+                    doc_obj = json.loads(doc_text)
+                except Exception:
+                    doc_obj = {}
+
+            if isinstance(doc_obj, dict):
+                direction = _normalize_direction_text(
+                    doc_obj.get("direction")
+                    or (doc_obj.get("signal", {}) if isinstance(doc_obj.get("signal"), dict) else {}).get("direction")
+                    or direction
+                )
+                if "risk_delta" in doc_obj:
+                    risk_delta = float(np.clip(_safe_float(doc_obj.get("risk_delta", risk_delta), risk_delta), -1.0, 1.0))
+                elif isinstance(doc_obj.get("signal"), dict) and "strength" in doc_obj.get("signal", {}):
+                    s = float(np.clip(_safe_float(doc_obj["signal"].get("strength", 0.0), 0.0), -1.0, 1.0))
+                    if direction == "overweight":
+                        risk_delta = abs(s)
+                    elif direction == "underweight":
+                        risk_delta = -abs(s)
+                    else:
+                        risk_delta = 0.0
+                if "confidence" in doc_obj:
+                    confidence = float(np.clip(_safe_float(doc_obj.get("confidence", confidence), confidence), 0.0, 1.0))
+                elif isinstance(doc_obj.get("signal"), dict) and "confidence" in doc_obj.get("signal", {}):
+                    confidence = float(np.clip(_safe_float(doc_obj["signal"].get("confidence", confidence), confidence), 0.0, 1.0))
+
+            row = {
+                "bucket": l2,
+                "local_direction": direction,
+                "local_risk_delta": float(risk_delta),
+                "local_confidence": float(confidence),
+                "local_timestamp": ts.isoformat(),
+            }
+            prev = latest.get(l2)
+            if prev is None:
+                latest[l2] = row
+            else:
+                prev_ts = _parse_iso_or_none(prev.get("local_timestamp"))
+                if prev_ts is None or ts > prev_ts:
+                    latest[l2] = row
+    except Exception as e:
+        meta["status"] = "read_error"
+        meta["error"] = str(e)
+
+    for bucket in CANONICAL_INDUSTRY_BUCKETS:
+        if bucket in latest:
+            rows_out.append(dict(latest[bucket]))
+        else:
+            rows_out.append(
+                {
+                    "bucket": bucket,
+                    "local_direction": "missing",
+                    "local_risk_delta": None,
+                    "local_confidence": None,
+                    "local_timestamp": None,
+                }
+            )
+    return latest, rows_out, meta
+
+
+def _compute_effective_cash_impact_for_bucket(row, news_overlay_cfg):
+    if not isinstance(row, dict):
+        return 0.0
+    if row.get("local_risk_delta") is None or row.get("local_confidence") is None:
+        return 0.0
+    try:
+        alpha = float(np.clip(_safe_float(news_overlay_cfg.get("alpha", 0.08), 0.08), 0.0, 1.0))
+        max_abs_delta = float(np.clip(_safe_float(news_overlay_cfg.get("max_abs_delta", 0.10), 0.10), 0.0, 1.0))
+        min_conf = float(np.clip(_safe_float(news_overlay_cfg.get("min_confidence", 0.55), 0.55), 0.0, 1.0))
+        mode = str(news_overlay_cfg.get("mode", "risk_only")).strip().lower()
+        max_age_hours = float(max(0.0, _safe_float(news_overlay_cfg.get("max_age_hours", 48), 48.0)))
+        confidence = float(np.clip(_safe_float(row.get("local_confidence", 0.0), 0.0), 0.0, 1.0))
+        if confidence < min_conf:
+            return 0.0
+        ts = _parse_iso_or_none(row.get("local_timestamp"))
+        if ts is None:
+            return 0.0
+        age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+        if age_h > max_age_hours:
+            return 0.0
+        risk_delta = float(np.clip(_safe_float(row.get("local_risk_delta", 0.0), 0.0), -1.0, 1.0))
+        delta = float(np.clip(risk_delta * alpha, -max_abs_delta, max_abs_delta))
+        if mode == "risk_only" and delta > 0:
+            delta = 0.0
+        return float(np.clip(abs(min(0.0, delta)), 0.0, max_abs_delta))
+    except Exception:
+        return 0.0
+
+
+def build_industry_sanity_check_report(config_path="paper_config.json"):
+    try:
+        cfg = _load_json_config(config_path)
+    except Exception:
+        cfg = {}
+    overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
+    latest_map, local_rows, read_meta = _load_latest_industry_signals_per_bucket(config_path=config_path)
+
+    rows = []
+    local_risks = []
+    local_dirs = []
+    baseline_risks = []
+    for row in local_rows:
+        bucket = str(row.get("bucket", "")).strip()
+        base = BASELINE_INDUSTRY_EXPECTATION.get(bucket, {"direction_label": "neutral", "risk_delta": 0.0, "confidence": 0.5})
+        baseline_risk = float(_safe_float(base.get("risk_delta", 0.0), 0.0))
+        baseline_conf = float(_safe_float(base.get("confidence", 0.5), 0.5))
+        baseline_dir = _direction_from_delta(baseline_risk)
+
+        local_risk = row.get("local_risk_delta")
+        local_conf = row.get("local_confidence")
+        local_dir = str(row.get("local_direction", "missing"))
+        if local_risk is not None:
+            local_risk = float(local_risk)
+            local_risks.append(local_risk)
+            baseline_risks.append(baseline_risk)
+            local_dirs.append(local_dir)
+        diff_risk = (float(local_risk) - baseline_risk) if local_risk is not None else None
+        diff_conf = (float(local_conf) - baseline_conf) if local_conf is not None else None
+
+        rows.append(
+            {
+                "bucket": bucket,
+                "local_direction": local_dir,
+                "local_risk_delta": local_risk,
+                "local_confidence": local_conf,
+                "local_timestamp": row.get("local_timestamp"),
+                "baseline_direction": str(base.get("direction_label", baseline_dir)),
+                "baseline_risk_delta": baseline_risk,
+                "baseline_confidence": baseline_conf,
+                "diff_risk_delta": diff_risk,
+                "diff_confidence": diff_conf,
+                "direction_match": bool(local_dir == baseline_dir) if local_risk is not None else False,
+                "effective_cash_impact": _compute_effective_cash_impact_for_bucket(row, overlay_cfg),
+                "flags": "",
+            }
+        )
+
+    direction_counts = {}
+    for d in local_dirs:
+        direction_counts[d] = direction_counts.get(d, 0) + 1
+    dominant_ratio = 0.0
+    if direction_counts and len(local_dirs) > 0:
+        dominant_ratio = float(max(direction_counts.values()) / max(1, len(local_dirs)))
+    std_local = float(np.std(local_risks)) if local_risks else 0.0
+    overweight_ratio = float(sum(1 for d in local_dirs if d == "overweight") / max(1, len(local_dirs)))
+    flag_uniformity = bool((std_local < 0.05) or (dominant_ratio > 0.80))
+
+    flag_rate_sensitive_mismatch = False
+    for b in ("utilities", "real_estate"):
+        row = next((x for x in rows if x["bucket"] == b), None)
+        if row and row.get("local_direction") == "overweight":
+            base_dir = _direction_from_delta(float(_safe_float(row.get("baseline_risk_delta", 0.0), 0.0)))
+            if base_dir == "underweight":
+                flag_rate_sensitive_mismatch = True
+                break
+
+    row_consumer = next((x for x in rows if x["bucket"] == "consumer"), None)
+    flag_consumer_mismatch = False
+    if row_consumer and row_consumer.get("local_direction") == "overweight":
+        base_dir = _direction_from_delta(float(_safe_float(row_consumer.get("baseline_risk_delta", 0.0), 0.0)))
+        if base_dir == "underweight":
+            flag_consumer_mismatch = True
+
+    for row in rows:
+        fl = []
+        if flag_uniformity:
+            fl.append("FLAG_UNIFORMITY")
+        if row.get("bucket") in {"utilities", "real_estate"}:
+            if row.get("local_direction") == "overweight" and _direction_from_delta(float(_safe_float(row.get("baseline_risk_delta", 0.0), 0.0))) == "underweight":
+                fl.append("FLAG_RATE_SENSITIVE_MISMATCH")
+        if row.get("bucket") == "consumer":
+            if row.get("local_direction") == "overweight" and _direction_from_delta(float(_safe_float(row.get("baseline_risk_delta", 0.0), 0.0))) == "underweight":
+                fl.append("FLAG_CONSUMER_MISMATCH")
+        row["flags"] = ",".join(fl)
+
+    correlation = None
+    if len(local_risks) >= 2 and len(baseline_risks) == len(local_risks):
+        try:
+            local_arr = np.array(local_risks, dtype=float)
+            base_arr = np.array(baseline_risks, dtype=float)
+            # Guard zero-variance cases to avoid RuntimeWarning invalid value encountered in divide.
+            if np.std(local_arr) > 1e-12 and np.std(base_arr) > 1e-12:
+                correlation = float(np.corrcoef(local_arr, base_arr)[0, 1])
+            else:
+                correlation = None
+        except Exception:
+            correlation = None
+
+    df = pd.DataFrame(rows)
+    summary = {
+        "read_status": read_meta.get("status"),
+        "read_error": read_meta.get("error"),
+        "collection": read_meta.get("collection"),
+        "chroma_path": read_meta.get("chroma_path"),
+        "available_buckets": int(sum(1 for r in rows if r.get("local_risk_delta") is not None)),
+        "missing_buckets": int(sum(1 for r in rows if r.get("local_risk_delta") is None)),
+        "std_local_risk_delta": std_local,
+        "dominant_direction_ratio": dominant_ratio,
+        "pct_overweight": overweight_ratio,
+        "correlation_local_vs_baseline": correlation,
+        "FLAG_UNIFORMITY": flag_uniformity,
+        "FLAG_RATE_SENSITIVE_MISMATCH": flag_rate_sensitive_mismatch,
+        "FLAG_CONSUMER_MISMATCH": flag_consumer_mismatch,
+        "overlay_cfg": {
+            "mode": str(overlay_cfg.get("mode", "risk_only")),
+            "alpha": float(_safe_float(overlay_cfg.get("alpha", 0.08), 0.08)),
+            "min_confidence": float(_safe_float(overlay_cfg.get("min_confidence", 0.55), 0.55)),
+            "max_abs_delta": float(_safe_float(overlay_cfg.get("max_abs_delta", 0.10), 0.10)),
+            "max_age_hours": float(_safe_float(overlay_cfg.get("max_age_hours", 48), 48)),
+        },
+    }
+    return {"df": df, "summary": summary}
 
 
 def build_industry_membership(config):
@@ -439,6 +762,731 @@ def _run_taxonomy_cli_if_requested():
         return 1
 
 
+def _run_industry_sanity_cli_if_requested():
+    if "--industry-sanity-check" not in sys.argv:
+        return None
+    parser = argparse.ArgumentParser(description="Industry signals sanity check")
+    parser.add_argument("--industry-sanity-check", action="store_true")
+    parser.add_argument("--config", default="paper_config.json")
+    parser.add_argument("--output", default="outputs/industry_sanity_check_latest.json")
+    args, _ = parser.parse_known_args()
+    try:
+        report = build_industry_sanity_check_report(config_path=args.config)
+        df = report.get("df", pd.DataFrame())
+        summary = report.get("summary", {})
+        print("[SANITY] Industry signal sanity check")
+        print(
+            f"[SANITY] status={summary.get('read_status')} available={summary.get('available_buckets')} "
+            f"missing={summary.get('missing_buckets')} pct_overweight={_safe_float(summary.get('pct_overweight', 0.0), 0.0):.2f} "
+            f"std={_safe_float(summary.get('std_local_risk_delta', 0.0), 0.0):.4f} "
+            f"corr={summary.get('correlation_local_vs_baseline')}"
+        )
+        print(
+            f"[SANITY] flags uniformity={summary.get('FLAG_UNIFORMITY')} "
+            f"rate_sensitive_mismatch={summary.get('FLAG_RATE_SENSITIVE_MISMATCH')} "
+            f"consumer_mismatch={summary.get('FLAG_CONSUMER_MISMATCH')}"
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            cols = [
+                "bucket",
+                "local_direction",
+                "local_risk_delta",
+                "local_confidence",
+                "local_timestamp",
+                "baseline_direction",
+                "baseline_risk_delta",
+                "baseline_confidence",
+                "diff_risk_delta",
+                "diff_confidence",
+                "direction_match",
+                "effective_cash_impact",
+                "flags",
+            ]
+            safe_cols = [c for c in cols if c in df.columns]
+            print(df[safe_cols].to_string(index=False))
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "rows": df.to_dict("records") if isinstance(df, pd.DataFrame) else [],
+        }
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[SANITY] wrote: {args.output}")
+        return 0
+    except Exception as e:
+        print(f"[SANITY] ERROR: {e}")
+        return 1
+
+
+def _run_industry_runtime_once_cli_if_requested():
+    if "--run-industry-runtime-once" not in sys.argv:
+        return None
+    parser = argparse.ArgumentParser(description="Run industry runtime pipeline once and exit")
+    parser.add_argument("--run-industry-runtime-once", action="store_true")
+    parser.add_argument("--config", default="paper_config.json")
+    args, _ = parser.parse_known_args()
+    try:
+        result = run_industry_news_pipeline_runtime(config_path=args.config)
+        print(f"[INDUSTRY_RUNTIME] status={result.get('status')}")
+        latest_map, rows, meta = _load_latest_industry_signals_per_bucket(config_path=args.config)
+        print(
+            f"[INDUSTRY_RUNTIME] latest_read_status={meta.get('status')} "
+            f"collection={meta.get('collection')} count={meta.get('count')}"
+        )
+        payload = {
+            "runtime_result": result,
+            "latest_rows": rows,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as e:
+        print(f"[INDUSTRY_RUNTIME] ERROR: {e}")
+        return 1
+
+
+def _build_industry_write_id(signal_obj):
+    if not isinstance(signal_obj, dict):
+        return None
+    l2 = str(signal_obj.get("L2", "unknown"))
+    asof = str(signal_obj.get("asof_utc", datetime.now(timezone.utc).isoformat()))
+    date_key = asof[:10]
+    # Mirror write_industry_signals_to_chroma hash input (which does not include debug-only status).
+    payload_obj = dict(signal_obj)
+    payload_obj.pop("status", None)
+    payload = json.dumps(payload_obj, ensure_ascii=False)
+    item_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    return f"industry::{l2}::{date_key}::{item_hash}"
+
+
+def _safe_load_json_text(text):
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _optional_float(value):
+    try:
+        if value is None:
+            return None
+        v = float(value)
+        if not np.isfinite(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _read_back_industry_signal(collection_name, chroma_path, bucket, write_timestamp_used, write_id=None):
+    fallback = {
+        "id": write_id,
+        "bucket": bucket,
+        "timestamp": write_timestamp_used,
+        "status": "not_found",
+        "direction": None,
+        "risk_delta": None,
+        "confidence": None,
+        "metadata": {},
+        "document_obj": None,
+    }
+    if not CHROMADB_IMPORTED:
+        fallback["status"] = "chroma_unavailable"
+        return fallback
+    try:
+        client = chromadb.PersistentClient(path=chroma_path)
+        coll = client.get_or_create_collection(name=collection_name)
+        ids = []
+        metadatas = []
+        documents = []
+        # Chroma where parser in some versions accepts only single-field equality.
+        # Query by L2 first, then filter timestamp client-side.
+        by_l2 = coll.get(
+            where={"L2": str(bucket)},
+            include=["metadatas", "documents"],
+            limit=200,
+        )
+        by_l2_ids = by_l2.get("ids", []) if isinstance(by_l2, dict) else []
+        by_l2_metas = by_l2.get("metadatas", []) if isinstance(by_l2, dict) else []
+        by_l2_docs = by_l2.get("documents", []) if isinstance(by_l2, dict) else []
+        target_ts = str(write_timestamp_used)
+        picked_idx = None
+        for idx, md in enumerate(by_l2_metas):
+            if isinstance(md, dict) and str(md.get("timestamp", "")) == target_ts:
+                picked_idx = idx
+                break
+        if picked_idx is not None:
+            ids = [by_l2_ids[picked_idx]] if picked_idx < len(by_l2_ids) else []
+            metadatas = [by_l2_metas[picked_idx]]
+            documents = [by_l2_docs[picked_idx]] if picked_idx < len(by_l2_docs) else []
+        elif write_id:
+            by_id = coll.get(ids=[str(write_id)], include=["metadatas", "documents"])
+            ids = by_id.get("ids", []) if isinstance(by_id, dict) else []
+            metadatas = by_id.get("metadatas", []) if isinstance(by_id, dict) else []
+            documents = by_id.get("documents", []) if isinstance(by_id, dict) else []
+
+        if not ids:
+            return fallback
+        row_id = ids[0]
+        md = metadatas[0] if metadatas else {}
+        doc_obj = _safe_load_json_text(documents[0] if documents else None)
+        risk_delta = None
+        confidence = None
+        direction = None
+        status = "ok"
+        if isinstance(md, dict):
+            risk_delta = _optional_float(md.get("risk_delta", None))
+            confidence = _optional_float(md.get("confidence", None))
+            direction = md.get("direction")
+            status = str(md.get("status", status))
+        if isinstance(doc_obj, dict):
+            if "risk_delta" in doc_obj:
+                risk_delta = _optional_float(doc_obj.get("risk_delta", risk_delta))
+            if "confidence" in doc_obj:
+                confidence = _optional_float(doc_obj.get("confidence", confidence))
+            direction = doc_obj.get("direction", direction)
+            status = str(doc_obj.get("status", status))
+        return {
+            "id": row_id,
+            "bucket": bucket,
+            "timestamp": write_timestamp_used,
+            "status": status,
+            "direction": direction,
+            "risk_delta": risk_delta,
+            "confidence": confidence,
+            "metadata": md if isinstance(md, dict) else {},
+            "document_obj": doc_obj,
+        }
+    except Exception as e:
+        fallback["status"] = "read_error"
+        fallback["error"] = str(e)
+        return fallback
+
+
+def _print_industry_runtime_debug_summary(debug_entries):
+    if not isinstance(debug_entries, list) or not debug_entries:
+        print("[INDUSTRY_RUNTIME_DEBUG] no bucket entries")
+        return
+    print("\n[INDUSTRY_RUNTIME_DEBUG] Summary")
+    print(
+        f"{'bucket':<22} {'items':>5} {'llm':>5} "
+        f"{'final(direction,delta,conf,status)':<44} {'read_back(status)':<18} {'neutral_cap':<12}"
+    )
+    print("-" * 120)
+    for row in debug_entries:
+        bucket = str(row.get("bucket", ""))[:22]
+        items = int(_safe_int(row.get("bucket_items_count", 0), 0))
+        llm_called = "Y" if bool(row.get("llm_called", False)) else "N"
+        final = row.get("final_to_write_obj", {}) if isinstance(row.get("final_to_write_obj"), dict) else {}
+        read_back = row.get("read_back_obj", {}) if isinstance(row.get("read_back_obj"), dict) else {}
+        f_dir = str(final.get("direction", "n/a"))
+        f_conf = _optional_float(final.get("confidence", None))
+        f_delta = _optional_float(final.get("risk_delta", None))
+        f_status = str(final.get("status", "n/a"))
+        rb_status = str(read_back.get("status", "n/a"))
+        neutral_cap = bool(row.get("neutral_confidence_capped", False))
+        f_txt = f"{f_dir},{f_delta!s},{f_conf!s},{f_status}"[:44]
+        print(f"{bucket:<22} {items:>5} {llm_called:>5} {f_txt:<44} {rb_status:<18} {str(neutral_cap):<12}")
+
+
+def run_industry_runtime_once_debug(config_path="paper_config.json", output_path="outputs/industry_runtime_debug_latest.json"):
+    try:
+        cfg = _load_json_config(config_path)
+    except Exception as e:
+        payload = {
+            "status": "config_error",
+            "error": str(e),
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "config_path": config_path,
+            "bucket_debug": [],
+        }
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return payload
+
+    overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
+    if not bool(overlay_cfg.get("enabled", False)):
+        payload = {
+            "status": "disabled",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "config_path": config_path,
+            "bucket_debug": [],
+            "news_overlay_enabled": False,
+        }
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return payload
+
+    portfolio_tickers = _get_runtime_portfolio_tickers(
+        snapshot_path=cfg.get("reporting", {}).get("snapshot_live_path", "outputs/snapshot_live.json")
+    )
+    candidate_tickers = _get_runtime_candidate_tickers(
+        cfg,
+        limit=_safe_int(cfg.get("news_sources", {}).get("max_candidate_tickers", 20), 20),
+    )
+    debug_trace = {"bucket_entries": {}}
+    result = run_industry_news_pipeline(
+        cfg,
+        portfolio_tickers=portfolio_tickers,
+        candidate_tickers=candidate_tickers,
+        debug_trace=debug_trace,
+    )
+
+    collection_name = str(overlay_cfg.get("industry_collection", "industry_signals"))
+    chroma_path = str(cfg.get("macro_integration", {}).get("chroma_path", "./memory_db"))
+    entries = []
+    bucket_entries = debug_trace.get("bucket_entries", {}) if isinstance(debug_trace, dict) else {}
+    write_rows = result.get("write_info", {}).get("rows", [])
+    write_row_by_bucket = {}
+    if isinstance(write_rows, list):
+        for wr in write_rows:
+            if isinstance(wr, dict):
+                write_row_by_bucket[str(wr.get("L2", "")).strip()] = wr
+    for bucket in sorted(bucket_entries.keys()):
+        row = dict(bucket_entries.get(bucket, {}))
+        final_obj = row.get("final_to_write_obj", {})
+        if not isinstance(final_obj, dict):
+            final_obj = {}
+        write_timestamp_used = str(final_obj.get("asof_utc", row.get("asof_utc", datetime.now(timezone.utc).isoformat())))
+        write_id = _build_industry_write_id(final_obj) if final_obj else None
+        read_back_obj = _read_back_industry_signal(
+            collection_name=collection_name,
+            chroma_path=chroma_path,
+            bucket=bucket,
+            write_timestamp_used=write_timestamp_used,
+            write_id=write_id,
+        )
+        row["write_timestamp_used"] = write_timestamp_used
+        row["write_id"] = write_id
+        row["read_back_obj"] = read_back_obj
+        wr = write_row_by_bucket.get(str(bucket), {})
+        row["status_written_to_chroma"] = (
+            str(wr.get("status", "")) if isinstance(wr, dict) and str(wr.get("status", "")).strip() else None
+        )
+        row["neutral_confidence_capped"] = bool(final_obj.get("_neutral_confidence_capped", False))
+        row["bull_score"] = _safe_int(final_obj.get("bull_score", 0), 0)
+        row["bear_score"] = _safe_int(final_obj.get("bear_score", 0), 0)
+        row["net_score"] = _safe_int(final_obj.get("net_score", 0), 0)
+        row["postprocess_overrode_direction"] = bool(final_obj.get("postprocess_overrode_direction", False))
+        row["postprocess_overrode_risk_delta"] = bool(final_obj.get("postprocess_overrode_risk_delta", False))
+        row["postprocess_downgrade_reason"] = str(final_obj.get("postprocess_downgrade_reason", ""))
+        row["postprocess_kept_direction"] = bool(final_obj.get("postprocess_kept_direction", False))
+        labels_head = final_obj.get("labels_head", [])
+        row["labels_head"] = [dict(x) for x in labels_head[:4] if isinstance(x, dict)] if isinstance(labels_head, list) else []
+        row["score_mapping_reason"] = str(final_obj.get("score_mapping_reason", ""))
+        row["macro_prior_applied"] = bool(final_obj.get("macro_prior_applied", False))
+        row["macro_prior_reasons"] = list(final_obj.get("macro_prior_reasons", [])) if isinstance(final_obj.get("macro_prior_reasons", []), list) else []
+        row["macro_prior_strength"] = int(_safe_int(final_obj.get("macro_prior_strength", 0), 0))
+        row["macro_risk_off_score"] = int(_safe_int(final_obj.get("macro_risk_off_score", 0), 0))
+        row["macro_prior_skipped_due_to_score"] = bool(final_obj.get("macro_prior_skipped_due_to_score", False))
+        row["macro_prior_skipped_due_to_cooldown"] = bool(final_obj.get("macro_prior_skipped_due_to_cooldown", False))
+        entries.append(row)
+
+    status_match_all = True
+    for row in entries:
+        final_status = str((row.get("final_to_write_obj", {}) or {}).get("status", ""))
+        rb_status = str((row.get("read_back_obj", {}) or {}).get("status", ""))
+        if final_status != rb_status:
+            status_match_all = False
+            break
+
+    payload = {
+        "status": "ok",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "config_path": config_path,
+        "runtime_result_status": result.get("write_info", {}).get("written", None),
+        "collection": collection_name,
+        "chroma_path": chroma_path,
+        "all_buckets_readback_status_match_final_status": bool(status_match_all),
+        "bucket_debug": entries,
+        "write_info": result.get("write_info", {}),
+    }
+
+    dir_counter = Counter()
+    risk_values = set()
+    conf_values = set()
+    net_scores = []
+    overrode_direction = 0
+    overrode_risk = 0
+    negative_risk_delta_count = 0
+    for row in entries:
+        final_obj = row.get("final_to_write_obj", {}) if isinstance(row.get("final_to_write_obj"), dict) else {}
+        direction = str(final_obj.get("direction", "neutral")).strip().lower() or "neutral"
+        dir_counter[direction] += 1
+        rv = _optional_float(final_obj.get("risk_delta", None))
+        cv = _optional_float(final_obj.get("confidence", None))
+        nv = _optional_float(final_obj.get("net_score", None))
+        if rv is not None:
+            risk_values.add(float(rv))
+            if float(rv) < -1e-12:
+                negative_risk_delta_count += 1
+        if cv is not None:
+            conf_values.add(float(cv))
+        if nv is not None:
+            net_scores.append(float(nv))
+        if bool(final_obj.get("postprocess_overrode_direction", False)):
+            overrode_direction += 1
+        if bool(final_obj.get("postprocess_overrode_risk_delta", False)):
+            overrode_risk += 1
+    net_min = float(np.min(net_scores)) if net_scores else 0.0
+    net_mean = float(np.mean(net_scores)) if net_scores else 0.0
+    net_max = float(np.max(net_scores)) if net_scores else 0.0
+    payload["distribution_summary"] = {
+        "direction_counts": dict(dir_counter),
+        "underweight_count": int(dir_counter.get("underweight", 0)),
+        "negative_risk_delta_count": int(negative_risk_delta_count),
+        "risk_delta_unique": sorted(risk_values),
+        "confidence_unique": sorted(conf_values),
+        "net_score_min": net_min,
+        "net_score_mean": net_mean,
+        "net_score_max": net_max,
+        "count_overrode_direction": int(overrode_direction),
+        "count_overrode_risk_delta": int(overrode_risk),
+    }
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _print_industry_runtime_debug_summary(entries)
+    print(
+        "[INDUSTRY_RUNTIME_DEBUG] direction_counts "
+        f"overweight={dir_counter.get('overweight', 0)} "
+        f"neutral={dir_counter.get('neutral', 0)} "
+        f"underweight={dir_counter.get('underweight', 0)}"
+    )
+    print(f"[INDUSTRY_RUNTIME_DEBUG] negative_risk_delta_count={negative_risk_delta_count}")
+    print(f"[INDUSTRY_RUNTIME_DEBUG] risk_delta_unique={sorted(risk_values)}")
+    print(f"[INDUSTRY_RUNTIME_DEBUG] confidence_unique={sorted(conf_values)}")
+    print(
+        f"[INDUSTRY_RUNTIME_DEBUG] count_overrode_direction={overrode_direction} "
+        f"count_overrode_risk_delta={overrode_risk}"
+    )
+    print(f"[INDUSTRY_RUNTIME_DEBUG] net_score_min_mean_max=({net_min:.2f},{net_mean:.2f},{net_max:.2f})")
+    print(f"[INDUSTRY_RUNTIME_DEBUG] all_buckets_readback_status_match_final_status={status_match_all}")
+    print(f"[INDUSTRY_RUNTIME_DEBUG] wrote: {output_path}")
+    return payload
+
+
+def _run_industry_runtime_once_debug_cli_if_requested():
+    if "--run-industry-runtime-once-debug" not in sys.argv:
+        return None
+    parser = argparse.ArgumentParser(description="Run industry runtime pipeline once with debug trace and exit")
+    parser.add_argument("--run-industry-runtime-once-debug", action="store_true")
+    parser.add_argument("--config", default="paper_config.json")
+    parser.add_argument("--output", default="outputs/industry_runtime_debug_latest.json")
+    args, _ = parser.parse_known_args()
+    try:
+        run_industry_runtime_once_debug(config_path=args.config, output_path=args.output)
+        return 0
+    except Exception as e:
+        print(f"[INDUSTRY_RUNTIME_DEBUG] ERROR: {e}")
+        return 1
+
+
+def _extract_parsed_confidence(parsed_obj):
+    if not isinstance(parsed_obj, dict):
+        return None
+    if "confidence" in parsed_obj:
+        try:
+            return float(parsed_obj.get("confidence"))
+        except Exception:
+            pass
+    signal_obj = parsed_obj.get("signal", {})
+    if isinstance(signal_obj, dict) and "confidence" in signal_obj:
+        try:
+            return float(signal_obj.get("confidence"))
+        except Exception:
+            pass
+    return None
+
+
+def _run_debug_industry_one_bucket_cli_if_requested():
+    if ("--debug-industry-one-bucket" not in sys.argv) and ("--run-industry-one-bucket-debug" not in sys.argv):
+        return None
+
+    parser = argparse.ArgumentParser(description="Debug one industry bucket end-to-end")
+    parser.add_argument("--debug-industry-one-bucket", default=None, help="Target L2 bucket name (legacy flag)")
+    parser.add_argument("--run-industry-one-bucket-debug", default=None, help="Target L2 bucket name (step8 flag)")
+    parser.add_argument("--config", default="paper_config.json")
+    parser.add_argument("--output", default="outputs/debug_industry_one_bucket.json")
+    parser.add_argument("--max_evidence", type=int, default=4)
+    parser.add_argument("--llm_timeout_seconds", type=int, default=120)
+    args, _ = parser.parse_known_args()
+
+    target_l2 = str(args.run_industry_one_bucket_debug or args.debug_industry_one_bucket or "").strip()
+    if not target_l2:
+        print("[DEBUG_BUCKET] ERROR: empty bucket")
+        return 1
+
+    try:
+        cfg = _load_json_config(args.config)
+        news_overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
+        sources_cfg = _merge_cfg(_default_news_sources_cfg(), cfg.get("news_sources", {}))
+        industry_taxonomy = cfg.get("industry_taxonomy", {})
+
+        l2_to_tickers, _l3_to_tickers, ticker_to_tags = build_industry_membership(cfg)
+        l2_list = list(l2_to_tickers.keys())
+
+        portfolio_tickers = _get_runtime_portfolio_tickers(
+            snapshot_path=cfg.get("reporting", {}).get("snapshot_live_path", "outputs/snapshot_live.json")
+        )
+        candidate_tickers = _get_runtime_candidate_tickers(
+            cfg,
+            limit=_safe_int(cfg.get("news_sources", {}).get("max_candidate_tickers", 20), 20),
+        )
+        context = {
+            "portfolio_tickers": portfolio_tickers,
+            "candidate_tickers": candidate_tickers,
+            "industry_topics": l2_list,
+        }
+
+        all_items = []
+        providers = []
+        if bool(sources_cfg.get("market_rss_enabled", True)):
+            providers.append(
+                MarketRSSProvider(
+                    sources_cfg.get("market_rss_feeds", {}),
+                    timeout_seconds=_safe_int(sources_cfg.get("timeout_seconds", 8), 8),
+                    retries=_safe_int(sources_cfg.get("retries", 1), 1),
+                )
+            )
+        if bool(sources_cfg.get("ticker_rss_enabled", True)):
+            providers.append(
+                TickerYahooRSSProvider(
+                    sources_cfg.get("ticker_rss_template", ""),
+                    timeout_seconds=_safe_int(sources_cfg.get("timeout_seconds", 8), 8),
+                    retries=_safe_int(sources_cfg.get("retries", 1), 1),
+                    max_tickers=_safe_int(
+                        max(
+                            _safe_int(sources_cfg.get("max_portfolio_tickers", 20), 20),
+                            _safe_int(sources_cfg.get("max_candidate_tickers", 20), 20),
+                        ),
+                        20,
+                    ),
+                )
+            )
+        if bool(sources_cfg.get("industry_rss_enabled", True)):
+            providers.append(
+                IndustryGoogleRSSProvider(
+                    sources_cfg.get("industry_rss_template", ""),
+                    sources_cfg.get("industry_topic_queries", {}),
+                    timeout_seconds=_safe_int(sources_cfg.get("timeout_seconds", 8), 8),
+                    retries=_safe_int(sources_cfg.get("retries", 1), 1),
+                )
+            )
+
+        provider_errors = []
+        for provider in providers:
+            try:
+                fetched = provider.fetch(context)
+                if isinstance(fetched, list):
+                    all_items.extend(fetched)
+            except Exception as e:
+                provider_errors.append({"provider": getattr(provider, "provider_name", "unknown"), "error": str(e)})
+
+        max_age_hours = _safe_float(news_overlay_cfg.get("max_age_hours", 48), 48.0)
+        age_filtered = []
+        for item in all_items:
+            row = dict(item)
+            if not row.get("published_at"):
+                row["published_at"] = datetime.now(timezone.utc).isoformat()
+            if _within_hours(row.get("published_at"), max_age_hours):
+                age_filtered.append(row)
+
+        deduped = _dedup_news_sorted(age_filtered)
+        mapped = map_news_items_to_taxonomy(
+            deduped,
+            ticker_to_tags=ticker_to_tags,
+            industry_taxonomy=industry_taxonomy,
+            industry_keyword_map=sources_cfg.get("industry_keyword_map", {}),
+        )
+        buckets = bucket_news_by_l2(
+            mapped,
+            l2_list=l2_list,
+            max_per_l2=_safe_int(sources_cfg.get("max_per_l2", 8), 8),
+            prefer_seed_primary=bool(sources_cfg.get("prefer_seed_primary", True)),
+        )
+        buckets = _apply_post_bucket_total_cap(buckets, sources_cfg.get("post_bucket_max_total"))
+        bucket_items_all = buckets.get(target_l2, [])
+        max_evidence = max(1, _safe_int(args.max_evidence, 4))
+        bucket_items = list(bucket_items_all[:max_evidence]) if isinstance(bucket_items_all, list) else []
+
+        seed_counter = Counter()
+        matched_l2_counter = Counter()
+        bucket_preview = []
+        for item in bucket_items:
+            seed = str(item.get("seed_l2", "")).strip()
+            if seed:
+                seed_counter[seed] += 1
+            for l2 in item.get("matched_L2", []) if isinstance(item.get("matched_L2"), list) else []:
+                matched_l2_counter[str(l2)] += 1
+            if len(bucket_preview) < 10:
+                bucket_preview.append(
+                    {
+                        "title": str(item.get("title", "")),
+                        "source": str(item.get("source", "")),
+                        "seed_l2": item.get("seed_l2"),
+                        "matched_L2": item.get("matched_L2", []),
+                    }
+                )
+
+        asof_utc = datetime.now(timezone.utc).isoformat()
+        llm_model = str(
+            cfg.get("news_overlay", {}).get(
+                "llm_model",
+                cfg.get("macro_integration", {}).get("llm_topic_model", LOCAL_MODEL),
+            )
+        )
+        macro_context_for_prior = _build_macro_context_for_industry_pipeline(cfg, mapped)
+        macro_prior_cfg = _get_macro_risk_off_prior_cfg(news_overlay_cfg)
+        collection_name = str(news_overlay_cfg.get("industry_collection", "industry_signals"))
+        chroma_path = str(cfg.get("macro_integration", {}).get("chroma_path", "./memory_db"))
+
+        raw_text = ""
+        parsed_obj = {}
+        normalized_obj = _neutral_industry_signal(target_l2, asof_utc, bucket_items, reason="no_items")
+        llm_error = None
+        llm_time_seconds = 0.0
+        llm_timeout_hit = False
+
+        if bucket_items:
+            started = time.time()
+            normalized_obj, raw_text, llm_error, parsed_obj = _generate_industry_signal_with_llm(
+                target_l2,
+                bucket_items,
+                llm_model,
+                return_debug=True,
+                macro_context=macro_context_for_prior,
+                macro_risk_off_prior_cfg=macro_prior_cfg,
+                collection_name=collection_name,
+                chroma_path=chroma_path,
+                llm_timeout_seconds=_safe_int(args.llm_timeout_seconds, 120),
+            )
+            llm_time_seconds = float(max(0.0, time.time() - started))
+            llm_timeout_hit = bool(isinstance(normalized_obj, dict) and normalized_obj.get("llm_timeout_hit", False))
+            if (not llm_timeout_hit) and isinstance(llm_error, str) and "timeout" in llm_error.lower():
+                llm_timeout_hit = True
+
+        write_info = {
+            "written": 0,
+            "collection": collection_name,
+        }
+        read_back_obj = {}
+        if isinstance(normalized_obj, dict) and bucket_items:
+            try:
+                write_info = write_industry_signals_to_chroma(
+                    [normalized_obj],
+                    collection_name=collection_name,
+                    chroma_path=chroma_path,
+                )
+                write_rows = write_info.get("rows", []) if isinstance(write_info, dict) else []
+                wr = write_rows[0] if isinstance(write_rows, list) and write_rows else {}
+                read_back_obj = _read_back_industry_signal(
+                    collection_name=collection_name,
+                    chroma_path=chroma_path,
+                    bucket=target_l2,
+                    write_timestamp_used=str((wr or {}).get("timestamp", normalized_obj.get("asof_utc", asof_utc))),
+                    write_id=str((wr or {}).get("id", _build_industry_write_id(normalized_obj))),
+                )
+            except Exception as e:
+                log_error(f"[ONE_BUCKET_STEP8] chroma write/readback failed: {e}")
+
+        parsed_confidence_value = _extract_parsed_confidence(parsed_obj)
+        normalized_confidence_value = _safe_float(normalized_obj.get("confidence", 0.0), 0.0)
+        raw_has_confidence_field = bool(re.search(r'"confidence"\s*:', str(raw_text or ""), re.IGNORECASE))
+        evidence_ids_used = [
+            str(item.get("id", "")).strip()
+            for item in bucket_items
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        ]
+
+        output_payload = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "config_path": args.config,
+            "target_bucket": target_l2,
+            "max_evidence": int(max_evidence),
+            "llm_timeout_seconds": int(_safe_int(args.llm_timeout_seconds, 120)),
+            "runtime_context": {
+                "portfolio_tickers_count": len(portfolio_tickers),
+                "candidate_tickers_count": len(candidate_tickers),
+                "providers_enabled": [getattr(p, "provider_name", "unknown") for p in providers],
+                "provider_errors": provider_errors,
+                "raw_items_count": len(all_items),
+                "age_filtered_count": len(age_filtered),
+                "dedup_count": len(deduped),
+                "bucket_items_count": len(bucket_items),
+                "bucket_items_count_before_max_evidence": len(bucket_items_all) if isinstance(bucket_items_all, list) else 0,
+                "evidence_ids_used": evidence_ids_used,
+            },
+            "bucket_mapping_debug": {
+                "seed_l2_distribution": dict(seed_counter),
+                "matched_L2_distribution": dict(matched_l2_counter),
+                "items_preview_top10": bucket_preview,
+            },
+            "llm_debug": {
+                "model": llm_model,
+                "llm_error": llm_error,
+                "llm_time_seconds": float(llm_time_seconds),
+                "llm_timeout_hit": bool(llm_timeout_hit),
+                "raw_text": raw_text,
+                "raw_text_head_4000": str(raw_text or "")[:4000],
+                "parsed_obj": parsed_obj,
+                "normalized_obj": normalized_obj,
+                "raw_has_confidence_field": raw_has_confidence_field,
+                "parsed_confidence_value": parsed_confidence_value,
+                "normalized_confidence_value": normalized_confidence_value,
+            },
+            "step8_summary": {
+                "bucket_items_count": len(bucket_items),
+                "evidence_ids_used": evidence_ids_used,
+                "macro_risk_off_score": int(_safe_int(normalized_obj.get("macro_risk_off_score", 0), 0)) if isinstance(normalized_obj, dict) else 0,
+                "macro_prior_applied": bool(normalized_obj.get("macro_prior_applied", False)) if isinstance(normalized_obj, dict) else False,
+                "macro_prior_skipped_due_to_score": bool(normalized_obj.get("macro_prior_skipped_due_to_score", False)) if isinstance(normalized_obj, dict) else False,
+                "macro_prior_skipped_due_to_cooldown": bool(normalized_obj.get("macro_prior_skipped_due_to_cooldown", False)) if isinstance(normalized_obj, dict) else False,
+                "macro_prior_reasons": list(normalized_obj.get("macro_prior_reasons", [])) if isinstance(normalized_obj, dict) else [],
+                "bull_score": int(_safe_int(normalized_obj.get("bull_score", 0), 0)) if isinstance(normalized_obj, dict) else 0,
+                "bear_score": int(_safe_int(normalized_obj.get("bear_score", 0), 0)) if isinstance(normalized_obj, dict) else 0,
+                "net_score": int(_safe_int(normalized_obj.get("net_score", 0), 0)) if isinstance(normalized_obj, dict) else 0,
+                "final": {
+                    "direction": str(normalized_obj.get("direction", "neutral")) if isinstance(normalized_obj, dict) else "neutral",
+                    "risk_delta": float(_safe_float(normalized_obj.get("risk_delta", 0.0), 0.0)) if isinstance(normalized_obj, dict) else 0.0,
+                    "confidence": float(_safe_float(normalized_obj.get("confidence", 0.0), 0.0)) if isinstance(normalized_obj, dict) else 0.0,
+                    "status": str(normalized_obj.get("status", "error")) if isinstance(normalized_obj, dict) else "error",
+                },
+                "llm_time_seconds": float(llm_time_seconds),
+                "llm_timeout_hit": bool(llm_timeout_hit),
+            },
+            "write_info": write_info,
+            "read_back_obj": read_back_obj,
+        }
+
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(output_payload, f, ensure_ascii=False, indent=2)
+
+        ss = output_payload.get("step8_summary", {})
+        ff = ss.get("final", {}) if isinstance(ss.get("final"), dict) else {}
+        print(
+            f"[ONE_BUCKET_STEP8] bucket={target_l2} items={ss.get('bucket_items_count', 0)} "
+            f"score={ss.get('macro_risk_off_score', 0)} reasons={ss.get('macro_prior_reasons', [])} "
+            f"applied={ss.get('macro_prior_applied', False)} "
+            f"skip_score={ss.get('macro_prior_skipped_due_to_score', False)} "
+            f"skip_cooldown={ss.get('macro_prior_skipped_due_to_cooldown', False)} "
+            f"bull={ss.get('bull_score', 0)} bear={ss.get('bear_score', 0)} net={ss.get('net_score', 0)} "
+            f"final=({ff.get('risk_delta', 0.0)},{ff.get('confidence', 0.0)},{ff.get('direction', 'neutral')},{ff.get('status', 'error')}) "
+            f"llm_time={ss.get('llm_time_seconds', 0.0):.2f}s timeout={ss.get('llm_timeout_hit', False)}"
+        )
+        print(f"[DEBUG_BUCKET] wrote: {args.output}")
+        return 0
+    except Exception as e:
+        print(f"[DEBUG_BUCKET] ERROR: {e}")
+        return 1
+
+
 def _load_json_config(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -454,6 +1502,21 @@ def _default_news_overlay_cfg():
         "min_confidence": 0.55,
         "max_abs_delta": 0.10,
         "runtime_min_interval_seconds": 900,
+        "macro_risk_off_prior": {
+            "enabled": False,
+            "strength": 1,
+            "min_score": 2,
+            "cooldown_minutes": 180,
+            "buckets": [
+                "utilities",
+                "real_estate",
+                "rates_and_gold",
+                "broad_market_etf",
+                "cash_equivalent",
+            ],
+            "mode": "add_bearish_label",
+            "min_macro_confidence": 0.55,
+        },
     }
 
 
@@ -462,10 +1525,12 @@ def _default_news_sources_cfg():
         "market_rss_enabled": True,
         "ticker_rss_enabled": True,
         "industry_rss_enabled": True,
+        "prefer_seed_primary": True,
         "timeout_seconds": 8,
         "retries": 1,
         "max_per_l2": 8,
         "max_total": 60,
+        "post_bucket_max_total": None,
         "max_portfolio_tickers": 20,
         "max_candidate_tickers": 20,
         "market_rss_feeds": dict(RSS_FEEDS),
@@ -750,6 +1815,78 @@ def _dedup_and_limit_news(items, max_total=60):
     return merged[: max(1, _safe_int(max_total, 60))]
 
 
+def _dedup_news_sorted(items):
+    """Deduplicate and sort by published_at desc without global truncation."""
+    dedup = {}
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title", "")).strip()
+        url = str(raw.get("url", "")).strip()
+        if not title and not url:
+            continue
+        url_key = url.lower()
+        title_key = normalize_title(title) if title else ""
+        key = url_key or f"title::{title_key}"
+        if key in dedup:
+            continue
+        item = dict(raw)
+        item["id"] = _stable_news_id(item)
+        dedup[key] = item
+    merged = list(dedup.values())
+    merged.sort(
+        key=lambda x: _parse_iso_or_none(x.get("published_at")) or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return merged
+
+
+def _apply_post_bucket_total_cap(buckets, post_bucket_max_total):
+    """Optional post-bucket cap with a one-item-per-nonempty-bucket floor."""
+    try:
+        cap = _safe_int(post_bucket_max_total, 0)
+    except Exception:
+        cap = 0
+    if cap <= 0 or not isinstance(buckets, dict):
+        return buckets
+
+    bucket_keys = list(buckets.keys())
+    nonempty_keys = [k for k in bucket_keys if isinstance(buckets.get(k), list) and len(buckets.get(k)) > 0]
+    if not nonempty_keys:
+        return buckets
+
+    effective_cap = max(cap, len(nonempty_keys))
+    base = {k: [] for k in bucket_keys}
+    used = 0
+
+    # First pass: keep one item for each non-empty bucket to avoid starvation.
+    for k in nonempty_keys:
+        if used >= effective_cap:
+            break
+        base[k].append(buckets[k][0])
+        used += 1
+
+    if used >= effective_cap:
+        return base
+
+    # Round-robin fill from remaining items.
+    cursor = {k: 1 for k in nonempty_keys}
+    progressed = True
+    while used < effective_cap and progressed:
+        progressed = False
+        for k in nonempty_keys:
+            idx = cursor.get(k, 1)
+            rows = buckets.get(k, [])
+            if idx < len(rows):
+                base[k].append(rows[idx])
+                cursor[k] = idx + 1
+                used += 1
+                progressed = True
+                if used >= effective_cap:
+                    break
+    return base
+
+
 def _build_l3_to_l2_map(industry_taxonomy):
     l3_map = {}
     if not isinstance(industry_taxonomy, dict):
@@ -777,6 +1914,14 @@ def map_news_items_to_taxonomy(news_items, ticker_to_tags, industry_taxonomy, in
         matched_l3 = set(match.get("matched_L3", []))
         matched_keywords = set(match.get("matched_keywords", []))
 
+        seed_l2 = str(row.get("seed_l2", "")).strip()
+        if seed_l2:
+            row["primary_l2"] = seed_l2
+            # Strongly retain the original industry intent from provider.
+            matched_l2.add(seed_l2)
+        else:
+            row["primary_l2"] = None
+
         text = f"{row.get('title', '')} {row.get('summary', '')}".lower()
         for l2, keywords in keyword_map.items():
             if not isinstance(keywords, list):
@@ -800,9 +1945,37 @@ def map_news_items_to_taxonomy(news_items, ticker_to_tags, industry_taxonomy, in
     return mapped
 
 
-def bucket_news_by_l2(mapped_news, l2_list, max_per_l2=8):
+def bucket_news_by_l2(mapped_news, l2_list, max_per_l2=8, prefer_seed_primary=True):
     buckets = {str(l2): [] for l2 in l2_list}
+    max_per = max(1, _safe_int(max_per_l2, 8))
+
+    if not prefer_seed_primary:
+        for item in mapped_news:
+            l2_tags = item.get("matched_L2", [])
+            if not isinstance(l2_tags, list):
+                continue
+            for l2 in l2_tags:
+                key = str(l2)
+                if key not in buckets:
+                    continue
+                if len(buckets[key]) >= max_per:
+                    continue
+                buckets[key].append(item)
+        return buckets
+
+    # Phase 1: route seed/primary items exclusively to their primary bucket.
+    non_seed_items = []
     for item in mapped_news:
+        primary = str(item.get("primary_l2") or item.get("seed_l2") or "").strip()
+        if primary and primary in buckets:
+            if len(buckets[primary]) < max_per:
+                buckets[primary].append(item)
+            continue
+        non_seed_items.append(item)
+
+    # Phase 2: only allow non-seed expansion into buckets that currently have no primary-seed coverage.
+    seeded_covered = {k for k, rows in buckets.items() if len(rows) > 0}
+    for item in non_seed_items:
         l2_tags = item.get("matched_L2", [])
         if not isinstance(l2_tags, list):
             continue
@@ -810,7 +1983,9 @@ def bucket_news_by_l2(mapped_news, l2_list, max_per_l2=8):
             key = str(l2)
             if key not in buckets:
                 continue
-            if len(buckets[key]) >= max(1, _safe_int(max_per_l2, 8)):
+            if key in seeded_covered:
+                continue
+            if len(buckets[key]) >= max_per:
                 continue
             buckets[key].append(item)
     return buckets
@@ -870,7 +2045,10 @@ def _normalize_industry_signal(signal, l2, asof_utc, evidence_items):
     else:
         risk_delta = strength
 
-    normalized["risk_delta"] = float(np.clip(risk_delta, -1.0, 1.0))
+    # Prefer explicit risk_delta schema when provided.
+    if "risk_delta" in signal:
+        risk_delta = float(_safe_float(signal.get("risk_delta", risk_delta), risk_delta))
+    normalized["risk_delta"] = float(np.clip(risk_delta, -0.30, 0.30))
     normalized["confidence"] = confidence
 
     expiry_hours = int(np.clip(_safe_int(signal.get("expiry_hours", 24), 24), 12, 72))
@@ -933,10 +2111,27 @@ def _normalize_industry_signal(signal, l2, asof_utc, evidence_items):
     )
     normalized["mode"] = str(signal.get("mode", "BATCH"))
     normalized["notes"] = str(signal.get("notes", ""))[:240]
+    counterpoints = signal.get("counterpoints", [])
+    if isinstance(counterpoints, list):
+        normalized["counterpoints"] = [str(x)[:180] for x in counterpoints if str(x).strip()][:2]
+    else:
+        normalized["counterpoints"] = []
+    rs = str(signal.get("rate_sensitivity", "")).strip().lower()
+    if rs not in {"low", "med", "high"}:
+        rs = ""
+    normalized["rate_sensitivity"] = rs
     normalized["asof_utc"] = str(signal.get("asof_utc", asof_utc))
     if normalized["confidence"] < 0.4:
         normalized["risk_delta"] = 0.0
         normalized["direction"] = "neutral"
+    else:
+        # Enforce directional consistency with risk_delta.
+        if normalized["risk_delta"] > 1e-12:
+            normalized["direction"] = "overweight"
+        elif normalized["risk_delta"] < -1e-12:
+            normalized["direction"] = "underweight"
+        else:
+            normalized["direction"] = "neutral"
     return normalized
 
 
@@ -957,15 +2152,16 @@ def _build_industry_llm_prompt(l2, news_items, asof_utc):
         )
     bucket_description = (
         f"Industry bucket '{l2}' for portfolio risk overlays. "
-        "Assess whether this bucket should be overweight, underweight, or neutral."
+        "Label each evidence item for short-term (1d) directional impact."
     )
+    evidence_ids = [str(x.get("id")) for x in compact_rows if isinstance(x, dict) and str(x.get("id", "")).strip()]
     prompt = f"""
-You are GlobalWatch Batch Industry Signal Generator.
+You are GlobalWatch Batch Industry Evidence Labeler.
 
 GOAL
-- Generate ONE industry bucket signal for portfolio risk overlays.
-- This runs in background; you may be more thorough than interactive mode,
-  but keep output structured and bounded.
+- Label each evidence item for ONE industry bucket.
+- Do NOT output final direction/risk_delta/confidence.
+- Final scoring is computed by code.
 
 MODE
 - mode: BATCH
@@ -981,32 +2177,32 @@ INPUTS (already fetched; do NOT browse)
 
 OUTPUT REQUIREMENTS (STRICT)
 - Output MUST be valid JSON only. No markdown.
-- Keep it compact: <= 450 output tokens.
+- Keep it compact: <= 400 output tokens.
 - Do NOT include chain-of-thought. Use short rationale.
-- If there is not enough relevant evidence, return neutral.
 
-SIGNAL RULES
-- direction: overweight / underweight / neutral
-- strength: float in [-1.0, +1.0]
-- confidence: float in [0.0, 1.0]
-- expiry_hours: 12-72 depending on how time-sensitive the news is.
+RULES
+- For each input evidence id, produce exactly one label item.
+- Allowed sentiment: bullish | bearish | neutral
+- Allowed strength:
+  * bullish/bearish: integer 1..3
+  * neutral: must be 1
+- rationale max 140 chars and must be bucket-specific.
+- If evidence is unrelated to bucket: sentiment=neutral, rationale="not bucket-specific"
+- Avoid generic phrases like "across sectors mixed signals" in rationale.
+- Labels must cover all ids exactly once from:
+{json.dumps(evidence_ids, ensure_ascii=False)}
 
 JSON SCHEMA (MUST FOLLOW)
 {{
-  "mode": "BATCH",
-  "bucket": "{l2}",
-  "signal": {{
-    "direction": "overweight" | "underweight" | "neutral",
-    "strength": -1.0 to +1.0,
-    "confidence": 0.0 to 1.0
-  }},
-  "drivers": ["max 5 short bullets"],
-  "headline_evidence": [
-    {{"title": "...", "source": "...", "why": "short"}}
+  "labels": [
+    {{
+      "id": "<evidence_id>",
+      "sentiment": "bullish" | "bearish" | "neutral",
+      "strength": 1 | 2 | 3,
+      "rationale": "<=140 chars>"
+    }}
   ],
-  "expiry_hours": 12-72,
-  "notes": "short",
-  "limits": {{"llm_profile": "batch"}}
+  "notes": "<=200 chars>"
 }}
 
 NOW PRODUCE THE JSON.
@@ -1014,20 +2210,777 @@ NOW PRODUCE THE JSON.
     return prompt
 
 
-def _generate_industry_signal_with_llm(l2, items, model_name):
+def _postprocess_industry_signals(signals, news_overlay_cfg):
+    rows = [dict(x) for x in (signals or []) if isinstance(x, dict)]
+    if not rows:
+        return rows, {
+            "status": "empty",
+            "uniformity_triggered": False,
+            "overweight_ratio": 0.0,
+            "mean_risk_delta_before": 0.0,
+            "mean_risk_delta_after": 0.0,
+            "std_risk_delta_before": 0.0,
+            "std_risk_delta_after": 0.0,
+            "low_conf_neutralized": 0,
+        }
+
+    min_conf = float(np.clip(_safe_float(news_overlay_cfg.get("min_confidence", 0.55), 0.55), 0.0, 1.0))
+    low_conf_neutralized = 0
+    overrode_direction_count = 0
+    overrode_risk_count = 0
+    neutral_capped_count = 0
+
+    def _risk_from_net(net_score):
+        n = int(net_score)
+        if n >= 4:
+            return 0.20
+        if n == 3:
+            return 0.10
+        if n == 2:
+            return 0.05
+        if n in (-1, 0, 1):
+            return 0.0
+        if n == -2:
+            return -0.05
+        if n == -3:
+            return -0.10
+        return -0.20
+
+    for row in rows:
+        pre_direction = _normalize_direction_text(row.get("direction"))
+        pre_risk = float(np.clip(_safe_float(row.get("risk_delta", 0.0), 0.0), -0.30, 0.30))
+        row["_pre_post_direction"] = pre_direction
+        row["_pre_post_risk_delta"] = pre_risk
+        conf = float(np.clip(_safe_float(row.get("confidence", 0.0), 0.0), 0.0, 1.0))
+        risk = float(np.clip(_safe_float(row.get("risk_delta", 0.0), 0.0), -0.30, 0.30))
+        direction = _normalize_direction_text(row.get("direction"))
+        evidence_count = 0
+        row["status"] = str(row.get("status", "ok")).strip() or "ok"
+        row["_neutral_confidence_capped"] = bool(row.get("_neutral_confidence_capped", False))
+        row["postprocess_overrode_direction"] = False
+        row["postprocess_overrode_risk_delta"] = False
+        row["postprocess_downgrade_reason"] = ""
+        row["postprocess_kept_direction"] = False
+        row["postprocess_downgraded_to_neutral"] = False
+
+        bull = int(_safe_int(row.get("bull_score", 0), 0))
+        bear = int(_safe_int(row.get("bear_score", 0), 0))
+        net = int(_safe_int(row.get("net_score", bull - bear), bull - bear))
+        total_non_neutral = max(0, bull + bear)
+        abs_net = abs(net)
+        if isinstance(row.get("evidence"), list):
+            evidence_count = len([x for x in row.get("evidence", []) if isinstance(x, dict)])
+
+        strong_keep = (
+            row.get("status") == "ok"
+            and evidence_count > 0
+            and abs_net >= 2
+            and total_non_neutral >= 2
+        )
+        allow_downgrade = (
+            row.get("status") != "ok"
+            or evidence_count == 0
+            or total_non_neutral == 0
+            or abs_net <= 1
+        )
+
+        if strong_keep:
+            # Keep deterministic direction/risk for strong signals.
+            if abs(risk) < 1e-9:
+                risk = _risk_from_net(net)
+            if direction == "overweight":
+                risk = abs(risk)
+            elif direction == "underweight":
+                risk = -abs(risk)
+            row["risk_delta"] = float(np.clip(risk, -0.30, 0.30))
+            row["direction"] = _direction_from_delta(row["risk_delta"])
+            row["postprocess_kept_direction"] = True
+            note = str(row.get("notes", "")).strip()
+            keep_tag = "postprocess_kept_direction=True"
+            if keep_tag not in note:
+                row["notes"] = f"{note}; {keep_tag}".strip("; ").strip()
+        elif allow_downgrade:
+            reason = ""
+            if row.get("status") != "ok":
+                reason = "status_not_ok"
+            elif evidence_count == 0:
+                reason = "evidence_items_count_0"
+            elif total_non_neutral == 0:
+                reason = "bull_plus_bear_zero"
+            elif abs_net <= 1:
+                reason = "weak_net_score"
+            row["risk_delta"] = 0.0
+            row["direction"] = "neutral"
+            row["postprocess_downgraded_to_neutral"] = True
+            row["postprocess_downgrade_reason"] = reason
+            low_conf_neutralized += 1
+        else:
+            # Keep direction but enforce sign coherence.
+            if direction == "overweight":
+                risk = abs(risk)
+            elif direction == "underweight":
+                risk = -abs(risk)
+            row["risk_delta"] = float(np.clip(risk, -0.30, 0.30))
+            row["direction"] = _direction_from_delta(row["risk_delta"])
+
+        if conf < min_conf and strong_keep:
+            # For strong net signals, bypass neutralization and keep direction.
+            pass
+
+    before_vals = np.array([float(np.clip(_safe_float(r.get("risk_delta", 0.0), 0.0), -0.30, 0.30)) for r in rows], dtype=float)
+    overweight_ratio = float(np.mean(np.array([1.0 if _normalize_direction_text(r.get("direction")) == "overweight" else 0.0 for r in rows])))
+    mean_before = float(np.mean(before_vals)) if len(before_vals) > 0 else 0.0
+    std_before = float(np.std(before_vals)) if len(before_vals) > 0 else 0.0
+
+    uniformity_triggered = bool(overweight_ratio > 0.80 and mean_before > 0.10)
+    # Keep deterministic direction for strong signals; no uniformity recenter override here.
+    for row in rows:
+        conf = float(np.clip(_safe_float(row.get("confidence", 0.0), 0.0), 0.0, 1.0))
+        risk = float(np.clip(_safe_float(row.get("risk_delta", 0.0), 0.0), -0.30, 0.30))
+        direction = _normalize_direction_text(row.get("direction"))
+        should_cap = (direction == "neutral") or (abs(risk) < 1e-9)
+        high_conf_zero = conf >= 0.65 and abs(risk) < 1e-9
+        if should_cap or high_conf_zero:
+            new_conf = min(conf, 0.45)
+            if new_conf < conf - 1e-12:
+                neutral_capped_count += 1
+                row["_neutral_confidence_capped"] = True
+                row["confidence"] = float(new_conf)
+                note_tag = "confidence_capped_for_neutral"
+                note = str(row.get("notes", "")).strip()
+                if note_tag not in note:
+                    row["notes"] = f"{note}; {note_tag}".strip("; ").strip()
+                drivers = row.get("top_drivers", [])
+                if not isinstance(drivers, list):
+                    drivers = []
+                if note_tag not in [str(x) for x in drivers]:
+                    drivers = list(drivers) + [note_tag]
+                row["top_drivers"] = [str(x) for x in drivers if str(x).strip()][:5]
+            else:
+                row["confidence"] = float(new_conf)
+
+    allowed_risk = np.array([-0.30, -0.20, -0.10, -0.05, 0.0, 0.05, 0.10, 0.20, 0.30], dtype=float)
+    allowed_conf = np.array([0.35, 0.45, 0.55, 0.65, 0.75], dtype=float)
+
+    for row in rows:
+        pre_direction = _normalize_direction_text(row.get("_pre_post_direction", row.get("direction")))
+        pre_risk = float(np.clip(_safe_float(row.get("_pre_post_risk_delta", row.get("risk_delta", 0.0)), 0.0), -0.30, 0.30))
+        risk = float(np.clip(_safe_float(row.get("risk_delta", 0.0), 0.0), -0.30, 0.30))
+        conf = float(np.clip(_safe_float(row.get("confidence", 0.0), 0.0), 0.0, 1.0))
+        snapped_risk = float(allowed_risk[int(np.argmin(np.abs(allowed_risk - risk)))])
+        snapped_conf = float(allowed_conf[int(np.argmin(np.abs(allowed_conf - conf)))])
+        row["risk_delta"] = snapped_risk
+        row["confidence"] = snapped_conf
+        row["direction"] = _direction_from_delta(snapped_risk)
+        row["postprocess_overrode_direction"] = bool(row["direction"] != pre_direction)
+        row["postprocess_overrode_risk_delta"] = bool(abs(snapped_risk - pre_risk) > 1e-9)
+        if row["postprocess_overrode_direction"]:
+            overrode_direction_count += 1
+        if row["postprocess_overrode_risk_delta"]:
+            overrode_risk_count += 1
+
+    after_vals = np.array([float(np.clip(_safe_float(r.get("risk_delta", 0.0), 0.0), -0.30, 0.30)) for r in rows], dtype=float)
+    return rows, {
+        "status": "ok",
+        "uniformity_triggered": uniformity_triggered,
+        "overweight_ratio": overweight_ratio,
+        "mean_risk_delta_before": mean_before,
+        "mean_risk_delta_after": float(np.mean(after_vals)) if len(after_vals) > 0 else 0.0,
+        "std_risk_delta_before": std_before,
+        "std_risk_delta_after": float(np.std(after_vals)) if len(after_vals) > 0 else 0.0,
+        "low_conf_neutralized": int(low_conf_neutralized),
+        "neutral_confidence_capped": int(neutral_capped_count),
+        "count_overrode_direction": int(overrode_direction_count),
+        "count_overrode_risk_delta": int(overrode_risk_count),
+    }
+
+
+def _get_bucket_rate_sensitivity(bucket):
+    key = str(bucket or "").strip().lower()
+    mapping = {
+        "utilities": "high",
+        "real_estate": "high",
+        "rates_and_gold": "high",
+        "broad_market_etf": "med",
+        "cash_equivalent": "high",
+    }
+    return mapping.get(key, "low")
+
+
+def _get_macro_risk_off_prior_cfg(news_overlay_cfg):
+    defaults = {
+        "enabled": False,
+        "strength": 1,
+        "min_score": 2,
+        "cooldown_minutes": 180,
+        "buckets": [
+            "utilities",
+            "real_estate",
+            "rates_and_gold",
+            "broad_market_etf",
+            "cash_equivalent",
+        ],
+        "mode": "add_bearish_label",
+        "min_macro_confidence": 0.55,
+    }
+    cfg = dict(defaults)
+    if isinstance(news_overlay_cfg, dict):
+        raw = news_overlay_cfg.get("macro_risk_off_prior", {})
+        if isinstance(raw, dict):
+            cfg.update(raw)
+    cfg["enabled"] = bool(cfg.get("enabled", False))
+    cfg["strength"] = int(np.clip(_safe_int(cfg.get("strength", 1), 1), 1, 3))
+    cfg["min_score"] = int(np.clip(_safe_int(cfg.get("min_score", 2), 2), 0, 10))
+    cfg["cooldown_minutes"] = int(np.clip(_safe_int(cfg.get("cooldown_minutes", 180), 180), 0, 1440 * 7))
+    raw_buckets = cfg.get("buckets", defaults["buckets"])
+    if not isinstance(raw_buckets, list):
+        raw_buckets = defaults["buckets"]
+    cfg["buckets"] = [str(x).strip().lower() for x in raw_buckets if str(x).strip()]
+    cfg["mode"] = str(cfg.get("mode", "add_bearish_label")).strip().lower() or "add_bearish_label"
+    cfg["min_macro_confidence"] = float(
+        np.clip(_safe_float(cfg.get("min_macro_confidence", 0.55), 0.55), 0.0, 1.0)
+    )
+    return cfg
+
+
+def _build_macro_context_for_industry_pipeline(cfg, mapped_news):
+    context = {
+        "risk_state": "",
+        "trend_score": None,
+        "headline_text": "",
+        "macro_text": "",
+    }
+    text_parts = []
+
+    for item in (mapped_news or [])[:80]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        summary = str(item.get("summary", "")).strip()
+        if title:
+            text_parts.append(title)
+        if summary:
+            text_parts.append(summary)
+
+    reporting_cfg = cfg.get("reporting", {}) if isinstance(cfg, dict) else {}
+    snapshot_path = str(reporting_cfg.get("snapshot_live_path", "outputs/snapshot_live.json"))
+    try:
+        if os.path.exists(snapshot_path):
+            with open(snapshot_path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            if isinstance(snap, dict):
+                risk_cfg = snap.get("risk_config", {})
+                if isinstance(risk_cfg, dict):
+                    context["risk_state"] = str(
+                        risk_cfg.get("risk_state", snap.get("market_state", ""))
+                    ).strip().upper()
+                    ts = _optional_float(risk_cfg.get("regime_trend_score", None))
+                    context["trend_score"] = float(ts) if ts is not None else None
+                for k in ("macro_summary", "topic_summary", "last_macro"):
+                    val = snap.get(k, "")
+                    if isinstance(val, str) and val.strip():
+                        text_parts.append(val.strip())
+    except Exception as e:
+        log_error(f"_build_macro_context_for_industry_pipeline snapshot read error: {e}")
+
+    context["headline_text"] = " | ".join(text_parts[:120])
+    context["macro_text"] = context["headline_text"]
+    return context
+
+
+def _is_macro_risk_off(macro_context):
+    ctx = macro_context if isinstance(macro_context, dict) else {}
+    risk_state = str(ctx.get("risk_state", "")).strip().upper()
+    trend_score = _optional_float(ctx.get("trend_score", None))
+    text_parts = []
+    for key in ("macro_text", "headline_text", "summary", "text", "notes"):
+        val = ctx.get(key, "")
+        if isinstance(val, str) and val.strip():
+            text_parts.append(val.strip().lower())
+    text = " ".join(text_parts)
+
+    keyword_map = {
+        "hawkish": ["hawkish", "fed hawk", "hawk tone"],
+        "rates up": ["rates up", "rate hike", "rates rising", "treasury yields", "yield jump", "yields rising"],
+        "higher for longer": ["higher for longer"],
+        "volatility spike": ["volatility spike", "vix spike", "vol spike"],
+        "risk-off": ["risk-off", "risk off"],
+        "credit spread widening": ["credit spread widening", "credit spreads widen", "credit spread widening"],
+        "liquidity tightening": ["liquidity tightening", "tight liquidity", "liquidity drain"],
+    }
+    hits = []
+    for canonical, patterns in keyword_map.items():
+        if any(str(pat).lower() in text for pat in patterns):
+            hits.append(canonical)
+
+    if risk_state == "RISK_OFF":
+        hits.append("risk_state_risk_off")
+    if trend_score is not None and float(trend_score) <= 0.5:
+        hits.append("trend_score_low")
+
+    hit_set = sorted(set(hits))
+    strong = {"risk_state_risk_off", "risk-off", "hawkish", "higher for longer", "credit spread widening", "liquidity tightening", "rates up"}
+    weak = {"rates up", "volatility spike", "trend_score_low"}
+    strong_hits = [h for h in hit_set if h in strong]
+    weak_hits = [h for h in hit_set if h in weak]
+    risk_off_score = len(hit_set)
+    risk_off = bool(strong_hits) or (len(hit_set) >= 2) or (len(weak_hits) >= 2)
+
+    confidence = 0.35 + 0.25 * len(strong_hits) + 0.12 * len(weak_hits)
+    if "risk_state_risk_off" in hit_set:
+        confidence += 0.20
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    return bool(risk_off), hit_set, confidence, int(risk_off_score)
+
+
+def _get_last_macro_prior_applied_age_minutes(bucket, collection_name, chroma_path):
+    if not CHROMADB_IMPORTED:
+        return None
+    try:
+        client = chromadb.PersistentClient(path=chroma_path)
+        coll = client.get_or_create_collection(name=collection_name)
+        rows = None
+        # Preferred: metadata filter on macro_prior_applied==True.
+        for where_clause in (
+            {"$and": [{"L2": str(bucket)}, {"macro_prior_applied": True}]},
+            {"L2": str(bucket), "macro_prior_applied": True},
+        ):
+            try:
+                rows = coll.get(
+                    where=where_clause,
+                    include=["metadatas"],
+                    limit=120,
+                )
+                break
+            except Exception:
+                rows = None
+        if rows is None:
+            # Fallback only if where filtering is unavailable.
+            rows = coll.get(
+                where={"L2": str(bucket)},
+                include=["metadatas"],
+                limit=120,
+            )
+        metadatas = rows.get("metadatas", []) if isinstance(rows, dict) else []
+        now_utc = datetime.now(timezone.utc)
+        best_age = None
+        for idx, md in enumerate(metadatas):
+            if not isinstance(md, dict):
+                continue
+            applied_meta = bool(md.get("macro_prior_applied", False))
+            ts = str(md.get("timestamp", "")).strip()
+            if not applied_meta:
+                continue
+            if not ts:
+                continue
+            dt = _parse_iso_or_none(ts)
+            if dt is None:
+                continue
+            age_minutes = (now_utc - dt).total_seconds() / 60.0
+            if age_minutes < 0:
+                continue
+            if best_age is None or age_minutes < best_age:
+                best_age = age_minutes
+        return float(best_age) if best_age is not None else None
+    except Exception:
+        return None
+
+
+def _apply_macro_risk_off_prior(
+    bucket,
+    labels,
+    macro_context,
+    prior_cfg,
+    *,
+    collection_name="industry_signals",
+    chroma_path="./memory_db",
+):
+    labels_out = [dict(x) for x in (labels or []) if isinstance(x, dict)]
+    info = {
+        "macro_prior_applied": False,
+        "macro_prior_reasons": [],
+        "macro_prior_strength": 0,
+        "macro_prior_confidence": None,
+        "macro_risk_off_score": 0,
+        "macro_prior_skipped_due_to_score": False,
+        "macro_prior_skipped_due_to_cooldown": False,
+    }
+    cfg = prior_cfg if isinstance(prior_cfg, dict) else {}
+    if not bool(cfg.get("enabled", False)):
+        return labels_out, info
+    bucket_key = str(bucket or "").strip().lower()
+    allowed_buckets = set(str(x).strip().lower() for x in cfg.get("buckets", []) if str(x).strip())
+    if bucket_key not in allowed_buckets:
+        return labels_out, info
+    if str(cfg.get("mode", "add_bearish_label")).strip().lower() != "add_bearish_label":
+        return labels_out, info
+
+    risk_off, reasons, macro_conf, risk_off_score = _is_macro_risk_off(macro_context)
+    info["macro_risk_off_score"] = int(risk_off_score)
+    if (not risk_off) or float(macro_conf) < float(cfg.get("min_macro_confidence", 0.55)):
+        info["macro_prior_reasons"] = list(reasons)
+        info["macro_prior_confidence"] = float(macro_conf)
+        return labels_out, info
+    min_score = int(np.clip(_safe_int(cfg.get("min_score", 2), 2), 0, 10))
+    if int(risk_off_score) < min_score:
+        info["macro_prior_reasons"] = list(reasons)
+        info["macro_prior_confidence"] = float(macro_conf)
+        info["macro_prior_skipped_due_to_score"] = True
+        return labels_out, info
+    cooldown_minutes = int(np.clip(_safe_int(cfg.get("cooldown_minutes", 180), 180), 0, 1440 * 7))
+    if cooldown_minutes > 0:
+        age_minutes = _get_last_macro_prior_applied_age_minutes(
+            bucket_key,
+            collection_name=collection_name,
+            chroma_path=chroma_path,
+        )
+        if age_minutes is not None and age_minutes < float(cooldown_minutes):
+            info["macro_prior_reasons"] = list(reasons)
+            info["macro_prior_confidence"] = float(macro_conf)
+            info["macro_prior_skipped_due_to_cooldown"] = True
+            return labels_out, info
+
+    strength = int(np.clip(_safe_int(cfg.get("strength", 1), 1), 1, 3))
+    prior_reason = f"macro_prior: Macro risk-off prior ({', '.join(reasons[:3])})"
+    labels_out.append(
+        {
+            "id": "__macro_prior__",
+            "sentiment": "bearish",
+            "strength": int(strength),
+            "rationale": prior_reason[:140],
+        }
+    )
+    info.update(
+        {
+            "macro_prior_applied": True,
+            "macro_prior_reasons": list(reasons),
+            "macro_prior_strength": int(strength),
+            "macro_prior_confidence": float(macro_conf),
+        }
+    )
+    return labels_out, info
+
+
+def _validate_industry_label_payload(parsed_obj, evidence_items):
+    if not isinstance(parsed_obj, dict):
+        return False, "labels_payload_not_dict", []
+    labels = parsed_obj.get("labels", [])
+    if not isinstance(labels, list):
+        return False, "labels_not_list", []
+    if len(labels) != len(evidence_items):
+        return False, f"labels_count_mismatch:{len(labels)}!={len(evidence_items)}", []
+
+    allowed_ids = [
+        str(x.get("id")).strip() for x in (evidence_items or [])
+        if isinstance(x, dict) and str(x.get("id", "")).strip()
+    ]
+    allowed_id_set = set(allowed_ids)
+    seen_ids = set()
+    out = []
+    for row in labels:
+        if not isinstance(row, dict):
+            return False, "label_row_not_dict", []
+        ev_id = str(row.get("id", "")).strip()
+        if not ev_id:
+            return False, "label_missing_id", []
+        if ev_id not in allowed_id_set:
+            return False, f"label_unknown_id:{ev_id}", []
+        if ev_id in seen_ids:
+            return False, f"label_duplicate_id:{ev_id}", []
+        seen_ids.add(ev_id)
+
+        sentiment = str(row.get("sentiment", "")).strip().lower()
+        if sentiment not in {"bullish", "bearish", "neutral"}:
+            return False, f"invalid_sentiment:{sentiment}", []
+        strength = _safe_int(row.get("strength", 1), 1)
+        if sentiment == "neutral":
+            strength = 1
+        else:
+            strength = int(np.clip(strength, 1, 3))
+        rationale = str(row.get("rationale", "")).strip()
+        if len(rationale) > 140:
+            rationale = rationale[:140]
+        out.append(
+            {
+                "id": ev_id,
+                "sentiment": sentiment,
+                "strength": int(strength),
+                "rationale": rationale,
+            }
+        )
+
+    if seen_ids != allowed_id_set:
+        missing = sorted(list(allowed_id_set - seen_ids))
+        return False, f"missing_ids:{','.join(missing)}", []
+
+    return True, None, out
+
+
+def _llm_label_industry_evidence(bucket, evidence_items, macro_context, model, llm_timeout_seconds=None):
     asof_utc = datetime.now(timezone.utc).isoformat()
-    prompt = _build_industry_llm_prompt(l2, items, asof_utc)
+    prompt = _build_industry_llm_prompt(bucket, evidence_items, asof_utc)
     try:
         raw_text = query_ollama(
-            model=model_name,
-            prompt=prompt,
-            num_ctx=3072,
-            temperature=0.1
+            model,
+            prompt,
+            num_ctx=4096,
+            temperature=0.1,
+            timeout_seconds=llm_timeout_seconds,
         )
-        parsed = robust_json_parse(raw_text, model_name, max_retries=1)
-        return _normalize_industry_signal(parsed, l2, asof_utc, items), raw_text, None
+        timeout_hit = False
+    except Exception as e:
+        if "ollama_timeout" in str(e):
+            fallback_labels = []
+            for item in (evidence_items or []):
+                if not isinstance(item, dict):
+                    continue
+                ev_id = str(item.get("id", "")).strip()
+                if not ev_id:
+                    continue
+                fallback_labels.append(
+                    {
+                        "id": ev_id,
+                        "sentiment": "neutral",
+                        "strength": 1,
+                        "rationale": "timeout_fallback_neutral",
+                    }
+                )
+            return {
+                "ok": True,
+                "error": None,
+                "raw_text": "",
+                "parsed_obj": {"labels": fallback_labels, "notes": "ollama_timeout_fallback"},
+                "labels": fallback_labels,
+                "notes": "ollama_timeout_fallback",
+                "timeout_hit": True,
+            }
+        raise
+    parsed = robust_json_parse(raw_text, model, max_retries=1)
+    if bool(parsed.get("_parse_error")):
+        reason = str(parsed.get("_parse_error_reason", "parse_error"))
+        return {
+            "ok": False,
+            "error": f"parse_error:{reason}",
+            "raw_text": raw_text,
+            "parsed_obj": parsed,
+            "labels": [],
+            "notes": "",
+            "timeout_hit": False,
+        }
+    ok, reason, labels = _validate_industry_label_payload(parsed, evidence_items)
+    if not ok:
+        return {
+            "ok": False,
+            "error": f"label_schema_invalid:{reason}",
+            "raw_text": raw_text,
+            "parsed_obj": parsed,
+            "labels": [],
+            "notes": str(parsed.get("notes", ""))[:200] if isinstance(parsed, dict) else "",
+            "timeout_hit": False,
+        }
+    return {
+        "ok": True,
+        "error": None,
+        "raw_text": raw_text,
+        "parsed_obj": parsed,
+        "labels": labels,
+        "notes": str(parsed.get("notes", ""))[:200],
+        "timeout_hit": bool(timeout_hit),
+    }
+
+
+def _score_industry_from_labels(bucket, labels, rate_sensitivity, macro_context):
+    bull = int(sum(int(x.get("strength", 0)) for x in labels if str(x.get("sentiment", "")).strip().lower() == "bullish"))
+    bear = int(sum(int(x.get("strength", 0)) for x in labels if str(x.get("sentiment", "")).strip().lower() == "bearish"))
+    net = int(bull - bear)
+
+    if net >= 4:
+        risk_delta = 0.20
+    elif net == 3:
+        risk_delta = 0.10
+    elif net == 2:
+        risk_delta = 0.05
+    elif net in (-1, 0, 1):
+        risk_delta = 0.0
+    elif net == -2:
+        risk_delta = -0.05
+    elif net == -3:
+        risk_delta = -0.10
+    else:
+        risk_delta = -0.20
+
+    total_polar = bull + bear
+    if total_polar <= 0:
+        confidence = 0.35
+    else:
+        dominance = abs(net) / float(total_polar)
+        confidence = 0.45 if dominance < 0.5 else 0.55
+        if total_polar >= 6 and dominance >= 0.67:
+            confidence = 0.65
+        if total_polar >= 8 and dominance >= 0.75:
+            confidence = 0.75
+
+    allowed_conf = np.array([0.35, 0.45, 0.55, 0.65, 0.75], dtype=float)
+    confidence = float(allowed_conf[int(np.argmin(np.abs(allowed_conf - float(confidence))))])
+    direction = _direction_from_delta(risk_delta)
+
+    ranked = sorted(
+        [x for x in labels if isinstance(x, dict)],
+        key=lambda x: int(x.get("strength", 0)),
+        reverse=True,
+    )
+    if direction == "overweight":
+        main_side = "bullish"
+        counter_side = "bearish"
+    elif direction == "underweight":
+        main_side = "bearish"
+        counter_side = "bullish"
+    else:
+        main_side = "neutral"
+        counter_side = "bullish"
+
+    top_drivers = [str(x.get("rationale", "")).strip() for x in ranked if str(x.get("sentiment", "")).strip().lower() == main_side and str(x.get("rationale", "")).strip()]
+    if direction == "neutral" and not top_drivers:
+        top_drivers = [str(x.get("rationale", "")).strip() for x in ranked if str(x.get("rationale", "")).strip()]
+    top_drivers = top_drivers[:3]
+
+    counterpoints = [str(x.get("rationale", "")).strip() for x in ranked if str(x.get("sentiment", "")).strip().lower() == counter_side and str(x.get("rationale", "")).strip()][:2]
+
+    evidence_used = [
+        str(x.get("id", "")).strip()
+        for x in ranked
+        if str(x.get("id", "")).strip() and str(x.get("id", "")).strip() != "__macro_prior__"
+    ][:4]
+    return {
+        "direction": direction,
+        "risk_delta": float(risk_delta),
+        "confidence": float(confidence),
+        "top_drivers": top_drivers,
+        "counterpoints": counterpoints,
+        "evidence_used": evidence_used,
+        "rate_sensitivity": str(rate_sensitivity),
+        "bull_score": bull,
+        "bear_score": bear,
+        "net_score": net,
+        "score_mapping_reason": f"net={net} -> risk_delta={risk_delta:+.2f}",
+    }
+
+
+def _industry_schema_fallback(l2, asof_utc, items, reason):
+    neutral = _neutral_industry_signal(l2, asof_utc, items, reason=f"schema_invalid:{reason}")
+    neutral["direction"] = "neutral"
+    neutral["risk_delta"] = 0.0
+    neutral["confidence"] = 0.35
+    neutral["status"] = "error"
+    drivers = neutral.get("top_drivers", [])
+    if not isinstance(drivers, list):
+        drivers = []
+    tag = f"schema_invalid:{reason}"
+    if tag not in [str(x) for x in drivers]:
+        drivers = [tag] + [str(x) for x in drivers if str(x).strip()]
+    neutral["top_drivers"] = [str(x) for x in drivers if str(x).strip()][:5]
+    neutral["counterpoints"] = []
+    neutral["evidence_used"] = []
+    neutral["bull_score"] = 0
+    neutral["bear_score"] = 0
+    neutral["net_score"] = 0
+    neutral["labels_head"] = []
+    neutral["score_mapping_reason"] = "fallback"
+    neutral["rate_sensitivity"] = _get_bucket_rate_sensitivity(l2)
+    return neutral
+
+
+def _generate_industry_signal_with_llm(
+    l2,
+    items,
+    model_name,
+    return_debug=False,
+    macro_context=None,
+    macro_risk_off_prior_cfg=None,
+    collection_name="industry_signals",
+    chroma_path="./memory_db",
+    llm_timeout_seconds=None,
+):
+    asof_utc = datetime.now(timezone.utc).isoformat()
+    macro_ctx = {"asof_utc": asof_utc, "bucket": l2}
+    if isinstance(macro_context, dict):
+        macro_ctx.update(macro_context)
+    prior_cfg = (
+        macro_risk_off_prior_cfg
+        if isinstance(macro_risk_off_prior_cfg, dict)
+        else _get_macro_risk_off_prior_cfg({})
+    )
+    try:
+        label_result = _llm_label_industry_evidence(
+            l2,
+            items,
+            macro_ctx,
+            model_name,
+            llm_timeout_seconds=llm_timeout_seconds,
+        )
+        raw_text = str(label_result.get("raw_text", ""))
+        parsed = label_result.get("parsed_obj", {})
+        timeout_hit = bool(label_result.get("timeout_hit", False))
+        if not bool(label_result.get("ok", False)):
+            reason = str(label_result.get("error", "label_error"))
+            neutral = _industry_schema_fallback(l2, asof_utc, items, reason=reason)
+            neutral["macro_prior_applied"] = False
+            neutral["macro_prior_reasons"] = []
+            neutral["macro_prior_strength"] = 0
+            neutral["macro_risk_off_score"] = 0
+            neutral["macro_prior_skipped_due_to_score"] = False
+            neutral["macro_prior_skipped_due_to_cooldown"] = False
+            neutral["llm_timeout_hit"] = bool(timeout_hit)
+            if return_debug:
+                return neutral, raw_text, reason, parsed
+            return neutral, raw_text, reason
+
+        labels = label_result.get("labels", [])
+        if not isinstance(labels, list):
+            labels = []
+        labels_scoring, prior_info = _apply_macro_risk_off_prior(
+            l2,
+            labels,
+            macro_ctx,
+            prior_cfg,
+            collection_name=collection_name,
+            chroma_path=chroma_path,
+        )
+        scored = _score_industry_from_labels(
+            l2,
+            labels_scoring,
+            rate_sensitivity=_get_bucket_rate_sensitivity(l2),
+            macro_context=macro_ctx,
+        )
+        normalized = _neutral_industry_signal(l2, asof_utc, items, reason="scored")
+        normalized.update(scored)
+        normalized["asof_utc"] = asof_utc
+        normalized["scope"] = "industry"
+        normalized["L2"] = str(l2)
+        normalized["status"] = "ok"
+        normalized["notes"] = str(label_result.get("notes", ""))[:240]
+        normalized["labels_head"] = [dict(x) for x in labels_scoring[:4] if isinstance(x, dict)]
+        normalized["macro_prior_applied"] = bool(prior_info.get("macro_prior_applied", False))
+        normalized["macro_prior_reasons"] = list(prior_info.get("macro_prior_reasons", []))
+        normalized["macro_prior_strength"] = int(prior_info.get("macro_prior_strength", 0))
+        normalized["macro_prior_confidence"] = _optional_float(prior_info.get("macro_prior_confidence", None))
+        normalized["macro_risk_off_score"] = int(_safe_int(prior_info.get("macro_risk_off_score", 0), 0))
+        normalized["macro_prior_skipped_due_to_score"] = bool(prior_info.get("macro_prior_skipped_due_to_score", False))
+        normalized["macro_prior_skipped_due_to_cooldown"] = bool(prior_info.get("macro_prior_skipped_due_to_cooldown", False))
+        normalized["llm_timeout_hit"] = bool(timeout_hit)
+        normalized["status"] = "ok"
+        if return_debug:
+            return normalized, raw_text, None, parsed
+        return normalized, raw_text, None
     except Exception as e:
         neutral = _neutral_industry_signal(l2, asof_utc, items, reason=f"llm_error:{e}")
+        neutral["status"] = "error"
+        neutral["macro_risk_off_score"] = 0
+        neutral["macro_prior_skipped_due_to_score"] = False
+        neutral["macro_prior_skipped_due_to_cooldown"] = False
+        neutral["llm_timeout_hit"] = False
+        if return_debug:
+            return neutral, "", str(e), {}
         return neutral, "", str(e)
 
 
@@ -1045,6 +2998,7 @@ def write_industry_signals_to_chroma(signals, collection_name="industry_signals"
     ids = []
     docs = []
     metas = []
+    row_details = []
     for signal in signals:
         if not isinstance(signal, dict):
             continue
@@ -1054,25 +3008,39 @@ def write_industry_signals_to_chroma(signals, collection_name="industry_signals"
         payload = json.dumps(signal, ensure_ascii=False)
         item_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
         row_id = f"industry::{l2}::{date_key}::{item_hash}"
+        row_status = str(signal.get("status", "ok")).strip() or "ok"
+        row_meta = {
+            "timestamp": asof,
+            "status": row_status,
+            "scope": "industry",
+            "L2": l2,
+            "direction": str(signal.get("direction", _direction_from_delta(_safe_float(signal.get("risk_delta", 0.0), 0.0)))),
+            "confidence": float(np.clip(_safe_float(signal.get("confidence", 0.0), 0.0), 0.0, 1.0)),
+            "risk_delta": float(np.clip(_safe_float(signal.get("risk_delta", 0.0), 0.0), -0.30, 0.30)),
+            "horizon": str(signal.get("horizon", "1d")),
+            "rate_sensitivity": str(signal.get("rate_sensitivity", "")),
+            "source_count": len(signal.get("evidence", []) if isinstance(signal.get("evidence"), list) else []),
+            "ticker_count": len(signal.get("impacted_tickers", []) if isinstance(signal.get("impacted_tickers"), list) else []),
+            "version": "industry_news_v1",
+            "macro_prior_applied": bool(signal.get("macro_prior_applied", False)),
+        }
         ids.append(row_id)
         docs.append(payload)
-        metas.append(
+        metas.append(row_meta)
+        row_details.append(
             {
-                "timestamp": asof,
-                "status": "PENDING",
-                "scope": "industry",
+                "id": row_id,
                 "L2": l2,
-                "confidence": float(np.clip(_safe_float(signal.get("confidence", 0.0), 0.0), 0.0, 1.0)),
-                "risk_delta": float(np.clip(_safe_float(signal.get("risk_delta", 0.0), 0.0), -1.0, 1.0)),
-                "horizon": str(signal.get("horizon", "1d")),
-                "source_count": len(signal.get("evidence", []) if isinstance(signal.get("evidence"), list) else []),
-                "ticker_count": len(signal.get("impacted_tickers", []) if isinstance(signal.get("impacted_tickers"), list) else []),
-                "version": "industry_news_v1",
+                "timestamp": asof,
+                "status": row_status,
+                "direction": row_meta["direction"],
+                "risk_delta": row_meta["risk_delta"],
+                "confidence": row_meta["confidence"],
             }
         )
     if ids:
         coll.upsert(ids=ids, documents=docs, metadatas=metas)
-    return {"written": len(ids), "collection": collection_name}
+    return {"written": len(ids), "collection": collection_name, "rows": row_details}
 
 
 def run_industry_news_pipeline(
@@ -1084,6 +3052,7 @@ def run_industry_news_pipeline(
     llm_stub=None,
     chroma_client_override=None,
     chroma_path_override=None,
+    debug_trace=None,
 ):
     cfg = config if isinstance(config, dict) else {}
     news_overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
@@ -1153,7 +3122,7 @@ def run_industry_news_pipeline(
         if _within_hours(row.get("published_at"), max_age_hours):
             age_filtered.append(row)
 
-    deduped = _dedup_and_limit_news(age_filtered, max_total=_safe_int(sources_cfg.get("max_total", 60), 60))
+    deduped = _dedup_news_sorted(age_filtered)
     mapped = map_news_items_to_taxonomy(
         deduped,
         ticker_to_tags=ticker_to_tags,
@@ -1164,7 +3133,57 @@ def run_industry_news_pipeline(
         mapped,
         l2_list=l2_list,
         max_per_l2=_safe_int(sources_cfg.get("max_per_l2", 8), 8),
+        prefer_seed_primary=bool(sources_cfg.get("prefer_seed_primary", True)),
     )
+    buckets = _apply_post_bucket_total_cap(buckets, sources_cfg.get("post_bucket_max_total"))
+    macro_context_for_prior = _build_macro_context_for_industry_pipeline(cfg, mapped)
+    macro_prior_cfg = _get_macro_risk_off_prior_cfg(news_overlay_cfg)
+    collection_name = str(news_overlay_cfg.get("industry_collection", "industry_signals"))
+    chroma_path = (
+        str(chroma_path_override)
+        if chroma_path_override
+        else str(cfg.get("macro_integration", {}).get("chroma_path", "./memory_db"))
+    )
+
+    debug_bucket_entries = {}
+    debug_enabled = isinstance(debug_trace, dict)
+    if debug_enabled:
+        for l2 in l2_list:
+            items = buckets.get(l2, []) if isinstance(buckets, dict) else []
+            source_counter = Counter(
+                str(x.get("source", "")).strip() for x in items if isinstance(x, dict) and str(x.get("source", "")).strip()
+            )
+            debug_bucket_entries[str(l2)] = {
+                "bucket": str(l2),
+                "asof_utc": datetime.now(timezone.utc).isoformat(),
+                "bucket_items_count": len(items),
+                "evidence_source_counts": dict(source_counter),
+                "llm_called": False,
+                "llm_error": None,
+                "parse_error": False,
+                "parse_error_reason": None,
+                "raw_text_len": 0,
+                "raw_text_head_1200": "",
+                "bull_score": 0,
+                "bear_score": 0,
+                "net_score": 0,
+                "macro_prior_applied": False,
+                "macro_prior_reasons": [],
+                "macro_prior_strength": 0,
+                "macro_risk_off_score": 0,
+                "macro_prior_skipped_due_to_score": False,
+                "macro_prior_skipped_due_to_cooldown": False,
+                "labels_head": [],
+                "score_mapping_reason": "",
+                "parsed_obj": {},
+                "normalized_obj": {},
+                "final_to_write_obj": {
+                    "direction": "neutral",
+                    "risk_delta": 0.0,
+                    "confidence": 0.0,
+                    "status": "no_items",
+                },
+            }
 
     generated_signals = []
     llm_errors = []
@@ -1175,14 +3194,20 @@ def run_industry_news_pipeline(
         )
     )
     for l2, items in buckets.items():
+        if debug_enabled and str(l2) in debug_bucket_entries:
+            debug_bucket_entries[str(l2)]["bucket_items_count"] = len(items)
+            debug_bucket_entries[str(l2)]["asof_utc"] = datetime.now(timezone.utc).isoformat()
         if not items:
             continue
-        print(f"[TRACE] industry_llm bucket {l2} start", flush=True)
+        raw_text_for_debug = ""
+        parsed_obj_for_debug = {}
         if callable(llm_stub):
             try:
                 stub_obj = llm_stub(l2, items)
                 if isinstance(stub_obj, str):
+                    raw_text_for_debug = stub_obj
                     parsed = robust_json_parse(stub_obj, llm_model, max_retries=1)
+                    parsed_obj_for_debug = parsed if isinstance(parsed, dict) else {}
                     normalized = _normalize_industry_signal(
                         parsed,
                         l2,
@@ -1190,6 +3215,8 @@ def run_industry_news_pipeline(
                         items,
                     )
                 else:
+                    parsed_obj_for_debug = stub_obj if isinstance(stub_obj, dict) else {}
+                    raw_text_for_debug = json.dumps(parsed_obj_for_debug, ensure_ascii=False)
                     normalized = _normalize_industry_signal(
                         stub_obj,
                         l2,
@@ -1201,25 +3228,83 @@ def run_industry_news_pipeline(
                 normalized = _neutral_industry_signal(l2, datetime.now(timezone.utc).isoformat(), items, reason="stub_error")
                 err = str(e)
         else:
-            normalized, _raw_text, err = _generate_industry_signal_with_llm(l2, items, llm_model)
+            if debug_enabled:
+                normalized, raw_text_for_debug, err, parsed_obj_for_debug = _generate_industry_signal_with_llm(
+                    l2,
+                    items,
+                    llm_model,
+                    return_debug=True,
+                    macro_context=macro_context_for_prior,
+                    macro_risk_off_prior_cfg=macro_prior_cfg,
+                    collection_name=collection_name,
+                    chroma_path=chroma_path,
+                )
+            else:
+                normalized, _raw_text, err = _generate_industry_signal_with_llm(
+                    l2,
+                    items,
+                    llm_model,
+                    macro_context=macro_context_for_prior,
+                    macro_risk_off_prior_cfg=macro_prior_cfg,
+                    collection_name=collection_name,
+                    chroma_path=chroma_path,
+                )
 
         if err:
             llm_errors.append({"L2": l2, "error": err})
         generated_signals.append(normalized)
-        print(f"[TRACE] industry_llm bucket {l2} done", flush=True)
 
-    collection_name = str(news_overlay_cfg.get("industry_collection", "industry_signals"))
-    chroma_path = (
-        str(chroma_path_override)
-        if chroma_path_override
-        else str(cfg.get("macro_integration", {}).get("chroma_path", "./memory_db"))
+        if debug_enabled and str(l2) in debug_bucket_entries:
+            debug_bucket_entries[str(l2)]["llm_called"] = True
+            debug_bucket_entries[str(l2)]["llm_error"] = err
+            debug_bucket_entries[str(l2)]["raw_text_len"] = len(str(raw_text_for_debug or ""))
+            debug_bucket_entries[str(l2)]["raw_text_head_1200"] = str(raw_text_for_debug or "")[:1200]
+            debug_bucket_entries[str(l2)]["parsed_obj"] = parsed_obj_for_debug if isinstance(parsed_obj_for_debug, dict) else {}
+            debug_bucket_entries[str(l2)]["normalized_obj"] = dict(normalized) if isinstance(normalized, dict) else {}
+            debug_bucket_entries[str(l2)]["macro_prior_applied"] = bool(normalized.get("macro_prior_applied", False)) if isinstance(normalized, dict) else False
+            debug_bucket_entries[str(l2)]["macro_prior_reasons"] = list(normalized.get("macro_prior_reasons", [])) if isinstance(normalized, dict) else []
+            debug_bucket_entries[str(l2)]["macro_prior_strength"] = int(_safe_int(normalized.get("macro_prior_strength", 0), 0)) if isinstance(normalized, dict) else 0
+            debug_bucket_entries[str(l2)]["macro_risk_off_score"] = int(_safe_int(normalized.get("macro_risk_off_score", 0), 0)) if isinstance(normalized, dict) else 0
+            debug_bucket_entries[str(l2)]["macro_prior_skipped_due_to_score"] = bool(normalized.get("macro_prior_skipped_due_to_score", False)) if isinstance(normalized, dict) else False
+            debug_bucket_entries[str(l2)]["macro_prior_skipped_due_to_cooldown"] = bool(normalized.get("macro_prior_skipped_due_to_cooldown", False)) if isinstance(normalized, dict) else False
+            if isinstance(parsed_obj_for_debug, dict) and bool(parsed_obj_for_debug.get("_parse_error")):
+                debug_bucket_entries[str(l2)]["parse_error"] = True
+                debug_bucket_entries[str(l2)]["parse_error_reason"] = str(
+                    parsed_obj_for_debug.get("_parse_error_reason", "parse_error")
+                )
+
+    generated_signals, calibration_info = _postprocess_industry_signals(
+        generated_signals, news_overlay_cfg=news_overlay_cfg
     )
+
+    if debug_enabled:
+        final_by_l2 = {}
+        for sig in generated_signals:
+            if isinstance(sig, dict):
+                final_by_l2[str(sig.get("L2", "")).strip()] = sig
+        for l2, entry in debug_bucket_entries.items():
+            final_obj = final_by_l2.get(str(l2))
+            if isinstance(final_obj, dict):
+                final_with_status = dict(final_obj)
+                final_with_status["status"] = str(final_with_status.get("status", "ok"))
+                entry["final_to_write_obj"] = final_with_status
+            else:
+                entry["final_to_write_obj"] = {
+                    "direction": "neutral",
+                    "risk_delta": 0.0,
+                    "confidence": 0.0,
+                    "status": "no_items",
+                }
+
     write_info = write_industry_signals_to_chroma(
         generated_signals,
         collection_name=collection_name,
         chroma_path=chroma_path,
         client_override=chroma_client_override,
     )
+
+    if debug_enabled:
+        debug_trace["bucket_entries"] = debug_bucket_entries
 
     return {
         "raw_count": len(all_items),
@@ -1232,6 +3317,7 @@ def run_industry_news_pipeline(
         "ticker_to_tags": ticker_to_tags,
         "l2_to_tickers": {k: sorted(list(v)) for k, v in l2_to_tickers.items()},
         "llm_errors": llm_errors,
+        "calibration_info": calibration_info,
         "config_used": {
             "news_overlay": news_overlay_cfg,
             "news_sources": sources_cfg,
@@ -1526,7 +3612,6 @@ def _get_runtime_candidate_tickers(cfg, limit=20):
 
 def run_industry_news_pipeline_runtime(config_path="paper_config.json"):
     global _INDUSTRY_PIPELINE_LAST_RUN_TS
-
     try:
         cfg = _load_json_config(config_path)
     except Exception as e:
@@ -1537,13 +3622,17 @@ def run_industry_news_pipeline_runtime(config_path="paper_config.json"):
     if not bool(overlay_cfg.get("enabled", False)):
         return {"status": "disabled"}
 
-    now_ts = time.time()
     min_interval = max(0, _safe_int(overlay_cfg.get("runtime_min_interval_seconds", 900), 900))
+    now_ts = time.time()
     if min_interval > 0 and _INDUSTRY_PIPELINE_LAST_RUN_TS > 0:
         elapsed = now_ts - _INDUSTRY_PIPELINE_LAST_RUN_TS
         if elapsed < min_interval:
-            wait_s = int(max(1, min_interval - elapsed))
-            return {"status": "throttled", "wait_seconds": wait_s}
+            remaining = max(0.0, min_interval - elapsed)
+            return {
+                "status": "throttled",
+                "remaining_seconds": round(remaining, 1),
+                "min_interval_seconds": int(min_interval),
+            }
 
     portfolio_tickers = _get_runtime_portfolio_tickers(
         snapshot_path=cfg.get("reporting", {}).get("snapshot_live_path", "outputs/snapshot_live.json")
@@ -1558,349 +3647,14 @@ def run_industry_news_pipeline_runtime(config_path="paper_config.json"):
         portfolio_tickers=portfolio_tickers,
         candidate_tickers=candidate_tickers,
     )
-    _INDUSTRY_PIPELINE_LAST_RUN_TS = now_ts
     write_info = result.get("write_info", {})
     print(
         f"[INDUSTRY_NEWS] signals={len(result.get('signals', []))} "
         f"writes={int(write_info.get('written', 0) or 0)} "
         f"collection={write_info.get('collection', overlay_cfg.get('industry_collection', 'industry_signals'))}"
     )
+    _INDUSTRY_PIPELINE_LAST_RUN_TS = now_ts
     return {"status": "ok", "result": result}
-
-
-def _load_runtime_snapshot(config):
-    snapshot_path = "outputs/snapshot_live.json"
-    try:
-        if isinstance(config, dict):
-            reporting = config.get("reporting", {})
-            if isinstance(reporting, dict):
-                snapshot_path = str(reporting.get("snapshot_live_path", snapshot_path))
-        if os.path.exists(snapshot_path):
-            with open(snapshot_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception as e:
-        log_error(f"_load_runtime_snapshot error: {e}")
-    return {}
-
-
-def _load_latest_topic_signals_summary(max_items=8):
-    rows = []
-    try:
-        data = signals_collection.get(include=["metadatas"])  # no-op collection safely returns empty
-        metas = data.get("metadatas", []) if isinstance(data, dict) else []
-        if isinstance(metas, list):
-            for md in metas[-max(1, int(max_items)):]:
-                if not isinstance(md, dict):
-                    continue
-                rows.append(
-                    {
-                        "timestamp": md.get("timestamp"),
-                        "theme": md.get("theme"),
-                        "topic_sector": md.get("topic_sector"),
-                        "direction": md.get("direction"),
-                        "confidence": _safe_float(md.get("confidence", 0.0), 0.0),
-                        "status": md.get("status"),
-                    }
-                )
-    except Exception as e:
-        log_error(f"_load_latest_topic_signals_summary error: {e}")
-    return rows
-
-
-def _build_runtime_portfolio_state(config):
-    cfg = config if isinstance(config, dict) else {}
-    snap = _load_runtime_snapshot(cfg)
-    objectives = cfg.get("objectives", {}) if isinstance(cfg.get("objectives"), dict) else {}
-    execution = cfg.get("execution", {}) if isinstance(cfg.get("execution"), dict) else {}
-
-    total_equity = _safe_float(snap.get("total_equity"), _safe_float(cfg.get("initial_cash_usd", 30000.0), 30000.0))
-    cash_value = _safe_float(snap.get("cash"), total_equity)
-    positions_detail = snap.get("positions_detail", {}) if isinstance(snap.get("positions_detail"), dict) else {}
-    position_weights = {}
-    for ticker, row in positions_detail.items():
-        if str(ticker).upper() == "CASH":
-            continue
-        if not isinstance(row, dict):
-            continue
-        w = None
-        try:
-            raw_w = row.get("weight")
-            if raw_w is not None and str(raw_w).strip() != "":
-                w = _safe_float(raw_w, 0.0)
-        except Exception:
-            w = None
-        if w is None and total_equity > 0:
-            val = _safe_float(row.get("market_value"), 0.0)
-            w = val / total_equity
-        if w is not None:
-            position_weights[str(ticker).upper()] = float(np.clip(w, 0.0, 1.0))
-
-    state = {
-        "total_equity": total_equity,
-        "cash_value": cash_value,
-        "cash_ratio": float(np.clip(cash_value / total_equity if total_equity > 0 else 1.0, 0.0, 1.0)),
-        "positions": position_weights,
-        "constraints": {
-            "min_cash": float(np.clip(_safe_float(objectives.get("min_cash_pct", 0.1), 0.1), 0.0, 1.0)),
-            "max_cash": float(np.clip(_safe_float(cfg.get("news_overlay", {}).get("max_cash_pct", 0.6), 0.6), 0.0, 1.0)),
-            "max_weight_per_asset": float(np.clip(_safe_float(objectives.get("max_weight_per_asset", 0.25), 0.25), 0.05, 0.40)),
-            "turnover_cap": float(np.clip(_safe_float(execution.get("max_turnover_pct_per_rebalance", 0.2), 0.2), 0.0, 1.0)),
-        },
-    }
-    return state
-
-
-def _build_runtime_macro_snapshot(config):
-    cfg = config if isinstance(config, dict) else {}
-    snap = _load_runtime_snapshot(cfg)
-    risk_cfg = snap.get("risk_config", {}) if isinstance(snap.get("risk_config"), dict) else {}
-    state = (
-        str(risk_cfg.get("risk_state") or snap.get("regime_state") or snap.get("market_regime_state") or "RISK_MIXED")
-        .strip()
-        .upper()
-    )
-    if state not in {"RISK_ON", "RISK_OFF", "RISK_MIXED"}:
-        state = "RISK_MIXED"
-    return {
-        "regime": state,
-        "trend_score": _safe_float(risk_cfg.get("regime_trend_score", snap.get("trend_score", 0.5)), 0.5),
-        "cash_target_current": _safe_float(risk_cfg.get("cash_target", snap.get("cash_target", 0.2)), 0.2),
-        "timestamp": snap.get("timestamp"),
-    }
-
-
-def _build_trading_loop_prompt(cycle_id, timestamp_local, portfolio_state, macro_snapshot, topic_signals, industry_signals):
-    return f"""
-You are GlobalWatch Trading Risk Parameter Composer.
-
-GOAL
-- Convert existing signals (macro + industry) into conservative, executable trading parameters
-  that a paper trading engine can apply next cycle.
-- DO NOT fetch news, DO NOT run deep analysis, DO NOT regenerate industry buckets.
-
-MODE
-- mode: TRADING_LOOP
-- cycle_id: {cycle_id}
-- timestamp_local: {timestamp_local}
-
-INPUTS
-1) Portfolio state:
-{json.dumps(portfolio_state, ensure_ascii=False)}
-
-2) Current macro regime & trend snapshot:
-{json.dumps(macro_snapshot, ensure_ascii=False)}
-
-3) Latest confirmed topic signals (optional):
-{json.dumps(topic_signals, ensure_ascii=False)}
-
-4) Latest industry_signals summary (already computed by batch job):
-{json.dumps(industry_signals, ensure_ascii=False)}
-
-CONSTRAINTS (MUST OBEY)
-- cash_target must be within [min_cash, max_cash] from portfolio constraints
-- max_weight_per_asset within [0.05, 0.40] unless constraints specify otherwise
-- if regime == RISK_OFF:
-  - do NOT propose offensive tilts
-  - prefer defensive assets/tags
-- keep deltas small and stable (avoid thrashing):
-  - cash_target_delta magnitude <= 0.10 per cycle
-  - per-bucket tilt delta magnitude <= 0.05
-
-OUTPUT REQUIREMENTS (STRICT)
-- Output MUST be valid JSON only. No markdown.
-- Keep it short: <= 400 output tokens.
-- If signals are stale or missing, return a safe default (neutral parameters).
-
-JSON SCHEMA (MUST FOLLOW)
-{{
-  "mode": "TRADING_LOOP",
-  "cycle_id": {cycle_id},
-  "regime": "RISK_ON" | "RISK_OFF" | "RISK_MIXED",
-  "cash_target": 0.0-1.0,
-  "max_weight_per_asset": 0.0-1.0,
-  "tilts": [
-    {{"tag": "energy|technology|consumer|...", "delta": -0.05 to +0.05, "reason": "short"}}
-  ],
-  "risk_limits": {{
-    "turnover_cap": 0.0-1.0,
-    "notes": "short"
-  }},
-  "explain": {{"summary": "1-2 sentences", "drivers": ["max 4 bullets"]}},
-  "limits": {{"llm_profile": "trading_loop"}}
-}}
-
-NOW PRODUCE THE JSON.
-"""
-
-
-def _safe_default_trading_loop_params(cycle_id, macro_snapshot, portfolio_state):
-    constraints = portfolio_state.get("constraints", {}) if isinstance(portfolio_state, dict) else {}
-    min_cash = float(np.clip(_safe_float(constraints.get("min_cash", 0.1), 0.1), 0.0, 1.0))
-    max_cash = float(np.clip(_safe_float(constraints.get("max_cash", 0.6), 0.6), min_cash, 1.0))
-    current_cash = float(np.clip(_safe_float(portfolio_state.get("cash_ratio", min_cash), min_cash), min_cash, max_cash))
-    max_weight = float(np.clip(_safe_float(constraints.get("max_weight_per_asset", 0.25), 0.25), 0.05, 0.40))
-    turnover_cap = float(np.clip(_safe_float(constraints.get("turnover_cap", 0.2), 0.2), 0.0, 1.0))
-    regime = str(macro_snapshot.get("regime", "RISK_MIXED")).upper()
-    if regime not in {"RISK_ON", "RISK_OFF", "RISK_MIXED"}:
-        regime = "RISK_MIXED"
-    return {
-        "mode": "TRADING_LOOP",
-        "cycle_id": int(_safe_int(cycle_id, 0)),
-        "regime": regime,
-        "cash_target": current_cash,
-        "max_weight_per_asset": max_weight,
-        "tilts": [],
-        "risk_limits": {"turnover_cap": turnover_cap, "notes": "safe default"},
-        "explain": {"summary": "Signals unavailable or stale. Keep neutral constraints.", "drivers": []},
-        "limits": {"llm_profile": "trading_loop"},
-    }
-
-
-def _normalize_trading_loop_params(payload, cycle_id, macro_snapshot, portfolio_state):
-    if not isinstance(payload, dict):
-        payload = {}
-    out = _safe_default_trading_loop_params(cycle_id, macro_snapshot, portfolio_state)
-    constraints = portfolio_state.get("constraints", {}) if isinstance(portfolio_state, dict) else {}
-    min_cash = float(np.clip(_safe_float(constraints.get("min_cash", 0.1), 0.1), 0.0, 1.0))
-    max_cash = float(np.clip(_safe_float(constraints.get("max_cash", 0.6), 0.6), min_cash, 1.0))
-    current_cash = _safe_float(portfolio_state.get("cash_ratio", min_cash), min_cash)
-
-    regime = str(payload.get("regime", macro_snapshot.get("regime", out["regime"]))).strip().upper()
-    if regime not in {"RISK_ON", "RISK_OFF", "RISK_MIXED"}:
-        regime = out["regime"]
-    out["regime"] = regime
-
-    cash_target = _safe_float(payload.get("cash_target", current_cash), current_cash)
-    cash_target = float(np.clip(cash_target, min_cash, max_cash))
-    if abs(cash_target - current_cash) > 0.10:
-        cash_target = current_cash + (0.10 if cash_target > current_cash else -0.10)
-        cash_target = float(np.clip(cash_target, min_cash, max_cash))
-    out["cash_target"] = cash_target
-
-    max_weight = _safe_float(payload.get("max_weight_per_asset", out["max_weight_per_asset"]), out["max_weight_per_asset"])
-    out["max_weight_per_asset"] = float(np.clip(max_weight, 0.05, 0.40))
-
-    tilts = payload.get("tilts", [])
-    tilt_rows = []
-    if isinstance(tilts, list):
-        for row in tilts[:10]:
-            if not isinstance(row, dict):
-                continue
-            tag = str(row.get("tag", "")).strip().lower()
-            if not tag:
-                continue
-            delta = float(np.clip(_safe_float(row.get("delta", 0.0), 0.0), -0.05, 0.05))
-            if regime == "RISK_OFF" and delta > 0:
-                # Keep RISK_OFF conservative.
-                continue
-            tilt_rows.append({"tag": tag, "delta": delta, "reason": str(row.get("reason", ""))[:160]})
-    out["tilts"] = tilt_rows
-
-    risk_limits = payload.get("risk_limits", {})
-    turnover_cap = _safe_float(
-        risk_limits.get("turnover_cap", constraints.get("turnover_cap", out["risk_limits"]["turnover_cap"]))
-        if isinstance(risk_limits, dict)
-        else constraints.get("turnover_cap", out["risk_limits"]["turnover_cap"]),
-        out["risk_limits"]["turnover_cap"],
-    )
-    out["risk_limits"] = {
-        "turnover_cap": float(np.clip(turnover_cap, 0.0, 1.0)),
-        "notes": str((risk_limits.get("notes", "") if isinstance(risk_limits, dict) else ""))[:200],
-    }
-
-    explain = payload.get("explain", {})
-    drivers = []
-    if isinstance(explain, dict) and isinstance(explain.get("drivers"), list):
-        drivers = [str(x)[:140] for x in explain.get("drivers", [])[:4]]
-    out["explain"] = {
-        "summary": str((explain.get("summary", "") if isinstance(explain, dict) else ""))[:240],
-        "drivers": drivers,
-    }
-    out["limits"] = {"llm_profile": "trading_loop"}
-    return out
-
-
-def compose_trading_risk_parameters(
-    cycle_id,
-    timestamp_local,
-    portfolio_state,
-    macro_snapshot,
-    topic_signals,
-    industry_signals,
-    *,
-    model_name=None,
-):
-    model = str(model_name or LOCAL_MODEL)
-    prompt = _build_trading_loop_prompt(
-        cycle_id=cycle_id,
-        timestamp_local=timestamp_local,
-        portfolio_state=portfolio_state,
-        macro_snapshot=macro_snapshot,
-        topic_signals=topic_signals,
-        industry_signals=industry_signals,
-    )
-    try:
-        raw = query_ollama(model, prompt, num_ctx=2048, temperature=0.1)
-        _thought, json_text = parse_deepseek_output(raw)
-        parsed = robust_json_parse(json_text, model, max_retries=1)
-        if parsed.get("_parse_error"):
-            safe = _safe_default_trading_loop_params(cycle_id, macro_snapshot, portfolio_state)
-            safe["parse_error"] = parsed.get("reason")
-            return safe
-        return _normalize_trading_loop_params(parsed, cycle_id, macro_snapshot, portfolio_state)
-    except Exception as e:
-        safe = _safe_default_trading_loop_params(cycle_id, macro_snapshot, portfolio_state)
-        safe["error"] = str(e)
-        return safe
-
-
-def run_trading_loop_compose_runtime(config_path="paper_config.json", outdir="outputs"):
-    os.makedirs(outdir, exist_ok=True)
-    cfg = _load_json_config(config_path)
-    snapshot = _load_runtime_snapshot(cfg)
-    cycle_id = _safe_int(snapshot.get("cycle", 0), 0)
-    timestamp_local = datetime.now().isoformat()
-    portfolio_state = _build_runtime_portfolio_state(cfg)
-    macro_snapshot = _build_runtime_macro_snapshot(cfg)
-    topic_signals = _load_latest_topic_signals_summary(max_items=8)
-    industry_signals = _load_latest_industry_signals_summary(max_items=8)
-    payload = compose_trading_risk_parameters(
-        cycle_id=cycle_id,
-        timestamp_local=timestamp_local,
-        portfolio_state=portfolio_state,
-        macro_snapshot=macro_snapshot,
-        topic_signals=topic_signals,
-        industry_signals=industry_signals,
-        model_name=str(cfg.get("news_overlay", {}).get("llm_model", LOCAL_MODEL)),
-    )
-    out_path = os.path.join(outdir, "trading_risk_params_live.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(
-        f"[TRADING_LOOP] cycle={payload.get('cycle_id')} regime={payload.get('regime')} "
-        f"cash_target={_safe_float(payload.get('cash_target', 0.0), 0.0):.3f} "
-        f"tilts={len(payload.get('tilts', []))} out={out_path}"
-    )
-    return 0
-
-
-def _run_trading_loop_cli_if_requested():
-    env_trigger = str(os.environ.get("GW_COMPOSE_TRADING_LOOP", "0")).strip().lower() in ("1", "true", "yes", "on")
-    arg_trigger = "--compose-trading-loop-risk" in sys.argv
-    if not env_trigger and not arg_trigger:
-        return None
-    parser = argparse.ArgumentParser(description="Compose TRADING_LOOP risk parameters from existing signals")
-    parser.add_argument("--compose-trading-loop-risk", action="store_true")
-    parser.add_argument("--config", default="paper_config.json")
-    parser.add_argument("--debug-outdir", default="outputs")
-    args, _ = parser.parse_known_args()
-    try:
-        return run_trading_loop_compose_runtime(config_path=args.config, outdir=args.debug_outdir)
-    except Exception as e:
-        print(f"[TRADING_LOOP] ERROR compose failed: {e}")
-        return 1
 
 
 def _normalize_theme_key(theme):
@@ -2071,100 +3825,146 @@ def _accuracy_to_adaptive_weight(accuracy):
     return 1.00
 
 
-def _is_transient_ollama_error(exc):
-    text = str(exc).lower()
-    markers = [
-        "winerror 10054",
-        "forcibly closed by the remote host",
-        "connection reset",
-        "connection aborted",
-        "timeout",
-        "timed out",
-        "eof",
-        "stopping",
-        "broken pipe",
-    ]
-    return any(marker in text for marker in markers)
-
-
-def _build_ollama_model_candidates(primary_model):
-    primary = str(primary_model or LOCAL_MODEL).strip() or LOCAL_MODEL
-    out = [primary]
-    for alt in OLLAMA_FALLBACK_MODELS:
-        if alt not in out:
-            out.append(alt)
-    return out
-
-
-def _ollama_chat_content(model, prompt, *, num_ctx, temperature):
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "options": {"num_ctx": int(num_ctx), "temperature": float(temperature)},
-    }
-    try:
-        resp = ollama.chat(**payload, keep_alive=OLLAMA_KEEP_ALIVE)
-    except TypeError:
-        # Backward compatibility for older ollama python packages.
-        resp = ollama.chat(**payload)
-    return (resp or {}).get("message", {}).get("content", "")
-
-
-def query_ollama(model, prompt, num_ctx=None, temperature=None):
-    """Robust wrapper for ollama.chat with retry/fallback to reduce transient failures."""
+def query_ollama(model, prompt, num_ctx=8192, temperature=None, timeout_seconds=None):
+    """
+    Robust wrapper for ollama.chat.
+    - Retries with backoff
+    - Optional fallback models
+    - Empty content is treated as hard failure
+    """
     if temperature is None:
         temperature = TEMPERATURE
-    if num_ctx is None:
-        num_ctx = DEFAULT_LLM_NUM_CTX
 
-    candidates = _build_ollama_model_candidates(model)
+    primary = str(model or "").strip()
+    model_candidates = []
+    if primary:
+        model_candidates.append(primary)
+    for fallback in OLLAMA_FALLBACK_MODELS:
+        fb = str(fallback or "").strip()
+        if fb and fb not in model_candidates:
+            model_candidates.append(fb)
+    if not model_candidates:
+        raise RuntimeError("ollama_model_missing")
+
+    retries = max(0, int(DEFAULT_OLLAMA_RETRIES))
+    backoff = max(0.2, float(DEFAULT_OLLAMA_RETRY_BACKOFF))
     last_error = None
 
-    for idx, candidate in enumerate(candidates):
-        for attempt in range(DEFAULT_OLLAMA_RETRIES + 1):
+    timeout_value = None
+    if timeout_seconds is not None:
+        timeout_value = max(1.0, float(_safe_float(timeout_seconds, 0.0)))
+
+    for model_name in model_candidates:
+        for attempt in range(retries + 1):
             try:
-                content = _ollama_chat_content(
-                    candidate,
-                    prompt,
-                    num_ctx=max(1024, int(num_ctx)),
-                    temperature=float(temperature),
-                )
-                if content and str(content).strip():
-                    if idx > 0:
-                        print(f"[OLLAMA] Fallback model used: {candidate}")
-                    return str(content)
-                raise RuntimeError(f"Empty model response from {candidate}")
+                if timeout_value is not None:
+                    def _chat_once():
+                        return ollama.chat(
+                            model=model_name,
+                            messages=[{"role": "user", "content": prompt}],
+                            options={"num_ctx": int(num_ctx), "temperature": float(temperature)},
+                            keep_alive=OLLAMA_KEEP_ALIVE,
+                        )
+                    with ThreadPoolExecutor(max_workers=1) as ex:
+                        fut = ex.submit(_chat_once)
+                        try:
+                            response = fut.result(timeout=timeout_value)
+                        except FuturesTimeoutError:
+                            fut.cancel()
+                            raise RuntimeError("ollama_timeout")
+                else:
+                    response = ollama.chat(
+                        model=model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        options={"num_ctx": int(num_ctx), "temperature": float(temperature)},
+                        keep_alive=OLLAMA_KEEP_ALIVE,
+                    )
+                content = str(response.get("message", {}).get("content", "") or "").strip()
+                if not content:
+                    raise RuntimeError("ollama_empty_content")
+                return content
             except Exception as e:
                 last_error = e
-                retryable = _is_transient_ollama_error(e)
-                if attempt < DEFAULT_OLLAMA_RETRIES and retryable:
-                    sleep_s = DEFAULT_OLLAMA_RETRY_BACKOFF * (attempt + 1)
-                    print(
-                        f"[OLLAMA] transient error on {candidate} (attempt {attempt + 1}/"
-                        f"{DEFAULT_OLLAMA_RETRIES + 1}): {e}; retry in {sleep_s:.1f}s"
-                    )
-                    time.sleep(sleep_s)
-                    continue
-                break
+                if attempt < retries:
+                    sleep_sec = backoff * float(attempt + 1)
+                    time.sleep(sleep_sec)
 
-    raise RuntimeError(f"Ollama request failed for models {candidates}: {last_error}")
+    if str(last_error) == "ollama_empty_content":
+        raise RuntimeError("ollama_empty_content")
+    if str(last_error) == "ollama_timeout":
+        raise RuntimeError("ollama_timeout")
+    raise RuntimeError(f"ollama_query_failed:{last_error}")
 
 def parse_deepseek_output(text):
-    """
-     DeepSeek-R1 ?
-    : (? SON)
-    """
-    # 1.  <think>...</think> ?
-    think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
-    thought_process = think_match.group(1).strip() if think_match else "No internal thought process detected (Direct Output)."
-    
-    # 2.  <think> ?JSON 
-    json_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    #  Markdown ?
-    json_text = re.sub(r'```json', '', json_text)
-    json_text = re.sub(r'```', '', json_text).strip()
-    
+    """Extract optional reasoning text and the JSON payload."""
+    raw_text = str(text or "")
+    thought_process = ""
+
+    think_match = re.search(r"<think>(.*?)</think>", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    if think_match:
+        thought_process = str(think_match.group(1) or "").strip()
+    else:
+        alt_match = re.search(
+            r"(?:THOUGHT_PROCESS|ANALYSIS)\s*:\s*(.*?)\s*(?:FINAL\s*:|$)",
+            raw_text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if alt_match:
+            thought_process = str(alt_match.group(1) or "").strip()
+
+    json_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    json_text = re.sub(r"```json", "", json_text, flags=re.IGNORECASE)
+    json_text = re.sub(r"```", "", json_text).strip()
+
     return thought_process, json_text
+
+
+def build_reasoning_summary(res):
+    """Build a compact human-readable reasoning summary from parsed result fields."""
+    data = res if isinstance(res, dict) else {}
+    lines = []
+
+    def _add(label, value):
+        txt = str(value or "").strip()
+        if txt:
+            lines.append(f"- {label}: {txt}")
+
+    _add("Event", data.get("event") or data.get("summary") or data.get("reason"))
+    _add("Advice", data.get("advice") or data.get("key_risk"))
+
+    key_drivers = data.get("key_drivers", [])
+    if isinstance(key_drivers, list):
+        for item in key_drivers[:3]:
+            txt = str(item or "").strip()
+            if txt:
+                lines.append(f"- Driver: {txt}")
+
+    counterpoints = data.get("counterpoints", [])
+    if isinstance(counterpoints, list):
+        for item in counterpoints[:2]:
+            txt = str(item or "").strip()
+            if txt:
+                lines.append(f"- Counterpoint: {txt}")
+
+    top_drivers = data.get("top_drivers", [])
+    if isinstance(top_drivers, list):
+        for item in top_drivers[:2]:
+            txt = str(item or "").strip()
+            if txt:
+                lines.append(f"- Topic: {txt}")
+
+    predictions = data.get("predictions", {})
+    if isinstance(predictions, dict):
+        for k, v in list(predictions.items())[:3]:
+            k_txt = str(k or "").strip()
+            v_txt = str(v or "").strip()
+            if k_txt and v_txt:
+                lines.append(f"- {k_txt}: {v_txt}")
+
+    if not lines:
+        lines.append("- No structured reasoning summary available.")
+
+    return "\n".join(lines[:8])
 
 def extract_json_from_text(text):
     """
@@ -2222,23 +4022,27 @@ def self_repair_json(raw_output, model):
     Returns:
         repaired_json_str:  JSON  None
     """
+    raw_text = str(raw_output or "")
+    if len(raw_text.strip()) < 20:
+        return None
+
     repair_prompt = f"""
 The following output contains a JSON object but may have extra text or formatting issues.
 Please extract and output ONLY the valid JSON object, with NO explanations, NO markdown, NO extra text.
 
 Original output:
-{raw_output}
+{raw_text}
 
 Output ONLY the JSON:
 """
     
     try:
-        repaired_text = query_ollama(
-            model=model,
-            prompt=repair_prompt,
-            num_ctx=2048,
-            temperature=0.0
-        ).strip()
+        response = ollama.chat(
+            model=model, 
+            messages=[{'role': 'user', 'content': repair_prompt}],
+            options={"num_ctx": 4096, "temperature": 0}  # ?
+        )
+        repaired_text = response['message']['content'].strip()
         
         #  JSON
         json_str = extract_json_from_text(repaired_text)
@@ -2262,8 +4066,18 @@ def robust_json_parse(raw_content, model, max_retries=1):
     Returns:
         dict:  JSON 
     """
+    raw_text = str(raw_content or "")
+    if len(raw_text.strip()) < 20:
+        return {
+            "_parse_error": True,
+            "_parse_error_reason": "empty_raw_content",
+            "_raw_head": raw_text[:2000],
+            "status": "error",
+            "evidence": [],
+        }
+
     #  JSON
-    json_str = extract_json_from_text(raw_content)
+    json_str = extract_json_from_text(raw_text)
     
     if json_str:
         try:
@@ -2273,7 +4087,7 @@ def robust_json_parse(raw_content, model, max_retries=1):
     
     # ?
     for attempt in range(max_retries):
-        repaired_json_str = self_repair_json(raw_content, model)
+        repaired_json_str = self_repair_json(raw_text, model)
         if repaired_json_str:
             try:
                 return json.loads(repaired_json_str)
@@ -2284,9 +4098,11 @@ def robust_json_parse(raw_content, model, max_retries=1):
     return {
         "status": "error",
         "reason": "Failed to parse JSON after extraction and self-repair attempts",
-        "raw_output": raw_content[:500] + "..." if len(raw_content) > 500 else raw_content,
+        "raw_output": raw_text[:500] + "..." if len(raw_text) > 500 else raw_text,
         "evidence": [],
-        "_parse_error": True
+        "_parse_error": True,
+        "_parse_error_reason": "json_parse_failed",
+        "_raw_head": raw_text[:2000],
     }
 
 # ================= 2.  =================
@@ -2456,12 +4272,7 @@ def extract_llm_topic_sentiment(news, macro_data, lang_mode):
 
     model_name = str(RUNTIME_SETTINGS.get("llm_topic_model", LOCAL_MODEL))
     lang_instruction = "OUTPUT LANGUAGE: ENGLISH"
-    headlines = "\n".join(
-        [
-            f"- [{item.get('source', 'Unknown')}] {str(item.get('title', ''))[:180]}"
-            for item in news[:12]
-        ]
-    )
+    headlines = "\n".join([f"- [{item.get('source', 'Unknown')}] {item.get('title', '')}" for item in news[:20]])
 
     prompt = f"""
 You are a macro-news signal parser. {lang_instruction}
@@ -2491,7 +4302,7 @@ Rules:
 - include only sectors/themes with clear directional evidence
 """
     try:
-        raw_content = query_ollama(model_name, prompt, num_ctx=4096)
+        raw_content = query_ollama(model_name, prompt, num_ctx=8192)
         thought, json_text = parse_deepseek_output(raw_content)
         parsed = robust_json_parse(json_text, model_name, max_retries=1)
         if parsed.get("_parse_error"):
@@ -3782,6 +5593,91 @@ def get_rss_news():
     
     return news[:8]  # 
 
+
+def build_keywords_for_assets(selected_asset_names, selected_pairs):
+    """Build lightweight keyword list for targeted RSS filtering in interactive mode."""
+    keyword_map = {
+        "usd": ["usd", "dollar", "fed", "treasury"],
+        "cad": ["cad", "canadian", "canada"],
+        "cny": ["cny", "yuan", "renminbi", "china"],
+        "jpy": ["jpy", "yen", "boj", "japan"],
+        "gbp": ["gbp", "pound", "uk", "boe"],
+        "gold": ["gold", "bullion", "xau"],
+        "crude": ["oil", "crude", "wti", "brent", "opec"],
+        "bitcoin": ["bitcoin", "btc", "crypto"],
+        "btc": ["bitcoin", "btc", "crypto"],
+    }
+
+    def _asset_token(name):
+        txt = str(name or "").strip().lower()
+        if not txt:
+            return ""
+        if "usd" in txt or "dollar" in txt:
+            return "usd"
+        if "cad" in txt or "canadian" in txt:
+            return "cad"
+        if "cny" in txt or "yuan" in txt or "renminbi" in txt or "china" in txt:
+            return "cny"
+        if "jpy" in txt or "yen" in txt or "boj" in txt or "japan" in txt:
+            return "jpy"
+        if "gbp" in txt or "pound" in txt or "boe" in txt or "british" in txt:
+            return "gbp"
+        if "gold" in txt or "xau" in txt:
+            return "gold"
+        if "crude" in txt or "oil" in txt or "wti" in txt or "brent" in txt:
+            return "crude"
+        if "bitcoin" in txt or txt == "btc":
+            return "bitcoin"
+        return re.split(r"[^a-z0-9]+", txt)[0] if txt else ""
+
+    out = []
+    seen = set()
+
+    for asset_name in (selected_asset_names or []):
+        token = _asset_token(asset_name)
+        for kw in keyword_map.get(token, [token] if token else []):
+            k = str(kw).strip().lower()
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+
+    for pair in (selected_pairs or []):
+        pair_txt = str(pair or "").strip()
+        if not pair_txt:
+            continue
+        for part in pair_txt.split("/"):
+            token = _asset_token(part)
+            for kw in keyword_map.get(token, [token] if token else []):
+                k = str(kw).strip().lower()
+                if k and k not in seen:
+                    seen.add(k)
+                    out.append(k)
+
+    return out
+
+
+def filter_news_by_keywords(news, keywords, *, min_keep=4, max_keep=12):
+    """Keep targeted headlines first; fallback to mixed list when hits are too few."""
+    rows = [x for x in (news or []) if isinstance(x, dict)]
+    kws = [str(k).strip().lower() for k in (keywords or []) if str(k).strip()]
+    if not kws:
+        return rows[: max(1, int(max_keep))]
+
+    hits = []
+    non_hits = []
+    for item in rows:
+        title_l = str(item.get("title", "")).strip().lower()
+        if any(kw in title_l for kw in kws):
+            hits.append(item)
+        else:
+            non_hits.append(item)
+
+    if len(hits) >= int(min_keep):
+        return hits[: max(1, int(max_keep))]
+
+    merged = hits + non_hits
+    return merged[: max(1, int(max_keep))]
+
 def get_stock_news(ticker_symbol):
     try:
         query = urllib.parse.quote(f"{ticker_symbol} stock news")
@@ -3879,62 +5775,71 @@ def validate_evidence(evidence_list, input_news):
 
 # ================= 4. AI  (DeepSeek Logic with Evidence) =================
 
-def _compact_news_for_interactive(news_items, max_items=6):
+def _get_latest_industry_signals_summary(config_path="paper_config.json", limit=12):
+    try:
+        cfg = _load_json_config(config_path)
+    except Exception:
+        cfg = {}
+
+    overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
+    collection_name = str(overlay_cfg.get("industry_collection", "industry_signals"))
+    chroma_path = str(cfg.get("macro_integration", {}).get("chroma_path", "./memory_db"))
     out = []
-    for item in (news_items or [])[:max(1, int(max_items))]:
-        if not isinstance(item, dict):
-            continue
-        out.append({
-            "source": str(item.get("source", "Unknown")),
-            "title": str(item.get("title", ""))[:220],
-            "summary": str(item.get("summary", item.get("title", "")))[:260],
-            "published_at": item.get("published") or item.get("published_at"),
-            "url": item.get("link") or item.get("url") or ""
-        })
+    if not CHROMADB_IMPORTED:
+        return out
+    try:
+        client = chromadb.PersistentClient(path=chroma_path)
+        coll = client.get_or_create_collection(name=collection_name)
+        rows = coll.get(limit=max(1, int(limit)), include=["metadatas"])
+        metadatas = rows.get("metadatas", []) if isinstance(rows, dict) else []
+        for meta in metadatas:
+            if not isinstance(meta, dict):
+                continue
+            out.append(
+                {
+                    "L2": str(meta.get("L2", "")),
+                    "risk_delta": float(np.clip(_safe_float(meta.get("risk_delta", 0.0), 0.0), -1.0, 1.0)),
+                    "confidence": float(np.clip(_safe_float(meta.get("confidence", 0.0), 0.0), 0.0, 1.0)),
+                    "timestamp": str(meta.get("timestamp", "")),
+                    "horizon": str(meta.get("horizon", "")),
+                }
+            )
+    except Exception as e:
+        log_error(f"_get_latest_industry_signals_summary error: {e}")
     return out
 
 
-def _load_latest_industry_signals_summary(max_items=5):
-    rows = []
-    try:
-        cfg_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
-        cfg = _load_json_config(cfg_path) if os.path.exists(cfg_path) else {}
-        overlay_cfg = cfg.get("news_overlay", {}) if isinstance(cfg, dict) else {}
-        macro_cfg = cfg.get("macro_integration", {}) if isinstance(cfg, dict) else {}
-        collection_name = str(overlay_cfg.get("industry_collection", "industry_signals"))
-        chroma_path = str(macro_cfg.get("chroma_path", "./memory_db"))
-        if not CHROMADB_IMPORTED:
-            return rows
-        client = chroma_client if chroma_client is not None else chromadb.PersistentClient(path=chroma_path)
-        coll = client.get_or_create_collection(name=collection_name)
-        data = coll.get(include=["metadatas", "documents"])
-        metas = data.get("metadatas", []) if isinstance(data, dict) else []
-        docs = data.get("documents", []) if isinstance(data, dict) else []
-        total = min(len(metas), len(docs))
-        start = max(0, total - max(1, int(max_items)))
-        for i in range(start, total):
-            md = metas[i] if i < len(metas) and isinstance(metas[i], dict) else {}
-            doc = docs[i] if i < len(docs) else ""
-            parsed = {}
-            if isinstance(doc, str) and doc.strip():
-                try:
-                    parsed = json.loads(doc)
-                except Exception:
-                    parsed = {}
-            rows.append({
-                "L2": md.get("L2") or parsed.get("L2"),
-                "risk_delta": parsed.get("risk_delta", md.get("risk_delta", 0.0)),
-                "confidence": parsed.get("confidence", md.get("confidence", 0.0)),
-                "timestamp": md.get("timestamp") or parsed.get("asof_utc")
-            })
-    except Exception as e:
-        log_error(f"_load_latest_industry_signals_summary error: {e}")
-    return rows
-
-
-def _build_interactive_prompt(selected_scope, selected_targets, user_question, news_json, macro_context_json, latest_industry_signals_json):
-    return f"""
+def _build_interactive_prompt(
+    selected_scope,
+    selected_targets,
+    user_question,
+    news_items,
+    macro_context,
+    latest_industry_signals,
+    request_think=False,
+):
+    compact_news = []
+    for item in (news_items or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        compact_news.append(
+            {
+                "source": str(item.get("source", "")),
+                "title": str(item.get("title", ""))[:220],
+                "summary": str(item.get("summary", ""))[:260],
+                "published_at": item.get("published") or item.get("published_at"),
+                "url": item.get("link") or item.get("url"),
+            }
+        )
+    think_instruction = ""
+    if bool(request_think):
+        think_instruction = (
+            "If supported, output your reasoning inside <think>...</think> FIRST, "
+            "then output ONLY the required JSON.\n"
+        )
+    prompt = f"""
 You are GlobalWatch Interactive Analyst.
+{think_instruction}
 
 GOAL
 - Return a fast, high-signal analysis for ONLY the user-selected target(s).
@@ -3949,14 +5854,14 @@ SCOPE
 
 INPUTS
 1) Recent news items (already fetched; do NOT fetch new sources):
-{json.dumps(news_json, ensure_ascii=False)}
+{json.dumps(compact_news, ensure_ascii=False)}
 
 2) Market context snapshot (already computed):
-{json.dumps(macro_context_json, ensure_ascii=False)}
+{json.dumps(macro_context, ensure_ascii=False)}
 
 3) Optional existing background signals (read-only; do NOT recompute heavy pipelines):
 - latest_industry_signals_summary (may be empty):
-{json.dumps(latest_industry_signals_json, ensure_ascii=False)}
+{json.dumps(latest_industry_signals, ensure_ascii=False)}
 
 OUTPUT REQUIREMENTS (STRICT)
 - Output MUST be valid JSON only. No markdown. No extra commentary.
@@ -3966,7 +5871,7 @@ OUTPUT REQUIREMENTS (STRICT)
 DECISION RULES
 - Focus only on selected_targets; ignore unrelated sectors/buckets/tickers.
 - Provide a single event narrative: what happened and why it matters.
-- Convert the narrative into actionable risk parameters in small bounded deltas.
+- Convert the narrative into actionable "risk parameters" in small bounded deltas.
 - Use conservative deltas for INTERACTIVE mode:
   - cash_target_delta in [-0.05, +0.05]
   - risk_on_score in [0, 10]
@@ -4008,173 +5913,236 @@ JSON SCHEMA (MUST FOLLOW)
 
 NOW PRODUCE THE JSON.
 """
+    return prompt
 
 
-def _normalize_interactive_payload(payload, selected_scope, selected_targets):
-    if not isinstance(payload, dict):
-        payload = {}
-    status = str(payload.get("status", "no_update")).strip().lower()
-    if status not in {"alert", "watch", "neutral", "no_update", "error"}:
-        status = "neutral"
-    score = _safe_float(payload.get("score", 0.0), 0.0)
-    score = float(np.clip(score, 0.0, 10.0))
-    impact = payload.get("impact", {}) if isinstance(payload.get("impact"), dict) else {}
-    risk_params = impact.get("risk_params", {}) if isinstance(impact.get("risk_params"), dict) else {}
-    cash_delta = float(np.clip(_safe_float(risk_params.get("cash_target_delta", 0.0), 0.0), -0.05, 0.05))
-    max_pos_delta = float(np.clip(_safe_float(risk_params.get("max_position_weight_delta", 0.0), 0.0), -0.05, 0.05))
+def analyze_all(
+    news,
+    user_pairs,
+    macro_data,
+    lang_mode,
+    selected_scope="FX_PAIR",
+    selected_targets=None,
+    user_question="",
+    latest_industry_signals_summary=None,
+    request_think=False,
+    *,
+    run_topic_signals=None,
+    run_industry_runtime=None,
+    industry_config_path=None,
+):
+    if run_topic_signals is None:
+        run_topic_signals = bool(RUNTIME_SETTINGS.get("enable_llm_topic_signals", True))
+    if run_industry_runtime is None:
+        run_industry_runtime = True
+    if industry_config_path is None:
+        industry_config_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
 
-    return {
-        "mode": "INTERACTIVE",
-        "selected_scope": str(payload.get("selected_scope", selected_scope)),
-        "selected_targets": payload.get("selected_targets", selected_targets),
-        "status": status,
-        "score": score,
-        "event": str(payload.get("event", "No significant update."))[:500],
-        "key_drivers": [str(x)[:180] for x in payload.get("key_drivers", [])[:5]] if isinstance(payload.get("key_drivers"), list) else [],
-        "impact": {
-            "assets": payload.get("impact", {}).get("assets", []) if isinstance(payload.get("impact"), dict) else [],
-            "risk_params": {
-                "cash_target_delta": cash_delta,
-                "max_position_weight_delta": max_pos_delta,
-                "notes": str(risk_params.get("notes", ""))[:240]
-            }
-        },
-        "news_used": payload.get("news_used", [])[:5] if isinstance(payload.get("news_used"), list) else [],
-        "actions": payload.get("actions", [])[:3] if isinstance(payload.get("actions"), list) else [],
-        "limits": {"time_budget_sec": 90, "llm_profile": "interactive"}
-    }
-
-
-def _interactive_to_legacy_response(interactive_payload, original_news):
-    status = interactive_payload.get("status", "no_update")
-    event = interactive_payload.get("event", "No significant update.")
-    score = float(np.clip(_safe_float(interactive_payload.get("score", 0.0), 0.0), 0.0, 10.0))
-    key_drivers = interactive_payload.get("key_drivers", [])
-    assets = interactive_payload.get("impact", {}).get("assets", [])
-    risk_params = interactive_payload.get("impact", {}).get("risk_params", {})
-    actions = interactive_payload.get("actions", [])
-    news_used = interactive_payload.get("news_used", [])
-
-    predictions = {}
-    if isinstance(assets, list):
-        for row in assets:
-            if not isinstance(row, dict):
-                continue
-            symbol = str(row.get("symbol", "")).strip()
-            if not symbol:
-                continue
-            direction = str(row.get("direction", "mixed")).lower()
-            if direction == "bullish":
-                pred = "Bullish"
-            elif direction == "bearish":
-                pred = "Bearish"
-            else:
-                pred = "Mixed"
-            predictions[symbol] = f"{pred} ({row.get('horizon', '1w')})"
-
-    evidence = []
-    if isinstance(news_used, list):
-        for n in news_used[:5]:
-            if not isinstance(n, dict):
-                continue
-            evidence.append({
-                "source": str(n.get("source", "Unknown")),
-                "headline": str(n.get("title", "N/A")),
-                "why_it_matters": "; ".join(key_drivers[:2]) if key_drivers else "Target-specific interactive analysis."
-            })
-    if not evidence and isinstance(original_news, list):
-        for n in original_news[:3]:
-            if isinstance(n, dict):
-                evidence.append({
-                    "source": str(n.get("source", "Unknown")),
-                    "headline": str(n.get("title", "N/A")),
-                    "why_it_matters": "Potentially relevant to selected targets."
-                })
-
-    advice_lines = []
-    if isinstance(actions, list) and actions:
-        for a in actions[:2]:
-            if isinstance(a, dict):
-                advice_lines.append(f"{a.get('type', 'no_action')}: {a.get('details', '')}".strip())
-    cash_delta = _safe_float(risk_params.get("cash_target_delta", 0.0), 0.0)
-    max_weight_delta = _safe_float(risk_params.get("max_position_weight_delta", 0.0), 0.0)
-    advice_lines.append(f"risk_params cash_delta={cash_delta:+.3f}, max_weight_delta={max_weight_delta:+.3f}")
-    advice = " | ".join([x for x in advice_lines if x])[:700]
-
-    return {
-        "status": "alert" if status in {"alert", "watch"} and score >= 6 else ("no_update" if status == "no_update" else status),
-        "impact_score": score,
-        "summary": event,
-        "evidence": evidence,
-        "predictions": predictions,
-        "advice": advice,
-        "_interactive_payload": interactive_payload
-    }
-
-
-def _should_run_broad_industry_analysis(user_question):
-    if str(os.environ.get("GW_FORCE_INDUSTRY_PIPELINE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
-        return True
-    text = str(user_question or "").lower()
-    keywords = ["industry bucket", "all sectors", "broad industry", "run industry pipeline", "full industry"]
-    return any(k in text for k in keywords)
-
-
-def analyze_all(news, user_pairs, macro_data, lang_mode, selected_scope=None, selected_targets=None, user_question=""):
     if not news:
-        return {"status": "no_update", "impact_score": 0, "summary": "No news available.", "evidence": [], "predictions": {}, "advice": "No action."}
+        return {
+            "mode": "INTERACTIVE",
+            "selected_scope": str(selected_scope),
+            "selected_targets": selected_targets or [],
+            "status": "no_update",
+            "score": 0,
+            "event": "No recent news available.",
+            "impact_score": 0,
+            "summary": "No recent news available.",
+            "predictions": {},
+            "advice": "no_action",
+        }
 
+    selected_targets = selected_targets if isinstance(selected_targets, list) and selected_targets else list(user_pairs or [])
     if not selected_targets:
-        selected_targets = list(user_pairs) if isinstance(user_pairs, list) and user_pairs else ["US_MACRO"]
-    if not selected_scope:
-        if len(selected_targets) == 1 and "/" in str(selected_targets[0]):
-            selected_scope = "FX_PAIR"
-        elif len(selected_targets) == 1:
-            selected_scope = "SINGLE_STOCK"
-        else:
-            selected_scope = "MACRO_OVERVIEW"
-
-    compact_news = _compact_news_for_interactive(news, max_items=6)
-    latest_signals = _load_latest_industry_signals_summary(max_items=5)
+        selected_targets = ["US_MACRO"]
+    if latest_industry_signals_summary is None:
+        latest_industry_signals_summary = _get_latest_industry_signals_summary(
+            config_path=os.environ.get("PAPER_CONFIG_PATH", "paper_config.json"),
+            limit=12,
+        )
     prompt = _build_interactive_prompt(
-        selected_scope=selected_scope,
+        selected_scope=str(selected_scope),
         selected_targets=selected_targets,
-        user_question=user_question or "",
-        news_json=compact_news,
-        macro_context_json=macro_data or {},
-        latest_industry_signals_json=latest_signals,
+        user_question=str(user_question or ""),
+        news_items=news,
+        macro_context=macro_data or {},
+        latest_industry_signals=latest_industry_signals_summary or [],
+        request_think=bool(request_think),
     )
 
     try:
-        print("[TRACE] macro_llm start", flush=True)
-        raw_content = query_ollama(LOCAL_MODEL, prompt, num_ctx=2048, temperature=0.15)
-        print("[TRACE] macro_llm done", flush=True)
+        raw_content = query_ollama(LOCAL_MODEL, prompt, num_ctx=4096, temperature=0.15)
         thought, json_text = parse_deepseek_output(raw_content)
         parsed = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
+
         if parsed.get("_parse_error"):
             parsed["thought_process"] = thought
             return parsed
 
-        interactive_payload = _normalize_interactive_payload(parsed, selected_scope, selected_targets)
-        res = _interactive_to_legacy_response(interactive_payload, compact_news)
-        res["thought_process"] = thought
+        status = str(parsed.get("status", "no_update")).strip().lower()
+        if status not in {"alert", "watch", "neutral", "no_update", "error"}:
+            status = "no_update"
+        score = float(np.clip(_safe_float(parsed.get("score", parsed.get("impact_score", 0.0)), 0.0), 0.0, 10.0))
+        key_drivers = parsed.get("key_drivers", [])
+        if not isinstance(key_drivers, list):
+            key_drivers = []
+        key_drivers = [str(x) for x in key_drivers if str(x).strip()][:5]
 
-        # Interactive mode defaults to fast path: skip broad topic/industry heavy pipelines.
-        if _should_run_broad_industry_analysis(user_question):
-            print("[TRACE] topic_llm start", flush=True)
-            topic_payload = extract_llm_topic_sentiment(news, macro_data, lang_mode)
-            print("[TRACE] topic_llm done", flush=True)
-            news_sources = [item.get("source") for item in news]
-            if topic_payload and topic_payload.get("signals"):
-                recorded_topic_count = record_llm_topic_signals(topic_payload, news_sources)
-                res["topic_signals"] = topic_payload
-                res["_topic_signals_recorded"] = recorded_topic_count
-            else:
+        impact_obj = parsed.get("impact", {}) if isinstance(parsed.get("impact"), dict) else {}
+        assets = impact_obj.get("assets", [])
+        if not isinstance(assets, list):
+            assets = []
+        normalized_assets = []
+        selected_upper = {str(x).strip().upper() for x in selected_targets}
+        for item in assets[:12]:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol", "")).strip()
+            if not symbol:
+                continue
+            if selected_upper and symbol.upper() not in selected_upper:
+                continue
+            direction = str(item.get("direction", "mixed")).strip().lower()
+            if direction not in {"bullish", "bearish", "mixed"}:
+                direction = "mixed"
+            horizon = str(item.get("horizon", "1d")).strip().lower()
+            if horizon not in {"1d", "1w"}:
+                horizon = "1d"
+            normalized_assets.append(
+                {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "horizon": horizon,
+                    "confidence": float(np.clip(_safe_float(item.get("confidence", 0.0), 0.0), 0.0, 1.0)),
+                    "rationale": str(item.get("rationale", ""))[:220],
+                }
+            )
+        if not normalized_assets:
+            for tgt in selected_targets[:3]:
+                normalized_assets.append(
+                    {
+                        "symbol": str(tgt),
+                        "direction": "mixed",
+                        "horizon": "1d",
+                        "confidence": 0.3,
+                        "rationale": "Insufficient direct evidence for a directional call.",
+                    }
+                )
+
+        risk_params = impact_obj.get("risk_params", {}) if isinstance(impact_obj.get("risk_params"), dict) else {}
+        risk_params_norm = {
+            "cash_target_delta": float(np.clip(_safe_float(risk_params.get("cash_target_delta", 0.0), 0.0), -0.05, 0.05)),
+            "max_position_weight_delta": float(np.clip(_safe_float(risk_params.get("max_position_weight_delta", 0.0), 0.0), -0.05, 0.05)),
+            "notes": str(risk_params.get("notes", ""))[:220],
+        }
+
+        news_used = parsed.get("news_used", [])
+        if not isinstance(news_used, list):
+            news_used = []
+        news_used_norm = []
+        for item in news_used[:5]:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "")).strip()
+            source = str(item.get("source", "")).strip()
+            if title:
+                news_used_norm.append({"title": title, "source": source})
+        if not news_used_norm:
+            for item in news[:5]:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", "")).strip()
+                if title:
+                    news_used_norm.append({"title": title, "source": str(item.get("source", ""))})
+
+        actions = parsed.get("actions", [])
+        if not isinstance(actions, list):
+            actions = []
+        actions_norm = []
+        for item in actions[:3]:
+            if not isinstance(item, dict):
+                continue
+            act_type = str(item.get("type", "no_action")).strip().lower()
+            if act_type not in {"no_action", "reduce_risk", "increase_risk", "hedge"}:
+                act_type = "no_action"
+            actions_norm.append({"type": act_type, "details": str(item.get("details", ""))[:220]})
+        if not actions_norm:
+            actions_norm.append({"type": "no_action", "details": "Hold current stance until clearer evidence."})
+
+        event_text = str(parsed.get("event", parsed.get("summary", ""))).strip()[:420]
+        if not event_text:
+            event_text = "No clear actionable update from selected targets."
+
+        res = {
+            "mode": "INTERACTIVE",
+            "selected_scope": str(parsed.get("selected_scope", selected_scope)),
+            "selected_targets": selected_targets,
+            "status": status,
+            "score": score,
+            "event": event_text,
+            "key_drivers": key_drivers,
+            "impact": {
+                "assets": normalized_assets[:5],
+                "risk_params": risk_params_norm,
+            },
+            "news_used": news_used_norm[:5],
+            "actions": actions_norm,
+            "limits": {"time_budget_sec": 90, "llm_profile": "interactive"},
+            "thought_process": thought,
+        }
+
+        # Backward-compatible fields for existing UI components.
+        res["impact_score"] = score
+        res["summary"] = event_text
+        pred = {}
+        for item in normalized_assets:
+            pred[item["symbol"]] = f"{item['direction']} ({item['horizon']}, conf={item['confidence']:.2f})"
+        res["predictions"] = pred
+        res["advice"] = actions_norm[0].get("details", "") if actions_norm else risk_params_norm.get("notes", "")
+        res["evidence"] = [
+            {
+                "source": str(item.get("source", "")),
+                "headline": str(item.get("title", "")),
+                "why_it_matters": event_text,
+            }
+            for item in news_used_norm[:5]
+        ]
+        res["_valid_evidence_count"] = len(res["evidence"])
+
+        news_sources = [item.get("source") for item in news if isinstance(item, dict)]
+        if run_topic_signals:
+            try:
+                topic_payload = extract_llm_topic_sentiment(news, macro_data, lang_mode)
+                res["_topic_signals_recorded"] = int(record_llm_topic_signals(topic_payload, news_sources) if topic_payload else 0)
+            except Exception as e:
+                log_error(f"[TOPIC_SIGNALS] interactive record failed: {e}")
                 res["_topic_signals_recorded"] = 0
+        else:
+            res["_topic_signals_recorded"] = 0
 
+        if res.get("status") == "alert" and res.get("predictions"):
+            for asset, prediction_text in res.get("predictions", {}).items():
+                direction = "Neutral"
+                txt = str(prediction_text).lower()
+                if "bullish" in txt:
+                    direction = "Bullish"
+                elif "bearish" in txt:
+                    direction = "Bearish"
+                record_signal(
+                    asset=asset,
+                    direction=direction,
+                    confidence=score,
+                    predictions_dict=res.get("predictions", {}),
+                    news_sources=news_sources,
+                )
+        if res.get("status") == "alert":
+            save_to_memory(res.get("summary"), res.get("impact_score", 0), res.get("advice"))
+
+        # Interactive plane should not trigger broad batch pipeline unless explicitly requested.
+        if run_industry_runtime:
             try:
                 industry_runtime = run_industry_news_pipeline_runtime(
-                    config_path=os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
+                    config_path=industry_config_path
                 )
                 if isinstance(industry_runtime, dict):
                     res["_industry_news_status"] = industry_runtime.get("status")
@@ -4182,9 +6150,6 @@ def analyze_all(news, user_pairs, macro_data, lang_mode, selected_scope=None, se
                         result_obj = industry_runtime.get("result", {})
                         write_info = result_obj.get("write_info", {}) if isinstance(result_obj, dict) else {}
                         res["_industry_news_written"] = int(write_info.get("written", 0) or 0)
-                    elif industry_runtime.get("status") == "throttled":
-                        res["_industry_news_written"] = 0
-                        res["_industry_news_wait_seconds"] = int(industry_runtime.get("wait_seconds", 0) or 0)
                     else:
                         res["_industry_news_written"] = 0
             except Exception as e:
@@ -4192,97 +6157,236 @@ def analyze_all(news, user_pairs, macro_data, lang_mode, selected_scope=None, se
                 res["_industry_news_status"] = "error"
                 res["_industry_news_written"] = 0
         else:
-            print("[TRACE] topic_llm skipped", flush=True)
-            print("[TRACE] industry_llm skipped (interactive scoped mode)", flush=True)
-            res["_topic_signals_recorded"] = 0
             res["_industry_news_status"] = "skipped"
             res["_industry_news_written"] = 0
 
-        if res.get("status") == "alert" and res.get("predictions"):
-            predictions = res.get("predictions", {})
-            impact_score = res.get("impact_score", 0)
-            news_sources = [item.get("source") for item in news]
-            for asset, prediction_text in predictions.items():
-                direction = "Neutral"
-                if "Bullish" in prediction_text or "bullish" in prediction_text:
-                    direction = "Bullish"
-                elif "Bearish" in prediction_text or "bearish" in prediction_text:
-                    direction = "Bearish"
-                record_signal(
-                    asset=asset,
-                    direction=direction,
-                    confidence=impact_score,
-                    predictions_dict=predictions,
-                    news_sources=news_sources
-                )
-
-        if res.get("status") == "alert":
-            save_to_memory(res.get("summary"), res.get("impact_score", 0), res.get("advice"))
         return res
     except Exception as e:
         return {
+            "mode": "INTERACTIVE",
+            "selected_scope": str(selected_scope),
+            "selected_targets": selected_targets,
             "status": "error",
             "reason": f"Unexpected error: {str(e)}",
             "raw_output": "",
             "evidence": [],
-            "_parse_error": True
+            "_parse_error": True,
         }
 
-def analyze_single_stock(ticker, news, lang_mode):
-    try:
-        news_rows = []
-        for row in (news or [])[:6]:
-            line = str(row).strip()
-            if not line:
-                continue
-            news_rows.append({"source": "StockNews", "title": line, "summary": line, "url": ""})
-        prompt = _build_interactive_prompt(
-            selected_scope="SINGLE_STOCK",
-            selected_targets=[str(ticker).upper()],
-            user_question="",
-            news_json=news_rows,
-            macro_context_json={},
-            latest_industry_signals_json=[]
+def analyze_single_stock(ticker, news, lang_mode, request_think=False):
+    lang_instruction = "OUTPUT LANGUAGE: ENGLISH"
+    news_str = " ".join(news)
+    
+    think_instruction = ""
+    if bool(request_think):
+        think_instruction = (
+            "If supported, output your reasoning inside <think>...</think> FIRST, "
+            "then output ONLY the required JSON.\n"
         )
-        print("[TRACE] stock_llm start", flush=True)
-        raw_content = query_ollama(LOCAL_MODEL, prompt, num_ctx=2048, temperature=0.15)
-        print("[TRACE] stock_llm done", flush=True)
+    prompt = f"""
+    You are a Wall Street Analyst. {lang_instruction}
+    {think_instruction}
+    Stock: {ticker}
+    News: {news_str}
+    
+    TASK:
+    1. Think about the market sentiment and risks.
+    2. Output JSON.
+    
+    STRICT JSON OUTPUT FORMAT:
+    {{
+        "sentiment": "Bullish/Bearish/Neutral",
+        "reason": "...",
+        "key_risk": "..."
+    }}
+    """
+    try:
+        response = ollama.chat(model=LOCAL_MODEL, messages=[{'role': 'user', 'content': prompt}], options={"num_ctx": 8192})
+        raw_content = response['message']['content']
         thought, json_text = parse_deepseek_output(raw_content)
-        parsed = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
-        if parsed.get("_parse_error"):
+        
+        # ?robust_json_parse
+        res = robust_json_parse(json_text, LOCAL_MODEL, max_retries=1)
+        
+        # ?
+        if res.get('_parse_error'):
             return {
                 "sentiment": "AI Error",
-                "reason": f"Parse Error: {parsed.get('reason', 'Unknown')}",
+                "reason": f"Parse Error: {res.get('reason', 'Unknown')}",
                 "key_risk": "Unable to analyze due to parsing failure",
                 "thought_process": thought
             }
-
-        payload = _normalize_interactive_payload(parsed, "SINGLE_STOCK", [str(ticker).upper()])
-        assets = payload.get("impact", {}).get("assets", [])
-        first_asset = assets[0] if isinstance(assets, list) and assets else {}
-        direction = str(first_asset.get("direction", "mixed")).lower()
-        if direction == "bullish":
-            sentiment = "Bullish"
-        elif direction == "bearish":
-            sentiment = "Bearish"
-        elif direction == "mixed":
-            sentiment = "Mixed"
-        else:
-            sentiment = "Neutral"
-
-        risk_notes = payload.get("impact", {}).get("risk_params", {}).get("notes", "")
-        key_drivers = payload.get("key_drivers", [])
-        key_risk = str(risk_notes).strip() or ("; ".join(key_drivers[:2]) if key_drivers else "No major risk highlighted.")
-
-        return {
-            "sentiment": sentiment,
-            "reason": payload.get("event", "No significant update."),
-            "key_risk": key_risk,
-            "thought_process": thought,
-            "_interactive_payload": payload
-        }
+        
+        res['thought_process'] = thought
+        return res
     except Exception as e:
         return {"sentiment": "AI Error", "reason": f"Parse Error: {str(e)}", "key_risk": "N/A"}
+
+
+def _build_trading_loop_prompt(
+    cycle_id,
+    timestamp_local,
+    portfolio_state,
+    macro_snapshot,
+    topic_signals,
+    latest_industry_signals,
+):
+    return f"""
+You are GlobalWatch Trading Risk Parameter Composer.
+
+GOAL
+- Convert existing signals (macro + industry) into conservative, executable trading parameters
+  that a paper trading engine can apply next cycle.
+- DO NOT fetch news, DO NOT run deep analysis, DO NOT regenerate industry buckets.
+
+MODE
+- mode: TRADING_LOOP
+- cycle_id: {cycle_id}
+- timestamp_local: {timestamp_local}
+
+INPUTS
+1) Portfolio state:
+{json.dumps(portfolio_state or {{}}, ensure_ascii=False)}
+
+2) Current macro regime & trend snapshot:
+{json.dumps(macro_snapshot or {{}}, ensure_ascii=False)}
+
+3) Latest confirmed topic signals (optional):
+{json.dumps(topic_signals or {{}}, ensure_ascii=False)}
+
+4) Latest industry_signals summary (already computed by batch job):
+{json.dumps(latest_industry_signals or [], ensure_ascii=False)}
+
+CONSTRAINTS (MUST OBEY)
+- cash_target must be within [min_cash, max_cash] from portfolio constraints
+- max_weight_per_asset within [0.05, 0.40] unless constraints specify otherwise
+- if regime == RISK_OFF:
+  - do NOT propose offensive tilts
+  - prefer defensive assets/tags
+- keep deltas small and stable (avoid thrashing):
+  - cash_target_delta magnitude <= 0.10 per cycle
+  - per-bucket tilt delta magnitude <= 0.05
+
+OUTPUT REQUIREMENTS (STRICT)
+- Output MUST be valid JSON only. No markdown.
+- Keep it short: <= 400 output tokens.
+- If signals are stale or missing, return a safe default (neutral parameters).
+
+JSON SCHEMA (MUST FOLLOW)
+{{
+  "mode": "TRADING_LOOP",
+  "cycle_id": {cycle_id},
+  "regime": "RISK_ON" | "RISK_OFF" | "RISK_MIXED",
+  "cash_target": 0.0-1.0,
+  "max_weight_per_asset": 0.0-1.0,
+  "tilts": [
+    {{"tag": "energy|technology|consumer|...", "delta": -0.05 to +0.05, "reason": "short"}}
+  ],
+  "risk_limits": {{
+    "turnover_cap": 0.0-1.0,
+    "notes": "short"
+  }},
+  "explain": {{"summary": "1-2 sentences", "drivers": ["max 4 bullets"]}},
+  "limits": {{"llm_profile": "trading_loop"}}
+}}
+
+NOW PRODUCE THE JSON.
+"""
+
+
+def compose_trading_loop_risk_parameters(
+    cycle_id,
+    portfolio_state,
+    macro_snapshot,
+    topic_signals=None,
+    latest_industry_signals=None,
+):
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    prompt = _build_trading_loop_prompt(
+        cycle_id=cycle_id,
+        timestamp_local=now_local,
+        portfolio_state=portfolio_state,
+        macro_snapshot=macro_snapshot,
+        topic_signals=topic_signals or {},
+        latest_industry_signals=latest_industry_signals or [],
+    )
+    safe_default = {
+        "mode": "TRADING_LOOP",
+        "cycle_id": cycle_id,
+        "regime": "RISK_MIXED",
+        "cash_target": float(np.clip(_safe_float((portfolio_state or {}).get("cash_target", 0.2), 0.2), 0.0, 1.0)),
+        "max_weight_per_asset": float(np.clip(_safe_float((portfolio_state or {}).get("max_weight_per_asset", 0.2), 0.2), 0.05, 0.40)),
+        "tilts": [],
+        "risk_limits": {"turnover_cap": float(np.clip(_safe_float((portfolio_state or {}).get("turnover_cap", 0.2), 0.2), 0.0, 1.0)), "notes": "safe default"},
+        "explain": {"summary": "Insufficient fresh signals; keep neutral risk parameters.", "drivers": []},
+        "limits": {"llm_profile": "trading_loop"},
+    }
+    try:
+        raw = query_ollama(LOCAL_MODEL, prompt, num_ctx=3072, temperature=0.1)
+        parsed = robust_json_parse(raw, LOCAL_MODEL, max_retries=1)
+        if parsed.get("_parse_error"):
+            return safe_default
+
+        constraints = {}
+        if isinstance(portfolio_state, dict):
+            constraints = portfolio_state.get("constraints", {})
+        min_cash = float(np.clip(_safe_float(constraints.get("min_cash", 0.0), 0.0), 0.0, 1.0))
+        max_cash = float(np.clip(_safe_float(constraints.get("max_cash", 1.0), 1.0), 0.0, 1.0))
+        if max_cash < min_cash:
+            max_cash = min_cash
+
+        regime = str(parsed.get("regime", "RISK_MIXED")).strip().upper()
+        if regime not in {"RISK_ON", "RISK_OFF", "RISK_MIXED"}:
+            regime = "RISK_MIXED"
+        cash_target = float(np.clip(_safe_float(parsed.get("cash_target", safe_default["cash_target"]), safe_default["cash_target"]), min_cash, max_cash))
+        max_weight = float(np.clip(_safe_float(parsed.get("max_weight_per_asset", safe_default["max_weight_per_asset"]), safe_default["max_weight_per_asset"]), 0.05, 0.40))
+
+        tilts_raw = parsed.get("tilts", [])
+        tilts = []
+        if isinstance(tilts_raw, list):
+            for item in tilts_raw[:12]:
+                if not isinstance(item, dict):
+                    continue
+                tag = str(item.get("tag", "")).strip()
+                if not tag:
+                    continue
+                delta = float(np.clip(_safe_float(item.get("delta", 0.0), 0.0), -0.05, 0.05))
+                if regime == "RISK_OFF" and delta > 0:
+                    continue
+                tilts.append({"tag": tag, "delta": delta, "reason": str(item.get("reason", ""))[:180]})
+
+        risk_limits = parsed.get("risk_limits", {})
+        if not isinstance(risk_limits, dict):
+            risk_limits = {}
+        turnover_cap = float(np.clip(_safe_float(risk_limits.get("turnover_cap", safe_default["risk_limits"]["turnover_cap"]), safe_default["risk_limits"]["turnover_cap"]), 0.0, 1.0))
+
+        explain = parsed.get("explain", {})
+        if not isinstance(explain, dict):
+            explain = {}
+        drivers = explain.get("drivers", [])
+        if not isinstance(drivers, list):
+            drivers = []
+
+        return {
+            "mode": "TRADING_LOOP",
+            "cycle_id": cycle_id,
+            "regime": regime,
+            "cash_target": cash_target,
+            "max_weight_per_asset": max_weight,
+            "tilts": tilts,
+            "risk_limits": {
+                "turnover_cap": turnover_cap,
+                "notes": str(risk_limits.get("notes", ""))[:180],
+            },
+            "explain": {
+                "summary": str(explain.get("summary", ""))[:240],
+                "drivers": [str(x)[:180] for x in drivers[:4]],
+            },
+            "limits": {"llm_profile": "trading_loop"},
+        }
+    except Exception as e:
+        log_error(f"compose_trading_loop_risk_parameters error: {e}")
+        return safe_default
 
 # ================= 4. UI  =================
 
@@ -4710,7 +6814,7 @@ def render_portfolio_monitor():
                 st.caption("Updates on app rerun. Enable Auto refresh or click Refresh data for near real-time updates.")
                 if trades:
                     trade_rows = []
-                    for trade in trades:
+                    for row_idx, trade in enumerate(trades):
                         timestamp = trade.get("timestamp") or trade.get("time") or trade.get("datetime") or ""
                         ticker = str(trade.get("ticker", ""))
                         side = str(trade.get("side", trade.get("direction", "")))
@@ -4757,18 +6861,53 @@ def render_portfolio_monitor():
                                 "side": side,
                                 "amount": amount,
                                 "weight_change": weight_change if weight_change is not None else "N/A",
+                                "_row_order": int(row_idx),
                             }
                         )
 
                     trade_df = pd.DataFrame(trade_rows)
                     if not trade_df.empty:
-                        trade_df["time_sort"] = pd.to_datetime(trade_df["time"], errors="coerce", utc=True)
+                        time_raw = trade_df["time"].astype(str).str.strip()
+                        try:
+                            # pandas>=2 supports mixed-format parsing and handles timezone/no-timezone rows together.
+                            trade_df["time_sort"] = pd.to_datetime(
+                                time_raw, errors="coerce", utc=True, format="mixed"
+                            )
+                        except Exception:
+                            trade_df["time_sort"] = pd.to_datetime(time_raw, errors="coerce", utc=True)
+
+                        # Row-wise fallback for entries that still fail vector parsing (e.g. mixed tz edge cases).
+                        if trade_df["time_sort"].isna().any():
+                            def _parse_trade_ts_single(value):
+                                try:
+                                    text = str(value).strip()
+                                    if not text:
+                                        return pd.NaT
+                                    ts = pd.Timestamp(text.replace("Z", "+00:00"))
+                                    if ts.tzinfo is None:
+                                        return ts.tz_localize("UTC")
+                                    return ts.tz_convert("UTC")
+                                except Exception:
+                                    return pd.NaT
+
+                            fallback_ts = time_raw.map(_parse_trade_ts_single)
+                            trade_df["time_sort"] = trade_df["time_sort"].fillna(fallback_ts)
+                        trade_df["time_str"] = trade_df["time"].astype(str)
                         if trade_df["time_sort"].notna().any():
-                            trade_df = trade_df.sort_values("time_sort", ascending=False)
+                            trade_df = trade_df.sort_values(
+                                ["time_sort", "time_str", "_row_order"],
+                                ascending=[False, False, False],
+                                na_position="last",
+                                kind="mergesort",
+                            )
                         else:
-                            # If timestamps are not parseable, keep UI newest-first by reversing read order.
-                            trade_df = trade_df.iloc[::-1]
-                        trade_df = trade_df.drop(columns=["time_sort"])
+                            # If timestamps are not parseable, fall back to ISO string + read-order newest-first.
+                            trade_df = trade_df.sort_values(
+                                ["time_str", "_row_order"],
+                                ascending=[False, False],
+                                kind="mergesort",
+                            )
+                        trade_df = trade_df.drop(columns=["time_sort", "time_str", "_row_order"]).reset_index(drop=True)
                         st.dataframe(trade_df, width="stretch", hide_index=True)
                 else:
                     st.info("No trade history found in outputs/trade_history.jsonl")
@@ -5171,13 +7310,25 @@ _industry_cli_code = _run_industry_news_cli_if_requested()
 if _industry_cli_code is not None:
     raise SystemExit(_industry_cli_code)
 
-_trading_loop_cli_code = _run_trading_loop_cli_if_requested()
-if _trading_loop_cli_code is not None:
-    raise SystemExit(_trading_loop_cli_code)
-
 _taxonomy_cli_code = _run_taxonomy_cli_if_requested()
 if _taxonomy_cli_code is not None:
     raise SystemExit(_taxonomy_cli_code)
+
+_sanity_cli_code = _run_industry_sanity_cli_if_requested()
+if _sanity_cli_code is not None:
+    raise SystemExit(_sanity_cli_code)
+
+_runtime_once_cli_code = _run_industry_runtime_once_cli_if_requested()
+if _runtime_once_cli_code is not None:
+    raise SystemExit(_runtime_once_cli_code)
+
+_runtime_once_debug_cli_code = _run_industry_runtime_once_debug_cli_if_requested()
+if _runtime_once_debug_cli_code is not None:
+    raise SystemExit(_runtime_once_debug_cli_code)
+
+_debug_one_bucket_cli_code = _run_debug_industry_one_bucket_cli_if_requested()
+if _debug_one_bucket_cli_code is not None:
+    raise SystemExit(_debug_one_bucket_cli_code)
 
 st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", page_icon=":satellite:")
 
@@ -5251,24 +7402,114 @@ with tab_macro:
         score = st.session_state.get('res', {}).get('impact_score', 0)
         plot_gauge(score)
 
+    available_pairs = list(dict.fromkeys(user_pairs))
+    current_selected_pairs = st.session_state.get("macro_selected_pairs", [])
+    if not isinstance(current_selected_pairs, list):
+        current_selected_pairs = []
+    current_selected_pairs = [p for p in current_selected_pairs if p in available_pairs]
+    if not current_selected_pairs:
+        current_selected_pairs = available_pairs[:]
+    st.session_state["macro_selected_pairs"] = current_selected_pairs
+
+    selected_pairs = st.multiselect(
+        "Pairs to Analyze (Only selected pairs will be reasoned)",
+        options=available_pairs,
+        key="macro_selected_pairs",
+    )
+    selected_scope = "FX_PAIR" if selected_pairs else "MACRO_OVERVIEW"
+    selected_targets = selected_pairs[:] if selected_pairs else ["US_MACRO"]
+    user_question = st.text_input(
+        "Question for selected target(s) (optional)",
+        value="",
+        key="interactive_user_question",
+        help="Interactive analysis focuses only on selected targets and avoids broad bucket recompute.",
+    )
+    use_targeted_news = st.checkbox(
+        "Targeted RSS filter (recommended)",
+        value=True,
+        key="macro_targeted_news",
+    )
+    run_topic_signals_now = st.checkbox(
+        "Update Topic Signals (extra ~10-20s)",
+        value=False,
+        key="macro_run_topic_signals",
+    )
+    request_think_macro = st.checkbox(
+        "Request <think> reasoning block (model-dependent)",
+        value=False,
+        key="req_think_macro",
+    )
+    update_industry_buckets_now = st.checkbox(
+        "Include Industry Buckets (slow)",
+        value=False,
+        key="interactive_run_industry_batch",
+        help="Disabled by default to keep interactive analysis fast. Batch updates can run in background.",
+    )
+
     delta = (datetime.now() - st.session_state['last_run']).total_seconds()
     remain = max(0, refresh_sec - delta) if refresh_sec > 0 else 0
     
-    if st.button("Run Deep Reason Analysis") or (refresh_sec > 0 and remain == 0 and auto_run):
-        with st.status("DeepSeek is thinking...", expanded=True) as s:
-            print("[TRACE] step=1 start get_rss_news", flush=True)
-            news = get_rss_news()
-            print("[TRACE] step=2 start analyze_all", flush=True)
-            res = analyze_all(news, user_pairs, macro, lang_mode)
-            
-            if enable_toast and res.get("status") == "alert" and res.get("impact_score", 0) >= 7:
-                send_notification("Market Alert", res.get("summary"))
-                
-            st.session_state['last_run'] = datetime.now()
-            st.session_state['res'] = res
-            st.session_state['news'] = news
-            s.update(label="Reasoning Complete", state="complete", expanded=False)
-            st.rerun()
+    run_trigger = st.button("Run Deep Reason Analysis") or (refresh_sec > 0 and remain == 0 and auto_run)
+    if run_trigger:
+        if not selected_pairs:
+            st.warning("Please select at least 1 pair.")
+        else:
+            with st.status("DeepSeek is thinking...", expanded=True) as s:
+                t0 = time.perf_counter()
+                s.write("step=1 start get_rss_news")
+                news_raw = get_rss_news()
+                t1 = time.perf_counter()
+
+                s.write("step=2 start targeted_filter")
+                if use_targeted_news:
+                    keywords = build_keywords_for_assets([b1, q1, b2, q2], selected_pairs)
+                    news = filter_news_by_keywords(news_raw, keywords, min_keep=4, max_keep=12)
+                else:
+                    keywords = []
+                    news = list(news_raw)
+                t2 = time.perf_counter()
+
+                s.write(f"[UI] rss_raw={len(news_raw)} filtered={len(news)} pairs={selected_pairs}")
+                if use_targeted_news:
+                    s.write(f"[UI] targeted_keywords={keywords[:12]}")
+
+                s.write("step=3 start analyze_all")
+                res = analyze_all(
+                    news,
+                    selected_pairs,
+                    macro,
+                    lang_mode,
+                    selected_scope=selected_scope,
+                    selected_targets=selected_targets,
+                    user_question=user_question,
+                    latest_industry_signals_summary=_get_latest_industry_signals_summary(
+                        config_path=os.environ.get("PAPER_CONFIG_PATH", "paper_config.json"),
+                        limit=12,
+                    ),
+                    request_think=bool(request_think_macro),
+                    run_topic_signals=bool(run_topic_signals_now),
+                    run_industry_runtime=bool(update_industry_buckets_now),
+                    industry_config_path=os.environ.get("PAPER_CONFIG_PATH", "paper_config.json"),
+                )
+                t3 = time.perf_counter()
+                s.write(
+                    f"[UI] elapsed_fetch={t1 - t0:.2f}s "
+                    f"elapsed_filter={t2 - t1:.2f}s "
+                    f"elapsed_llm={t3 - t2:.2f}s"
+                )
+                s.write(
+                    f"[UI] topic_recorded={int(res.get('_topic_signals_recorded', 0) or 0)} "
+                    f"industry_status={res.get('_industry_news_status', 'skipped')} "
+                    f"industry_written={int(res.get('_industry_news_written', 0) or 0)}"
+                )
+                if enable_toast and res.get("status") == "alert" and res.get("impact_score", 0) >= 7:
+                    send_notification("Market Alert", res.get("summary"))
+
+                st.session_state['last_run'] = datetime.now()
+                st.session_state['res'] = res
+                st.session_state['news'] = news
+                s.update(label="Reasoning Complete", state="complete", expanded=False)
+                st.rerun()
 
     if 'res' in st.session_state:
         res = st.session_state['res']
@@ -5293,16 +7534,24 @@ with tab_macro:
             - Check Ollama logs for errors
             """)
             
-            # Optional thought process rendering
-            if res.get('thought_process'):
+            thought_text = str(res.get('thought_process', '') or '').strip()
+            if thought_text:
                 with st.expander("DeepSeek Thought Process (Click to expand)", expanded=False):
-                    st.markdown(res.get('thought_process', 'No thoughts recorded.'))
+                    st.markdown(thought_text)
+            else:
+                with st.expander("Reasoning Summary", expanded=False):
+                    st.markdown(build_reasoning_summary(res))
         # ================================
         
         # V3 thought process rendering
         elif res.get("status") != "error":
-            with st.expander("DeepSeek Thought Process (Click to expand)", expanded=False):
-                st.markdown(res.get('thought_process', 'No thoughts recorded.'))
+            thought_text = str(res.get('thought_process', '') or '').strip()
+            if thought_text:
+                with st.expander("DeepSeek Thought Process (Click to expand)", expanded=False):
+                    st.markdown(thought_text)
+            else:
+                with st.expander("Reasoning Summary", expanded=False):
+                    st.markdown(build_reasoning_summary(res))
         # ==========================
 
         if res.get("status") == "alert":
@@ -5370,11 +7619,59 @@ with tab_macro:
             else:
                 st.caption("No news available")
 
+        with st.expander("Industry Signal Sanity Check", expanded=False):
+            config_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
+            try:
+                sanity_report = build_industry_sanity_check_report(config_path=config_path)
+                sanity_df = sanity_report.get("df", pd.DataFrame())
+                sanity_summary = sanity_report.get("summary", {})
+
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Available Buckets", int(_safe_float(sanity_summary.get("available_buckets", 0), 0)))
+                s2.metric("Missing Buckets", int(_safe_float(sanity_summary.get("missing_buckets", 0), 0)))
+                s3.metric("Overweight Ratio", f"{100.0 * _safe_float(sanity_summary.get('pct_overweight', 0.0), 0.0):.1f}%")
+                s4.metric("Risk Delta Std", f"{_safe_float(sanity_summary.get('std_local_risk_delta', 0.0), 0.0):.4f}")
+
+                st.caption(
+                    f"Uniformity={bool(sanity_summary.get('FLAG_UNIFORMITY', False))} | "
+                    f"RateSensitiveMismatch={bool(sanity_summary.get('FLAG_RATE_SENSITIVE_MISMATCH', False))} | "
+                    f"ConsumerMismatch={bool(sanity_summary.get('FLAG_CONSUMER_MISMATCH', False))} | "
+                    f"Corr(local,baseline)={sanity_summary.get('correlation_local_vs_baseline')}"
+                )
+
+                if isinstance(sanity_df, pd.DataFrame) and not sanity_df.empty:
+                    view_cols = [
+                        "bucket",
+                        "local_direction",
+                        "local_risk_delta",
+                        "local_confidence",
+                        "local_timestamp",
+                        "baseline_direction",
+                        "baseline_risk_delta",
+                        "baseline_confidence",
+                        "diff_risk_delta",
+                        "diff_confidence",
+                        "direction_match",
+                        "effective_cash_impact",
+                        "flags",
+                    ]
+                    view_cols = [c for c in view_cols if c in sanity_df.columns]
+                    st.dataframe(sanity_df[view_cols], width="stretch")
+                else:
+                    st.info("No industry signal rows available.")
+            except Exception as e:
+                st.error(f"[SANITY] failed to build report: {e}")
+
 # === TAB 2: Stock Analysis ===
 with tab_stock:
     st.header("US Stock Deep Dive")
     c_in, c_go = st.columns([3, 1])
     ticker = c_in.text_input("Ticker", value="NVDA").upper()
+    request_think_stock = st.checkbox(
+        "Request <think> reasoning block (model-dependent)",
+        value=False,
+        key="req_think_stock",
+    )
     
     if c_go.button("Analyze"):
         with st.spinner(f"Reasoning about {ticker}..."):
@@ -5392,11 +7689,19 @@ with tab_stock:
                     with st.expander("Latest News"):
                         for n in stock_news: st.write(n)
                     
-                    analysis = analyze_single_stock(ticker, stock_news, lang_mode)
-                    
-                    # V3 thought process rendering
-                    with st.expander(" AI Thought Process (Stock)", expanded=True):
-                        st.markdown(analysis.get('thought_process', 'No thoughts.'))
+                    analysis = analyze_single_stock(
+                        ticker,
+                        stock_news,
+                        lang_mode,
+                        request_think=bool(request_think_stock),
+                    )
+                    thought_text_stock = str(analysis.get('thought_process', '') or '').strip()
+                    if thought_text_stock:
+                        with st.expander("DeepSeek Thought Process (Stock)", expanded=False):
+                            st.markdown(thought_text_stock)
+                    else:
+                        with st.expander("Reasoning Summary", expanded=False):
+                            st.markdown(build_reasoning_summary(analysis))
                     
                     sentiment = analysis.get("sentiment", "Neutral")
                     box_col = "green" if "Bullish" in sentiment else "red" if "Bearish" in sentiment else "gray"
@@ -6014,8 +8319,3 @@ with tab_warning:
         - Pay attention to evidence - not just the score
         - Act on CRITICAL levels, monitor HIGH levels
         """)
-
-
-
-
-
