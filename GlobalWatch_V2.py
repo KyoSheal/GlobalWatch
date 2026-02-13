@@ -19,6 +19,7 @@ import uuid
 import urllib.parse
 import urllib.request
 import os
+from atomic_io import atomic_write_json as io_atomic_write_json, safe_read_json as io_safe_read_json
 
 try:
     import chromadb
@@ -719,9 +720,7 @@ def dump_industry_taxonomy_preview(config_path, output_path=None):
         }
     }
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(preview, f, indent=2, ensure_ascii=False)
+    io_atomic_write_json(output_path, preview, indent=2)
 
     print(f"[TAXONOMY] L2 count: {len(l2_to_tickers)}")
     for l2 in sorted(l2_to_tickers.keys()):
@@ -804,14 +803,12 @@ def _run_industry_sanity_cli_if_requested():
             ]
             safe_cols = [c for c in cols if c in df.columns]
             print(df[safe_cols].to_string(index=False))
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "summary": summary,
             "rows": df.to_dict("records") if isinstance(df, pd.DataFrame) else [],
         }
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        io_atomic_write_json(args.output, payload, indent=2)
         print(f"[SANITY] wrote: {args.output}")
         return 0
     except Exception as e:
@@ -1002,9 +999,7 @@ def run_industry_runtime_once_debug(config_path="paper_config.json", output_path
             "config_path": config_path,
             "bucket_debug": [],
         }
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        io_atomic_write_json(output_path, payload, indent=2)
         return payload
 
     overlay_cfg = _merge_cfg(_default_news_overlay_cfg(), cfg.get("news_overlay", {}))
@@ -1016,9 +1011,7 @@ def run_industry_runtime_once_debug(config_path="paper_config.json", output_path
             "bucket_debug": [],
             "news_overlay_enabled": False,
         }
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        io_atomic_write_json(output_path, payload, indent=2)
         return payload
 
     portfolio_tickers = _get_runtime_portfolio_tickers(
@@ -1148,9 +1141,7 @@ def run_industry_runtime_once_debug(config_path="paper_config.json", output_path
         "count_overrode_risk_delta": int(overrode_risk),
     }
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    io_atomic_write_json(output_path, payload, indent=2)
     _print_industry_runtime_debug_summary(entries)
     print(
         "[INDUSTRY_RUNTIME_DEBUG] direction_counts "
@@ -1464,9 +1455,7 @@ def _run_debug_industry_one_bucket_cli_if_requested():
             "read_back_obj": read_back_obj,
         }
 
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(output_payload, f, ensure_ascii=False, indent=2)
+        io_atomic_write_json(args.output, output_payload, indent=2)
 
         ss = output_payload.get("step8_summary", {})
         ff = ss.get("final", {}) if isinstance(ss.get("final"), dict) else {}
@@ -2466,9 +2455,13 @@ def _build_macro_context_for_industry_pipeline(cfg, mapped_news):
     snapshot_path = str(reporting_cfg.get("snapshot_live_path", "outputs/snapshot_live.json"))
     try:
         if os.path.exists(snapshot_path):
-            with open(snapshot_path, "r", encoding="utf-8") as f:
-                snap = json.load(f)
-            if isinstance(snap, dict):
+            snap = io_safe_read_json(snapshot_path, retries=3, sleep_ms=30)
+            if snap is None:
+                log_error(
+                    f"_build_macro_context_for_industry_pipeline snapshot read warning: "
+                    f"safe_read_json returned None for {snapshot_path}"
+                )
+            elif isinstance(snap, dict):
                 risk_cfg = snap.get("risk_config", {})
                 if isinstance(risk_cfg, dict):
                     context["risk_state"] = str(
@@ -3499,8 +3492,7 @@ def run_industry_news_dryrun(config_path="paper_config.json", outdir="outputs/gw
         cfg_copy["news_overlay"]["min_confidence"] = float(cfg_copy["news_overlay"].get("min_confidence", 0.55))
         cfg_copy.setdefault("macro_integration", {})
         cfg_copy["macro_integration"]["chroma_path"] = chroma_path
-        with open(dryrun_cfg_path, "w", encoding="utf-8") as f:
-            json.dump(cfg_copy, f, ensure_ascii=False, indent=2)
+        io_atomic_write_json(dryrun_cfg_path, cfg_copy, indent=2)
 
         old_checkpoint_env = os.environ.get("GW_CHECKPOINT_ACTION")
         os.environ["GW_CHECKPOINT_ACTION"] = "fresh"
@@ -3541,8 +3533,7 @@ def run_industry_news_dryrun(config_path="paper_config.json", outdir="outputs/gw
         "signals": signals[:10],
     }
     out_json = os.path.join(outdir, "industry_news_dryrun_summary.json")
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(preview_payload, f, ensure_ascii=False, indent=2)
+    io_atomic_write_json(out_json, preview_payload, indent=2)
     print(f"[TAXONOMY_PREVIEW] Dryrun summary written: {out_json}")
 
     pass_count = len([c for c in checks if c["pass"]])
@@ -3722,8 +3713,7 @@ def save_topic_signal_memory(memory_state):
         os.makedirs("outputs", exist_ok=True)
         payload = dict(memory_state or {})
         payload["updated_at"] = datetime.now().isoformat()
-        with open(TOPIC_MEMORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        io_atomic_write_json(TOPIC_MEMORY_PATH, payload, indent=2)
     except Exception as e:
         log_error(f"save_topic_signal_memory error: {str(e)}")
 
@@ -6394,11 +6384,8 @@ def compose_trading_loop_risk_parameters(
 
 def _safe_read_json(path):
     try:
-        if not os.path.exists(path):
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        obj = io_safe_read_json(path, retries=2, sleep_ms=15)
+        return obj if isinstance(obj, dict) else {}
     except Exception as e:
         log_error(f"_safe_read_json error for {path}: {str(e)}")
         return {}

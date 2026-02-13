@@ -12,6 +12,7 @@ import argparse
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from atomic_io import safe_read_json as io_safe_read_json
 
 try:
     from zoneinfo import ZoneInfo
@@ -134,10 +135,7 @@ def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
 
 def _safe_read_json(path: str) -> Optional[Dict[str, Any]]:
     try:
-        if not os.path.exists(path) or os.path.getsize(path) <= 2:
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
+        obj = io_safe_read_json(path, retries=2, sleep_ms=15)
         if isinstance(obj, dict):
             return obj
     except Exception:

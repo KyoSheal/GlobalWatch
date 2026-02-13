@@ -10,6 +10,8 @@ backup/
 globalwatch/
 papertrader/
 tools/
+debug/
+scripts/
 
 # 如果你有虚拟环境
 venv/

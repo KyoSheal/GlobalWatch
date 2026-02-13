@@ -1,6 +1,7 @@
 ﻿"""Paper trading engine (simulation only)."""
 
 import json
+import io
 import os
 import sys
 import time
@@ -16,6 +17,11 @@ import matplotlib
 matplotlib.use('Agg')  # NOTE: comment omitted (was garbled/non-ASCII).
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from atomic_io import (
+    atomic_write_json as io_atomic_write_json,
+    atomic_write_jsonl as io_atomic_write_jsonl,
+    atomic_write_text as io_atomic_write_text,
+)
 
 try:
     from zoneinfo import ZoneInfo
@@ -1748,28 +1754,17 @@ class PaperTradingEngine:
         return payload
 
     def atomic_write_text(self, path, content):
-        """Atomically write text content using tmp + fsync + replace."""
-        folder = os.path.dirname(path) or '.'
-        os.makedirs(folder, exist_ok=True)
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        """Atomically write text content using the shared production-safe helper."""
+        io_atomic_write_text(str(path), str(content or ""))
 
     def atomic_write_json(self, path, obj):
-        """Atomically write a JSON object."""
-        content = json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False)
-        self.atomic_write_text(path, content)
+        """Atomically write a JSON object using the shared production-safe helper."""
+        io_atomic_write_json(str(path), obj, indent=2)
 
     def atomic_write_jsonl(self, path, list_of_dicts):
-        """Atomically rewrite a JSONL file."""
-        lines = [json.dumps(item, ensure_ascii=False, allow_nan=False) for item in list_of_dicts]
-        content = '\n'.join(lines)
-        if lines:
-            content += '\n'
-        self.atomic_write_text(path, content)
+        """Atomically rewrite a JSONL file using the shared production-safe helper."""
+        rows = list_of_dicts if isinstance(list_of_dicts, list) else []
+        io_atomic_write_jsonl(str(path), rows)
 
     def write_live_snapshot(self, snapshot, source="unknown"):
         """Write UI-friendly live snapshot to outputs/snapshot_live.json."""
@@ -7774,7 +7769,7 @@ class PaperTradingEngine:
 
         summary_path = self.config['reporting']['summary_report_path'].replace('.txt', '_live.txt')
         
-        with open(summary_path, 'w', encoding='utf-8') as f:
+        with io.StringIO() as f:
             f.write("="*60 + "\n")
             f.write("GlobalWatch Paper Trading LIVE Summary\n")
             f.write("="*60 + "\n\n")
@@ -7850,6 +7845,8 @@ class PaperTradingEngine:
             f.write("[LIVE] Updates every cycle\n")
             f.write("[SIMULATION ONLY] NO REAL MONEY\n")
             f.write("="*60 + "\n")
+            summary_content = f.getvalue()
+        self.atomic_write_text(summary_path, summary_content)
         
         print(f"[OK] Live summary updated: {summary_path}")
         import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
@@ -8221,9 +8218,8 @@ class PaperTradingEngine:
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         snapshots_path = self.config['reporting']['portfolio_snapshots_path']
-        with open(snapshots_path, 'w', encoding='utf-8') as f:
-            for snapshot in self.portfolio_snapshots:
-                f.write(json.dumps(snapshot) + '\n')
+        snapshots_content = ''.join(f"{json.dumps(snapshot)}\n" for snapshot in self.portfolio_snapshots)
+        self.atomic_write_text(snapshots_path, snapshots_content)
         print(f"[OK] Portfolio snapshots saved: {snapshots_path}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -8306,7 +8302,7 @@ class PaperTradingEngine:
         
         report_path = self.config['reporting']['summary_report_path']
         
-        with open(report_path, 'w', encoding='utf-8') as f:
+        with io.StringIO() as f:
             f.write("="*60 + "\n")
             f.write("GlobalWatch Paper Trading Summary Report\n")
             f.write("="*60 + "\n\n")
@@ -8391,6 +8387,8 @@ class PaperTradingEngine:
             f.write("[SIMULATION ONLY] NO REAL MONEY\n")
             f.write("[DISCLAIMER] Past performance does not guarantee future results\n")
             f.write("="*60 + "\n")
+            report_content = f.getvalue()
+        self.atomic_write_text(report_path, report_content)
         
         print(f"[OK] Summary report saved: {report_path}")
         
@@ -8644,8 +8642,7 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     reporting_cfg["env"] = "live"
 
     dryrun_config_path = os.path.join(outdir_abs, "dryrun_config.json")
-    with open(dryrun_config_path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    io_atomic_write_json(dryrun_config_path, cfg, indent=2)
 
     old_checkpoint_env = os.environ.get("GW_CHECKPOINT_ACTION")
     old_session_env = os.environ.get("GW_SESSION_ID")
@@ -9281,8 +9278,7 @@ def debug_run_news_overlay_phase2(config_path: str = "paper_config.json", outdir
         "cases": case_rows,
     }
     summary_path = os.path.join(outdir_abs, "news_overlay_phase2_dryrun_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    io_atomic_write_json(summary_path, summary, indent=2)
     print(f"[PHASE2-DRYRUN] Summary written: {summary_path}")
     print(f"DRYRUN_SUMMARY pass={pass_count} fail={fail_count}")
     return 1 if fail_count > 0 else 0
@@ -9393,8 +9389,7 @@ def debug_run_news_overlay_once(config_path: str = "paper_config.json", outdir: 
         },
     }
     summary_path = os.path.join(outdir_abs, "news_overlay_once_debug.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    io_atomic_write_json(summary_path, payload, indent=2)
 
     info = payload.get("overlay_info", {}) if isinstance(payload.get("overlay_info", {}), dict) else {}
     print(f"[NEWS_OVERLAY_ONCE] Summary written: {summary_path}")
@@ -9715,9 +9710,7 @@ def calibrate_news_overlay(
     }
 
     out_abs = os.path.abspath(str(out_path or "outputs/news_overlay_calibration.json"))
-    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
-    with open(out_abs, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+    io_atomic_write_json(out_abs, output, indent=2)
 
     replay_p90 = output.get("replay", {}).get("cash_delta_simulated", {}).get("p90")
     print(f"[CALIBRATOR] wrote: {out_abs}")
