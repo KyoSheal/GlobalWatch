@@ -7169,13 +7169,28 @@ def render_portfolio_monitor():
                         y_title = "PnL ($)" if y_metric == "pnl_from_initial" else "Equity ($)"
                         x_tick_mode = str(st.session_state.get("pm_x_tick_mode", "auto"))
                         x_tick_minutes = int(st.session_state.get("pm_x_tick_minutes", 15))
+                        pm_window_hours = int(st.session_state.get("pm_window_hours", 48))
+                        pm_resample_rule = str(st.session_state.get("pm_resample_rule", "15min"))
+                        pm_hide_off_hours = bool(st.session_state.get("pm_hide_off_hours", True))
+                        pm_y_mode = str(st.session_state.get("pm_y_mode", "auto"))
+                        pm_y_metric = str(st.session_state.get("pm_y_metric", "equity"))
+                        pm_uirev = (
+                            f"pm:{pm_window_hours}:{pm_resample_rule}:{x_tick_mode}:{x_tick_minutes}:"
+                            f"{int(pm_hide_off_hours)}:{pm_y_mode}:{pm_y_metric}"
+                        )
+                        if pm_y_mode == "manual":
+                            pm_uirev += (
+                                f":{float(st.session_state.get('pm_y_min', y_min)):.6f}:"
+                                f"{float(st.session_state.get('pm_y_max', y_max)):.6f}:"
+                                f"{float(st.session_state.get('pm_y_dtick', y_dtick)):.6f}"
+                            )
                         x_tick_label = "auto" if x_tick_mode == "auto" else f"{x_tick_minutes}min"
                         y_mode_label = "auto"
                         if str(st.session_state.get("pm_y_mode", "auto")) == "manual":
                             y_mode_label = f"manual [{y_min:.2f}, {y_max:.2f}]"
                         st.caption(
                             "X: last "
-                            f"{int(st.session_state.get('pm_window_hours', 48))}h @ {str(st.session_state.get('pm_resample_rule', '15min'))}"
+                            f"{pm_window_hours}h @ {pm_resample_rule}"
                             f" | X tick: {x_tick_label} | Y: {y_metric} {y_mode_label}"
                         )
     
@@ -7222,8 +7237,9 @@ def render_portfolio_monitor():
                                 xaxis=xaxis_config,
                                 yaxis=yaxis_config,
                                 hovermode="x unified",
+                                uirevision=pm_uirev,
                             )
-                            st.plotly_chart(fig, width="stretch")
+                            st.plotly_chart(fig, width="stretch", key="pm_equity_curve")
                             plot_rendered = True
                         except Exception:
                             plot_rendered = False
