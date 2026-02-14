@@ -1,4 +1,4 @@
-﻿# GlobalWatch Paper Trading (V3.2.2)
+﻿# GlobalWatch Paper Trading (V3.2.4)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -13,35 +13,23 @@ The stack combines:
 - execution safeguards (stale policy, turnover budget, planner)
 - structured runtime outputs consumed by Streamlit monitoring pages
 
-## What's New in V3.2.2
-This release finalizes the recent strategy and system upgrades and moves the engine fingerprint to `v3.2.2`.
+## What's New in V3.2.4
+This release updates the engine fingerprint to `v3.2.4` and adds the latest execution/risk-control improvements.
 
-### Quant and Signal Engine
-- L2/L3 multi-tag taxonomy support with `industry_taxonomy` + `ticker_tags`
-- industry runtime no longer starves buckets before bucketing; dedup happens before per-bucket limits
-- seed-aware industry mapping and bucket contamination controls
-- deterministic industry scoring path: evidence labels -> deterministic bucket score -> bounded signal
-- macro risk-off prior (gated + cooldown) for risk-sensitive buckets
-- confidence and schema guards for LLM output parsing and fallback handling
-
-### Paper Engine and Overlay
-- industry signal consumption is integrated into cash-target overlay with explicit gating
-- `min_confidence`, `risk_only`, `max_abs_delta`, and confidence-scaling are enforceable and debuggable
-- calibration and replay tools added to tune overlay strength against historical signal distribution
-- covariance risk diagnostics are retained for risk visibility and audit outputs
-
-### Execution and Risk Control
-- trade planner path remains configurable and auditable
-- stale quote policy and session-aware rebalance gates remain active
-- post-rebalance snapshot refresh ensures UI holdings state is up-to-date after fills
-- debug fields for planner/cost/overlay are written for cycle-level traceability
-
-### UI and UX
-- interactive macro analysis can run in scoped mode (selected targets only)
-- optional `Request <think>` checkbox added; default is concise JSON path
-- when no `<think>` block is returned, UI now shows `Reasoning Summary` instead of misleading placeholder text
-- equity chart supports trading-hour focused visualization and manual axis controls
-- portfolio monitor reads latest snapshot/trades and shows newest trades first in UI
+1. Target-cov risk gate routing is now configurable and fallback-safe:
+   - `execution.enable_target_cov_gate`
+   - `execution.target_cov_gate_min_coverage`
+   - `execution.target_cov_gate_require_ok`
+2. Risk gate observability now includes:
+   - snapshot fields: `risk_gate_basis`, `risk_gate_cov_coverage_used`
+   - telemetry event: `RISK_GATE_DECISION`
+   - cycle-metrics fields for basis and coverage used
+3. Portfolio exposure cap is configurable instead of fixed:
+   - `execution.portfolio_exposure_cap` (default `0.90`)
+   - invalid inputs auto-fallback and clamp to `[0.0, 1.0]`
+4. Default behavior remains backward-compatible:
+   - target-cov gate stays off unless enabled
+   - exposure cap remains 90% unless changed
 
 ## Functional Capabilities
 ### Quant Layer

@@ -859,6 +859,12 @@ class PaperTradingEngine:
         self._last_cov_risk_cycle_id = None
         self._last_vol_target_diag_cycle_id = None
         self._last_vol_target_apply_cycle_id = None
+        self._last_rebalance_cost_diag_cycle_id = None
+        self._last_rebalance_cost_diag_status = None
+        self._last_rebalance_plan_filter_cycle_id = None
+        self._last_rebalance_plan_filter_status = None
+        self._last_rebalance_plan_filter_n_raw = None
+        self._last_risk_gate_decision_cycle_id = None
         self._rebind_telemetry_logger()
         self.last_rebalance_time = None  # backward-compatible alias of last successful rebalance time
         self.last_rebalance_attempt_time = None
@@ -895,6 +901,46 @@ class PaperTradingEngine:
             'slippage': 0.0,
             'impact': 0.0,
             'num_trades': 0
+        }
+        self.current_rebalance_cost_diag_info = {
+            'status': 'unavailable',
+            'n_trades_raw': 0,
+            'turnover_raw': 0.0,
+            'turnover_raw_notional': 0.0,
+            'est_total_cost_raw': 0.0,
+            'est_total_cost_topN': 0.0,
+            'topN': 10,
+            'trade_scores_top10': [],
+        }
+        self.current_rebalance_cost_diag_filtered_info = {
+            'status': 'unavailable',
+            'n_trades_raw': 0,
+            'turnover_raw': 0.0,
+            'turnover_raw_notional': 0.0,
+            'est_total_cost_raw': 0.0,
+            'est_total_cost_topN': 0.0,
+            'topN': 10,
+            'trade_scores_top10': [],
+        }
+        self.current_rebalance_plan_filter_info = {
+            'status': 'unavailable',
+            'enabled': False,
+            'n_raw': 0,
+            'n_hard': 0,
+            'n_soft': 0,
+            'n_filtered': 0,
+            'est_cost_raw': 0.0,
+            'est_cost_filtered': 0.0,
+            'turnover_raw': 0.0,
+            'turnover_filtered': 0.0,
+            'turnover_raw_notional': 0.0,
+            'turnover_filtered_notional': 0.0,
+            'skipped_small_notional': 0,
+            'skipped_tiny_delta': 0,
+            'skipped_small_count': 0,
+            'min_keep_trades': 0,
+            'kept_due_to_min_keep_count': 0,
+            'top_selected_by_score': [],
         }
         self.current_news_overlay_info = {
             'enabled': False,
@@ -1100,6 +1146,10 @@ class PaperTradingEngine:
         execution_config.setdefault('enable_diversity_check', True)
         execution_config.setdefault('max_herfindahl_index', 0.35)
         execution_config.setdefault('portfolio_vol_min_coverage', 0.70)
+        execution_config.setdefault('enable_target_cov_gate', False)
+        execution_config.setdefault('target_cov_gate_min_coverage', 0.60)
+        execution_config.setdefault('target_cov_gate_require_ok', True)
+        execution_config.setdefault('portfolio_exposure_cap', 0.90)
         execution_config.setdefault('price_ttl_seconds', 45)
         execution_config.setdefault('price_batch_chunk_size', 50)
         execution_config.setdefault('price_batch_allow_1m_fallback', True)
@@ -1174,6 +1224,27 @@ class PaperTradingEngine:
         reporting_config.setdefault('daily_report_stale_ratio_threshold', 0.8)
         reporting_config.setdefault('daily_report_stale_streak_threshold', 3)
         reporting_config.setdefault('max_price_debug_items', 50)
+
+        # Normalize exposure cap to a safe float in [0, 1] with backward-compatible default.
+        exposure_cap_raw = execution_config.get('portfolio_exposure_cap', 0.90)
+        exposure_cap = 0.90
+        invalid_exposure_cap = False
+        try:
+            exposure_cap = float(exposure_cap_raw)
+            if not np.isfinite(exposure_cap):
+                raise ValueError("non-finite exposure cap")
+        except Exception:
+            invalid_exposure_cap = True
+            exposure_cap = 0.90
+        if invalid_exposure_cap:
+            print(f"[WARN] Invalid execution.portfolio_exposure_cap={exposure_cap_raw!r}; fallback to 0.90")
+        exposure_cap_clamped = float(np.clip(exposure_cap, 0.0, 1.0))
+        if abs(exposure_cap_clamped - exposure_cap) > 1e-12:
+            print(
+                f"[WARN] execution.portfolio_exposure_cap clipped from "
+                f"{exposure_cap:.4f} to {exposure_cap_clamped:.4f}"
+            )
+        execution_config['portfolio_exposure_cap'] = float(exposure_cap_clamped)
         
         return config
 
@@ -1236,6 +1307,11 @@ class PaperTradingEngine:
         assert isinstance(self.config.get('execution', {}).get('enable_diversity_check', True), bool), "execution.enable_diversity_check must be bool"
         assert 0.0 < float(self.config.get('execution', {}).get('max_herfindahl_index', 0.35)) <= 1.0, "execution.max_herfindahl_index must be in (0,1]"
         assert 0.0 <= float(self.config.get('execution', {}).get('portfolio_vol_min_coverage', 0.70)) <= 1.0, "execution.portfolio_vol_min_coverage must be in [0,1]"
+        assert isinstance(self.config.get('execution', {}).get('enable_target_cov_gate', False), bool), "execution.enable_target_cov_gate must be bool"
+        assert 0.0 <= float(self.config.get('execution', {}).get('target_cov_gate_min_coverage', 0.60)) <= 1.0, "execution.target_cov_gate_min_coverage must be in [0,1]"
+        assert isinstance(self.config.get('execution', {}).get('target_cov_gate_require_ok', True), bool), "execution.target_cov_gate_require_ok must be bool"
+        assert isinstance(self.config.get('execution', {}).get('portfolio_exposure_cap', 0.90), (int, float)), "execution.portfolio_exposure_cap must be float"
+        assert 0.0 <= float(self.config.get('execution', {}).get('portfolio_exposure_cap', 0.90)) <= 1.0, "execution.portfolio_exposure_cap must be in [0,1]"
         assert float(self.config.get('execution', {}).get('max_weight_boost_for_hot', 0.05)) >= 0.0, "execution.max_weight_boost_for_hot must be >= 0"
         assert float(self.config.get('execution', {}).get('hot_zscore_threshold', 1.5)) >= 0.0, "execution.hot_zscore_threshold must be >= 0"
         assert int(self.config.get('execution', {}).get('hot_momentum_top_k', 3)) >= 1, "execution.hot_momentum_top_k must be >= 1"
@@ -1760,6 +1836,64 @@ class PaperTradingEngine:
                 'a5_cov_coverage': None,
                 'a5_reason': 'unavailable',
             }
+        rebalance_cost_diag_meta = None
+        if isinstance(snapshot.get('rebalance_cost_diag'), dict):
+            rebalance_cost_diag_meta = dict(snapshot.get('rebalance_cost_diag'))
+        elif isinstance(self.current_rebalance_cost_diag_info, dict):
+            rebalance_cost_diag_meta = dict(self.current_rebalance_cost_diag_info)
+        else:
+            rebalance_cost_diag_meta = {
+                'status': 'unavailable',
+                'n_trades_raw': 0,
+                'turnover_raw': 0.0,
+                'turnover_raw_notional': 0.0,
+                'est_total_cost_raw': 0.0,
+                'est_total_cost_topN': 0.0,
+                'topN': 10,
+                'trade_scores_top10': [],
+            }
+        rebalance_cost_diag_filtered_meta = None
+        if isinstance(snapshot.get('rebalance_cost_diag_filtered'), dict):
+            rebalance_cost_diag_filtered_meta = dict(snapshot.get('rebalance_cost_diag_filtered'))
+        elif isinstance(self.current_rebalance_cost_diag_filtered_info, dict):
+            rebalance_cost_diag_filtered_meta = dict(self.current_rebalance_cost_diag_filtered_info)
+        else:
+            rebalance_cost_diag_filtered_meta = {
+                'status': 'unavailable',
+                'n_trades_raw': 0,
+                'turnover_raw': 0.0,
+                'turnover_raw_notional': 0.0,
+                'est_total_cost_raw': 0.0,
+                'est_total_cost_topN': 0.0,
+                'topN': 10,
+                'trade_scores_top10': [],
+            }
+        rebalance_plan_filter_diag_meta = None
+        if isinstance(snapshot.get('rebalance_plan_filter_diag'), dict):
+            rebalance_plan_filter_diag_meta = dict(snapshot.get('rebalance_plan_filter_diag'))
+        elif isinstance(self.current_rebalance_plan_filter_info, dict):
+            rebalance_plan_filter_diag_meta = dict(self.current_rebalance_plan_filter_info)
+        else:
+            rebalance_plan_filter_diag_meta = {
+                'status': 'unavailable',
+                'enabled': False,
+                'n_raw': 0,
+                'n_hard': 0,
+                'n_soft': 0,
+                'n_filtered': 0,
+                'est_cost_raw': 0.0,
+                'est_cost_filtered': 0.0,
+                'turnover_raw': 0.0,
+                'turnover_filtered': 0.0,
+                'turnover_raw_notional': 0.0,
+                'turnover_filtered_notional': 0.0,
+                'skipped_small_notional': 0,
+                'skipped_tiny_delta': 0,
+                'skipped_small_count': 0,
+                'min_keep_trades': 0,
+                'kept_due_to_min_keep_count': 0,
+                'top_selected_by_score': [],
+            }
         cost_est_meta = snapshot.get('cost_est')
         if isinstance(cost_est_meta, dict):
             cost_est_meta = dict(cost_est_meta)
@@ -1887,6 +2021,8 @@ class PaperTradingEngine:
             'cov_gate_coverage': snapshot.get('cov_gate_coverage', self.current_risk_check_info.get('cov_gate_coverage') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_vol': snapshot.get('cov_gate_vol', self.current_risk_check_info.get('cov_gate_vol') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_max_rc': snapshot.get('cov_gate_max_rc', self.current_risk_check_info.get('cov_gate_max_rc') if isinstance(self.current_risk_check_info, dict) else None),
+            'risk_gate_basis': snapshot.get('risk_gate_basis', self.current_risk_check_info.get('risk_gate_basis') if isinstance(self.current_risk_check_info, dict) else 'current'),
+            'risk_gate_cov_coverage_used': snapshot.get('risk_gate_cov_coverage_used', self.current_risk_check_info.get('risk_gate_cov_coverage_used') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_risk_diag': cov_diag,
             'cov_risk_current_summary': cov_current_summary,
             'cov_risk_target_summary': cov_target_summary,
@@ -1899,6 +2035,9 @@ class PaperTradingEngine:
             'vol_targeting_vol_before': vt_meta.get('vol_before') if isinstance(vt_meta, dict) else None,
             'vol_targeting_cash_after': vt_meta.get('cash_after') if isinstance(vt_meta, dict) else None,
             'vol_target_diag': vt_diag_meta,
+            'rebalance_cost_diag': rebalance_cost_diag_meta,
+            'rebalance_cost_diag_filtered': rebalance_cost_diag_filtered_meta,
+            'rebalance_plan_filter_diag': rebalance_plan_filter_diag_meta,
             'cost_est': cost_est_meta,
             'trade_planner': planner_meta,
             'trade_planner_num_dropped': int(planner_meta.get('num_dropped', 0) or 0),
@@ -2372,6 +2511,348 @@ class PaperTradingEngine:
             info["non_cash_after"] = info.get("non_cash_before", 0.0)
             return dict(base), info
 
+    def score_trade(self, trade, price, total_equity, *, bps=0.0008, min_fee=0.0):
+        """A4-1 diagnostic score for one planned trade (does not affect execution)."""
+        t = dict(trade) if isinstance(trade, dict) else {}
+        ticker = str(t.get("ticker", "")).upper()
+        side = str(t.get("side", "")).upper()
+        try:
+            desired = abs(float(t.get("desired_trade_value", t.get("notional", 0.0)) or 0.0))
+        except Exception:
+            desired = 0.0
+        try:
+            total_eq = float(total_equity) if total_equity is not None else 0.0
+        except Exception:
+            total_eq = 0.0
+        if total_eq > 0:
+            try:
+                abs_delta_w = abs(float(t.get("delta_weight", 0.0) or 0.0))
+            except Exception:
+                abs_delta_w = 0.0
+            if abs_delta_w <= 0:
+                abs_delta_w = float(desired / total_eq)
+        else:
+            abs_delta_w = 0.0
+
+        est_dollar = float(abs_delta_w * total_eq) if total_eq > 0 else float(desired)
+        if est_dollar <= 0:
+            est_dollar = float(desired)
+        try:
+            bps_v = float(bps)
+        except Exception:
+            bps_v = 0.0008
+        try:
+            min_fee_v = float(min_fee)
+        except Exception:
+            min_fee_v = 0.0
+        est_cost = float(max(min_fee_v, est_dollar * bps_v))
+        benefit = float(abs_delta_w)
+        score = float(benefit / (est_cost + 1e-9))
+
+        flags = []
+        if bool(t.get("is_forced", False)):
+            flags.append("forced")
+        priority = str(t.get("priority", "") or "").lower()
+        if priority:
+            flags.append(priority)
+        if est_dollar < 1.0:
+            flags.append("small_notional")
+        if abs_delta_w < 1e-4:
+            flags.append("tiny_delta")
+        reason = ",".join(flags) if flags else "normal"
+
+        return {
+            "ticker": ticker,
+            "side": side,
+            "abs_delta_w": float(abs_delta_w),
+            "est_dollar": float(est_dollar),
+            "est_cost": float(est_cost),
+            "benefit": float(benefit),
+            "score": float(score),
+            "reason": str(reason),
+        }
+
+    def _build_rebalance_cost_diag(self, planned_trades, total_equity):
+        """A4-1 aggregate cost/benefit diagnostics for current planned trades."""
+        exec_cfg = self.config.get("execution", {}) if isinstance(self.config, dict) else {}
+        try:
+            bps = float(exec_cfg.get("rebalance_cost_bps", 0.0008) or 0.0008)
+        except Exception:
+            bps = 0.0008
+        try:
+            min_fee = float(exec_cfg.get("rebalance_cost_min_fee", 0.0) or 0.0)
+        except Exception:
+            min_fee = 0.0
+        try:
+            top_n = int(exec_cfg.get("rebalance_cost_diag_top_n", 10) or 10)
+        except Exception:
+            top_n = 10
+        top_n = int(np.clip(top_n, 1, 50))
+
+        rows = []
+        turnover_notional = 0.0
+        for tr in (planned_trades or []):
+            if not isinstance(tr, dict):
+                continue
+            price = tr.get("price")
+            score_row = self.score_trade(tr, price, total_equity, bps=bps, min_fee=min_fee)
+            rows.append(score_row)
+            try:
+                turnover_notional += abs(float(tr.get("desired_trade_value", tr.get("notional", 0.0)) or 0.0))
+            except Exception:
+                continue
+        rows_sorted = sorted(
+            rows,
+            key=lambda x: (float(x.get("score", 0.0)), float(x.get("benefit", 0.0))),
+            reverse=True,
+        )
+        est_total_cost_raw = float(sum(float(x.get("est_cost", 0.0) or 0.0) for x in rows_sorted))
+        est_total_cost_topn = float(sum(float(x.get("est_cost", 0.0) or 0.0) for x in rows_sorted[:top_n]))
+        try:
+            total_eq = float(total_equity)
+        except Exception:
+            total_eq = 0.0
+        turnover_raw = float(0.5 * (turnover_notional / total_eq)) if total_eq > 0 else 0.0
+        return {
+            "status": "ok",
+            "n_trades_raw": int(len(rows_sorted)),
+            "turnover_raw": float(turnover_raw),
+            "turnover_raw_notional": float(turnover_notional),
+            "est_total_cost_raw": float(est_total_cost_raw),
+            "est_total_cost_topN": float(est_total_cost_topn),
+            "topN": int(top_n),
+            "cost_bps": float(bps),
+            "min_fee": float(min_fee),
+            "trade_scores_top10": list(rows_sorted[:10]),
+        }
+
+    def _summarize_rebalance_cost_diag_for_metrics(self, payload, key="rebalance_cost_diag"):
+        """Compact rebalance cost diagnostics for metrics payload."""
+        info = payload.get(str(key), {}) if isinstance(payload, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        return {
+            "status": str(info.get("status", "unknown")),
+            "n_trades_raw": int(info.get("n_trades_raw", 0) or 0),
+            "turnover_raw": float(info.get("turnover_raw", 0.0) or 0.0),
+            "turnover_raw_notional": float(info.get("turnover_raw_notional", 0.0) or 0.0),
+            "est_total_cost_raw": float(info.get("est_total_cost_raw", 0.0) or 0.0),
+            "est_total_cost_topN": float(info.get("est_total_cost_topN", 0.0) or 0.0),
+            "topN": int(info.get("topN", 10) or 10),
+        }
+
+    def _summarize_rebalance_plan_filter_for_metrics(self, payload):
+        """Compact greedy filter diagnostics for metrics payload."""
+        info = payload.get("rebalance_plan_filter_diag", {}) if isinstance(payload, dict) else {}
+        if not isinstance(info, dict):
+            info = {}
+        return {
+            "status": str(info.get("status", "unknown")),
+            "enabled": bool(info.get("enabled", False)),
+            "n_raw": int(info.get("n_raw", 0) or 0),
+            "n_filtered": int(info.get("n_filtered", 0) or 0),
+            "n_hard": int(info.get("n_hard", 0) or 0),
+            "n_soft": int(info.get("n_soft", 0) or 0),
+            "est_cost_raw": float(info.get("est_cost_raw", 0.0) or 0.0),
+            "est_cost_filtered": float(info.get("est_cost_filtered", 0.0) or 0.0),
+            "turnover_raw": float(info.get("turnover_raw", 0.0) or 0.0),
+            "turnover_filtered": float(info.get("turnover_filtered", 0.0) or 0.0),
+            "skipped_small_count": int(info.get("skipped_small_count", 0) or 0),
+            "min_keep_trades": int(info.get("min_keep_trades", 0) or 0),
+            "kept_due_to_min_keep_count": int(info.get("kept_due_to_min_keep_count", 0) or 0),
+        }
+
+    def _default_greedy_hard_predicate(self, trade, *, total_equity=0.0, hard_sell_overweight=True):
+        """Default hard-trade predicate for A4-2."""
+        if not isinstance(trade, dict):
+            return False
+        if bool(trade.get("hard", False)):
+            return True
+        if bool(trade.get("is_forced", False)):
+            return True
+        reason = str(trade.get("force_reason", "") or "").lower()
+        if reason in ("overweight_forced", "risk_reduce_forced", "vol_target_forced", "min_cash_forced"):
+            return True
+        if bool(hard_sell_overweight) and str(trade.get("side", "")).upper() == "SELL":
+            try:
+                current_value = float(trade.get("current_value", 0.0) or 0.0)
+                ticker = str(trade.get("ticker", "")).upper()
+                total_eq = float(total_equity or 0.0)
+                if total_eq > 0 and current_value > 0 and ticker:
+                    current_weight = current_value / total_eq
+                    cap = None
+                    max_effective = self.current_regime.get("max_weight_per_asset_effective", {}) if isinstance(self.current_regime, dict) else {}
+                    if isinstance(max_effective, dict) and ticker in max_effective:
+                        cap = float(max_effective.get(ticker))
+                    if cap is None:
+                        cap = float(self.current_regime.get("dynamic_max_weight", self.config.get("objectives", {}).get("max_weight_per_asset", 0.25)) if isinstance(self.current_regime, dict) else self.config.get("objectives", {}).get("max_weight_per_asset", 0.25))
+                    if np.isfinite(cap) and current_weight > (cap + 1e-6):
+                        return True
+            except Exception:
+                return False
+        return False
+
+    def filter_trades_greedy(
+        self,
+        trades,
+        *,
+        total_equity,
+        turnover_cap=None,
+        max_trades_per_cycle=25,
+        min_keep_trades=0,
+        min_trade_notional=200.0,
+        min_trade_delta_w=0.002,
+        cost_bps=0.0008,
+        hard_predicate=None,
+        hard_sell_overweight=True,
+    ):
+        """A4-2 greedy selection over soft trades while always keeping hard trades."""
+        rows = []
+        turnover_raw_notional = 0.0
+        est_cost_raw = 0.0
+        row_uid = 0
+        for tr in (trades or []):
+            if not isinstance(tr, dict):
+                continue
+            score_row = self.score_trade(tr, tr.get("price"), total_equity, bps=cost_bps, min_fee=0.0)
+            score_row["_trade"] = tr
+            score_row["_row_uid"] = int(row_uid)
+            row_uid += 1
+            if callable(hard_predicate):
+                is_hard = bool(hard_predicate(tr))
+            else:
+                is_hard = self._default_greedy_hard_predicate(
+                    tr,
+                    total_equity=total_equity,
+                    hard_sell_overweight=hard_sell_overweight,
+                )
+            score_row["_is_hard"] = bool(is_hard)
+            rows.append(score_row)
+            est_cost_raw += float(score_row.get("est_cost", 0.0) or 0.0)
+            turnover_raw_notional += abs(float(tr.get("desired_trade_value", tr.get("notional", 0.0)) or 0.0))
+
+        hard_selected = []
+        soft_rows = []
+        soft_scored_all = []
+        skipped_small_notional = 0
+        skipped_tiny_delta = 0
+        for row in rows:
+            if bool(row.get("_is_hard", False)):
+                hard_selected.append(row)
+                continue
+            soft_scored_all.append(row)
+            est_d = float(row.get("est_dollar", 0.0) or 0.0)
+            abs_dw = float(row.get("abs_delta_w", 0.0) or 0.0)
+            if est_d < float(min_trade_notional):
+                skipped_small_notional += 1
+                continue
+            if abs_dw < float(min_trade_delta_w):
+                skipped_tiny_delta += 1
+                continue
+            soft_rows.append(row)
+
+        soft_rows.sort(
+            key=lambda x: (float(x.get("score", 0.0) or 0.0), float(x.get("benefit", 0.0) or 0.0)),
+            reverse=True,
+        )
+        selected_soft = []
+        selected_soft_uids = set()
+        selected_notional = float(sum(abs(float(x.get("_trade", {}).get("desired_trade_value", x.get("est_dollar", 0.0)) or 0.0)) for x in hard_selected))
+        soft_slots = max(0, int(max_trades_per_cycle) - len(hard_selected))
+        cap_notional = float(turnover_cap) if turnover_cap is not None else None
+        min_keep_trades = max(0, int(min_keep_trades))
+        kept_due_to_min_keep_count = 0
+
+        for row in soft_rows:
+            if len(selected_soft) >= soft_slots:
+                break
+            n = abs(float(row.get("_trade", {}).get("desired_trade_value", row.get("est_dollar", 0.0)) or 0.0))
+            if cap_notional is not None and cap_notional > 0 and (selected_notional + n) > cap_notional:
+                continue
+            selected_soft.append(row)
+            selected_soft_uids.add(int(row.get("_row_uid", -1)))
+            selected_notional += n
+
+        if min_keep_trades > len(selected_soft) and soft_slots > 0:
+            need = int(min_keep_trades - len(selected_soft))
+            fallback_candidates = [
+                r for r in soft_scored_all
+                if int(r.get("_row_uid", -1)) not in selected_soft_uids
+            ]
+            fallback_candidates.sort(
+                key=lambda x: (float(x.get("score", 0.0) or 0.0), float(x.get("benefit", 0.0) or 0.0)),
+                reverse=True,
+            )
+            for row in fallback_candidates:
+                if need <= 0:
+                    break
+                if len(selected_soft) >= soft_slots:
+                    break
+                n = abs(float(row.get("_trade", {}).get("desired_trade_value", row.get("est_dollar", 0.0)) or 0.0))
+                if cap_notional is not None and cap_notional > 0 and (selected_notional + n) > cap_notional:
+                    continue
+                row["_kept_due_to_min_keep"] = True
+                tr_ref = row.get("_trade")
+                if isinstance(tr_ref, dict):
+                    tr_ref["kept_due_to_min_keep"] = True
+                selected_soft.append(row)
+                selected_soft_uids.add(int(row.get("_row_uid", -1)))
+                selected_notional += n
+                kept_due_to_min_keep_count += 1
+                need -= 1
+
+        selected_rows = list(hard_selected) + list(selected_soft)
+        filtered_trades = [dict(r.get("_trade", {})) for r in selected_rows if isinstance(r.get("_trade", {}), dict)]
+        est_cost_filtered = float(sum(float(r.get("est_cost", 0.0) or 0.0) for r in selected_rows))
+        turnover_filtered_notional = float(sum(abs(float(t.get("desired_trade_value", t.get("notional", 0.0)) or 0.0)) for t in filtered_trades))
+        total_eq = float(total_equity or 0.0)
+        turnover_raw = float(0.5 * (turnover_raw_notional / total_eq)) if total_eq > 0 else 0.0
+        turnover_filtered = float(0.5 * (turnover_filtered_notional / total_eq)) if total_eq > 0 else 0.0
+
+        top_selected = sorted(
+            selected_rows,
+            key=lambda x: float(x.get("score", 0.0) or 0.0),
+            reverse=True,
+        )[:5]
+        top_selected_by_score = [
+            {
+                "ticker": str(r.get("ticker", "")),
+                "side": str(r.get("side", "")),
+                "score": float(r.get("score", 0.0) or 0.0),
+                "est_cost": float(r.get("est_cost", 0.0) or 0.0),
+                "abs_delta_w": float(r.get("abs_delta_w", 0.0) or 0.0),
+                "hard": bool(r.get("_is_hard", False)),
+                "kept_due_to_min_keep": bool(r.get("_kept_due_to_min_keep", False)),
+            }
+            for r in top_selected
+        ]
+
+        diag = {
+            "status": "ok",
+            "enabled": True,
+            "n_raw": int(len(rows)),
+            "n_hard": int(len(hard_selected)),
+            "n_soft": int(len(soft_rows)),
+            "n_filtered": int(len(filtered_trades)),
+            "est_cost_raw": float(est_cost_raw),
+            "est_cost_filtered": float(est_cost_filtered),
+            "turnover_raw": float(turnover_raw),
+            "turnover_filtered": float(turnover_filtered),
+            "turnover_raw_notional": float(turnover_raw_notional),
+            "turnover_filtered_notional": float(turnover_filtered_notional),
+            "skipped_small_notional": int(skipped_small_notional),
+            "skipped_tiny_delta": int(skipped_tiny_delta),
+            "skipped_small_count": int(skipped_small_notional + skipped_tiny_delta),
+            "max_trades_per_cycle": int(max_trades_per_cycle),
+            "min_keep_trades": int(min_keep_trades),
+            "kept_due_to_min_keep_count": int(kept_due_to_min_keep_count),
+            "min_trade_notional": float(min_trade_notional),
+            "min_trade_delta_w": float(min_trade_delta_w),
+            "cost_bps": float(cost_bps),
+            "top_selected_by_score": top_selected_by_score,
+        }
+        return filtered_trades, diag
+
     def classify_price_freshness(self, row, now_utc):
         """Classify one price row into LIVE/RECENT/STALE/MISSING with age diagnostics."""
         now_ts = self._coerce_datetime_utc(now_utc) or self._now()
@@ -2669,6 +3150,15 @@ class PaperTradingEngine:
         vol_target_diag = payload.get('vol_target_diag', {})
         if not isinstance(vol_target_diag, dict):
             vol_target_diag = {}
+        rebalance_cost_diag = payload.get('rebalance_cost_diag', {})
+        if not isinstance(rebalance_cost_diag, dict):
+            rebalance_cost_diag = {}
+        rebalance_cost_diag_filtered = payload.get('rebalance_cost_diag_filtered', {})
+        if not isinstance(rebalance_cost_diag_filtered, dict):
+            rebalance_cost_diag_filtered = {}
+        rebalance_plan_filter_diag = payload.get('rebalance_plan_filter_diag', {})
+        if not isinstance(rebalance_plan_filter_diag, dict):
+            rebalance_plan_filter_diag = {}
         n_positions = 0
         positions_detail = payload.get('positions_detail')
         if isinstance(positions_detail, dict):
@@ -2695,6 +3185,11 @@ class PaperTradingEngine:
             'trend_score': float(payload.get('trend_score', 0.0) or 0.0),
             'dynamic_min_cash': float(payload.get('dynamic_min_cash', 0.0) or 0.0),
             'dynamic_max_weight': float(payload.get('dynamic_max_weight', 0.0) or 0.0),
+            'risk_gate_basis': str(payload.get('risk_gate_basis', 'current') or 'current'),
+            'risk_gate_cov_coverage_used': (
+                float(payload.get('risk_gate_cov_coverage_used'))
+                if payload.get('risk_gate_cov_coverage_used') is not None else None
+            ),
             'price_fetch_stats': dict(payload.get('price_fetch_stats', {}) if isinstance(payload.get('price_fetch_stats', {}), dict) else {}),
             'price_diagnostics_summary': self._summarize_price_diagnostics_for_metrics(payload),
             'news_overlay_stats': self._summarize_news_overlay_for_metrics(payload),
@@ -2732,6 +3227,18 @@ class PaperTradingEngine:
                 if vol_target_diag.get('a5_cov_coverage') is not None else None
             ),
             'vol_target_reason': str(vol_target_diag.get('a5_reason', '')),
+            'rebalance_n_trades_raw': int(rebalance_cost_diag.get('n_trades_raw', 0) or 0),
+            'rebalance_turnover_raw': float(rebalance_cost_diag.get('turnover_raw', 0.0) or 0.0),
+            'rebalance_est_cost_raw': float(rebalance_cost_diag.get('est_total_cost_raw', 0.0) or 0.0),
+            'rebalance_est_cost_topN': float(rebalance_cost_diag.get('est_total_cost_topN', 0.0) or 0.0),
+            'rebalance_cost_diag': self._summarize_rebalance_cost_diag_for_metrics(payload, key='rebalance_cost_diag'),
+            'rebalance_n_trades_filtered': int(rebalance_plan_filter_diag.get('n_filtered', 0) or 0),
+            'rebalance_turnover_filtered': float(rebalance_plan_filter_diag.get('turnover_filtered', 0.0) or 0.0),
+            'rebalance_est_cost_filtered': float(rebalance_plan_filter_diag.get('est_cost_filtered', 0.0) or 0.0),
+            'rebalance_skipped_small': int(rebalance_plan_filter_diag.get('skipped_small_count', 0) or 0),
+            'rebalance_kept_due_to_min_keep': int(rebalance_plan_filter_diag.get('kept_due_to_min_keep_count', 0) or 0),
+            'rebalance_cost_diag_filtered': self._summarize_rebalance_cost_diag_for_metrics(payload, key='rebalance_cost_diag_filtered'),
+            'rebalance_plan_filter_diag': self._summarize_rebalance_plan_filter_for_metrics(payload),
         }
         self._telemetry_log_event(
             "CYCLE_METRICS",
@@ -2805,6 +3312,36 @@ class PaperTradingEngine:
                     stream="events",
                 )
                 self._last_cov_risk_cycle_id = cycle_id_for_event
+            if self._last_risk_gate_decision_cycle_id != cycle_id_for_event:
+                risk_gate_payload = {
+                    "risk_gate_basis": str(payload.get("risk_gate_basis", "current") or "current"),
+                    "risk_gate_cov_coverage_used": payload.get("risk_gate_cov_coverage_used"),
+                    "gate_vol_method": str(payload.get("gate_vol_method", "")),
+                    "cov_gate_used": payload.get("cov_gate_used"),
+                    "cov_gate_pass": payload.get("cov_gate_pass"),
+                    "cov_gate_reason": str(payload.get("cov_gate_reason", "")),
+                    "cov_gate_coverage": payload.get("cov_gate_coverage"),
+                    "cov_gate_vol": payload.get("cov_gate_vol"),
+                    "cov_gate_max_rc": payload.get("cov_gate_max_rc"),
+                    "max_portfolio_volatility": payload.get("portfolio_volatility_limit"),
+                    "rc_limit": self.current_risk_check_info.get("rc_limit") if isinstance(self.current_risk_check_info, dict) else None,
+                    "min_cov_gate_coverage": self.current_risk_check_info.get("min_cov_gate_coverage") if isinstance(self.current_risk_check_info, dict) else None,
+                    "use_cov_vol_for_gate": self.current_risk_check_info.get("use_cov_vol_for_gate") if isinstance(self.current_risk_check_info, dict) else None,
+                    "enable_target_cov_gate": self.current_risk_check_info.get("enable_target_cov_gate") if isinstance(self.current_risk_check_info, dict) else None,
+                    "target_cov_gate_min_coverage": self.current_risk_check_info.get("target_cov_gate_min_coverage") if isinstance(self.current_risk_check_info, dict) else None,
+                    "target_cov_gate_require_ok": self.current_risk_check_info.get("target_cov_gate_require_ok") if isinstance(self.current_risk_check_info, dict) else None,
+                    "abort": bool(payload.get("risk_check_abort", False)),
+                    "abort_reason": str(payload.get("risk_check_reason", "")),
+                }
+                gate_status = "blocked" if bool(payload.get("risk_check_abort", False)) else "pass"
+                self._telemetry_log_event(
+                    "RISK_GATE_DECISION",
+                    cycle_id=cycle_id_for_event,
+                    status=gate_status,
+                    payload=risk_gate_payload,
+                    stream="events",
+                )
+                self._last_risk_gate_decision_cycle_id = cycle_id_for_event
             vol_target_diag = payload.get("vol_target_diag", {})
             if not isinstance(vol_target_diag, dict):
                 vol_target_diag = {}
@@ -2847,6 +3384,65 @@ class PaperTradingEngine:
                     stream="events",
                 )
                 self._last_vol_target_apply_cycle_id = cycle_id_for_event
+            rebalance_cost_diag = payload.get("rebalance_cost_diag", {})
+            if not isinstance(rebalance_cost_diag, dict):
+                rebalance_cost_diag = {}
+            rebalance_cost_status = str(rebalance_cost_diag.get("status", "unknown"))
+            allow_rebalance_cost_log = (
+                rebalance_cost_status.lower() not in ("pending", "")
+            )
+            same_cycle_upgrade = (
+                self._last_rebalance_cost_diag_cycle_id == cycle_id_for_event
+                and str(self._last_rebalance_cost_diag_status or "").lower() in ("pending", "unavailable", "")
+                and rebalance_cost_status.lower() not in ("pending", "unavailable", "")
+            )
+            if allow_rebalance_cost_log and (
+                self._last_rebalance_cost_diag_cycle_id != cycle_id_for_event or same_cycle_upgrade
+            ):
+                self._telemetry_log_event(
+                    "REBALANCE_COST_DIAG",
+                    cycle_id=cycle_id_for_event,
+                    status=rebalance_cost_status,
+                    payload=dict(rebalance_cost_diag),
+                    stream="events",
+                )
+                self._last_rebalance_cost_diag_cycle_id = cycle_id_for_event
+                self._last_rebalance_cost_diag_status = rebalance_cost_status
+            rebalance_plan_filter_diag = payload.get("rebalance_plan_filter_diag", {})
+            if not isinstance(rebalance_plan_filter_diag, dict):
+                rebalance_plan_filter_diag = {}
+            rebalance_plan_filter_status = str(rebalance_plan_filter_diag.get("status", "unknown"))
+            try:
+                rebalance_plan_filter_n_raw = int(rebalance_plan_filter_diag.get("n_raw", 0) or 0)
+            except Exception:
+                rebalance_plan_filter_n_raw = 0
+            allow_plan_filter_log = (
+                rebalance_plan_filter_status.lower() not in ("pending", "")
+            )
+            plan_filter_same_cycle_upgrade = (
+                self._last_rebalance_plan_filter_cycle_id == cycle_id_for_event
+                and str(self._last_rebalance_plan_filter_status or "").lower() in ("pending", "unavailable", "")
+                and rebalance_plan_filter_status.lower() not in ("pending", "unavailable", "")
+            )
+            plan_filter_same_cycle_payload_upgrade = (
+                self._last_rebalance_plan_filter_cycle_id == cycle_id_for_event
+                and rebalance_plan_filter_n_raw > int(self._last_rebalance_plan_filter_n_raw or 0)
+            )
+            if allow_plan_filter_log and (
+                self._last_rebalance_plan_filter_cycle_id != cycle_id_for_event
+                or plan_filter_same_cycle_upgrade
+                or plan_filter_same_cycle_payload_upgrade
+            ):
+                self._telemetry_log_event(
+                    "REBALANCE_PLAN_FILTERED",
+                    cycle_id=cycle_id_for_event,
+                    status=rebalance_plan_filter_status,
+                    payload=dict(rebalance_plan_filter_diag),
+                    stream="events",
+                )
+                self._last_rebalance_plan_filter_cycle_id = cycle_id_for_event
+                self._last_rebalance_plan_filter_status = rebalance_plan_filter_status
+                self._last_rebalance_plan_filter_n_raw = rebalance_plan_filter_n_raw
             self._emit_cycle_metrics_once(payload, source=str(source))
         except Exception as e:
             print(f"[WARN] Failed to write live snapshot: {e}")
@@ -2922,6 +3518,8 @@ class PaperTradingEngine:
             'dynamic_max_weight': self.current_regime.get('dynamic_max_weight', self.config['objectives']['max_weight_per_asset']),
             'cash_target': self.current_regime.get('cash_target', self.current_regime.get('dynamic_min_cash', self.config['objectives']['min_cash_pct'])),
             'risk_caps_applied': self.current_regime.get('risk_caps_applied', False),
+            'risk_gate_basis': self.current_risk_check_info.get('risk_gate_basis', 'current') if isinstance(self.current_risk_check_info, dict) else 'current',
+            'risk_gate_cov_coverage_used': self.current_risk_check_info.get('risk_gate_cov_coverage_used', None) if isinstance(self.current_risk_check_info, dict) else None,
             'forced_until_time': self.current_regime.get('forced_until_time', self.forced_until_time.isoformat() if self.forced_until_time else None),
             'forced_regime_reason': self.current_regime.get('forced_reason', self.forced_regime_reason),
             'macro_risk_score_raw': self.current_macro.get('macro_risk_score', 0.0),
@@ -2945,6 +3543,46 @@ class PaperTradingEngine:
                 'a5_vol_method': 'unavailable',
                 'a5_cov_coverage': None,
                 'a5_reason': 'unavailable',
+            },
+            'rebalance_cost_diag': dict(self.current_rebalance_cost_diag_info) if isinstance(self.current_rebalance_cost_diag_info, dict) else {
+                'status': 'unavailable',
+                'n_trades_raw': 0,
+                'turnover_raw': 0.0,
+                'turnover_raw_notional': 0.0,
+                'est_total_cost_raw': 0.0,
+                'est_total_cost_topN': 0.0,
+                'topN': 10,
+                'trade_scores_top10': [],
+            },
+            'rebalance_cost_diag_filtered': dict(self.current_rebalance_cost_diag_filtered_info) if isinstance(self.current_rebalance_cost_diag_filtered_info, dict) else {
+                'status': 'unavailable',
+                'n_trades_raw': 0,
+                'turnover_raw': 0.0,
+                'turnover_raw_notional': 0.0,
+                'est_total_cost_raw': 0.0,
+                'est_total_cost_topN': 0.0,
+                'topN': 10,
+                'trade_scores_top10': [],
+            },
+            'rebalance_plan_filter_diag': dict(self.current_rebalance_plan_filter_info) if isinstance(self.current_rebalance_plan_filter_info, dict) else {
+                'status': 'unavailable',
+                'enabled': False,
+                'n_raw': 0,
+                'n_hard': 0,
+                'n_soft': 0,
+                'n_filtered': 0,
+                'est_cost_raw': 0.0,
+                'est_cost_filtered': 0.0,
+                'turnover_raw': 0.0,
+                'turnover_filtered': 0.0,
+                'turnover_raw_notional': 0.0,
+                'turnover_filtered_notional': 0.0,
+                'skipped_small_notional': 0,
+                'skipped_tiny_delta': 0,
+                'skipped_small_count': 0,
+                'min_keep_trades': 0,
+                'kept_due_to_min_keep_count': 0,
+                'top_selected_by_score': [],
             },
             'trade_planner_num_dropped': int((self.current_planner_info or {}).get('num_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
             'trade_planner_turnover_used': (
@@ -4382,6 +5020,34 @@ class PaperTradingEngine:
             if cfg["benefit_mode"] not in ("delta_weight", "delta_notional"):
                 cfg["benefit_mode"] = "delta_weight"
             cfg["max_audit_items"] = max(1, int(cfg.get("max_audit_items", 20)))
+            return cfg
+        except Exception:
+            return dict(defaults)
+
+    def _get_greedy_trade_filter_cfg(self) -> dict:
+        """Return A4 greedy trade filter config with safe defaults."""
+        defaults = {
+            "enable_greedy_trade_filter": False,
+            "min_trade_notional": 200.0,
+            "min_trade_delta_w": 0.002,
+            "max_trades_per_cycle": 25,
+            "min_keep_trades": 0,
+            "cost_bps": 0.0008,
+            "hard_sell_overweight": True,
+        }
+        try:
+            exec_cfg = self.config.get("execution", {})
+            if not isinstance(exec_cfg, dict):
+                exec_cfg = {}
+            cfg = dict(defaults)
+            cfg.update(exec_cfg.get("greedy_trade_filter", {}) if isinstance(exec_cfg.get("greedy_trade_filter", {}), dict) else {})
+            cfg["enable_greedy_trade_filter"] = bool(exec_cfg.get("enable_greedy_trade_filter", cfg.get("enable_greedy_trade_filter", False)))
+            cfg["min_trade_notional"] = max(0.0, float(exec_cfg.get("min_trade_notional", cfg.get("min_trade_notional", 200.0))))
+            cfg["min_trade_delta_w"] = max(0.0, float(exec_cfg.get("min_trade_delta_w", cfg.get("min_trade_delta_w", 0.002))))
+            cfg["max_trades_per_cycle"] = max(1, int(exec_cfg.get("max_trades_per_cycle", cfg.get("max_trades_per_cycle", 25))))
+            cfg["min_keep_trades"] = max(0, int(exec_cfg.get("min_keep_trades", cfg.get("min_keep_trades", 0))))
+            cfg["cost_bps"] = max(0.0, float(exec_cfg.get("cost_bps", cfg.get("cost_bps", 0.0008))))
+            cfg["hard_sell_overweight"] = bool(exec_cfg.get("hard_sell_overweight", cfg.get("hard_sell_overweight", True)))
             return cfg
         except Exception:
             return dict(defaults)
@@ -6301,6 +6967,9 @@ class PaperTradingEngine:
         rc_limit = float(risk_model_cfg.get('rc_limit', 0.35))
         min_cov_gate_coverage = float(risk_model_cfg.get('min_cov_gate_coverage', 0.6))
         cov_gate_fallback_to_weighted = bool(risk_model_cfg.get('cov_gate_fallback_to_weighted', True))
+        enable_target_cov_gate = bool(execution_cfg.get('enable_target_cov_gate', False))
+        target_cov_gate_min_coverage = float(execution_cfg.get('target_cov_gate_min_coverage', 0.60))
+        target_cov_gate_require_ok = bool(execution_cfg.get('target_cov_gate_require_ok', True))
 
         invested_weights = {
             str(t).upper(): max(0.0, float(w))
@@ -6402,28 +7071,74 @@ class PaperTradingEngine:
         returns_meta = cov_diag_current.get('returns_meta', {}) if isinstance(cov_diag_current, dict) else {}
         if not isinstance(returns_meta, dict):
             returns_meta = {}
+        target_cov_status = str(cov_diag_target.get('status', '')).lower() if isinstance(cov_diag_target, dict) else 'error'
+        target_returns_meta = cov_diag_target.get('returns_meta', {}) if isinstance(cov_diag_target, dict) else {}
+        if not isinstance(target_returns_meta, dict):
+            target_returns_meta = {}
 
         try:
-            cov_gate_coverage = float(returns_meta.get('overall_row_coverage', 0.0))
+            cov_gate_coverage_current = float(returns_meta.get('overall_row_coverage', 0.0))
         except Exception:
-            cov_gate_coverage = 0.0
+            cov_gate_coverage_current = 0.0
+        try:
+            cov_cols_current = int(returns_meta.get('cols', 0) or 0)
+        except Exception:
+            cov_cols_current = 0
+        try:
+            cov_gate_vol_current = float(cov_diag_current.get('portfolio_vol_annualized')) if cov_diag_current.get('portfolio_vol_annualized') is not None else None
+        except Exception:
+            cov_gate_vol_current = None
+        try:
+            cov_gate_max_rc_current = float(cov_diag_current.get('max_rc_fraction')) if cov_diag_current.get('max_rc_fraction') is not None else None
+        except Exception:
+            cov_gate_max_rc_current = None
 
         try:
-            cov_cols = int(returns_meta.get('cols', 0) or 0)
+            cov_gate_coverage_target = float(target_returns_meta.get('overall_row_coverage', 0.0))
         except Exception:
-            cov_cols = 0
-
+            cov_gate_coverage_target = 0.0
         try:
-            cov_gate_vol = float(cov_diag_current.get('portfolio_vol_annualized')) if cov_diag_current.get('portfolio_vol_annualized') is not None else None
+            cov_cols_target = int(target_returns_meta.get('cols', 0) or 0)
         except Exception:
-            cov_gate_vol = None
-
+            cov_cols_target = 0
         try:
-            cov_gate_max_rc = float(cov_diag_current.get('max_rc_fraction')) if cov_diag_current.get('max_rc_fraction') is not None else None
+            cov_gate_vol_target = float(cov_diag_target.get('portfolio_vol_annualized')) if cov_diag_target.get('portfolio_vol_annualized') is not None else None
         except Exception:
-            cov_gate_max_rc = None
+            cov_gate_vol_target = None
+        try:
+            cov_gate_max_rc_target = float(cov_diag_target.get('max_rc_fraction')) if cov_diag_target.get('max_rc_fraction') is not None else None
+        except Exception:
+            cov_gate_max_rc_target = None
 
-        coverage_ok = bool(cov_status == 'ok' and cov_cols > 0 and cov_gate_coverage is not None and cov_gate_coverage >= min_cov_gate_coverage)
+        target_status_ok = bool(target_cov_status == 'ok') if target_cov_gate_require_ok else bool(target_cov_status in ('ok', 'warn'))
+        target_coverage_ok = bool(cov_cols_target > 0 and cov_gate_coverage_target is not None and cov_gate_coverage_target >= target_cov_gate_min_coverage)
+        use_target_cov_basis = bool(
+            use_cov_vol_for_gate and enable_target_cov_gate and target_status_ok and target_coverage_ok
+        )
+
+        if use_target_cov_basis:
+            risk_gate_basis = "target_cov"
+            cov_gate_coverage = float(cov_gate_coverage_target)
+            cov_gate_vol = cov_gate_vol_target
+            cov_gate_max_rc = cov_gate_max_rc_target
+            gate_cov_status = target_cov_status
+            gate_cov_cols = int(cov_cols_target)
+            gate_cov_min_coverage = float(target_cov_gate_min_coverage)
+        else:
+            risk_gate_basis = "current_fallback" if enable_target_cov_gate else "current"
+            cov_gate_coverage = float(cov_gate_coverage_current)
+            cov_gate_vol = cov_gate_vol_current
+            cov_gate_max_rc = cov_gate_max_rc_current
+            gate_cov_status = cov_status
+            gate_cov_cols = int(cov_cols_current)
+            gate_cov_min_coverage = float(min_cov_gate_coverage)
+
+        coverage_ok = bool(
+            gate_cov_status == 'ok'
+            and gate_cov_cols > 0
+            and cov_gate_coverage is not None
+            and cov_gate_coverage >= gate_cov_min_coverage
+        )
         vol_ok = bool(cov_gate_vol is not None and cov_gate_vol <= max_portfolio_volatility)
         if rc_limit > 0:
             rc_ok = bool(cov_gate_max_rc is not None and cov_gate_max_rc <= rc_limit)
@@ -6453,10 +7168,10 @@ class PaperTradingEngine:
                         abort_reason = "portfolio_cov_rc_limit"
                     abort_flag = True
             else:
-                unavailable_reason = cov_status if cov_status else "unavailable"
-                if cov_status == 'ok' and cov_cols <= 0:
+                unavailable_reason = gate_cov_status if gate_cov_status else "unavailable"
+                if gate_cov_status == 'ok' and gate_cov_cols <= 0:
                     unavailable_reason = "no_data"
-                elif cov_status == 'ok' and (cov_gate_coverage is None or cov_gate_coverage < min_cov_gate_coverage):
+                elif gate_cov_status == 'ok' and (cov_gate_coverage is None or cov_gate_coverage < gate_cov_min_coverage):
                     unavailable_reason = "low_coverage"
 
                 if cov_gate_fallback_to_weighted:
@@ -6507,10 +7222,15 @@ class PaperTradingEngine:
             'cov_gate_max_rc': float(cov_gate_max_rc) if cov_gate_max_rc is not None else None,
             'cov_gate_pass': cov_gate_pass,
             'cov_gate_reason': cov_gate_reason,
+            'risk_gate_basis': str(risk_gate_basis),
+            'risk_gate_cov_coverage_used': float(cov_gate_coverage) if cov_gate_coverage is not None else None,
             'rc_limit': float(rc_limit),
             'min_cov_gate_coverage': float(min_cov_gate_coverage),
             'use_cov_vol_for_gate': bool(use_cov_vol_for_gate),
             'cov_gate_fallback_to_weighted': bool(cov_gate_fallback_to_weighted),
+            'enable_target_cov_gate': bool(enable_target_cov_gate),
+            'target_cov_gate_min_coverage': float(target_cov_gate_min_coverage),
+            'target_cov_gate_require_ok': bool(target_cov_gate_require_ok),
         }
 
     def _estimate_current_cash_ratio(self):
@@ -7208,9 +7928,14 @@ class PaperTradingEngine:
 
         # NOTE: comment omitted (was garbled/non-ASCII).
         invested_budget_raw = max(0.0, 1.0 - cash_target)
-        invested_budget = min(0.90, invested_budget_raw)
+        exposure_cap = float(self.config.get("execution", {}).get("portfolio_exposure_cap", 0.90))
+        exposure_cap = max(0.0, min(1.0, exposure_cap))
+        invested_budget = min(exposure_cap, invested_budget_raw)
         if invested_budget < invested_budget_raw - 1e-12:
-            print(f"[EXPOSURE CAP] Invested budget clipped: {invested_budget_raw:.2%} -> {invested_budget:.2%} (hard cap 90%)")
+            print(
+                f"[EXPOSURE CAP] Invested budget clipped: "
+                f"{invested_budget_raw:.2%} -> {invested_budget:.2%} (cap={exposure_cap:.2%})"
+            )
         scaled_weights = {k: v * invested_budget for k, v in raw_weights.items()}
 
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -7291,7 +8016,8 @@ class PaperTradingEngine:
         alloc_diag['high_conviction_weight_boost'] = dict(weight_boost_info)
         alloc_diag['boosted_ticker'] = boosted_ticker
         alloc_diag['invested_budget_raw'] = float(invested_budget_raw)
-        alloc_diag['portfolio_exposure_cap'] = 0.90
+        alloc_diag['portfolio_exposure_cap'] = float(exposure_cap)
+        alloc_diag['invested_budget'] = float(invested_budget)
         alloc_diag['hot_boost_enabled'] = bool(hot_boost_info.get('enabled', False))
         alloc_diag['hot_boost_top_momentum'] = list(hot_boost_info.get('momentum_top', []))
         alloc_diag['hot_boost_assets'] = list(hot_boost_applied)
@@ -7498,6 +8224,46 @@ class PaperTradingEngine:
             'slippage': 0.0,
             'impact': 0.0,
             'num_trades': 0
+        }
+        self.current_rebalance_cost_diag_info = {
+            'status': 'pending',
+            'n_trades_raw': 0,
+            'turnover_raw': 0.0,
+            'turnover_raw_notional': 0.0,
+            'est_total_cost_raw': 0.0,
+            'est_total_cost_topN': 0.0,
+            'topN': int(self.config.get('execution', {}).get('rebalance_cost_diag_top_n', 10) or 10),
+            'trade_scores_top10': [],
+        }
+        self.current_rebalance_cost_diag_filtered_info = {
+            'status': 'pending',
+            'n_trades_raw': 0,
+            'turnover_raw': 0.0,
+            'turnover_raw_notional': 0.0,
+            'est_total_cost_raw': 0.0,
+            'est_total_cost_topN': 0.0,
+            'topN': int(self.config.get('execution', {}).get('rebalance_cost_diag_top_n', 10) or 10),
+            'trade_scores_top10': [],
+        }
+        self.current_rebalance_plan_filter_info = {
+            'status': 'pending',
+            'enabled': False,
+            'n_raw': 0,
+            'n_hard': 0,
+            'n_soft': 0,
+            'n_filtered': 0,
+            'est_cost_raw': 0.0,
+            'est_cost_filtered': 0.0,
+            'turnover_raw': 0.0,
+            'turnover_filtered': 0.0,
+            'turnover_raw_notional': 0.0,
+            'turnover_filtered_notional': 0.0,
+            'skipped_small_notional': 0,
+            'skipped_tiny_delta': 0,
+            'skipped_small_count': 0,
+            'min_keep_trades': 0,
+            'kept_due_to_min_keep_count': 0,
+            'top_selected_by_score': [],
         }
         try:
             rebalance_targets = []
@@ -7836,6 +8602,25 @@ class PaperTradingEngine:
         min_notional = execution_config.get('min_trade_notional_usd', 0)
         
         planned_trades = []  # [{ticker, side, current_value, target_value, desired_trade_value, price, age, status}]
+        max_weight_effective = self.current_regime.get('max_weight_per_asset_effective', {}) if isinstance(self.current_regime, dict) else {}
+        if not isinstance(max_weight_effective, dict):
+            max_weight_effective = {}
+        try:
+            default_max_weight = float(
+                self.current_regime.get(
+                    'dynamic_max_weight',
+                    self.config.get('objectives', {}).get('max_weight_per_asset', 0.25),
+                )
+                if isinstance(self.current_regime, dict)
+                else self.config.get('objectives', {}).get('max_weight_per_asset', 0.25)
+            )
+        except Exception:
+            default_max_weight = float(self.config.get('objectives', {}).get('max_weight_per_asset', 0.25) or 0.25)
+        try:
+            vol_target_scale_now = float((self.current_vol_target_diag_info or {}).get('a5_scale', 1.0) or 1.0)
+        except Exception:
+            vol_target_scale_now = 1.0
+        vol_target_forcing_active = bool(vol_target_scale_now < 0.999)
         stale_count_policy_pass = 0
         candidate_count_policy_pass = 0
         policy_skip_count = 0  # NOTE: comment omitted (was garbled/non-ASCII).
@@ -7901,7 +8686,31 @@ class PaperTradingEngine:
                     force_reason = 'risk_off'
                 elif status == 'STALE':
                     force_reason = 'stale_sell'
-            is_forced = force_reason is not None
+            hard_reason = None
+            hard_trade = False
+            if side == 'SELL':
+                try:
+                    ticker_u = str(ticker).upper().strip()
+                    current_weight_now = float(current_value / total_equity) if total_equity > 0 else 0.0
+                    target_weight_now = float(target_value / total_equity) if total_equity > 0 else 0.0
+                    cap_now = max_weight_effective.get(ticker_u, default_max_weight)
+                    cap_now = float(cap_now) if cap_now is not None else float(default_max_weight)
+                    if (
+                        np.isfinite(current_weight_now)
+                        and np.isfinite(target_weight_now)
+                        and np.isfinite(cap_now)
+                        and current_weight_now > (cap_now + 1e-6)
+                        and target_weight_now <= (cap_now + 1e-6)
+                    ):
+                        hard_reason = 'overweight_forced'
+                    elif vol_target_forcing_active and (target_weight_now + 1e-12 < current_weight_now):
+                        hard_reason = 'vol_target_forced'
+                except Exception:
+                    hard_reason = None
+                hard_trade = hard_reason is not None
+            if hard_trade and not force_reason:
+                force_reason = hard_reason
+            is_forced = (force_reason is not None) or hard_trade
             
             planned_trades.append({
                 'ticker': ticker,
@@ -7915,8 +8724,25 @@ class PaperTradingEngine:
                 'status': status,
                 'is_forced': is_forced,
                 'priority': 'forced' if is_forced else 'normal',
-                'force_reason': force_reason
+                'force_reason': force_reason,
+                'hard': bool(hard_trade),
+                'hard_reason': hard_reason,
             })
+
+        try:
+            self.current_rebalance_cost_diag_info = self._build_rebalance_cost_diag(planned_trades, total_equity)
+        except Exception as e:
+            self.current_rebalance_cost_diag_info = {
+                'status': 'error',
+                'error': str(e),
+                'n_trades_raw': int(len(planned_trades)),
+                'turnover_raw': 0.0,
+                'turnover_raw_notional': 0.0,
+                'est_total_cost_raw': 0.0,
+                'est_total_cost_topN': 0.0,
+                'topN': 10,
+                'trade_scores_top10': [],
+            }
 
         if self.current_holding_blocks:
             blocked_str = ", ".join([f"{x['ticker']}({x['remaining_cycles']})" for x in self.current_holding_blocks])
@@ -8231,6 +9057,91 @@ class PaperTradingEngine:
             if isinstance(self.current_risk_check_info, dict):
                 self.current_risk_check_info['trade_planner'] = dict(planner_meta_ref)
 
+        greedy_filter_cfg = self._get_greedy_trade_filter_cfg()
+        greedy_filter_enabled = bool(greedy_filter_cfg.get("enable_greedy_trade_filter", False))
+        if greedy_filter_enabled:
+            try:
+                filtered_plan, filter_diag = self.filter_trades_greedy(
+                    planned_trades,
+                    total_equity=float(total_equity),
+                    turnover_cap=float(turnover_limit) if turnover_limit is not None else None,
+                    max_trades_per_cycle=int(greedy_filter_cfg.get("max_trades_per_cycle", 25)),
+                    min_keep_trades=int(greedy_filter_cfg.get("min_keep_trades", 0)),
+                    min_trade_notional=float(greedy_filter_cfg.get("min_trade_notional", 200.0)),
+                    min_trade_delta_w=float(greedy_filter_cfg.get("min_trade_delta_w", 0.002)),
+                    cost_bps=float(greedy_filter_cfg.get("cost_bps", 0.0008)),
+                    hard_predicate=None,
+                    hard_sell_overweight=bool(greedy_filter_cfg.get("hard_sell_overweight", True)),
+                )
+                filter_diag = dict(filter_diag) if isinstance(filter_diag, dict) else {}
+                filter_diag["enabled"] = True
+                filter_diag["status"] = str(filter_diag.get("status", "ok") or "ok")
+                filter_diag["turnover_cap"] = float(turnover_limit)
+                self.current_rebalance_plan_filter_info = filter_diag
+                planned_trades = filtered_plan if isinstance(filtered_plan, list) else list(planned_trades)
+                self.current_rebalance_cost_diag_filtered_info = self._build_rebalance_cost_diag(planned_trades, total_equity)
+                print(
+                    f"[REBALANCE FILTER] enabled=true raw={int(filter_diag.get('n_raw', 0))} "
+                    f"filtered={int(filter_diag.get('n_filtered', 0))} "
+                    f"turnover={float(filter_diag.get('turnover_raw', 0.0) or 0.0):.2%}->{float(filter_diag.get('turnover_filtered', 0.0) or 0.0):.2%} "
+                    f"cost=${float(filter_diag.get('est_cost_raw', 0.0) or 0.0):,.2f}->${float(filter_diag.get('est_cost_filtered', 0.0) or 0.0):,.2f} "
+                    f"skipped_small={int(filter_diag.get('skipped_small_count', 0))} "
+                    f"kept_min_keep={int(filter_diag.get('kept_due_to_min_keep_count', 0))}"
+                )
+            except Exception as e:
+                self.current_rebalance_plan_filter_info = {
+                    "status": "error",
+                    "enabled": True,
+                    "error": str(e),
+                    "n_raw": int(len(planned_trades)),
+                    "n_hard": 0,
+                    "n_soft": int(len(planned_trades)),
+                    "n_filtered": int(len(planned_trades)),
+                    "est_cost_raw": float(self.current_rebalance_cost_diag_info.get("est_total_cost_raw", 0.0) or 0.0),
+                    "est_cost_filtered": float(self.current_rebalance_cost_diag_info.get("est_total_cost_raw", 0.0) or 0.0),
+                    "turnover_raw": float(self.current_rebalance_cost_diag_info.get("turnover_raw", 0.0) or 0.0),
+                    "turnover_filtered": float(self.current_rebalance_cost_diag_info.get("turnover_raw", 0.0) or 0.0),
+                    "turnover_raw_notional": float(self.current_rebalance_cost_diag_info.get("turnover_raw_notional", 0.0) or 0.0),
+                    "turnover_filtered_notional": float(self.current_rebalance_cost_diag_info.get("turnover_raw_notional", 0.0) or 0.0),
+                    "skipped_small_notional": 0,
+                    "skipped_tiny_delta": 0,
+                    "skipped_small_count": 0,
+                    "min_keep_trades": int(greedy_filter_cfg.get("min_keep_trades", 0) or 0),
+                    "kept_due_to_min_keep_count": 0,
+                    "top_selected_by_score": [],
+                }
+                try:
+                    self.current_rebalance_cost_diag_filtered_info = self._build_rebalance_cost_diag(planned_trades, total_equity)
+                except Exception:
+                    self.current_rebalance_cost_diag_filtered_info = dict(self.current_rebalance_cost_diag_info)
+                print(f"[WARN] Greedy trade filter failed: {e}")
+        else:
+            # Compatibility mode: no trade-list mutation when greedy filter disabled.
+            self.current_rebalance_plan_filter_info = {
+                "status": "disabled",
+                "enabled": False,
+                "n_raw": int(len(planned_trades)),
+                "n_hard": int(sum(1 for t in planned_trades if bool((t or {}).get("is_forced", False)))),
+                "n_soft": int(sum(1 for t in planned_trades if not bool((t or {}).get("is_forced", False)))),
+                "n_filtered": int(len(planned_trades)),
+                "est_cost_raw": float(self.current_rebalance_cost_diag_info.get("est_total_cost_raw", 0.0) or 0.0),
+                "est_cost_filtered": float(self.current_rebalance_cost_diag_info.get("est_total_cost_raw", 0.0) or 0.0),
+                "turnover_raw": float(self.current_rebalance_cost_diag_info.get("turnover_raw", 0.0) or 0.0),
+                "turnover_filtered": float(self.current_rebalance_cost_diag_info.get("turnover_raw", 0.0) or 0.0),
+                "turnover_raw_notional": float(self.current_rebalance_cost_diag_info.get("turnover_raw_notional", 0.0) or 0.0),
+                "turnover_filtered_notional": float(self.current_rebalance_cost_diag_info.get("turnover_raw_notional", 0.0) or 0.0),
+                "skipped_small_notional": 0,
+                "skipped_tiny_delta": 0,
+                "skipped_small_count": 0,
+                "min_keep_trades": int(greedy_filter_cfg.get("min_keep_trades", 0) or 0),
+                "kept_due_to_min_keep_count": 0,
+                "top_selected_by_score": [],
+            }
+            try:
+                self.current_rebalance_cost_diag_filtered_info = self._build_rebalance_cost_diag(planned_trades, total_equity)
+            except Exception:
+                self.current_rebalance_cost_diag_filtered_info = dict(self.current_rebalance_cost_diag_info)
+
         planned_after_exec_input = float(
             sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict))
         )
@@ -8383,6 +9294,8 @@ class PaperTradingEngine:
                 'is_forced': bool(trade.get('is_forced', False)),
                 'priority': str(trade.get('priority', 'normal')),
                 'force_reason': trade.get('force_reason'),
+                'hard': bool(trade.get('hard', False)),
+                'hard_reason': trade.get('hard_reason'),
                 'adv_notional': trade.get('adv_notional'),
                 'adv_limit_frac': trade.get('adv_limit_frac'),
                 'adv_max_notional': trade.get('adv_max_notional'),
@@ -8509,6 +9422,8 @@ class PaperTradingEngine:
                 'is_forced': bool(trade.get('is_forced', False)),
                 'priority': str(trade.get('priority', 'normal')),
                 'force_reason': trade.get('force_reason'),
+                'hard': bool(trade.get('hard', False)),
+                'hard_reason': trade.get('hard_reason'),
                 'adv_notional': trade.get('adv_notional'),
                 'adv_limit_frac': trade.get('adv_limit_frac'),
                 'adv_max_notional': trade.get('adv_max_notional'),
@@ -9148,6 +10063,8 @@ class PaperTradingEngine:
             'cov_gate_max_rc': self.current_risk_check_info.get('cov_gate_max_rc', None),
             'cov_gate_pass': self.current_risk_check_info.get('cov_gate_pass', None),
             'cov_gate_reason': self.current_risk_check_info.get('cov_gate_reason', ''),
+            'risk_gate_basis': self.current_risk_check_info.get('risk_gate_basis', 'current'),
+            'risk_gate_cov_coverage_used': self.current_risk_check_info.get('risk_gate_cov_coverage_used', None),
             'cov_risk_diag': self.current_risk_check_info.get('cov_risk_diag', {}),
             'vol_targeting': self.current_vol_targeting_info if isinstance(self.current_vol_targeting_info, dict) else {'enabled': False, 'status': 'unavailable'},
             'vol_targeting_scale': (self.current_vol_targeting_info.get('scale') if isinstance(self.current_vol_targeting_info, dict) else None),
@@ -9161,6 +10078,46 @@ class PaperTradingEngine:
                 'a5_vol_method': 'unavailable',
                 'a5_cov_coverage': None,
                 'a5_reason': 'unavailable',
+            },
+            'rebalance_cost_diag': dict(self.current_rebalance_cost_diag_info) if isinstance(self.current_rebalance_cost_diag_info, dict) else {
+                'status': 'unavailable',
+                'n_trades_raw': 0,
+                'turnover_raw': 0.0,
+                'turnover_raw_notional': 0.0,
+                'est_total_cost_raw': 0.0,
+                'est_total_cost_topN': 0.0,
+                'topN': 10,
+                'trade_scores_top10': [],
+            },
+            'rebalance_cost_diag_filtered': dict(self.current_rebalance_cost_diag_filtered_info) if isinstance(self.current_rebalance_cost_diag_filtered_info, dict) else {
+                'status': 'unavailable',
+                'n_trades_raw': 0,
+                'turnover_raw': 0.0,
+                'turnover_raw_notional': 0.0,
+                'est_total_cost_raw': 0.0,
+                'est_total_cost_topN': 0.0,
+                'topN': 10,
+                'trade_scores_top10': [],
+            },
+            'rebalance_plan_filter_diag': dict(self.current_rebalance_plan_filter_info) if isinstance(self.current_rebalance_plan_filter_info, dict) else {
+                'status': 'unavailable',
+                'enabled': False,
+                'n_raw': 0,
+                'n_hard': 0,
+                'n_soft': 0,
+                'n_filtered': 0,
+                'est_cost_raw': 0.0,
+                'est_cost_filtered': 0.0,
+                'turnover_raw': 0.0,
+                'turnover_filtered': 0.0,
+                'turnover_raw_notional': 0.0,
+                'turnover_filtered_notional': 0.0,
+                'skipped_small_notional': 0,
+                'skipped_tiny_delta': 0,
+                'skipped_small_count': 0,
+                'min_keep_trades': 0,
+                'kept_due_to_min_keep_count': 0,
+                'top_selected_by_score': [],
             },
             'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {
                 'enabled': False,
