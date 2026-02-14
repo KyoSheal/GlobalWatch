@@ -856,6 +856,9 @@ class PaperTradingEngine:
         self.telemetry_enabled = bool(reporting_cfg.get('telemetry_enabled', True))
         self._last_metrics_cycle_id = None
         self._last_price_quality_cycle_id = None
+        self._last_cov_risk_cycle_id = None
+        self._last_vol_target_diag_cycle_id = None
+        self._last_vol_target_apply_cycle_id = None
         self._rebind_telemetry_logger()
         self.last_rebalance_time = None  # backward-compatible alias of last successful rebalance time
         self.last_rebalance_attempt_time = None
@@ -874,6 +877,17 @@ class PaperTradingEngine:
         self.current_exit_info = {}
         self.current_risk_check_info = {}
         self.current_vol_targeting_info = {'enabled': False, 'status': 'disabled'}
+        self.current_vol_target_diag_info = {
+            'status': 'unavailable',
+            'a5_scale': 1.0,
+            'a5_target_vol': None,
+            'a5_cfg_target_vol': None,
+            'a5_vol_method': 'unavailable',
+            'a5_cov_coverage': None,
+            'a5_reason': 'uninitialized',
+            'applied': False,
+            'forced': False,
+        }
         self.current_cost_est_info = {
             'enabled': False,
             'total': 0.0,
@@ -1687,6 +1701,39 @@ class PaperTradingEngine:
         except Exception:
             pass
 
+        cov_current_summary = None
+        cov_target_summary = None
+        cov_target_diag = None
+        if isinstance(snapshot.get('cov_risk_current_summary'), dict):
+            cov_current_summary = dict(snapshot.get('cov_risk_current_summary'))
+        elif isinstance(self.current_risk_check_info, dict) and isinstance(self.current_risk_check_info.get('cov_risk_current_summary'), dict):
+            cov_current_summary = dict(self.current_risk_check_info.get('cov_risk_current_summary'))
+        else:
+            cov_current_summary = self._summarize_cov_risk_diag(cov_diag)
+
+        if isinstance(snapshot.get('cov_risk_target_summary'), dict):
+            cov_target_summary = dict(snapshot.get('cov_risk_target_summary'))
+        elif isinstance(self.current_risk_check_info, dict) and isinstance(self.current_risk_check_info.get('cov_risk_target_summary'), dict):
+            cov_target_summary = dict(self.current_risk_check_info.get('cov_risk_target_summary'))
+        else:
+            if isinstance(self.current_risk_check_info, dict) and isinstance(self.current_risk_check_info.get('cov_risk_diag_target'), dict):
+                cov_target_diag = dict(self.current_risk_check_info.get('cov_risk_diag_target'))
+            elif isinstance(snapshot.get('cov_risk_diag_target'), dict):
+                cov_target_diag = dict(snapshot.get('cov_risk_diag_target'))
+            else:
+                cov_target_diag = None
+            if isinstance(cov_target_diag, dict):
+                cov_target_summary = self._summarize_cov_risk_diag(cov_target_diag)
+            else:
+                cov_target_summary = {"status": "unavailable"}
+        try:
+            if not isinstance(self.current_risk_check_info, dict):
+                self.current_risk_check_info = {}
+            self.current_risk_check_info["cov_risk_current_summary"] = dict(cov_current_summary)
+            self.current_risk_check_info["cov_risk_target_summary"] = dict(cov_target_summary)
+        except Exception:
+            pass
+
         vt_meta = None
         if isinstance(snapshot.get('vol_targeting'), dict):
             vt_meta = dict(snapshot.get('vol_targeting'))
@@ -1696,6 +1743,23 @@ class PaperTradingEngine:
             vt_meta = dict(self.current_risk_check_info.get('vol_targeting'))
         else:
             vt_meta = {'enabled': False, 'status': 'unavailable'}
+        vt_diag_meta = None
+        if isinstance(snapshot.get('vol_target_diag'), dict):
+            vt_diag_meta = dict(snapshot.get('vol_target_diag'))
+        elif isinstance(self.current_vol_target_diag_info, dict):
+            vt_diag_meta = dict(self.current_vol_target_diag_info)
+        elif isinstance(self.current_risk_check_info, dict) and isinstance(self.current_risk_check_info.get('vol_target_diag'), dict):
+            vt_diag_meta = dict(self.current_risk_check_info.get('vol_target_diag'))
+        else:
+            vt_diag_meta = {
+                'status': 'unavailable',
+                'a5_scale': 1.0,
+                'a5_target_vol': None,
+                'a5_cfg_target_vol': None,
+                'a5_vol_method': 'unavailable',
+                'a5_cov_coverage': None,
+                'a5_reason': 'unavailable',
+            }
         cost_est_meta = snapshot.get('cost_est')
         if isinstance(cost_est_meta, dict):
             cost_est_meta = dict(cost_est_meta)
@@ -1824,6 +1888,8 @@ class PaperTradingEngine:
             'cov_gate_vol': snapshot.get('cov_gate_vol', self.current_risk_check_info.get('cov_gate_vol') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_max_rc': snapshot.get('cov_gate_max_rc', self.current_risk_check_info.get('cov_gate_max_rc') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_risk_diag': cov_diag,
+            'cov_risk_current_summary': cov_current_summary,
+            'cov_risk_target_summary': cov_target_summary,
             'portfolio_vol_cov_annualized': cov_diag.get('portfolio_vol_annualized') if isinstance(cov_diag, dict) else None,
             'max_rc_fraction_cov': cov_diag.get('max_rc_fraction') if isinstance(cov_diag, dict) else None,
             'max_rc_ticker_cov': cov_diag.get('max_rc_ticker') if isinstance(cov_diag, dict) else None,
@@ -1832,6 +1898,7 @@ class PaperTradingEngine:
             'vol_targeting_scale': vt_meta.get('scale') if isinstance(vt_meta, dict) else None,
             'vol_targeting_vol_before': vt_meta.get('vol_before') if isinstance(vt_meta, dict) else None,
             'vol_targeting_cash_after': vt_meta.get('cash_after') if isinstance(vt_meta, dict) else None,
+            'vol_target_diag': vt_diag_meta,
             'cost_est': cost_est_meta,
             'trade_planner': planner_meta,
             'trade_planner_num_dropped': int(planner_meta.get('num_dropped', 0) or 0),
@@ -1952,6 +2019,358 @@ class PaperTradingEngine:
             'l2_bucket': str(chosen.get('l2', info.get('worst_l2', '')) or ''),
             'delta': float(chosen.get('delta', info.get('worst_delta', 0.0)) or 0.0),
         }
+
+    def _cov_weight_signature(self, weights):
+        """Stable signature for covariance cache keys."""
+        if not isinstance(weights, dict):
+            return tuple()
+        items = []
+        for k, v in weights.items():
+            t = str(k).upper().strip()
+            if not t or t == "CASH":
+                continue
+            try:
+                w = float(v)
+            except Exception:
+                continue
+            if not np.isfinite(w):
+                continue
+            if abs(w) <= 1e-12:
+                continue
+            items.append((t, round(float(w), 12)))
+        return tuple(sorted(items))
+
+    def _compute_cov_diag_cached(self, kind, weights, *, cycle_id=None):
+        """Compute covariance diagnostics with lightweight cycle cache."""
+        kind_s = str(kind or "generic").strip().lower() or "generic"
+        cid = int(self.current_cycle if cycle_id is None else cycle_id)
+        signature = self._cov_weight_signature(weights)
+        cache_key = (f"cov_diag_{kind_s}", cid, signature)
+        cached_entry = self.returns_cache.get(cache_key)
+        if isinstance(cached_entry, dict):
+            meta = cached_entry.get("meta", {})
+            if isinstance(meta, dict):
+                maybe = meta.get("result")
+                if isinstance(maybe, dict):
+                    return maybe
+        diag = self.compute_cov_risk_diagnostics(weights, tickers=list((weights or {}).keys()))
+        self.returns_cache[cache_key] = {
+            "ts": datetime.now(),
+            "returns": pd.DataFrame(),
+            "meta": {"kind": f"cov_diag_{kind_s}", "cycle": cid, "result": diag},
+        }
+        for existing_key in list(self.returns_cache.keys()):
+            if existing_key == cache_key:
+                continue
+            if (
+                isinstance(existing_key, tuple)
+                and len(existing_key) > 0
+                and str(existing_key[0]) == f"cov_diag_{kind_s}"
+            ):
+                self.returns_cache.pop(existing_key, None)
+        return diag
+
+    def _summarize_cov_risk_diag(self, diag, *, max_corr_pairs=3, max_rc=5):
+        """Compact covariance diagnostics for snapshot/telemetry."""
+        if not isinstance(diag, dict):
+            return {"status": "error", "error": "invalid_cov_diag"}
+
+        returns_meta_raw = diag.get("returns_meta", {})
+        returns_meta = returns_meta_raw if isinstance(returns_meta_raw, dict) else {}
+        returns_meta_summary = {
+            "rows": int(returns_meta.get("rows", 0) or 0),
+            "cols": int(returns_meta.get("cols", 0) or 0),
+            "overall_row_coverage": float(returns_meta.get("overall_row_coverage", 0.0) or 0.0),
+        }
+
+        top_corr = []
+        raw_corr_pairs = diag.get("top_corr_pairs", [])
+        if isinstance(raw_corr_pairs, list):
+            for row in raw_corr_pairs[: max(0, int(max_corr_pairs))]:
+                if not isinstance(row, dict):
+                    continue
+                top_corr.append(
+                    {
+                        "a": str(row.get("a", "")),
+                        "b": str(row.get("b", "")),
+                        "corr": float(row.get("corr", 0.0) or 0.0),
+                    }
+                )
+
+        rc_top = []
+        rc_fraction = diag.get("rc_fraction", {})
+        if isinstance(rc_fraction, dict) and rc_fraction:
+            rc_items = []
+            for ticker, frac in rc_fraction.items():
+                try:
+                    rc_items.append((str(ticker), float(frac)))
+                except Exception:
+                    continue
+            rc_items.sort(key=lambda x: abs(float(x[1])), reverse=True)
+            for ticker, frac in rc_items[: max(0, int(max_rc))]:
+                rc_top.append({"ticker": ticker, "fraction": float(frac)})
+
+        out = {
+            "status": str(diag.get("status", "unknown")),
+            "method": diag.get("method"),
+            "returns_meta": returns_meta_summary,
+            "portfolio_vol_annualized": diag.get("portfolio_vol_annualized"),
+            "max_rc_fraction": diag.get("max_rc_fraction"),
+            "max_rc_ticker": diag.get("max_rc_ticker"),
+            "avg_pairwise_corr": diag.get("avg_pairwise_corr"),
+            "top_corr_pairs": top_corr,
+            "rc_fraction_top5": rc_top,
+        }
+        return out
+
+    def compute_vol_target_diag(self, target_weights: dict, *, reason_tag: str = "target_weights_diag") -> dict:
+        """A5 diagnostic-only vol target check (does not modify target weights)."""
+        exec_cfg = self.config.get("execution", {}) if isinstance(self.config, dict) else {}
+        risk_cfg = self._get_risk_model_cfg()
+        cfg_target = float(exec_cfg.get("target_vol_annual", risk_cfg.get("vol_target", 0.18)) or 0.18)
+        min_cov = float(exec_cfg.get("target_vol_cov_min_coverage", risk_cfg.get("vol_target_min_coverage", 0.6)) or 0.6)
+        diag = {
+            "enabled": True,
+            "status": "ok",
+            "reason_tag": str(reason_tag),
+            "a5_scale": 1.0,
+            "a5_target_vol": None,
+            "a5_cfg_target_vol": float(cfg_target),
+            "a5_vol_method": "unavailable",
+            "a5_cov_coverage": None,
+            "a5_reason": "vol_unavailable",
+            "scaled_cash_target": None,
+            "non_cash_sum_before": 0.0,
+            "cash_before": 0.0,
+            "cov_status": None,
+        }
+        try:
+            normalized = {}
+            for raw_ticker, raw_weight in (target_weights or {}).items():
+                ticker = str(raw_ticker).upper().strip()
+                if not ticker:
+                    continue
+                try:
+                    w = float(raw_weight) if raw_weight is not None else 0.0
+                except Exception:
+                    w = 0.0
+                if not np.isfinite(w):
+                    w = 0.0
+                if w < 0:
+                    w = 0.0
+                normalized[ticker] = float(normalized.get(ticker, 0.0) + w)
+
+            cash_before = float(normalized.get("CASH", 0.0) or 0.0)
+            non_cash = {
+                t: float(w)
+                for t, w in normalized.items()
+                if t != "CASH" and float(w) > 1e-12
+            }
+            non_cash_sum = float(sum(non_cash.values()) or 0.0)
+            diag["cash_before"] = float(cash_before)
+            diag["non_cash_sum_before"] = float(non_cash_sum)
+            diag["scaled_cash_target"] = float(np.clip(cash_before, 0.0, 1.0))
+            if non_cash_sum <= 1e-12:
+                diag["status"] = "unavailable"
+                diag["a5_reason"] = "no_risky_assets"
+                diag["a5_vol_method"] = "unavailable"
+                return diag
+
+            cycle_id = int(self.current_cycle)
+            cov_diag = self._compute_cov_diag_cached("a5_target_diag", non_cash, cycle_id=cycle_id)
+            if not isinstance(cov_diag, dict):
+                cov_diag = {"status": "error", "error": "invalid_cov_diag"}
+            cov_status = str(cov_diag.get("status", "error")).lower()
+            diag["cov_status"] = cov_status
+            coverage = None
+            returns_meta = cov_diag.get("returns_meta", {}) if isinstance(cov_diag, dict) else {}
+            if isinstance(returns_meta, dict):
+                try:
+                    coverage = float(returns_meta.get("overall_row_coverage", 0.0) or 0.0)
+                except Exception:
+                    coverage = None
+            diag["a5_cov_coverage"] = coverage
+
+            vol = None
+            vol_method = "unavailable"
+            if cov_status == "ok" and coverage is not None and coverage >= float(min_cov):
+                try:
+                    maybe_vol = cov_diag.get("portfolio_vol_annualized")
+                    maybe_vol = float(maybe_vol) if maybe_vol is not None else None
+                    if maybe_vol is not None and np.isfinite(maybe_vol) and maybe_vol > 0:
+                        vol = float(maybe_vol)
+                        vol_method = "cov_target"
+                except Exception:
+                    vol = None
+
+            if vol is None:
+                sumsq = 0.0
+                for ticker, w in non_cash.items():
+                    try:
+                        asset_vol = float(self.calculate_volatility(ticker))
+                    except Exception:
+                        continue
+                    if not np.isfinite(asset_vol) or asset_vol <= 0:
+                        continue
+                    sumsq += float((float(w) * asset_vol) ** 2)
+                if sumsq > 0:
+                    vol = float(np.sqrt(sumsq))
+                    vol_method = "fallback_simple"
+
+            diag["a5_vol_method"] = vol_method
+            if vol is None or not np.isfinite(vol) or vol <= 0:
+                diag["status"] = "unavailable"
+                diag["a5_reason"] = "vol_unavailable"
+                diag["a5_scale"] = 1.0
+                return diag
+
+            scale = float(min(1.0, float(cfg_target) / float(vol)))
+            scale = float(np.clip(scale, 0.0, 1.0))
+            diag["a5_target_vol"] = float(vol)
+            diag["a5_scale"] = float(scale)
+            if scale < 0.999999:
+                diag["a5_reason"] = "above_target"
+            else:
+                diag["a5_reason"] = "below_target"
+
+            scaled_cash_target = float(cash_before + (non_cash_sum * (1.0 - scale)))
+            diag["scaled_cash_target"] = float(np.clip(scaled_cash_target, 0.0, 1.0))
+            return diag
+        except Exception as e:
+            diag["status"] = "error"
+            diag["a5_reason"] = "error"
+            diag["error"] = str(e)
+            return diag
+
+    def apply_vol_target_scale_to_weights(
+        self,
+        target_weights: dict[str, float],
+        scale: float,
+        *,
+        min_scale: float = 0.2,
+        eps: float = 1e-9,
+    ) -> tuple[dict[str, float], dict]:
+        """Apply A5 scale to non-cash weights only, shifting the delta into CASH."""
+        base = dict(target_weights or {})
+        info = {
+            "applied": False,
+            "skipped": False,
+            "scale_input": float(scale if scale is not None else 1.0),
+            "scale_used": 1.0,
+            "reason": "",
+            "cash_before": 0.0,
+            "cash_after": 0.0,
+            "delta_cash": 0.0,
+            "non_cash_before": 0.0,
+            "non_cash_after": 0.0,
+        }
+        try:
+            normalized = {}
+            for raw_ticker, raw_weight in base.items():
+                ticker = str(raw_ticker).upper().strip()
+                if not ticker:
+                    continue
+                try:
+                    w = float(raw_weight) if raw_weight is not None else 0.0
+                except Exception:
+                    w = 0.0
+                if not np.isfinite(w):
+                    w = 0.0
+                if w < 0:
+                    w = 0.0
+                normalized[ticker] = float(normalized.get(ticker, 0.0) + w)
+
+            cash_before = float(max(0.0, normalized.get("CASH", 0.0) or 0.0))
+            non_cash_before = float(
+                sum(float(v) for k, v in normalized.items() if str(k).upper() != "CASH")
+            )
+            info["cash_before"] = cash_before
+            info["non_cash_before"] = non_cash_before
+
+            try:
+                scale_val = float(scale)
+            except Exception:
+                scale_val = 1.0
+            if not np.isfinite(scale_val):
+                scale_val = 1.0
+
+            if scale_val >= 0.999:
+                info["skipped"] = True
+                info["reason"] = "scale_ge_0.999"
+                info["cash_after"] = cash_before
+                info["non_cash_after"] = non_cash_before
+                return dict(normalized), info
+
+            min_scale_v = float(min_scale if min_scale is not None else 0.2)
+            if not np.isfinite(min_scale_v):
+                min_scale_v = 0.2
+            min_scale_v = float(np.clip(min_scale_v, 0.0, 1.0))
+
+            scale_used = scale_val
+            if scale_used < min_scale_v:
+                scale_used = min_scale_v
+                info["reason"] = "clamped"
+            else:
+                info["reason"] = "applied"
+            scale_used = float(np.clip(scale_used, 0.0, 1.0))
+            info["scale_used"] = scale_used
+
+            if non_cash_before < 0.01:
+                info["skipped"] = True
+                info["reason"] = "non_cash_too_small"
+                info["cash_after"] = cash_before
+                info["non_cash_after"] = non_cash_before
+                return dict(normalized), info
+
+            new_w = {}
+            for ticker, w in normalized.items():
+                if ticker == "CASH":
+                    continue
+                new_w[ticker] = float(max(0.0, float(w) * scale_used))
+
+            non_cash_after = float(sum(new_w.values()))
+            delta_cash = float(non_cash_before - non_cash_after)
+            new_cash = float(cash_before + delta_cash)
+            new_w["CASH"] = float(max(0.0, new_cash))
+
+            total = float(sum(new_w.values()))
+            if total <= eps:
+                return {"CASH": 1.0}, {
+                    **info,
+                    "applied": True,
+                    "cash_after": 1.0,
+                    "delta_cash": 1.0 - cash_before,
+                    "non_cash_after": 0.0,
+                    "reason": "degenerate_total",
+                }
+
+            if abs(total - 1.0) > 1e-6:
+                new_w["CASH"] = float(max(0.0, new_w.get("CASH", 0.0) + (1.0 - total)))
+                total = float(sum(new_w.values()))
+
+            if total > eps:
+                new_w = {k: float(max(0.0, v) / total) for k, v in new_w.items()}
+            else:
+                new_w = {"CASH": 1.0}
+
+            cash_after = float(new_w.get("CASH", 0.0) or 0.0)
+            non_cash_after = float(sum(v for k, v in new_w.items() if k != "CASH"))
+            info.update(
+                {
+                    "applied": True,
+                    "cash_after": cash_after,
+                    "delta_cash": float(cash_after - cash_before),
+                    "non_cash_after": non_cash_after,
+                }
+            )
+            return new_w, info
+        except Exception as e:
+            info["skipped"] = True
+            info["reason"] = "error"
+            info["error"] = str(e)
+            info["cash_after"] = info.get("cash_before", 0.0)
+            info["non_cash_after"] = info.get("non_cash_before", 0.0)
+            return dict(base), info
 
     def classify_price_freshness(self, row, now_utc):
         """Classify one price row into LIVE/RECENT/STALE/MISSING with age diagnostics."""
@@ -2241,6 +2660,15 @@ class PaperTradingEngine:
         total_equity = float(payload.get('total_equity', payload.get('equity', 0.0)) or 0.0)
         cash = float(payload.get('cash', 0.0) or 0.0)
         positions_value = float(payload.get('positions_value', max(0.0, total_equity - cash)) or 0.0)
+        cov_target_summary = payload.get('cov_risk_target_summary', {})
+        if not isinstance(cov_target_summary, dict):
+            cov_target_summary = {}
+        cov_target_returns_meta = cov_target_summary.get('returns_meta', {})
+        if not isinstance(cov_target_returns_meta, dict):
+            cov_target_returns_meta = {}
+        vol_target_diag = payload.get('vol_target_diag', {})
+        if not isinstance(vol_target_diag, dict):
+            vol_target_diag = {}
         n_positions = 0
         positions_detail = payload.get('positions_detail')
         if isinstance(positions_detail, dict):
@@ -2270,6 +2698,40 @@ class PaperTradingEngine:
             'price_fetch_stats': dict(payload.get('price_fetch_stats', {}) if isinstance(payload.get('price_fetch_stats', {}), dict) else {}),
             'price_diagnostics_summary': self._summarize_price_diagnostics_for_metrics(payload),
             'news_overlay_stats': self._summarize_news_overlay_for_metrics(payload),
+            'target_portfolio_vol_annualized': (
+                float(cov_target_summary.get('portfolio_vol_annualized'))
+                if cov_target_summary.get('portfolio_vol_annualized') is not None else None
+            ),
+            'target_max_rc_fraction': (
+                float(cov_target_summary.get('max_rc_fraction'))
+                if cov_target_summary.get('max_rc_fraction') is not None else None
+            ),
+            'target_cov_coverage': (
+                float(cov_target_returns_meta.get('overall_row_coverage'))
+                if cov_target_returns_meta.get('overall_row_coverage') is not None else None
+            ),
+            'target_avg_corr': (
+                float(cov_target_summary.get('avg_pairwise_corr'))
+                if cov_target_summary.get('avg_pairwise_corr') is not None else None
+            ),
+            'vol_target_scale': (
+                float(vol_target_diag.get('a5_scale'))
+                if vol_target_diag.get('a5_scale') is not None else None
+            ),
+            'vol_target_method': str(vol_target_diag.get('a5_vol_method', 'unavailable')),
+            'vol_target_target_vol': (
+                float(vol_target_diag.get('a5_target_vol'))
+                if vol_target_diag.get('a5_target_vol') is not None else None
+            ),
+            'vol_target_cfg': (
+                float(vol_target_diag.get('a5_cfg_target_vol'))
+                if vol_target_diag.get('a5_cfg_target_vol') is not None else None
+            ),
+            'vol_target_cov_coverage': (
+                float(vol_target_diag.get('a5_cov_coverage'))
+                if vol_target_diag.get('a5_cov_coverage') is not None else None
+            ),
+            'vol_target_reason': str(vol_target_diag.get('a5_reason', '')),
         }
         self._telemetry_log_event(
             "CYCLE_METRICS",
@@ -2325,6 +2787,66 @@ class PaperTradingEngine:
                         stream="events",
                     )
                     self._last_price_quality_cycle_id = cycle_id_for_event
+            cov_current_summary = payload.get("cov_risk_current_summary", {})
+            cov_target_summary = payload.get("cov_risk_target_summary", {})
+            if not isinstance(cov_current_summary, dict):
+                cov_current_summary = {}
+            if not isinstance(cov_target_summary, dict):
+                cov_target_summary = {}
+            if self._last_cov_risk_cycle_id != cycle_id_for_event:
+                self._telemetry_log_event(
+                    "COV_RISK",
+                    cycle_id=cycle_id_for_event,
+                    status=str(cov_target_summary.get("status", cov_current_summary.get("status", "unknown"))),
+                    payload={
+                        "current": dict(cov_current_summary),
+                        "target": dict(cov_target_summary),
+                    },
+                    stream="events",
+                )
+                self._last_cov_risk_cycle_id = cycle_id_for_event
+            vol_target_diag = payload.get("vol_target_diag", {})
+            if not isinstance(vol_target_diag, dict):
+                vol_target_diag = {}
+            if self._last_vol_target_diag_cycle_id != cycle_id_for_event:
+                self._telemetry_log_event(
+                    "VOL_TARGET_DIAG",
+                    cycle_id=cycle_id_for_event,
+                    status=str(vol_target_diag.get("status", "unknown")),
+                    payload=dict(vol_target_diag),
+                    stream="events",
+                )
+                self._last_vol_target_diag_cycle_id = cycle_id_for_event
+            if self._last_vol_target_apply_cycle_id != cycle_id_for_event:
+                apply_status = "applied" if bool(vol_target_diag.get("applied", False)) else "skipped"
+                self._telemetry_log_event(
+                    "VOL_TARGET_APPLY",
+                    cycle_id=cycle_id_for_event,
+                    status=apply_status,
+                    payload={
+                        "scale_used": float(vol_target_diag.get("scale_used", vol_target_diag.get("a5_scale", 1.0)) or 1.0),
+                        "cash_before": float(vol_target_diag.get("cash_before", 0.0) or 0.0),
+                        "cash_after": float(vol_target_diag.get("cash_after", 0.0) or 0.0),
+                        "delta_cash": float(vol_target_diag.get("delta_cash", 0.0) or 0.0),
+                        "method": str(vol_target_diag.get("a5_vol_method", "unavailable")),
+                        "target_vol": vol_target_diag.get("a5_target_vol"),
+                        "cfg_target_vol": vol_target_diag.get("a5_cfg_target_vol"),
+                        "coverage": vol_target_diag.get("a5_cov_coverage"),
+                        "reason": str(vol_target_diag.get("reason", vol_target_diag.get("a5_reason", ""))),
+                        **(
+                            {
+                                "forced": True,
+                                "forced_scale": float(vol_target_diag.get("forced_scale"))
+                                if vol_target_diag.get("forced_scale") is not None else None,
+                                "force_source": str(vol_target_diag.get("force_source", "env")),
+                            }
+                            if bool(vol_target_diag.get("forced", False))
+                            else {}
+                        ),
+                    },
+                    stream="events",
+                )
+                self._last_vol_target_apply_cycle_id = cycle_id_for_event
             self._emit_cycle_metrics_once(payload, source=str(source))
         except Exception as e:
             print(f"[WARN] Failed to write live snapshot: {e}")
@@ -2415,6 +2937,15 @@ class PaperTradingEngine:
             'turnover_capped': self.current_turnover_info.get('turnover_capped', False),
             'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {'enabled': False, 'total': 0.0, 'fee': 0.0, 'slippage': 0.0, 'impact': 0.0, 'num_trades': 0},
             'trade_planner': dict(self.current_planner_info) if isinstance(self.current_planner_info, dict) else {'enabled': False, 'status': 'disabled', 'dropped': [], 'scaled': []},
+            'vol_target_diag': dict(self.current_vol_target_diag_info) if isinstance(self.current_vol_target_diag_info, dict) else {
+                'status': 'unavailable',
+                'a5_scale': 1.0,
+                'a5_target_vol': None,
+                'a5_cfg_target_vol': None,
+                'a5_vol_method': 'unavailable',
+                'a5_cov_coverage': None,
+                'a5_reason': 'unavailable',
+            },
             'trade_planner_num_dropped': int((self.current_planner_info or {}).get('num_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
             'trade_planner_turnover_used': (
                 float((self.current_planner_info or {}).get('turnover_used_forced', 0.0) or 0.0) +
@@ -5846,7 +6377,8 @@ class PaperTradingEngine:
         except Exception:
             current_position_weights = {}
 
-        cov_diag = {"enabled": True, "status": "error", "error": "cov_diag_uninitialized"}
+        cov_diag_current = {"enabled": True, "status": "error", "error": "cov_diag_current_uninitialized"}
+        cov_diag_target = {"enabled": True, "status": "error", "error": "cov_diag_target_uninitialized"}
         cov_gate_coverage = None
         cov_gate_vol = None
         cov_gate_max_rc = None
@@ -5857,46 +6389,17 @@ class PaperTradingEngine:
 
         try:
             cycle_id = int(self.current_cycle)
-            weight_signature = tuple(
-                sorted(
-                    (str(k), round(float(v), 12))
-                    for k, v in current_position_weights.items()
-                    if np.isfinite(float(v))
-                )
-            )
-            cache_key = ("cov_diag_snapshot", cycle_id, weight_signature)
-            cached_result = None
-            cached_entry = self.returns_cache.get(cache_key)
-            if isinstance(cached_entry, dict):
-                cached_meta = cached_entry.get('meta', {})
-                if isinstance(cached_meta, dict):
-                    maybe_result = cached_meta.get('result')
-                    if isinstance(maybe_result, dict):
-                        cached_result = maybe_result
-
-            if isinstance(cached_result, dict):
-                cov_diag = cached_result
-            else:
-                cov_diag = self.compute_cov_risk_diagnostics(current_position_weights)
-                self.returns_cache[cache_key] = {
-                    "ts": datetime.now(),
-                    "returns": pd.DataFrame(),
-                    "meta": {
-                        "kind": "cov_diag",
-                        "cycle": cycle_id,
-                        "result": cov_diag
-                    }
-                }
-                for existing_key in list(self.returns_cache.keys()):
-                    if existing_key == cache_key:
-                        continue
-                    if isinstance(existing_key, tuple) and len(existing_key) > 0 and existing_key[0] == "cov_diag_snapshot":
-                        self.returns_cache.pop(existing_key, None)
+            cov_diag_current = self._compute_cov_diag_cached("current", current_position_weights, cycle_id=cycle_id)
+            cov_diag_target = self._compute_cov_diag_cached("target", invested_weights, cycle_id=cycle_id)
         except Exception as e:
-            cov_diag = {"enabled": True, "status": "error", "error": str(e)}
+            cov_diag_current = {"enabled": True, "status": "error", "error": str(e)}
+            cov_diag_target = {"enabled": True, "status": "error", "error": str(e)}
 
-        cov_status = str(cov_diag.get('status', '')).lower() if isinstance(cov_diag, dict) else 'error'
-        returns_meta = cov_diag.get('returns_meta', {}) if isinstance(cov_diag, dict) else {}
+        cov_current_summary = self._summarize_cov_risk_diag(cov_diag_current)
+        cov_target_summary = self._summarize_cov_risk_diag(cov_diag_target)
+
+        cov_status = str(cov_diag_current.get('status', '')).lower() if isinstance(cov_diag_current, dict) else 'error'
+        returns_meta = cov_diag_current.get('returns_meta', {}) if isinstance(cov_diag_current, dict) else {}
         if not isinstance(returns_meta, dict):
             returns_meta = {}
 
@@ -5911,12 +6414,12 @@ class PaperTradingEngine:
             cov_cols = 0
 
         try:
-            cov_gate_vol = float(cov_diag.get('portfolio_vol_annualized')) if cov_diag.get('portfolio_vol_annualized') is not None else None
+            cov_gate_vol = float(cov_diag_current.get('portfolio_vol_annualized')) if cov_diag_current.get('portfolio_vol_annualized') is not None else None
         except Exception:
             cov_gate_vol = None
 
         try:
-            cov_gate_max_rc = float(cov_diag.get('max_rc_fraction')) if cov_diag.get('max_rc_fraction') is not None else None
+            cov_gate_max_rc = float(cov_diag_current.get('max_rc_fraction')) if cov_diag_current.get('max_rc_fraction') is not None else None
         except Exception:
             cov_gate_max_rc = None
 
@@ -5992,7 +6495,11 @@ class PaperTradingEngine:
             'max_herfindahl_index': float(max_hhi),
             'invested_budget': float(invested_budget),
             'asset_volatility_map': vol_map,
-            'cov_risk_diag': cov_diag,
+            'cov_risk_diag': cov_diag_current,
+            'cov_risk_diag_current': cov_diag_current,
+            'cov_risk_diag_target': cov_diag_target,
+            'cov_risk_current_summary': cov_current_summary,
+            'cov_risk_target_summary': cov_target_summary,
             'gate_vol_method': gate_vol_method,
             'cov_gate_used': bool(cov_gate_used),
             'cov_gate_coverage': float(cov_gate_coverage) if cov_gate_coverage is not None else None,
@@ -6794,6 +7301,85 @@ class PaperTradingEngine:
 
         cash_weight = max(0.0, 1.0 - sum(adjusted_weights.values()))
         adjusted_weights['CASH'] = cash_weight
+
+        # A5-1: diagnostic-only target vol scaling signal (does not alter weights).
+        vol_target_diag = self.compute_vol_target_diag(
+            adjusted_weights,
+            reason_tag="target_weights_final",
+        )
+        self.current_vol_target_diag_info = dict(vol_target_diag) if isinstance(vol_target_diag, dict) else {
+            'status': 'invalid_diag',
+            'a5_scale': 1.0,
+            'a5_target_vol': None,
+            'a5_cfg_target_vol': None,
+            'a5_vol_method': 'unavailable',
+            'a5_cov_coverage': None,
+            'a5_reason': 'invalid_diag',
+            'applied': False,
+            'forced': False,
+        }
+        if not isinstance(self.current_risk_check_info, dict):
+            self.current_risk_check_info = {}
+        self.current_risk_check_info['vol_target_diag'] = dict(self.current_vol_target_diag_info)
+        alloc_diag['vol_target_diag'] = dict(self.current_vol_target_diag_info)
+        print(
+            "[VOL TARGET DIAG] "
+            f"method={self.current_vol_target_diag_info.get('a5_vol_method')} "
+            f"scale={float(self.current_vol_target_diag_info.get('a5_scale', 1.0) or 1.0):.4f} "
+            f"target_vol={self.current_vol_target_diag_info.get('a5_target_vol')} "
+            f"cfg_target={self.current_vol_target_diag_info.get('a5_cfg_target_vol')} "
+            f"cov={self.current_vol_target_diag_info.get('a5_cov_coverage')} "
+            f"reason={self.current_vol_target_diag_info.get('a5_reason')}"
+        )
+
+        a5_scale = float(self.current_vol_target_diag_info.get('a5_scale', 1.0) or 1.0)
+        force_raw = str(os.getenv("GW_VOL_TARGET_FORCE", "") or "").strip()
+        forced_scale = None
+        if force_raw:
+            try:
+                forced_scale = float(force_raw)
+            except Exception:
+                print(f"[WARN] [VOL TARGET FORCE] invalid GW_VOL_TARGET_FORCE='{force_raw}', ignore")
+                forced_scale = None
+            if forced_scale is not None:
+                forced_scale = float(np.clip(forced_scale, 0.0, 1.0))
+                a5_scale = forced_scale
+                self.current_vol_target_diag_info["forced"] = True
+                self.current_vol_target_diag_info["forced_scale"] = float(forced_scale)
+                self.current_vol_target_diag_info["force_source"] = "env"
+                print(f"[VOL TARGET FORCE] scale_forced={forced_scale:.2f} (env GW_VOL_TARGET_FORCE)")
+        else:
+            self.current_vol_target_diag_info["forced"] = False
+            self.current_vol_target_diag_info.pop("forced_scale", None)
+            self.current_vol_target_diag_info.pop("force_source", None)
+        adjusted_weights, a5_apply_info = self.apply_vol_target_scale_to_weights(
+            adjusted_weights,
+            a5_scale,
+            min_scale=float(self.config.get('execution', {}).get('target_vol_min_scale', 0.2) or 0.2),
+        )
+        self.current_vol_target_diag_info['applied'] = bool(a5_apply_info.get('applied', False))
+        self.current_vol_target_diag_info.update(dict(a5_apply_info))
+        if forced_scale is not None:
+            self.current_vol_target_diag_info["forced"] = True
+            self.current_vol_target_diag_info["forced_scale"] = float(forced_scale)
+            self.current_vol_target_diag_info["force_source"] = "env"
+        elif not bool(self.current_vol_target_diag_info.get("forced", False)):
+            self.current_vol_target_diag_info["forced"] = False
+            self.current_vol_target_diag_info.pop("forced_scale", None)
+            self.current_vol_target_diag_info.pop("force_source", None)
+        self.current_risk_check_info['vol_target_diag'] = dict(self.current_vol_target_diag_info)
+        alloc_diag['vol_target_diag'] = dict(self.current_vol_target_diag_info)
+        print(
+            "[VOL TARGET APPLY] "
+            f"scale={float(a5_apply_info.get('scale_used', 1.0) or 1.0):.4f} "
+            f"cash:{float(a5_apply_info.get('cash_before', 0.0) or 0.0):.2%}->"
+            f"{float(a5_apply_info.get('cash_after', 0.0) or 0.0):.2%} "
+            f"delta={float(a5_apply_info.get('delta_cash', 0.0) or 0.0):+.2%} "
+            f"method={self.current_vol_target_diag_info.get('a5_vol_method')} "
+            f"target_vol={self.current_vol_target_diag_info.get('a5_target_vol')} "
+            f"cfg={self.current_vol_target_diag_info.get('a5_cfg_target_vol')} "
+            f"reason={a5_apply_info.get('reason', '')}"
+        )
 
         adjusted_weights, vt_meta = self.apply_vol_targeting_to_targets(
             adjusted_weights,
@@ -8567,6 +9153,15 @@ class PaperTradingEngine:
             'vol_targeting_scale': (self.current_vol_targeting_info.get('scale') if isinstance(self.current_vol_targeting_info, dict) else None),
             'vol_targeting_vol_before': (self.current_vol_targeting_info.get('vol_before') if isinstance(self.current_vol_targeting_info, dict) else None),
             'vol_targeting_cash_after': (self.current_vol_targeting_info.get('cash_after') if isinstance(self.current_vol_targeting_info, dict) else None),
+            'vol_target_diag': dict(self.current_vol_target_diag_info) if isinstance(self.current_vol_target_diag_info, dict) else {
+                'status': 'unavailable',
+                'a5_scale': 1.0,
+                'a5_target_vol': None,
+                'a5_cfg_target_vol': None,
+                'a5_vol_method': 'unavailable',
+                'a5_cov_coverage': None,
+                'a5_reason': 'unavailable',
+            },
             'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {
                 'enabled': False,
                 'total': 0.0,

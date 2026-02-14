@@ -7043,6 +7043,27 @@ def render_portfolio_monitor():
                         st.caption("tz_bad_tickers (top 10)")
                         st.dataframe(pd.DataFrame({"ticker": tz_bad_list[:10]}), width="stretch", hide_index=True)
 
+                cov_target = snapshot.get("cov_risk_target_summary", {})
+                if isinstance(cov_target, dict) and cov_target:
+                    st.markdown("**Covariance Risk (Target)**")
+                    cov_returns_meta = cov_target.get("returns_meta", {})
+                    if not isinstance(cov_returns_meta, dict):
+                        cov_returns_meta = {}
+                    cov_coverage = _to_float(cov_returns_meta.get("overall_row_coverage", None), None)
+                    cov_vol = _to_float(cov_target.get("portfolio_vol_annualized", None), None)
+                    cov_max_rc = _to_float(cov_target.get("max_rc_fraction", None), None)
+                    cov_avg_corr = _to_float(cov_target.get("avg_pairwise_corr", None), None)
+                    cov_status = str(cov_target.get("status", "-") or "-")
+                    cov_method = str(cov_target.get("method", "-") or "-")
+                    st.caption(
+                        f"status={cov_status} | method={cov_method} | "
+                        f"vol={cov_vol} | max_rc={cov_max_rc} | coverage={cov_coverage} | avg_corr={cov_avg_corr}"
+                    )
+                    top_pairs = cov_target.get("top_corr_pairs", [])
+                    if isinstance(top_pairs, list) and top_pairs:
+                        st.caption("top_corr_pairs (target, top 3)")
+                        st.dataframe(pd.DataFrame(top_pairs[:3]), width="stretch", hide_index=True)
+
                 if bool(st.session_state.get("pm_telemetry_show_events", False)):
                     events_rows = read_jsonl_tail(events_path, max_lines=5000)
                     events_rows = _apply_common_filters(events_rows)
