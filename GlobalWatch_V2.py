@@ -6644,6 +6644,7 @@ def render_portfolio_monitor():
         "pm_telemetry_cycle_filter": False,
         "pm_telemetry_cycle_min": 0,
         "pm_telemetry_cycle_max": 0,
+        "diag_risk_profile_filter": "All",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -6718,6 +6719,23 @@ def render_portfolio_monitor():
 
     def load_trade_history(path, interval_seconds, refresh_nonce):
         ttl_seconds = 1
+        valid_profiles = {"low", "mid", "high", "ultra"}
+
+        def _normalize_trade_rows(rows):
+            if not isinstance(rows, list):
+                return []
+            normalized = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                out = dict(row)
+                profile = str(out.get("risk_profile", "") or "").strip().lower()
+                if profile not in valid_profiles:
+                    profile = "mid"
+                out["risk_profile"] = profile
+                normalized.append(out)
+            return normalized
+
         try:
             stat = os.stat(path)
             mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)))
@@ -6728,14 +6746,14 @@ def render_portfolio_monitor():
 
         @st.cache_data(ttl=ttl_seconds, show_spinner=False)
         def _cached_trades(trades_file, nonce, mtime_ns_key, size_key):
-            return _safe_read_jsonl(trades_file)
+            return _normalize_trade_rows(_safe_read_jsonl(trades_file))
 
         try:
             return _cached_trades(path, int(refresh_nonce), int(mtime_ns), int(file_size))
         except KeyError:
-            return _safe_read_jsonl(path)
+            return _normalize_trade_rows(_safe_read_jsonl(path))
         except Exception:
-            return _safe_read_jsonl(path)
+            return _normalize_trade_rows(_safe_read_jsonl(path))
 
     def load_daily_reports_index(path, interval_seconds, refresh_nonce):
         ttl_seconds = max(1, int(interval_seconds))
@@ -6836,6 +6854,10 @@ def render_portfolio_monitor():
         if not isinstance(daily_report_entries, list):
             daily_report_entries = []
 
+        def _norm_profile(value):
+            s = str(value or "").strip().lower()
+            return s if s in {"low", "mid", "high", "ultra"} else "mid"
+
         # Create container inside the render call so fragment-owned widgets
         # are not written into a container created outside fragment context.
         with st.container():
@@ -6864,11 +6886,24 @@ def render_portfolio_monitor():
             st.caption(f"Run: {run_id_short} | schema: {schema_text} | cycle: {cycle_text}")
 
             with st.expander("Diagnostics / Telemetry", expanded=False):
-                diag_col1, diag_col2, diag_col3, diag_col4 = st.columns(4)
+                diag_col1, diag_col2, diag_col3, diag_col4, diag_col5 = st.columns(5)
                 diag_col1.slider("Recent N", min_value=10, max_value=200, key="pm_telemetry_rows")
                 diag_col2.checkbox("Show events", key="pm_telemetry_show_events")
                 diag_col3.selectbox("Level", ["ALL", "INFO", "WARN", "ERROR"], key="pm_telemetry_level")
                 diag_col4.checkbox("Cycle range", key="pm_telemetry_cycle_filter")
+                diag_col5.selectbox(
+                    "Risk Profile Filter",
+                    ["All", "low", "mid", "high", "ultra"],
+                    index=0,
+                    key="diag_risk_profile_filter",
+                )
+                active_profile_for_filter = _norm_profile(snapshot.get("active_risk_profile"))
+                selected_profile_filter = str(st.session_state.get("diag_risk_profile_filter", "All") or "All")
+                if selected_profile_filter not in ("All", "low", "mid", "high", "ultra"):
+                    selected_profile_filter = "All"
+                if st.button("Use Active Profile", key="diag_use_active_profile_btn"):
+                    st.session_state["diag_risk_profile_filter"] = active_profile_for_filter
+                    selected_profile_filter = active_profile_for_filter
 
                 config_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
                 cfg_obj = _safe_read_json(config_path)
@@ -6907,6 +6942,15 @@ def render_portfolio_monitor():
                     if isinstance(payload, dict):
                         return payload
                     return {}
+
+                def _extract_active_risk_profile(row):
+                    payload = _extract_payload(row)
+                    profile = ""
+                    if isinstance(payload, dict):
+                        profile = str(payload.get("active_risk_profile", "") or "").strip().lower()
+                    if not profile:
+                        profile = str(row.get("active_risk_profile", row.get("risk_profile", "")) or "").strip().lower()
+                    return _norm_profile(profile)
 
                 def _apply_common_filters(rows):
                     filtered = [r for r in rows if isinstance(r, dict)]
@@ -6950,6 +6994,13 @@ def render_portfolio_monitor():
 
                 metrics_rows = read_jsonl_tail(metrics_path, max_lines=5000)
                 metrics_rows = _apply_common_filters(metrics_rows)
+                metrics_total = len(metrics_rows)
+                if selected_profile_filter != "All":
+                    metrics_rows = [
+                        r for r in metrics_rows
+                        if _extract_active_risk_profile(r) == selected_profile_filter
+                    ]
+                st.caption(f"Showing: {selected_profile_filter} ({len(metrics_rows)} / {metrics_total})")
                 if not run_id_text:
                     st.caption("Current snapshot has no run_id; showing all telemetry rows.")
 
@@ -6985,6 +7036,7 @@ def render_portfolio_monitor():
                             {
                                 "ts_utc": str(row.get("ts_utc", ""))[:19],
                                 "cycle_id": _extract_cycle_id(row),
+                                "active_risk_profile": _extract_active_risk_profile(row),
                                 "total_equity": _to_float(payload.get("total_equity", row.get("total_equity", None)), None),
                                 "cash_pct": _to_float(payload.get("cash_pct", row.get("cash_pct", None)), None),
                                 "drawdown": _to_float(payload.get("drawdown", row.get("drawdown", None)), None),
@@ -7067,6 +7119,13 @@ def render_portfolio_monitor():
                 if bool(st.session_state.get("pm_telemetry_show_events", False)):
                     events_rows = read_jsonl_tail(events_path, max_lines=5000)
                     events_rows = _apply_common_filters(events_rows)
+                    events_total = len(events_rows)
+                    if selected_profile_filter != "All":
+                        events_rows = [
+                            r for r in events_rows
+                            if _extract_active_risk_profile(r) == selected_profile_filter
+                        ]
+                    st.caption(f"Showing: {selected_profile_filter} ({len(events_rows)} / {events_total})")
                     if not events_rows:
                         st.info("No events telemetry yet.")
                     else:
@@ -7085,6 +7144,7 @@ def render_portfolio_monitor():
                                 {
                                     "ts_utc": str(row.get("ts_utc", ""))[:19],
                                     "cycle_id": _extract_cycle_id(row),
+                                    "active_risk_profile": _extract_active_risk_profile(row),
                                     "event": str(row.get("event", "")),
                                     "status": str(row.get("status", "")),
                                     "duration_ms": _to_float(row.get("duration_ms", None), None),
@@ -7133,9 +7193,20 @@ def render_portfolio_monitor():
             with trade_history_slot:
                 st.subheader("Trade History")
                 st.caption("Updates on app rerun. Enable Auto refresh or click Refresh data for near real-time updates.")
-                if trades:
+                trades_total = len(trades) if isinstance(trades, list) else 0
+                trades_view = list(trades) if isinstance(trades, list) else []
+                selected_profile_filter = str(st.session_state.get("diag_risk_profile_filter", "All") or "All")
+                if selected_profile_filter not in ("All", "low", "mid", "high", "ultra"):
+                    selected_profile_filter = "All"
+                if selected_profile_filter != "All":
+                    trades_view = [
+                        t for t in trades_view
+                        if _norm_profile((t or {}).get("risk_profile")) == selected_profile_filter
+                    ]
+                st.caption(f"Showing: {selected_profile_filter} ({len(trades_view)} / {trades_total})")
+                if trades_view:
                     trade_rows = []
-                    for row_idx, trade in enumerate(trades):
+                    for row_idx, trade in enumerate(trades_view):
                         timestamp = trade.get("timestamp") or trade.get("time") or trade.get("datetime") or ""
                         ticker = str(trade.get("ticker", ""))
                         side = str(trade.get("side", trade.get("direction", "")))
@@ -7180,6 +7251,7 @@ def render_portfolio_monitor():
                                 "time": str(timestamp),
                                 "ticker": ticker,
                                 "side": side,
+                                "risk_profile": str(trade.get("risk_profile", "mid") or "mid").strip().upper(),
                                 "amount": amount,
                                 "weight_change": weight_change if weight_change is not None else "N/A",
                                 "_row_order": int(row_idx),
@@ -7671,6 +7743,122 @@ st.set_page_config(page_title="GlobalWatch DeepSeek Edition", layout="wide", pag
 
 st.sidebar.header("Settings")
 st.sidebar.caption(f"Brain: {LOCAL_MODEL}")
+
+# Risk profile status + runtime request (next-cycle apply).
+_risk_profile_choices = ["low", "mid", "high", "ultra"]
+_paper_cfg_path = os.environ.get("PAPER_CONFIG_PATH", "paper_config.json")
+_paper_cfg_obj = _safe_read_json(_paper_cfg_path)
+_paper_reporting_cfg = _paper_cfg_obj.get("reporting", {}) if isinstance(_paper_cfg_obj, dict) else {}
+if not isinstance(_paper_reporting_cfg, dict):
+    _paper_reporting_cfg = {}
+_snapshot_live_path = str(_paper_reporting_cfg.get("snapshot_live_path", "outputs/snapshot_live.json")).strip() or "outputs/snapshot_live.json"
+_snapshot_live_obj = _safe_read_json(_snapshot_live_path)
+if not isinstance(_snapshot_live_obj, dict):
+    _snapshot_live_obj = {}
+
+_active_risk_profile = str(_snapshot_live_obj.get("active_risk_profile", "") or "").strip().lower()
+if _active_risk_profile not in _risk_profile_choices:
+    _active_risk_profile = "mid"
+_requested_risk_profile = str(_snapshot_live_obj.get("requested_risk_profile", "") or "").strip().lower()
+if _requested_risk_profile not in _risk_profile_choices:
+    _requested_risk_profile = _active_risk_profile
+_risk_profile_template_version = _snapshot_live_obj.get("risk_profile_template_version")
+_risk_profile_overrides_hash = str(_snapshot_live_obj.get("risk_profile_overrides_hash", "") or "").strip()
+_applied_cycle = _snapshot_live_obj.get("risk_profile_applied_cycle_id")
+_applied_time = _snapshot_live_obj.get("risk_profile_applied_at_utc")
+
+st.sidebar.markdown("**Risk Profile**")
+st.sidebar.caption(f"Active Risk Profile: {_active_risk_profile.upper()}")
+if _requested_risk_profile != _active_risk_profile:
+    st.sidebar.caption(f"Requested Risk Profile: {_requested_risk_profile.upper()} (pending, will apply next cycle)")
+else:
+    st.sidebar.caption(f"Requested Risk Profile: {_requested_risk_profile.upper()} (active)")
+st.sidebar.caption(
+    f"Applied at cycle: {str(_applied_cycle) if _applied_cycle not in (None, '') else '-'} / "
+    f"time: {str(_applied_time) if _applied_time not in (None, '') else '-'}"
+)
+st.sidebar.caption(
+    f"Template version: {str(_risk_profile_template_version) if _risk_profile_template_version not in (None, '') else '-'}"
+)
+st.sidebar.caption(
+    f"Profile hash: {_risk_profile_overrides_hash[:8] if _risk_profile_overrides_hash else '-'}"
+)
+
+if _requested_risk_profile in _risk_profile_choices:
+    _default_risk_profile = _requested_risk_profile
+elif _active_risk_profile in _risk_profile_choices:
+    _default_risk_profile = _active_risk_profile
+else:
+    _default_risk_profile = "mid"
+
+_selected_runtime_profile = st.sidebar.selectbox(
+    "Set risk profile",
+    _risk_profile_choices,
+    index=_risk_profile_choices.index(_default_risk_profile),
+    key="runtime_risk_profile_select",
+)
+
+_runtime_control_path_cfg = str(_paper_reporting_cfg.get("runtime_control_path", "")).strip()
+if _runtime_control_path_cfg:
+    _runtime_control_path = os.path.abspath(_runtime_control_path_cfg)
+else:
+    _reporting_out_dir = str(_paper_reporting_cfg.get("out_dir", "")).strip()
+    if _reporting_out_dir:
+        _runtime_control_path = os.path.abspath(os.path.join(_reporting_out_dir, "runtime_control.json"))
+    else:
+        _runtime_control_path = os.path.abspath(os.path.join("outputs", "runtime_control.json"))
+
+_runtime_control_obj = _safe_read_json(_runtime_control_path)
+if not isinstance(_runtime_control_obj, dict):
+    _runtime_control_obj = {}
+_runtime_control_updated_at = str(_runtime_control_obj.get("updated_at_utc", "") or "").strip()
+if _runtime_control_updated_at:
+    st.sidebar.caption(f"Last request at: {_runtime_control_updated_at}")
+
+if st.sidebar.button("Apply next cycle", key="runtime_risk_profile_apply_btn"):
+    try:
+        _selected_profile_norm = str(_selected_runtime_profile).strip().lower()
+        if _selected_profile_norm == _requested_risk_profile:
+            st.session_state["runtime_risk_profile_notice"] = {
+                "ok": True,
+                "noop": True,
+                "requested": _selected_profile_norm,
+            }
+        else:
+            _request_id = uuid.uuid4().hex[:12]
+            _runtime_payload = {
+                "schema_version": 1,
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "request_id": _request_id,
+                "requested_risk_profile": _selected_profile_norm,
+            }
+            io_atomic_write_json(_runtime_control_path, _runtime_payload, indent=2)
+            st.session_state["runtime_risk_profile_notice"] = {
+                "ok": True,
+                "request_id": _request_id,
+                "requested": _runtime_payload["requested_risk_profile"],
+            }
+    except Exception as _runtime_rp_err:
+        st.session_state["runtime_risk_profile_notice"] = {
+            "ok": False,
+            "error": str(_runtime_rp_err),
+        }
+
+_runtime_rp_notice = st.session_state.get("runtime_risk_profile_notice", {})
+if isinstance(_runtime_rp_notice, dict) and _runtime_rp_notice:
+    if bool(_runtime_rp_notice.get("ok", False)):
+        if bool(_runtime_rp_notice.get("noop", False)):
+            st.sidebar.info("Already requested; waiting for next cycle.")
+        else:
+            st.sidebar.success("Request sent. Will apply next cycle.")
+            _req_id = str(_runtime_rp_notice.get("request_id", "")).strip()
+            if _req_id:
+                st.sidebar.caption(f"request_id: {_req_id}")
+    else:
+        st.sidebar.error("Failed to send request.")
+        _err = str(_runtime_rp_notice.get("error", "")).strip()
+        if _err:
+            st.sidebar.caption(_err)
 
 page_options = ["\U0001F4E1 Global Macro Signals", "\U0001F4BC Portfolio Monitor"]
 if "page" not in st.session_state or st.session_state.get("page") not in page_options:

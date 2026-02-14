@@ -1317,6 +1317,7 @@
     "fallback_to_diag_on_error": true
   },
   "execution": {
+    "risk_profile": "",
     "weight_threshold": 0.025,
     "min_trade_notional_usd": 400,
     "signal_refresh_minutes": 1440,
@@ -1377,6 +1378,104 @@
         "RECENT",
         "STALE"
       ]
+    }
+  },
+  "risk_profiles": {
+    "low": {
+      "execution": {
+        "target_vol_annual": 0.08,
+        "portfolio_exposure_cap": 0.9,
+        "max_turnover_pct_per_rebalance": 0.12,
+        "weight_threshold": 0.02,
+        "enable_target_cov_gate": false,
+        "target_cov_gate_min_coverage": 0.6,
+        "target_cov_gate_require_ok": true
+      },
+      "objectives": {
+        "min_cash_pct": 0.2,
+        "max_weight_per_asset": 0.12
+      },
+      "risk_model": {
+        "rc_limit": 0.18,
+        "use_cov_vol_for_gate": false
+      },
+      "news_overlay": {
+        "alpha": 0.4,
+        "max_abs_delta": 0.02,
+        "min_confidence": 0.55
+      }
+    },
+    "mid": {
+      "execution": {
+        "target_vol_annual": 0.12,
+        "portfolio_exposure_cap": 0.95,
+        "max_turnover_pct_per_rebalance": 0.18,
+        "weight_threshold": 0.015,
+        "enable_target_cov_gate": false,
+        "target_cov_gate_min_coverage": 0.6,
+        "target_cov_gate_require_ok": true
+      },
+      "objectives": {
+        "min_cash_pct": 0.12,
+        "max_weight_per_asset": 0.15
+      },
+      "risk_model": {
+        "rc_limit": 0.22,
+        "use_cov_vol_for_gate": true
+      },
+      "news_overlay": {
+        "alpha": 0.6,
+        "max_abs_delta": 0.03,
+        "min_confidence": 0.45
+      }
+    },
+    "high": {
+      "execution": {
+        "target_vol_annual": 0.16,
+        "portfolio_exposure_cap": 1.0,
+        "max_turnover_pct_per_rebalance": 0.28,
+        "weight_threshold": 0.01,
+        "enable_target_cov_gate": true,
+        "target_cov_gate_min_coverage": 0.6,
+        "target_cov_gate_require_ok": true
+      },
+      "objectives": {
+        "min_cash_pct": 0.08,
+        "max_weight_per_asset": 0.22
+      },
+      "risk_model": {
+        "rc_limit": 0.3,
+        "use_cov_vol_for_gate": true
+      },
+      "news_overlay": {
+        "alpha": 0.75,
+        "max_abs_delta": 0.05,
+        "min_confidence": 0.4
+      }
+    },
+    "ultra": {
+      "execution": {
+        "target_vol_annual": 0.22,
+        "portfolio_exposure_cap": 1.0,
+        "max_turnover_pct_per_rebalance": 0.4,
+        "weight_threshold": 0.0075,
+        "enable_target_cov_gate": true,
+        "target_cov_gate_min_coverage": 0.6,
+        "target_cov_gate_require_ok": true
+      },
+      "objectives": {
+        "min_cash_pct": 0.03,
+        "max_weight_per_asset": 0.3
+      },
+      "risk_model": {
+        "rc_limit": 0.4,
+        "use_cov_vol_for_gate": true
+      },
+      "news_overlay": {
+        "alpha": 0.9,
+        "max_abs_delta": 0.07,
+        "min_confidence": 0.35
+      }
     }
   },
   "trade_planner": {

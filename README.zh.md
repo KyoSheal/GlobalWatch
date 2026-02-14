@@ -102,7 +102,7 @@ Streamlit 主要包含：
 3. `python paper_trading.py --debug-news-overlay-phase2 --debug-outdir outputs/gw_dryrun paper_config.json`  
    对应：Phase2 消费侧确定性验收（内置用例，输出 PASS/FAIL）。
 4. `python paper_trading.py --debug-system-s1-5 --debug-outdir outputs/gw_dryrun paper_config.json`  
-   对应：系统级 S1-S5 总体验收，快速确认主链路是否可运行。
+   对应：系统级总体验收，快速确认主链路是否可运行。
 
 ## 关键配置速查（paper_config.json）
 这里只写用途，不展开具体阈值调参细节。

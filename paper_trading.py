@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import uuid
+import copy
 import hashlib
 import argparse
 import shutil
@@ -22,6 +23,7 @@ from atomic_io import (
     atomic_write_json as io_atomic_write_json,
     atomic_write_jsonl as io_atomic_write_jsonl,
     atomic_write_text as io_atomic_write_text,
+    safe_read_json as io_safe_read_json,
 )
 from price_service import PriceService
 try:
@@ -101,6 +103,131 @@ for keyword in REAL_BROKER_KEYWORDS:
         pass  # Good, no real broker library
 
 LIVE_SCHEMA_VERSION = 2
+RISK_PROFILE_TEMPLATE_VERSION = 1
+DEFAULT_RISK_PROFILES = {
+    "low": {
+        "execution": {
+            "target_vol_annual": 0.08,
+            "portfolio_exposure_cap": 0.90,
+            "max_turnover_pct_per_rebalance": 0.12,
+            "weight_threshold": 0.02,
+            "enable_target_cov_gate": False,
+            "target_cov_gate_min_coverage": 0.60,
+            "target_cov_gate_require_ok": True,
+        },
+        "objectives": {
+            "min_cash_pct": 0.20,
+            "max_weight_per_asset": 0.12,
+        },
+        "risk_model": {
+            "rc_limit": 0.18,
+            "use_cov_vol_for_gate": False,
+        },
+        "news_overlay": {
+            "alpha": 0.40,
+            "max_abs_delta": 0.02,
+            "min_confidence": 0.55,
+        },
+    },
+    "mid": {
+        "execution": {
+            "target_vol_annual": 0.12,
+            "portfolio_exposure_cap": 0.95,
+            "max_turnover_pct_per_rebalance": 0.18,
+            "weight_threshold": 0.015,
+            "enable_target_cov_gate": False,
+            "target_cov_gate_min_coverage": 0.60,
+            "target_cov_gate_require_ok": True,
+        },
+        "objectives": {
+            "min_cash_pct": 0.12,
+            "max_weight_per_asset": 0.15,
+        },
+        "risk_model": {
+            "rc_limit": 0.22,
+            "use_cov_vol_for_gate": True,
+        },
+        "news_overlay": {
+            "alpha": 0.60,
+            "max_abs_delta": 0.03,
+            "min_confidence": 0.45,
+        },
+    },
+    "high": {
+        "execution": {
+            "target_vol_annual": 0.16,
+            "portfolio_exposure_cap": 1.00,
+            "max_turnover_pct_per_rebalance": 0.28,
+            "weight_threshold": 0.01,
+            "enable_target_cov_gate": True,
+            "target_cov_gate_min_coverage": 0.60,
+            "target_cov_gate_require_ok": True,
+        },
+        "objectives": {
+            "min_cash_pct": 0.08,
+            "max_weight_per_asset": 0.22,
+        },
+        "risk_model": {
+            "rc_limit": 0.30,
+            "use_cov_vol_for_gate": True,
+        },
+        "news_overlay": {
+            "alpha": 0.75,
+            "max_abs_delta": 0.05,
+            "min_confidence": 0.40,
+        },
+    },
+    "ultra": {
+        "execution": {
+            "target_vol_annual": 0.22,
+            "portfolio_exposure_cap": 1.00,
+            "max_turnover_pct_per_rebalance": 0.40,
+            "weight_threshold": 0.0075,
+            "enable_target_cov_gate": True,
+            "target_cov_gate_min_coverage": 0.60,
+            "target_cov_gate_require_ok": True,
+        },
+        "objectives": {
+            "min_cash_pct": 0.03,
+            "max_weight_per_asset": 0.30,
+        },
+        "risk_model": {
+            "rc_limit": 0.40,
+            "use_cov_vol_for_gate": True,
+        },
+        "news_overlay": {
+            "alpha": 0.90,
+            "max_abs_delta": 0.07,
+            "min_confidence": 0.35,
+        },
+    },
+}
+RISK_PROFILE_ALLOWED_KEYS = {
+    "execution": {
+        "target_vol_annual",
+        "portfolio_exposure_cap",
+        "max_turnover_pct_per_rebalance",
+        "weight_threshold",
+        "enable_target_cov_gate",
+        "target_cov_gate_min_coverage",
+        "target_cov_gate_require_ok",
+    },
+    "objectives": {
+        "min_cash_pct",
+        "max_weight_per_asset",
+    },
+    "risk_model": {
+        "rc_limit",
+        "use_cov_vol_for_gate",
+    },
+    "news_overlay": {
+        "alpha",
+        "max_abs_delta",
+        "min_confidence",
+    },
+}
+RISK_PROFILE_CHOICES = tuple(sorted(DEFAULT_RISK_PROFILES.keys()))
+RISK_PROFILE_DEFAULT = "mid"
 
 
 class MacroSignalAdapter:
@@ -819,10 +946,27 @@ class PaperTradingEngine:
     
     def __init__(self, config_path='paper_config.json'):
         """def __init__: docstring omitted (was garbled/non-ASCII)."""
+        self._risk_profile_default_events = []
+        self._risk_profile_default_event_keys = set()
         self.config = self.load_config(config_path)
+        self.config, self.risk_profile_diag = self.apply_risk_profile(self.config)
         self.validate_config()
         self.config_hash = self._compute_config_hash(self.config)
         reporting_cfg = self.config.get('reporting', {})
+        execution_cfg = self.config.get('execution', {}) if isinstance(self.config, dict) else {}
+        initial_profile = str(execution_cfg.get('risk_profile', '') or '').strip().lower()
+        self.active_risk_profile = initial_profile if isinstance(self.risk_profile_diag, dict) and self.risk_profile_diag.get('status') == 'applied' else ""
+        self.requested_risk_profile = str(self.active_risk_profile)
+        self.risk_profile_template_version = int((self.risk_profile_diag or {}).get('template_version', RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION)
+        self.risk_profile_overrides_hash = self._compute_risk_profile_overrides_hash(
+            self.risk_profile_diag if isinstance(self.risk_profile_diag, dict) else {},
+            self._build_risk_profile_important_values(self.config),
+        ) if self.active_risk_profile else ""
+        self.risk_profile_applied_cycle_id = 0 if self.active_risk_profile else None
+        self.risk_profile_applied_at_utc = self._now().isoformat() if self.active_risk_profile else None
+        self.runtime_control_request_id = None
+        self._last_runtime_control_result_key = None
+        self.runtime_control_path = self._resolve_runtime_control_path()
         self.account_id = str(reporting_cfg.get('account_id', 'paper_main') or 'paper_main').strip()
         self.runtime_env = str(reporting_cfg.get('env', 'live') or 'live').strip().lower()
         configured_session_id = str(os.environ.get('GW_SESSION_ID', '') or '').strip()
@@ -1090,8 +1234,51 @@ class PaperTradingEngine:
                 "account_id": self.account_id,
                 "env": self.runtime_env,
                 "telemetry_out_dir": self.telemetry_out_dir,
+                "runtime_control_path": self.runtime_control_path,
             },
         )
+        if isinstance(self._risk_profile_default_events, list):
+            for rp_evt in self._risk_profile_default_events:
+                if not isinstance(rp_evt, dict):
+                    continue
+                self._telemetry_log_event(
+                    "RISK_PROFILE_DEFAULTED",
+                    cycle_id=int(self.current_cycle),
+                    status="defaulted",
+                    payload=dict(rp_evt),
+                )
+        profile_diag = dict(self.risk_profile_diag) if isinstance(self.risk_profile_diag, dict) else {}
+        profile_status = str(profile_diag.get("status", "skipped") or "skipped")
+        overrides_applied = list(profile_diag.get("overrides_applied", []) or [])
+        important_values = self._build_risk_profile_important_values(self.config)
+        self._telemetry_log_event(
+            "RISK_PROFILE_SET",
+            cycle_id=int(self.current_cycle),
+            status=profile_status,
+            payload={
+                "profile": str(profile_diag.get("profile", "") or ""),
+                "enabled": bool(profile_diag.get("enabled", False)),
+                "template_version": int(profile_diag.get("template_version", RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION),
+                "overrides_count": int(len(overrides_applied)),
+                "overrides_applied": overrides_applied[:30],
+                "important_values": important_values,
+                "error": profile_diag.get("error"),
+            },
+        )
+        if profile_status == "applied":
+            print(
+                "[RISK PROFILE] "
+                f"applied={profile_diag.get('profile')} "
+                f"target_vol={float(important_values['target_vol_annual'] or 0.0):.2f} "
+                f"min_cash={float(important_values['min_cash_floor'] or 0.0):.2f} "
+                f"exposure_cap={float(important_values['portfolio_exposure_cap'] or 0.0):.2f} "
+                f"alpha={float(important_values['overlay_alpha'] or 0.0):.2f}"
+            )
+        elif profile_status == "unknown_profile":
+            print(
+                f"[WARN] [RISK PROFILE] unknown profile: "
+                f"{profile_diag.get('profile')!r}; using base config"
+            )
     
     def load_config(self, config_path):
         """def load_config: docstring omitted (was garbled/non-ASCII)."""
@@ -1149,6 +1336,7 @@ class PaperTradingEngine:
         execution_config.setdefault('enable_target_cov_gate', False)
         execution_config.setdefault('target_cov_gate_min_coverage', 0.60)
         execution_config.setdefault('target_cov_gate_require_ok', True)
+        execution_config.setdefault('risk_profile', '')
         execution_config.setdefault('portfolio_exposure_cap', 0.90)
         execution_config.setdefault('price_ttl_seconds', 45)
         execution_config.setdefault('price_batch_chunk_size', 50)
@@ -1224,6 +1412,18 @@ class PaperTradingEngine:
         reporting_config.setdefault('daily_report_stale_ratio_threshold', 0.8)
         reporting_config.setdefault('daily_report_stale_streak_threshold', 3)
         reporting_config.setdefault('max_price_debug_items', 50)
+        reporting_config.setdefault('runtime_control_path', '')
+        reporting_config.setdefault('write_snapshot_on_profile_apply', True)
+
+        # Risk profile templates (can be overridden in paper_config.json).
+        risk_profiles_cfg = config.setdefault('risk_profiles', {})
+        if not isinstance(risk_profiles_cfg, dict):
+            print("[WARN] risk_profiles must be an object; fallback to defaults")
+            risk_profiles_cfg = {}
+            config['risk_profiles'] = risk_profiles_cfg
+        for profile_name, profile_template in DEFAULT_RISK_PROFILES.items():
+            if profile_name not in risk_profiles_cfg or not isinstance(risk_profiles_cfg.get(profile_name), dict):
+                risk_profiles_cfg[profile_name] = copy.deepcopy(profile_template)
 
         # Normalize exposure cap to a safe float in [0, 1] with backward-compatible default.
         exposure_cap_raw = execution_config.get('portfolio_exposure_cap', 0.90)
@@ -1245,6 +1445,8 @@ class PaperTradingEngine:
                 f"{exposure_cap:.4f} to {exposure_cap_clamped:.4f}"
             )
         execution_config['portfolio_exposure_cap'] = float(exposure_cap_clamped)
+        # Force startup risk profile to one of low/mid/high/ultra.
+        self._normalize_execution_risk_profile(source="load_config", config_obj=config)
         
         return config
 
@@ -1255,9 +1457,359 @@ class PaperTradingEngine:
             return hashlib.sha256(serialized.encode('utf-8')).hexdigest()[:12]
         except Exception:
             return "unknown"
+
+    def _register_risk_profile_default_event(self, *, source, original, normalized, reason):
+        key = (str(source), str(reason), str(original), str(normalized))
+        if key in self._risk_profile_default_event_keys:
+            return
+        self._risk_profile_default_event_keys.add(key)
+        self._risk_profile_default_events.append(
+            {
+                "source": str(source),
+                "original": None if original is None else str(original),
+                "normalized": str(normalized),
+                "reason": str(reason),
+            }
+        )
+
+    def _normalize_execution_risk_profile(self, *, source, config_obj=None):
+        """Force execution.risk_profile to one of low/mid/high/ultra."""
+        target_cfg = config_obj if isinstance(config_obj, dict) else (self.config if isinstance(getattr(self, "config", None), dict) else {})
+        execution_cfg = target_cfg.get("execution", {}) if isinstance(target_cfg, dict) else {}
+        if not isinstance(execution_cfg, dict):
+            execution_cfg = {}
+            if isinstance(target_cfg, dict):
+                target_cfg["execution"] = execution_cfg
+        raw_value = execution_cfg.get("risk_profile", None)
+        normalized = str(raw_value).strip().lower() if raw_value is not None else ""
+
+        if not normalized:
+            execution_cfg["risk_profile"] = RISK_PROFILE_DEFAULT
+            print(f"[WARN] [RISK PROFILE] empty -> defaulting to {RISK_PROFILE_DEFAULT}")
+            self._register_risk_profile_default_event(
+                source=source,
+                original=raw_value,
+                normalized=RISK_PROFILE_DEFAULT,
+                reason="empty_default_mid",
+            )
+            return RISK_PROFILE_DEFAULT
+
+        if normalized not in RISK_PROFILE_CHOICES:
+            execution_cfg["risk_profile"] = RISK_PROFILE_DEFAULT
+            print(
+                f"[WARN] [RISK PROFILE] unknown profile {normalized!r} -> "
+                f"defaulting to {RISK_PROFILE_DEFAULT}"
+            )
+            self._register_risk_profile_default_event(
+                source=source,
+                original=raw_value,
+                normalized=RISK_PROFILE_DEFAULT,
+                reason="unknown_profile_default_mid",
+            )
+            return RISK_PROFILE_DEFAULT
+
+        execution_cfg["risk_profile"] = normalized
+        return normalized
+
+    def _deep_merge_dicts(self, dst, src):
+        """Recursively merge src into dst; src values override dst."""
+        if not isinstance(dst, dict):
+            dst = {}
+        if not isinstance(src, dict):
+            return copy.deepcopy(src)
+        out = copy.deepcopy(dst)
+        for k, v in src.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = self._deep_merge_dicts(out.get(k, {}), v)
+            else:
+                out[k] = copy.deepcopy(v)
+        return out
+
+    def apply_risk_profile(self, config):
+        """Apply optional risk profile template to config (whitelisted keys only)."""
+        if not isinstance(config, dict):
+            return config, {"enabled": False, "status": "skipped", "error": "invalid_config"}
+
+        execution_cfg = config.get("execution", {})
+        if not isinstance(execution_cfg, dict):
+            execution_cfg = {}
+            config["execution"] = execution_cfg
+        profile_name = str(execution_cfg.get("risk_profile", "") or "").strip().lower()
+        diag = {
+            "enabled": False,
+            "status": "skipped",
+            "profile": profile_name,
+            "template_version": int(RISK_PROFILE_TEMPLATE_VERSION),
+            "overrides_applied": [],
+        }
+        if not profile_name:
+            return config, diag
+
+        templates = config.get("risk_profiles", {})
+        if not isinstance(templates, dict):
+            print("[WARN] risk_profiles must be an object; skipping risk profile override")
+            diag.update({"status": "skipped", "error": "risk_profiles_not_object"})
+            return config, diag
+
+        template = templates.get(profile_name)
+        if not isinstance(template, dict):
+            print(f"[WARN] Unknown execution.risk_profile={profile_name!r}; skipping override")
+            diag.update({"status": "unknown_profile", "error": "unknown_profile"})
+            return config, diag
+
+        filtered_template = {}
+        overrides_applied = []
+        for section, allowed_keys in RISK_PROFILE_ALLOWED_KEYS.items():
+            section_values = template.get(section, {})
+            if not isinstance(section_values, dict):
+                continue
+            kept = {}
+            for key, value in section_values.items():
+                if key in allowed_keys:
+                    kept[key] = value
+                    overrides_applied.append(f"{section}.{key}")
+            if kept:
+                filtered_template[section] = kept
+
+        if not filtered_template:
+            diag.update({"status": "skipped", "error": "empty_filtered_template"})
+            return config, diag
+
+        merged = self._deep_merge_dicts(config, filtered_template)
+        diag.update(
+            {
+                "enabled": True,
+                "status": "applied",
+                "profile": profile_name,
+                "overrides_applied": overrides_applied,
+            }
+        )
+        return merged, diag
+
+    def _resolve_runtime_control_path(self):
+        """Resolve runtime control file path with config override support."""
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        configured = str(reporting_cfg.get('runtime_control_path', '') or '').strip()
+        if configured:
+            return os.path.abspath(configured)
+        out_dir = str(reporting_cfg.get('out_dir', '') or '').strip()
+        if out_dir:
+            return os.path.abspath(os.path.join(out_dir, 'runtime_control.json'))
+        return os.path.abspath(os.path.join('outputs', 'runtime_control.json'))
+
+    def _build_risk_profile_important_values(self, config_obj=None):
+        cfg = config_obj if isinstance(config_obj, dict) else self.config
+        execution_cfg = cfg.get('execution', {}) if isinstance(cfg, dict) else {}
+        objectives_cfg = cfg.get('objectives', {}) if isinstance(cfg, dict) else {}
+        strategy_cfg = cfg.get('strategy', {}) if isinstance(cfg, dict) else {}
+        risk_cfg = cfg.get('risk_model', {}) if isinstance(cfg, dict) else {}
+        news_cfg = cfg.get('news_overlay', {}) if isinstance(cfg, dict) else {}
+        return {
+            'target_vol_annual': execution_cfg.get('target_vol_annual', strategy_cfg.get('vol_target')),
+            'min_cash_floor': objectives_cfg.get('min_cash_pct'),
+            'portfolio_exposure_cap': execution_cfg.get('portfolio_exposure_cap'),
+            'max_single_weight': objectives_cfg.get('max_weight_per_asset'),
+            'rc_limit': risk_cfg.get('rc_limit'),
+            'overlay_alpha': news_cfg.get('alpha'),
+            'overlay_max_abs_delta': news_cfg.get('max_abs_delta'),
+            'overlay_min_confidence': news_cfg.get('min_confidence'),
+        }
+
+    def _compute_risk_profile_overrides_hash(self, diag, important_values):
+        payload = {
+            'template_version': int((diag or {}).get('template_version', RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION),
+            'overrides_applied': list((diag or {}).get('overrides_applied', []) or []),
+            'important_values': dict(important_values or {}),
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+        return hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:16]
+
+    def write_runtime_control_request(self, requested_risk_profile, request_id=None):
+        """Best-effort helper for writing runtime control request atomically."""
+        profile = str(requested_risk_profile or '').strip().lower()
+        rid = str(request_id or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
+        payload = {
+            'schema_version': 1,
+            'updated_at_utc': self._now().isoformat(),
+            'request_id': rid,
+            'requested_risk_profile': profile,
+        }
+        path = self.runtime_control_path
+        self.atomic_write_json(path, payload)
+        return path
+
+    def _maybe_apply_runtime_risk_profile(self, cycle_id, now_utc):
+        """Apply runtime risk profile request at cycle boundary only."""
+        path = getattr(self, 'runtime_control_path', None) or self._resolve_runtime_control_path()
+        control = io_safe_read_json(path, retries=2, sleep_ms=15)
+        if not isinstance(control, dict):
+            return
+
+        requested = str(control.get('requested_risk_profile', '') or '').strip().lower()
+        if not requested:
+            return
+        request_id = str(control.get('request_id', '') or '').strip()
+        key = f"{request_id}:{requested}" if request_id else requested
+
+        if requested not in RISK_PROFILE_CHOICES:
+            if self._last_runtime_control_result_key != f"reject:{key}":
+                self._telemetry_log_event(
+                    "RISK_PROFILE_APPLY_REJECTED",
+                    cycle_id=int(cycle_id),
+                    status="rejected",
+                    payload={
+                        "requested": requested,
+                        "request_id": request_id,
+                        "reason": "invalid_profile",
+                        "control_path": path,
+                    },
+                )
+                self._last_runtime_control_result_key = f"reject:{key}"
+            return
+
+        self.requested_risk_profile = requested
+        self.runtime_control_request_id = request_id or self.runtime_control_request_id
+
+        if requested == self.active_risk_profile:
+            return
+
+        old_profile = str(self.active_risk_profile or '')
+        working_cfg = copy.deepcopy(self.config)
+        working_cfg.setdefault('execution', {})
+        working_cfg['execution']['risk_profile'] = requested
+        merged_cfg, diag = self.apply_risk_profile(working_cfg)
+        diag = dict(diag) if isinstance(diag, dict) else {}
+        if str(diag.get('status', '')) != 'applied':
+            reason = str(diag.get('error', 'apply_failed') or 'apply_failed')
+            if self._last_runtime_control_result_key != f"reject:{key}:{reason}":
+                self._telemetry_log_event(
+                    "RISK_PROFILE_APPLY_REJECTED",
+                    cycle_id=int(cycle_id),
+                    status="rejected",
+                    payload={
+                        "requested": requested,
+                        "request_id": request_id,
+                        "reason": reason,
+                        "control_path": path,
+                    },
+                )
+                self._last_runtime_control_result_key = f"reject:{key}:{reason}"
+            return
+
+        self.config = merged_cfg
+        self.risk_profile_diag = dict(diag)
+        self.active_risk_profile = str(diag.get('profile', requested) or requested)
+        self.requested_risk_profile = requested
+        self.risk_profile_template_version = int(diag.get('template_version', RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION)
+        important_values = self._build_risk_profile_important_values(self.config)
+        overrides_hash = self._compute_risk_profile_overrides_hash(diag, important_values)
+        applied_at = now_utc.isoformat() if isinstance(now_utc, datetime) else self._now().isoformat()
+        self.risk_profile_overrides_hash = overrides_hash
+        self.risk_profile_applied_cycle_id = int(cycle_id)
+        self.risk_profile_applied_at_utc = applied_at
+        self.runtime_control_request_id = request_id or self.runtime_control_request_id
+        self._last_runtime_control_result_key = f"applied:{key}:{self.active_risk_profile}"
+        self._telemetry_log_event(
+            "RISK_PROFILE_APPLIED",
+            cycle_id=int(cycle_id),
+            status="applied",
+            payload={
+                "old": old_profile,
+                "new": self.active_risk_profile,
+                "request_id": request_id,
+                "applied_cycle_id": int(cycle_id),
+                "applied_at_utc": applied_at,
+                "overrides_hash": overrides_hash,
+                "overrides_count": int(len(diag.get('overrides_applied', []) or [])),
+                "template_version": int(self.risk_profile_template_version),
+                "control_path": path,
+            },
+        )
+        write_snapshot_on_apply = bool(self.config.get('reporting', {}).get('write_snapshot_on_profile_apply', True))
+        if write_snapshot_on_apply:
+            apply_snapshot_ok = False
+            try:
+                apply_snapshot = self._build_profile_apply_snapshot(cycle_id=int(cycle_id), now_utc=now_utc)
+                apply_snapshot_ok = bool(
+                    self.write_live_snapshot(
+                        apply_snapshot,
+                        source="risk_profile_apply",
+                        emit_telemetry=False,
+                        emit_cycle_metrics=False,
+                        lightweight=True,
+                    )
+                )
+            except Exception as e:
+                print(f"[WARN] Failed immediate snapshot write after risk profile apply: {e}")
+                apply_snapshot_ok = False
+            self._telemetry_log_event(
+                "RISK_PROFILE_APPLY_SNAPSHOT_WRITE",
+                cycle_id=int(cycle_id),
+                status="ok" if apply_snapshot_ok else "error",
+                payload={
+                    "request_id": request_id,
+                    "active_risk_profile": self.active_risk_profile,
+                    "requested_risk_profile": self.requested_risk_profile,
+                    "snapshot_source": "risk_profile_apply",
+                    "snapshot_path": str(self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')),
+                    "write_snapshot_on_profile_apply": bool(write_snapshot_on_apply),
+                },
+            )
+        print(
+            "[RUNTIME RISK PROFILE] "
+            f"cycle={cycle_id} old={old_profile or '-'} new={self.active_risk_profile} "
+            f"request_id={request_id or '-'} hash={overrides_hash}"
+        )
+
+    def _build_profile_apply_snapshot(self, cycle_id, now_utc):
+        """Build a lightweight snapshot payload after runtime profile apply."""
+        base = {}
+        if isinstance(self.portfolio_snapshots, list) and self.portfolio_snapshots:
+            last = self.portfolio_snapshots[-1]
+            if isinstance(last, dict):
+                try:
+                    base = copy.deepcopy(last)
+                except Exception:
+                    base = dict(last)
+
+        cycle_int = int(cycle_id)
+        ts_iso = now_utc.isoformat() if isinstance(now_utc, datetime) else self._now().isoformat()
+
+        cash_val = float(base.get('cash', self.cash) or self.cash or 0.0)
+        positions_value_val = float(base.get('positions_value', 0.0) or 0.0)
+        total_equity_val = float(base.get('total_equity', cash_val + positions_value_val) or (cash_val + positions_value_val))
+
+        base.update({
+            'timestamp': ts_iso,
+            'schema_version': int(LIVE_SCHEMA_VERSION),
+            'account_id': self.account_id,
+            'run_id': self.run_id,
+            'run_started_at': self.run_started_at,
+            'session_id': self.session_id,
+            'env': self.runtime_env,
+            'config_hash': self.config_hash,
+            'cycle': cycle_int,
+            'cycle_id': cycle_int,
+            'status': self.status,
+            'source': 'risk_profile_apply',
+            'cash': float(cash_val),
+            'positions_value': float(positions_value_val),
+            'total_equity': float(total_equity_val),
+            'active_risk_profile': str(self.active_risk_profile or RISK_PROFILE_DEFAULT),
+            'requested_risk_profile': str(self.requested_risk_profile or self.active_risk_profile or RISK_PROFILE_DEFAULT),
+            'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
+            'risk_profile_applied_cycle_id': self.risk_profile_applied_cycle_id,
+            'risk_profile_applied_at_utc': self.risk_profile_applied_at_utc,
+            'risk_profile_overrides_hash': str(self.risk_profile_overrides_hash or ''),
+        })
+        if not isinstance(base.get('positions'), dict):
+            base['positions'] = {}
+        return base
     
     def validate_config(self):
         """def validate_config: docstring omitted (was garbled/non-ASCII)."""
+        # Final guard: enforce allowed risk profiles without raising startup errors.
+        self._normalize_execution_risk_profile(source="validate_config")
         assert self.config['paper_mode'] == True, "paper_mode must be True"
         assert self.config['safety']['no_real_broker'] == True, "no_real_broker must be True"
         assert self.config['safety']['simulation_only'] == True, "simulation_only must be True"
@@ -1310,6 +1862,7 @@ class PaperTradingEngine:
         assert isinstance(self.config.get('execution', {}).get('enable_target_cov_gate', False), bool), "execution.enable_target_cov_gate must be bool"
         assert 0.0 <= float(self.config.get('execution', {}).get('target_cov_gate_min_coverage', 0.60)) <= 1.0, "execution.target_cov_gate_min_coverage must be in [0,1]"
         assert isinstance(self.config.get('execution', {}).get('target_cov_gate_require_ok', True), bool), "execution.target_cov_gate_require_ok must be bool"
+        assert isinstance(self.config.get('execution', {}).get('risk_profile', ''), str), "execution.risk_profile must be string"
         assert isinstance(self.config.get('execution', {}).get('portfolio_exposure_cap', 0.90), (int, float)), "execution.portfolio_exposure_cap must be float"
         assert 0.0 <= float(self.config.get('execution', {}).get('portfolio_exposure_cap', 0.90)) <= 1.0, "execution.portfolio_exposure_cap must be in [0,1]"
         assert float(self.config.get('execution', {}).get('max_weight_boost_for_hot', 0.05)) >= 0.0, "execution.max_weight_boost_for_hot must be >= 0"
@@ -1325,6 +1878,7 @@ class PaperTradingEngine:
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_buy'), "execution.price_stale_policy.allow_buy must not be empty"
         assert self.config.get('execution', {}).get('price_stale_policy', {}).get('allow_sell'), "execution.price_stale_policy.allow_sell must not be empty"
         assert int(self.config.get('reporting', {}).get('max_price_debug_items', 50)) >= 1, "reporting.max_price_debug_items must be >= 1"
+        assert isinstance(self.config.get('reporting', {}).get('write_snapshot_on_profile_apply', True), bool), "reporting.write_snapshot_on_profile_apply must be bool"
         macro_cfg = self.config.get('macro_integration', {})
         assert isinstance(macro_cfg.get('enable_llm_topic_signals', True), bool), "macro_integration.enable_llm_topic_signals must be bool"
         assert 0.0 <= float(macro_cfg.get('llm_topic_confidence_threshold', 0.6)) <= 1.0, "macro_integration.llm_topic_confidence_threshold must be in [0,1]"
@@ -1334,6 +1888,7 @@ class PaperTradingEngine:
         assert isinstance(macro_cfg.get('topic_sector_ticker_map', {}), dict), "macro_integration.topic_sector_ticker_map must be an object"
         assert isinstance(self.config.get('industry_map', {}), dict), "industry_map must be an object"
         assert isinstance(self.config.get('ticker_tags', {}), dict), "ticker_tags must be an object"
+        assert isinstance(self.config.get('risk_profiles', {}), dict), "risk_profiles must be an object"
         news_overlay_cfg = self.config.get('news_overlay', {})
         assert isinstance(news_overlay_cfg, dict), "news_overlay must be an object"
         assert isinstance(news_overlay_cfg.get('enabled', False), bool), "news_overlay.enabled must be bool"
@@ -1951,6 +2506,12 @@ class PaperTradingEngine:
             'env': self.runtime_env,
             'cycle': int(snapshot.get('cycle', self.current_cycle)),
             'cycle_id': int(snapshot.get('cycle_id', snapshot.get('cycle', self.current_cycle))),
+            'active_risk_profile': str(snapshot.get('active_risk_profile', self.active_risk_profile or '')),
+            'requested_risk_profile': str(snapshot.get('requested_risk_profile', self.requested_risk_profile or '')),
+            'risk_profile_template_version': int(snapshot.get('risk_profile_template_version', self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION),
+            'risk_profile_applied_cycle_id': snapshot.get('risk_profile_applied_cycle_id', self.risk_profile_applied_cycle_id),
+            'risk_profile_applied_at_utc': snapshot.get('risk_profile_applied_at_utc', self.risk_profile_applied_at_utc),
+            'risk_profile_overrides_hash': str(snapshot.get('risk_profile_overrides_hash', self.risk_profile_overrides_hash or '')),
             'status': snapshot.get('status', self.status),
             'total_equity': total_equity,
             'cash': cash,
@@ -2105,6 +2666,15 @@ class PaperTradingEngine:
             return
         try:
             cid = int(self.current_cycle if cycle_id is None else cycle_id)
+            payload_obj = payload if isinstance(payload, dict) else None
+            if payload_obj is not None:
+                payload_obj = dict(payload_obj)
+                payload_obj.setdefault("active_risk_profile", str(self.active_risk_profile or RISK_PROFILE_DEFAULT).strip().lower())
+                payload_obj.setdefault("requested_risk_profile", str(self.requested_risk_profile or self.active_risk_profile or RISK_PROFILE_DEFAULT).strip().lower())
+                payload_obj.setdefault("risk_profile_overrides_hash", str(self.risk_profile_overrides_hash or ""))
+                payload_obj.setdefault("risk_profile_template_version", int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION))
+                payload_obj.setdefault("risk_profile_applied_cycle_id", self.risk_profile_applied_cycle_id)
+                payload_obj.setdefault("risk_profile_applied_at_utc", self.risk_profile_applied_at_utc)
             logger.log_event(
                 str(event or ""),
                 cycle_id=cid,
@@ -2112,7 +2682,7 @@ class PaperTradingEngine:
                 level=str(level or "INFO"),
                 module="paper_trading",
                 message=message,
-                payload=payload if isinstance(payload, dict) else payload,
+                payload=payload_obj if payload_obj is not None else payload,
                 duration_ms=duration_ms,
                 status=status,
                 error=error,
@@ -3173,6 +3743,12 @@ class PaperTradingEngine:
             'cycle_id': int(cycle_id),
             'ts_utc': str(payload.get('timestamp', self._now().isoformat())),
             'source': str(source),
+            'active_risk_profile': str(payload.get('active_risk_profile', self.active_risk_profile or RISK_PROFILE_DEFAULT)).strip().lower(),
+            'requested_risk_profile': str(payload.get('requested_risk_profile', self.requested_risk_profile or self.active_risk_profile or RISK_PROFILE_DEFAULT)).strip().lower(),
+            'risk_profile_overrides_hash': str(payload.get('risk_profile_overrides_hash', self.risk_profile_overrides_hash or '')),
+            'risk_profile_template_version': int(payload.get('risk_profile_template_version', self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION),
+            'risk_profile_applied_cycle_id': payload.get('risk_profile_applied_cycle_id', self.risk_profile_applied_cycle_id),
+            'risk_profile_applied_at_utc': payload.get('risk_profile_applied_at_utc', self.risk_profile_applied_at_utc),
             'total_equity': float(total_equity),
             'cash': float(cash),
             'cash_pct': float((cash / total_equity) if total_equity > 0 else 0.0),
@@ -3249,11 +3825,13 @@ class PaperTradingEngine:
         )
         self._last_metrics_cycle_id = cycle_id
 
-    def write_live_snapshot(self, snapshot, source="unknown"):
+    def write_live_snapshot(self, snapshot, source="unknown", *, emit_telemetry=True, emit_cycle_metrics=True, lightweight=False):
         """Write UI-friendly live snapshot to outputs/snapshot_live.json."""
         try:
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
-            payload = self.build_live_snapshot(snapshot)
+            payload = self._build_live_snapshot_payload(snapshot) if bool(lightweight) else self.build_live_snapshot(snapshot)
+            if isinstance(payload, dict):
+                payload['source'] = str(source)
             price_debug_items = 0
             if isinstance(payload, dict) and isinstance(payload.get('price_debug'), dict):
                 price_debug_items = len(payload.get('price_debug', {}))
@@ -3274,17 +3852,18 @@ class PaperTradingEngine:
             self.atomic_write_json(live_snapshot_path, payload)
             payload_text = json.dumps(payload, ensure_ascii=False, allow_nan=False) if isinstance(payload, dict) else "{}"
             cycle_id_for_event = int(payload.get('cycle_id', payload.get('cycle', self.current_cycle)) if isinstance(payload, dict) else self.current_cycle)
-            self._telemetry_log_event(
-                "SNAPSHOT_WRITE",
-                cycle_id=cycle_id_for_event,
-                status="ok",
-                payload={
-                    "path": str(live_snapshot_path),
-                    "source": str(source),
-                    "bytes": len(payload_text.encode("utf-8")),
-                },
-            )
-            if isinstance(price_diag_summary, dict):
+            if bool(emit_telemetry):
+                self._telemetry_log_event(
+                    "SNAPSHOT_WRITE",
+                    cycle_id=cycle_id_for_event,
+                    status="ok",
+                    payload={
+                        "path": str(live_snapshot_path),
+                        "source": str(source),
+                        "bytes": len(payload_text.encode("utf-8")),
+                    },
+                )
+            if bool(emit_telemetry) and isinstance(price_diag_summary, dict):
                 if self._last_price_quality_cycle_id != cycle_id_for_event:
                     self._telemetry_log_event(
                         "PRICE_QUALITY",
@@ -3300,7 +3879,7 @@ class PaperTradingEngine:
                 cov_current_summary = {}
             if not isinstance(cov_target_summary, dict):
                 cov_target_summary = {}
-            if self._last_cov_risk_cycle_id != cycle_id_for_event:
+            if bool(emit_telemetry) and self._last_cov_risk_cycle_id != cycle_id_for_event:
                 self._telemetry_log_event(
                     "COV_RISK",
                     cycle_id=cycle_id_for_event,
@@ -3312,7 +3891,7 @@ class PaperTradingEngine:
                     stream="events",
                 )
                 self._last_cov_risk_cycle_id = cycle_id_for_event
-            if self._last_risk_gate_decision_cycle_id != cycle_id_for_event:
+            if bool(emit_telemetry) and self._last_risk_gate_decision_cycle_id != cycle_id_for_event:
                 risk_gate_payload = {
                     "risk_gate_basis": str(payload.get("risk_gate_basis", "current") or "current"),
                     "risk_gate_cov_coverage_used": payload.get("risk_gate_cov_coverage_used"),
@@ -3345,7 +3924,7 @@ class PaperTradingEngine:
             vol_target_diag = payload.get("vol_target_diag", {})
             if not isinstance(vol_target_diag, dict):
                 vol_target_diag = {}
-            if self._last_vol_target_diag_cycle_id != cycle_id_for_event:
+            if bool(emit_telemetry) and self._last_vol_target_diag_cycle_id != cycle_id_for_event:
                 self._telemetry_log_event(
                     "VOL_TARGET_DIAG",
                     cycle_id=cycle_id_for_event,
@@ -3354,7 +3933,7 @@ class PaperTradingEngine:
                     stream="events",
                 )
                 self._last_vol_target_diag_cycle_id = cycle_id_for_event
-            if self._last_vol_target_apply_cycle_id != cycle_id_for_event:
+            if bool(emit_telemetry) and self._last_vol_target_apply_cycle_id != cycle_id_for_event:
                 apply_status = "applied" if bool(vol_target_diag.get("applied", False)) else "skipped"
                 self._telemetry_log_event(
                     "VOL_TARGET_APPLY",
@@ -3396,7 +3975,7 @@ class PaperTradingEngine:
                 and str(self._last_rebalance_cost_diag_status or "").lower() in ("pending", "unavailable", "")
                 and rebalance_cost_status.lower() not in ("pending", "unavailable", "")
             )
-            if allow_rebalance_cost_log and (
+            if bool(emit_telemetry) and allow_rebalance_cost_log and (
                 self._last_rebalance_cost_diag_cycle_id != cycle_id_for_event or same_cycle_upgrade
             ):
                 self._telemetry_log_event(
@@ -3428,7 +4007,7 @@ class PaperTradingEngine:
                 self._last_rebalance_plan_filter_cycle_id == cycle_id_for_event
                 and rebalance_plan_filter_n_raw > int(self._last_rebalance_plan_filter_n_raw or 0)
             )
-            if allow_plan_filter_log and (
+            if bool(emit_telemetry) and allow_plan_filter_log and (
                 self._last_rebalance_plan_filter_cycle_id != cycle_id_for_event
                 or plan_filter_same_cycle_upgrade
                 or plan_filter_same_cycle_payload_upgrade
@@ -3443,18 +4022,22 @@ class PaperTradingEngine:
                 self._last_rebalance_plan_filter_cycle_id = cycle_id_for_event
                 self._last_rebalance_plan_filter_status = rebalance_plan_filter_status
                 self._last_rebalance_plan_filter_n_raw = rebalance_plan_filter_n_raw
-            self._emit_cycle_metrics_once(payload, source=str(source))
+            if bool(emit_cycle_metrics):
+                self._emit_cycle_metrics_once(payload, source=str(source))
         except Exception as e:
             print(f"[WARN] Failed to write live snapshot: {e}")
-            self._telemetry_log_event(
-                "SNAPSHOT_WRITE",
-                cycle_id=int(self.current_cycle),
-                level="ERROR",
-                status="error",
-                message="write_live_snapshot_failed",
-                error=e,
-                payload={"source": str(source)},
-            )
+            if bool(emit_telemetry):
+                self._telemetry_log_event(
+                    "SNAPSHOT_WRITE",
+                    cycle_id=int(self.current_cycle),
+                    level="ERROR",
+                    status="error",
+                    message="write_live_snapshot_failed",
+                    error=e,
+                    payload={"source": str(source)},
+                )
+            return False
+        return True
 
     def _build_post_rebalance_snapshot(self):
         """Build a lightweight snapshot from current in-memory state without appending history."""
@@ -3493,6 +4076,12 @@ class PaperTradingEngine:
             'config_hash': self.config_hash,
             'cycle': self.current_cycle,
             'cycle_id': int(self.current_cycle),
+            'active_risk_profile': str(self.active_risk_profile or ''),
+            'requested_risk_profile': str(self.requested_risk_profile or ''),
+            'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
+            'risk_profile_applied_cycle_id': self.risk_profile_applied_cycle_id,
+            'risk_profile_applied_at_utc': self.risk_profile_applied_at_utc,
+            'risk_profile_overrides_hash': str(self.risk_profile_overrides_hash or ''),
             'cash': float(self.cash),
             'positions_value': float(positions_value),
             'total_equity': float(total_equity),
@@ -3905,6 +4494,9 @@ class PaperTradingEngine:
                     trade_clean.setdefault('config_hash', self.config_hash)
                     trade_clean.setdefault('cycle', int(self.current_cycle))
                     trade_clean.setdefault('cycle_id', int(trade_clean.get('cycle', self.current_cycle)))
+                    trade_clean['risk_profile'] = str(self.active_risk_profile or RISK_PROFILE_DEFAULT).strip().lower()
+                    trade_clean['risk_profile_overrides_hash'] = str(self.risk_profile_overrides_hash or '')
+                    trade_clean['risk_profile_template_version'] = int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION)
                 trade_rows.append(trade_clean)
             self.atomic_write_jsonl(trade_history_path, trade_rows)
         except Exception as e:
@@ -9272,6 +9864,9 @@ class PaperTradingEngine:
                 'env': self.runtime_env,
                 'cycle': self.current_cycle,
                 'cycle_id': int(self.current_cycle),
+                'risk_profile': str(self.active_risk_profile or RISK_PROFILE_DEFAULT).strip().lower(),
+                'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
+                'risk_profile_overrides_hash': str(self.risk_profile_overrides_hash or ''),
                 'ticker': ticker,
                 'side': 'SELL',
                 'quantity': sell_qty,
@@ -9400,6 +9995,9 @@ class PaperTradingEngine:
                 'env': self.runtime_env,
                 'cycle': self.current_cycle,
                 'cycle_id': int(self.current_cycle),
+                'risk_profile': str(self.active_risk_profile or RISK_PROFILE_DEFAULT).strip().lower(),
+                'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
+                'risk_profile_overrides_hash': str(self.risk_profile_overrides_hash or ''),
                 'ticker': ticker,
                 'side': 'BUY',
                 'quantity': buy_qty,
@@ -9790,6 +10388,9 @@ class PaperTradingEngine:
                 'env': self.runtime_env,
                 'cycle': self.current_cycle,
                 'cycle_id': int(self.current_cycle),
+                'risk_profile': str(self.active_risk_profile or RISK_PROFILE_DEFAULT).strip().lower(),
+                'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
+                'risk_profile_overrides_hash': str(self.risk_profile_overrides_hash or ''),
                 'ticker': h['ticker'],
                 'side': 'SELL',
                 'quantity': sell_qty,
@@ -9962,6 +10563,12 @@ class PaperTradingEngine:
             'config_hash': self.config_hash,
             'cycle': self.current_cycle,
             'cycle_id': int(self.current_cycle),
+            'active_risk_profile': str(self.active_risk_profile or ''),
+            'requested_risk_profile': str(self.requested_risk_profile or ''),
+            'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
+            'risk_profile_applied_cycle_id': self.risk_profile_applied_cycle_id,
+            'risk_profile_applied_at_utc': self.risk_profile_applied_at_utc,
+            'risk_profile_overrides_hash': str(self.risk_profile_overrides_hash or ''),
             'cash': self.cash,
             'positions_value': positions_value,
             'total_equity': total_equity,
@@ -10436,6 +11043,7 @@ class PaperTradingEngine:
     def run_cycle(self):
         """def run_cycle: docstring omitted (was garbled/non-ASCII)."""
         now = self._now()
+        self._maybe_apply_runtime_risk_profile(cycle_id=int(self.current_cycle), now_utc=now)
         now_local = now.astimezone()
         print(f"\n{'='*60}")
         print(f"Cycle {self.current_cycle} - {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -12165,6 +12773,81 @@ def calibrate_news_overlay(
     return 0
 
 
+def print_risk_profile_summary(config_path="paper_config.json", json_output=False):
+    """Print effective risk-profile config without starting the trading loop."""
+    engine = PaperTradingEngine.__new__(PaperTradingEngine)
+    engine._risk_profile_default_events = []
+    engine._risk_profile_default_event_keys = set()
+    engine.config = {}
+
+    config = engine.load_config(config_path)
+    config, diag = engine.apply_risk_profile(config)
+    if not isinstance(diag, dict):
+        diag = {"enabled": False, "status": "skipped", "overrides_applied": []}
+    engine.config = config
+    engine.risk_profile_diag = dict(diag)
+    engine.validate_config()
+
+    execution_cfg = engine.config.get("execution", {}) if isinstance(engine.config, dict) else {}
+    objectives_cfg = engine.config.get("objectives", {}) if isinstance(engine.config, dict) else {}
+    risk_cfg = engine.config.get("risk_model", {}) if isinstance(engine.config, dict) else {}
+    news_cfg = engine.config.get("news_overlay", {}) if isinstance(engine.config, dict) else {}
+    strategy_cfg = engine.config.get("strategy", {}) if isinstance(engine.config, dict) else {}
+
+    requested_profile = str(execution_cfg.get("risk_profile", RISK_PROFILE_DEFAULT) or RISK_PROFILE_DEFAULT).strip().lower()
+    active_profile = str(diag.get("profile", requested_profile) or requested_profile).strip().lower()
+    template_version = int(diag.get("template_version", RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION)
+    overrides_applied = list(diag.get("overrides_applied", []) or [])
+    important_values = engine._build_risk_profile_important_values(engine.config)
+    overrides_hash = engine._compute_risk_profile_overrides_hash(diag, important_values)
+
+    key_params = {
+        "target_vol": execution_cfg.get("target_vol_annual", strategy_cfg.get("vol_target")),
+        "min_cash": objectives_cfg.get("min_cash_pct"),
+        "max_weight": objectives_cfg.get("max_weight_per_asset"),
+        "rc_limit": risk_cfg.get("rc_limit"),
+        "alpha": news_cfg.get("alpha"),
+        "max_abs_delta": news_cfg.get("max_abs_delta"),
+        "min_conf": news_cfg.get("min_confidence", news_cfg.get("min_conf")),
+        "cooldown": news_cfg.get("cooldown_cycles"),
+        "turnover_cap": execution_cfg.get("max_turnover_pct_per_rebalance", execution_cfg.get("turnover_cap")),
+        "exposure_cap": execution_cfg.get("portfolio_exposure_cap"),
+        "use_cov_vol_for_gate": risk_cfg.get("use_cov_vol_for_gate"),
+        "enable_target_cov_gate": execution_cfg.get("enable_target_cov_gate"),
+    }
+
+    result = {
+        "config_path": os.path.abspath(str(config_path)),
+        "requested_risk_profile": requested_profile,
+        "active_risk_profile": active_profile,
+        "template_version": template_version,
+        "overrides_hash": overrides_hash,
+        "overrides_applied": overrides_applied,
+        "key_params": key_params,
+    }
+
+    if bool(json_output):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    print("Risk Profile Effective Summary")
+    print(f"  Config: {result['config_path']}")
+    print(f"  Requested: {requested_profile}")
+    print(f"  Active: {active_profile}")
+    print(f"  Template Version: {template_version}")
+    print(f"  Overrides Hash: {overrides_hash}")
+    print(f"  Overrides Applied ({len(overrides_applied)}):")
+    if overrides_applied:
+        for item in overrides_applied:
+            print(f"    - {item}")
+    else:
+        print("    - (none)")
+    print("  Key Params:")
+    for key, value in key_params.items():
+        print(f"    - {key}: {value}")
+    return 0
+
+
 def main():
     """def main: docstring omitted (was garbled/non-ASCII)."""
     parser = argparse.ArgumentParser(description="Paper trading engine")
@@ -12230,6 +12913,16 @@ def main():
         default=None,
         help="Optional config path override.",
     )
+    parser.add_argument(
+        "--print-risk-profile",
+        action="store_true",
+        help="Print effective risk profile parameters and exit (no run loop).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="With --print-risk-profile, emit machine-readable JSON.",
+    )
     args = parser.parse_args()
 
     debug_env = str(os.environ.get("GW_DEBUG_PLANNER_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
@@ -12264,6 +12957,8 @@ def main():
             target_cash_delta=args.target_cash_delta,
             out_path=args.out,
         )
+    if bool(args.print_risk_profile):
+        return print_risk_profile_summary(config_path=config_path, json_output=bool(args.json))
     print(f"Loading config: {config_path}")
 
     engine = PaperTradingEngine(config_path)

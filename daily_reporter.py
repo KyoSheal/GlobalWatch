@@ -144,10 +144,11 @@ def _safe_read_json(path: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _ensure_report_meta_fields(report: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+def _ensure_report_meta_fields(report: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], bool]:
     """Ensure report metadata fields exist; return (patched_report, changed)."""
     if not isinstance(report, dict):
         return {}, False
+    snapshot_obj: Dict[str, Any] = snapshot if isinstance(snapshot, dict) else {}
     patched = dict(report)
     changed = False
     if "report_schema_version" not in patched:
@@ -155,6 +156,19 @@ def _ensure_report_meta_fields(report: Dict[str, Any]) -> Tuple[Dict[str, Any], 
         changed = True
     if not str(patched.get("generated_at") or "").strip():
         patched["generated_at"] = datetime.now(timezone.utc).isoformat()
+        changed = True
+    if not str(patched.get("risk_profile") or "").strip():
+        patched["risk_profile"] = str(
+            snapshot_obj.get("active_risk_profile")
+            or snapshot_obj.get("requested_risk_profile")
+            or "mid"
+        ).strip().lower() or "mid"
+        changed = True
+    if patched.get("risk_profile_template_version", None) in (None, ""):
+        patched["risk_profile_template_version"] = snapshot_obj.get("risk_profile_template_version")
+        changed = True
+    if patched.get("risk_profile_overrides_hash", None) in (None, ""):
+        patched["risk_profile_overrides_hash"] = str(snapshot_obj.get("risk_profile_overrides_hash") or "")
         changed = True
     return patched, changed
 
@@ -968,11 +982,12 @@ def generate_daily_report(
     report_date = _parse_date(date, tz) or datetime.now(_coerce_zone(tz)).date()
     date_str = report_date.isoformat()
     normalized_dirs = _normalize_report_dirs(report_dirs)
+    snapshot = _safe_read_json(snapshot_path) or {}
 
     existing, existing_path = _find_existing_report(date_str, normalized_dirs)
     if existing is not None:
         if _is_existing_report_usable(existing):
-            existing_patched, existing_changed = _ensure_report_meta_fields(existing)
+            existing_patched, existing_changed = _ensure_report_meta_fields(existing, snapshot=snapshot)
             if existing_changed and existing_path:
                 try:
                     _atomic_write_json(existing_path, existing_patched)
@@ -982,7 +997,6 @@ def generate_daily_report(
             existing_patched["_existing_path"] = existing_path
             return existing_patched
 
-    snapshot = _safe_read_json(snapshot_path) or {}
     snapshot_account_id = _norm_text(snapshot.get("account_id")) or "paper_main"
     snapshot_session_id = _norm_text(snapshot.get("session_id"))
     snapshot_run_id = _norm_text(snapshot.get("run_id")) or snapshot_session_id
@@ -1038,6 +1052,9 @@ def generate_daily_report(
         "run_id": snapshot_run_id or None,
         "schema_version": snapshot_schema_version,
         "cycle_id": snapshot_cycle_id,
+        "risk_profile": str(snapshot.get("active_risk_profile") or snapshot.get("requested_risk_profile") or "mid").strip().lower() or "mid",
+        "risk_profile_template_version": snapshot.get("risk_profile_template_version"),
+        "risk_profile_overrides_hash": str(snapshot.get("risk_profile_overrides_hash") or ""),
         "market_close": {
             "closed": True,
             "reason": {
@@ -1067,7 +1084,7 @@ def generate_daily_report(
             "price_fetch_summary": price_fetch_summary,
         },
     }
-    report, _ = _ensure_report_meta_fields(report)
+    report, _ = _ensure_report_meta_fields(report, snapshot=snapshot)
     return report
 
 
