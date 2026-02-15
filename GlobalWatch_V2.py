@@ -20,6 +20,9 @@ import urllib.parse
 import urllib.request
 import os
 from atomic_io import atomic_write_json as io_atomic_write_json, safe_read_json as io_safe_read_json
+from ui_window_presets import WINDOW_PRESETS, get_window_preset, format_till_now
+from ui_equity_window import filter_df_by_trading_day_window
+from ui_reports_window import select_window_effective_count
 
 try:
     import chromadb
@@ -6559,16 +6562,13 @@ def _parse_equity_history_cached(history_payload):
 
 
 @st.cache_data(ttl=30)
-def _prepare_equity_curve_cached(history_payload, window_hours, resample_rule):
-    """Apply time-window filtering and optional resampling."""
+def _prepare_equity_curve_cached(history_payload, window_key, resample_rule):
+    """Apply optional resampling for equity curve data."""
     df = _parse_equity_history_cached(history_payload)
     if df.empty:
         return df
 
-    cutoff = df["time"].max() - pd.Timedelta(hours=int(window_hours))
-    df = df[df["time"] >= cutoff]
-    if df.empty:
-        return pd.DataFrame(columns=["time", "equity"])
+    _ = window_key  # part of cache key for window-specific views
 
     if str(resample_rule).lower() != "raw":
         rule_map = {
@@ -6627,7 +6627,7 @@ def render_portfolio_monitor():
         "pm_auto_refresh_data": True,
         "pm_auto_refresh_interval": 60,
         "pm_refresh_nonce": 0,
-        "pm_window_hours": 48,
+        "pm_window_key": "1M",
         "pm_resample_rule": "15min",
         "pm_x_tick_mode": "auto",
         "pm_x_tick_minutes": 15,
@@ -7307,48 +7307,63 @@ def render_portfolio_monitor():
 
             def _render_reports_statistics_section():
                 st.subheader("Reports / Statistics")
-                window_defs = [
-                    ("Today (1D)", 1),
-                    ("3 Days (3D)", 3),
-                    ("1 Week (7D)", 7),
-                    ("1 Month (30D)", 30),
-                    ("3 Months (90D)", 90),
-                    ("Half Year (180D)", 180),
-                    ("1 Year (365D)", 365),
-                ]
+                window_keys = ["1D", "2D", "3D", "1W", "2W", "1M", "3M", "6M", "1Y"]
                 if not daily_report_entries:
                     st.info("No Daily Report index found in outputs/Daily Report/daily_reports_index.json")
                     return
 
-                tabs = st.tabs([x[0] for x in window_defs])
-                for tab, (_label, window_days) in zip(tabs, window_defs):
+                tabs = st.tabs(window_keys)
+                for tab, window_key in zip(tabs, window_keys):
                     with tab:
-                        if len(daily_report_entries) < window_days:
-                            st.info("Time insufficient")
+                        entries_sorted = [x for x in daily_report_entries if isinstance(x, dict)]
+                        entries_sorted.sort(key=lambda x: str(x.get("date", "")))
+                        entry_window = select_window_effective_count(len(entries_sorted), window_key)
+                        entry_status = str(entry_window.get("status", "no_data"))
+                        entry_message = str(entry_window.get("message", "No data yet"))
+                        entry_effective_days = int(entry_window.get("effective_days", 0) or 0)
+                        if entry_status == "no_data":
+                            st.info(entry_message)
                             continue
+                        if entry_status == "till_now":
+                            st.info(entry_message)
+                        else:
+                            st.success(entry_message)
 
-                        selected_entries = daily_report_entries[:window_days]
+                        selected_entries = entries_sorted[-entry_effective_days:]
                         selected_paths = []
                         for entry in selected_entries:
                             path = str(entry.get("path", "")).strip()
                             if path:
                                 selected_paths.append(path)
                         reports = load_daily_reports_by_paths(selected_paths, interval_seconds, refresh_nonce)
-                        if len(reports) < window_days:
-                            st.info("Time insufficient")
+                        reports_sorted = [x for x in reports if isinstance(x, dict)]
+                        reports_sorted.sort(key=lambda x: str(x.get("date", "")))
+
+                        report_window = select_window_effective_count(len(reports_sorted), window_key)
+                        report_status = str(report_window.get("status", "no_data"))
+                        report_message = str(report_window.get("message", "No data yet"))
+                        report_effective_days = int(report_window.get("effective_days", 0) or 0)
+                        if report_status == "no_data":
+                            st.info(report_message)
                             continue
+                        if report_message != entry_message:
+                            if report_status == "till_now":
+                                st.info(report_message)
+                            else:
+                                st.success(report_message)
 
                         if daily_reporter is None:
-                            st.info("Time insufficient")
+                            st.info("No data yet")
                             continue
 
+                        selected_reports = reports_sorted[-report_effective_days:]
                         try:
-                            agg = daily_reporter.aggregate_reports(reports, window_days)
+                            agg = daily_reporter.aggregate_reports(selected_reports, report_effective_days)
                         except Exception:
-                            agg = {"status": "insufficient"}
+                            agg = {"status": "error"}
 
                         if not isinstance(agg, dict) or agg.get("status") != "ok":
-                            st.info("Time insufficient")
+                            st.info("No data yet")
                             continue
 
                         agg_quality = str(agg.get("data_quality", "ok")).strip().lower()
@@ -7457,15 +7472,15 @@ def render_portfolio_monitor():
                 if not isinstance(equity_history, list) or not equity_history:
                     st.info("No equity_history found in outputs/snapshot_live.json")
                 else:
-                    window_options = [6, 12, 24, 48, 168]
+                    window_options = ["1D", "2D", "3D", "1W", "2W", "1M", "3M", "6M", "1Y"]
                     resample_options = ["raw", "1min", "5min", "15min", "1h", "1d"]
                     x_tick_mode_options = ["auto", "fixed"]
                     x_tick_options = [5, 15, 30, 60]
                     y_mode_options = ["auto", "manual"]
                     y_metric_options = ["equity", "pnl_from_initial"]
     
-                    if int(st.session_state.get("pm_window_hours", 48)) not in window_options:
-                        st.session_state["pm_window_hours"] = 48
+                    if str(st.session_state.get("pm_window_key", "1M")).strip().upper() not in window_options:
+                        st.session_state["pm_window_key"] = "1M"
                     if str(st.session_state.get("pm_resample_rule", "15min")) not in resample_options:
                         st.session_state["pm_resample_rule"] = "15min"
                     if str(st.session_state.get("pm_x_tick_mode", "auto")) not in x_tick_mode_options:
@@ -7479,10 +7494,10 @@ def render_portfolio_monitor():
     
                     control_col1, control_col2, control_col3, control_col4, control_col5 = st.columns(5)
                     control_col1.selectbox(
-                        "Window (hours)",
+                        "Window",
                         window_options,
-                        index=window_options.index(int(st.session_state.get("pm_window_hours", 48))),
-                        key="pm_window_hours",
+                        index=window_options.index(str(st.session_state.get("pm_window_key", "1M")).strip().upper()),
+                        key="pm_window_key",
                     )
                     control_col2.selectbox(
                         "Resample",
@@ -7522,15 +7537,24 @@ def render_portfolio_monitor():
                     )
     
                     history_payload = json.dumps(equity_history, ensure_ascii=False, sort_keys=True)
-                    equity_df = _prepare_equity_curve_cached(
+                    pm_window_key = str(st.session_state.get("pm_window_key", "1M")).strip().upper()
+                    equity_df_base = _prepare_equity_curve_cached(
                         history_payload,
-                        int(st.session_state.get("pm_window_hours", 48)),
+                        pm_window_key,
                         str(st.session_state.get("pm_resample_rule", "15min")),
+                    )
+                    equity_df, available_days, required_days = filter_df_by_trading_day_window(
+                        equity_df_base,
+                        pm_window_key,
                     )
     
                     if equity_df.empty:
                         st.info("No valid equity points in selected window.")
                     else:
+                        if int(available_days) < int(required_days):
+                            st.info(format_till_now(int(available_days), int(required_days)))
+                        else:
+                            st.caption(f"Coverage: {int(required_days)}/{int(required_days)} trading days")
                         first_equity = _to_float(equity_df["equity"].iloc[0], 0.0)
                         initial_equity = _infer_initial_equity(snapshot, summary_text, first_equity)
                         y_metric = str(st.session_state.get("pm_y_metric", "equity"))
@@ -7575,13 +7599,15 @@ def render_portfolio_monitor():
                         y_title = "PnL ($)" if y_metric == "pnl_from_initial" else "Equity ($)"
                         x_tick_mode = str(st.session_state.get("pm_x_tick_mode", "auto"))
                         x_tick_minutes = int(st.session_state.get("pm_x_tick_minutes", 15))
-                        pm_window_hours = int(st.session_state.get("pm_window_hours", 48))
+                        pm_window_key = str(st.session_state.get("pm_window_key", "1M")).strip().upper()
+                        window_preset = get_window_preset(pm_window_key)
+                        calendar_days = int(window_preset.get("calendar_days", 30) or 30)
                         pm_resample_rule = str(st.session_state.get("pm_resample_rule", "15min"))
                         pm_hide_off_hours = bool(st.session_state.get("pm_hide_off_hours", True))
                         pm_y_mode = str(st.session_state.get("pm_y_mode", "auto"))
                         pm_y_metric = str(st.session_state.get("pm_y_metric", "equity"))
                         pm_uirev = (
-                            f"pm:{pm_window_hours}:{pm_resample_rule}:{x_tick_mode}:{x_tick_minutes}:"
+                            f"pm:{pm_window_key}:{pm_resample_rule}:{x_tick_mode}:{x_tick_minutes}:"
                             f"{int(pm_hide_off_hours)}:{pm_y_mode}:{pm_y_metric}"
                         )
                         if pm_y_mode == "manual":
@@ -7595,8 +7621,8 @@ def render_portfolio_monitor():
                         if str(st.session_state.get("pm_y_mode", "auto")) == "manual":
                             y_mode_label = f"manual [{y_min:.2f}, {y_max:.2f}]"
                         st.caption(
-                            "X: last "
-                            f"{pm_window_hours}h @ {pm_resample_rule}"
+                            "X: "
+                            f"{pm_window_key} ({int(required_days)} trading days) @ {pm_resample_rule}"
                             f" | X tick: {x_tick_label} | Y: {y_metric} {y_mode_label}"
                         )
     
@@ -7629,6 +7655,10 @@ def render_portfolio_monitor():
                                 )
                             if bool(st.session_state.get("pm_hide_off_hours", True)):
                                 xaxis_config["rangebreaks"] = [{"bounds": [13, 6], "pattern": "hour"}]
+                            range_end = plot_df["time"].max()
+                            range_start = range_end - pd.Timedelta(days=int(calendar_days))
+                            if pd.notna(range_start) and pd.notna(range_end):
+                                xaxis_config["range"] = [range_start, range_end]
     
                             yaxis_config = {"title": y_title}
                             if str(st.session_state.get("pm_y_mode", "auto")) == "manual":
@@ -7663,7 +7693,7 @@ def render_portfolio_monitor():
                                     tick_count = max(
                                         2,
                                         int(
-                                            (int(st.session_state.get("pm_window_hours", 48)) * 60)
+                                            (int(calendar_days) * 24 * 60)
                                             / max(1, x_tick_minutes)
                                         ),
                                     )
