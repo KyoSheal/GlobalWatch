@@ -164,6 +164,13 @@ def _ensure_report_meta_fields(report: Dict[str, Any], snapshot: Optional[Dict[s
             or "mid"
         ).strip().lower() or "mid"
         changed = True
+    if not str(patched.get("active_risk_profile") or "").strip():
+        patched["active_risk_profile"] = str(
+            snapshot_obj.get("active_risk_profile")
+            or patched.get("risk_profile")
+            or "mid"
+        ).strip().lower() or "mid"
+        changed = True
     if patched.get("risk_profile_template_version", None) in (None, ""):
         patched["risk_profile_template_version"] = snapshot_obj.get("risk_profile_template_version")
         changed = True
@@ -191,6 +198,20 @@ def _normalize_report_dirs(report_dirs: Optional[List[str]]) -> List[str]:
     if not dedup:
         dedup = [os.path.abspath(DEFAULT_MAIN_REPORT_DIR)]
     return dedup
+
+
+def _resolve_run_reports_dir(snapshot_path: str, snapshot: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve per-run reports dir: <reporting.out_dir>/reports (derived from snapshot path)."""
+    snap_obj = snapshot if isinstance(snapshot, dict) else {}
+    candidate_out_dir = _norm_text(snap_obj.get("out_dir"))
+    if candidate_out_dir:
+        return os.path.abspath(os.path.join(candidate_out_dir, "reports"))
+    snap_path = _norm_text(snapshot_path)
+    if snap_path:
+        snap_dir = os.path.dirname(os.path.abspath(snap_path))
+        if snap_dir:
+            return os.path.abspath(os.path.join(snap_dir, "reports"))
+    return os.path.abspath(DEFAULT_MAIN_REPORT_DIR)
 
 
 def _find_existing_report(date_str: str, report_dirs: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -981,8 +1002,9 @@ def generate_daily_report(
     """Generate a single-day report dict (idempotent by existing file)."""
     report_date = _parse_date(date, tz) or datetime.now(_coerce_zone(tz)).date()
     date_str = report_date.isoformat()
-    normalized_dirs = _normalize_report_dirs(report_dirs)
     snapshot = _safe_read_json(snapshot_path) or {}
+    run_reports_dir = _resolve_run_reports_dir(snapshot_path, snapshot)
+    normalized_dirs = _normalize_report_dirs([run_reports_dir] + list(report_dirs or []))
 
     existing, existing_path = _find_existing_report(date_str, normalized_dirs)
     if existing is not None:
@@ -1050,6 +1072,7 @@ def generate_daily_report(
         "date": date_str,
         "generated_at_local": generated_at,
         "run_id": snapshot_run_id or None,
+        "active_risk_profile": str(snapshot.get("active_risk_profile") or snapshot.get("requested_risk_profile") or "mid").strip().lower() or "mid",
         "schema_version": snapshot_schema_version,
         "cycle_id": snapshot_cycle_id,
         "risk_profile": str(snapshot.get("active_risk_profile") or snapshot.get("requested_risk_profile") or "mid").strip().lower() or "mid",
@@ -1076,6 +1099,7 @@ def generate_daily_report(
         "meta": {
             "snapshot_path": snapshot_path,
             "trades_csv_path": trades_csv_path,
+            "reports_dir": run_reports_dir,
             "timezone": tz,
             "account_id": snapshot_account_id or None,
             "session_id": snapshot_session_id or None,
@@ -1097,7 +1121,12 @@ def write_daily_report(report_dict: Dict[str, Any], report_dirs: List[str]) -> L
     if not date_str:
         return []
 
-    raw_dirs = report_dirs or [DEFAULT_MAIN_REPORT_DIR, DEFAULT_MIRROR_REPORT_DIR]
+    meta = report_dict.get("meta", {}) if isinstance(report_dict.get("meta"), dict) else {}
+    meta_reports_dir = _norm_text(meta.get("reports_dir"))
+    if meta_reports_dir:
+        raw_dirs = [meta_reports_dir]
+    else:
+        raw_dirs = report_dirs or [DEFAULT_MAIN_REPORT_DIR, DEFAULT_MIRROR_REPORT_DIR]
     if isinstance(raw_dirs, str):  # type: ignore[unreachable]
         raw_dirs = [raw_dirs]  # type: ignore[assignment]
 

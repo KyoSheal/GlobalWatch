@@ -25,6 +25,7 @@ from atomic_io import (
     atomic_write_text as io_atomic_write_text,
     safe_read_json as io_safe_read_json,
 )
+from outpost import make_run_id, resolve_out_dir, write_latest_pointer, append_registry
 from price_service import PriceService
 try:
     from telemetry import TelemetryLogger, resolve_telemetry_out_dir
@@ -967,6 +968,8 @@ class PaperTradingEngine:
         self.runtime_control_request_id = None
         self._last_runtime_control_result_key = None
         self.runtime_control_path = self._resolve_runtime_control_path()
+        self._run_end_written = False
+        self._run_start_written = False
         self.account_id = str(reporting_cfg.get('account_id', 'paper_main') or 'paper_main').strip()
         self.runtime_env = str(reporting_cfg.get('env', 'live') or 'live').strip().lower()
         configured_session_id = str(os.environ.get('GW_SESSION_ID', '') or '').strip()
@@ -976,9 +979,11 @@ class PaperTradingEngine:
             self.session_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         reporting_run_id = str(reporting_cfg.get('run_id', '') or '').strip()
         env_run_id = str(os.environ.get('GW_RUN_ID', '') or '').strip()
-        self.run_id = env_run_id or reporting_run_id or self.session_id
+        self.run_id = env_run_id or reporting_run_id or make_run_id(self._now())
         self.schema_version = int(LIVE_SCHEMA_VERSION)
         self.run_started_at = self._now().isoformat()
+        self._configure_run_output_paths()
+        self.config_hash = self._compute_config_hash(self.config)
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.cash = self.config['initial_cash_usd']
@@ -1203,6 +1208,10 @@ class PaperTradingEngine:
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.resume_from_checkpoint()
         self._rebind_telemetry_logger()
+        try:
+            self._write_run_start_record()
+        except Exception as e:
+            print(f"[WARN] failed to write run start record: {e}")
         self.rebuild_position_entry_cycles()
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -1399,6 +1408,9 @@ class PaperTradingEngine:
         risk_model_config.setdefault('min_cov_gate_coverage', 0.6)
         risk_model_config.setdefault('cov_gate_fallback_to_weighted', True)
         reporting_config = config.setdefault('reporting', {})
+        out_dir_raw = str(reporting_config.get('out_dir', '') or '').strip()
+        reporting_config['_out_dir_explicit'] = bool(out_dir_raw)
+        reporting_config.setdefault('base_out_dir', 'outputs')
         reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
         reporting_config.setdefault('snapshot_live_path', 'outputs/snapshot_live.json')
         reporting_config.setdefault('trade_history_path', 'outputs/trade_history.jsonl')
@@ -1585,6 +1597,182 @@ class PaperTradingEngine:
             }
         )
         return merged, diag
+
+    def _configure_run_output_paths(self):
+        """Configure per-run output paths, respecting explicit reporting.out_dir."""
+        reporting_cfg = self.config.setdefault('reporting', {}) if isinstance(self.config, dict) else {}
+        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        explicit_out_dir = bool(reporting_cfg.get('_out_dir_explicit', False))
+        configured_out_dir = str(reporting_cfg.get('out_dir', '') or '').strip()
+
+        if explicit_out_dir and configured_out_dir:
+            out_dir_abs = os.path.abspath(configured_out_dir)
+        else:
+            out_dir_abs = str(resolve_out_dir(base_out_dir, run_id=self.run_id))
+            reporting_cfg['out_dir'] = out_dir_abs
+
+        os.makedirs(out_dir_abs, exist_ok=True)
+
+        reporting_cfg['snapshot_live_path'] = os.path.join(out_dir_abs, 'snapshot_live.json')
+        reporting_cfg['runtime_control_path'] = os.path.join(out_dir_abs, 'runtime_control.json')
+        reporting_cfg['trade_history_path'] = os.path.join(out_dir_abs, 'trade_history.jsonl')
+        reporting_cfg['trades_log_path'] = os.path.join(out_dir_abs, 'paper_trades.csv')
+        reporting_cfg['portfolio_snapshots_path'] = os.path.join(out_dir_abs, 'portfolio_snapshots.jsonl')
+        reporting_cfg['summary_report_path'] = os.path.join(out_dir_abs, 'paper_summary.txt')
+        reporting_cfg['equity_curve_path'] = os.path.join(out_dir_abs, 'equity_curve.png')
+        reporting_cfg['scoreboard_path'] = os.path.join(out_dir_abs, 'scoreboard.jsonl')
+        reporting_cfg['daily_report_dirs'] = [os.path.join(out_dir_abs, 'reports')]
+
+        telemetry_dir = os.path.join(out_dir_abs, 'telemetry')
+        os.makedirs(telemetry_dir, exist_ok=True)
+        self.runtime_control_path = self._resolve_runtime_control_path()
+        runtime_control_stub_path = str(self.runtime_control_path or "").strip()
+        if runtime_control_stub_path and not os.path.exists(runtime_control_stub_path):
+            try:
+                stub_payload = {
+                    "schema_version": 1,
+                    "updated_at_utc": self._now().isoformat(),
+                    "request_id": "INIT",
+                    "requested_risk_profile": str(self.active_risk_profile or RISK_PROFILE_DEFAULT),
+                }
+                io_atomic_write_json(runtime_control_stub_path, stub_payload, indent=2)
+            except Exception as e:
+                print(f"[WARN] Failed to initialize runtime_control stub: {e}")
+
+    def _build_run_registry_record(self, action):
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        out_dir_abs = os.path.abspath(str(reporting_cfg.get('out_dir', base_out_dir) or base_out_dir))
+        base_out_dir_abs = os.path.abspath(base_out_dir)
+        month_dir = ""
+        try:
+            rel_out_dir = os.path.relpath(out_dir_abs, base_out_dir_abs)
+            rel_parts = rel_out_dir.replace("\\", "/").split("/")
+            if len(rel_parts) >= 2:
+                month_dir = rel_parts[0]
+        except Exception:
+            month_dir = ""
+        if not month_dir:
+            month_dir = os.path.basename(os.path.dirname(out_dir_abs))
+        return {
+            "schema_version": 1,
+            "ts_utc": self._now().isoformat(),
+            "run_id": str(self.run_id or ""),
+            "out_dir": out_dir_abs,
+            "month_dir": str(month_dir or ""),
+            "action": str(action or "start"),
+            "risk_profile": str(self.active_risk_profile or RISK_PROFILE_DEFAULT),
+            "overrides_hash": str(self.risk_profile_overrides_hash or ""),
+            "requested_risk_profile": str(self.requested_risk_profile or self.active_risk_profile or RISK_PROFILE_DEFAULT),
+            "session_id": str(getattr(self, "session_id", "") or ""),
+        }
+
+    def _write_run_start_record(self):
+        if bool(getattr(self, '_run_start_written', False)):
+            return
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        record = self._build_run_registry_record(action="start")
+        append_registry(base_out_dir, record)
+        write_latest_pointer(base_out_dir, record)
+        self._run_start_written = True
+
+    def build_run_summary(self, snapshot_last=None, engine_state=None):
+        """Build per-run summary payload for run_summary.json."""
+        state_obj = engine_state if isinstance(engine_state, dict) else {}
+        if isinstance(snapshot_last, dict):
+            final_snapshot = dict(snapshot_last)
+        elif isinstance(self.portfolio_snapshots, list) and self.portfolio_snapshots and isinstance(self.portfolio_snapshots[-1], dict):
+            final_snapshot = dict(self.portfolio_snapshots[-1])
+        else:
+            final_snapshot = {}
+
+        ended_dt = self._now()
+        started_raw = state_obj.get('started_at_utc', self.run_started_at)
+        started_dt = self._parse_datetime_utc_safe(started_raw) or ended_dt
+        ended_iso = ended_dt.isoformat()
+        started_iso = started_dt.isoformat()
+
+        initial_cash = float(state_obj.get('initial_cash', self.initial_cash) or self.initial_cash or 0.0)
+        final_equity = float(
+            final_snapshot.get(
+                'total_equity',
+                state_obj.get('final_equity', self.cash + sum(float(pos.get('value', 0.0) or 0.0) for pos in self.positions.values())),
+            ) or 0.0
+        )
+        pnl = float(final_equity - initial_cash)
+        total_return = float((pnl / initial_cash) if initial_cash > 1e-12 else 0.0)
+
+        max_drawdown = 0.0
+        try:
+            if isinstance(self.portfolio_snapshots, list) and self.portfolio_snapshots:
+                max_drawdown = float(max(float(s.get('drawdown', 0.0) or 0.0) for s in self.portfolio_snapshots if isinstance(s, dict)))
+            else:
+                max_drawdown = float(final_snapshot.get('drawdown', 0.0) or 0.0)
+        except Exception:
+            max_drawdown = float(final_snapshot.get('drawdown', 0.0) or 0.0)
+
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        out_dir = os.path.abspath(str(reporting_cfg.get('out_dir', 'outputs') or 'outputs'))
+        telemetry_dir = os.path.abspath(str(self.telemetry_out_dir or os.path.join(out_dir, 'telemetry')))
+        telemetry_paths = {
+            'out_dir': telemetry_dir,
+            'events': os.path.join(telemetry_dir, 'events.jsonl'),
+            'metrics': os.path.join(telemetry_dir, 'metrics.jsonl'),
+        }
+
+        daily_dirs = self._resolve_daily_report_dirs()
+        daily_dir = str(daily_dirs[0]) if daily_dirs else ""
+
+        summary = {
+            'schema_version': 1,
+            'run_id': str(self.run_id or ''),
+            'session_id': str(self.session_id or ''),
+            'status': str(self.status or ''),
+            'started_at_utc': started_iso,
+            'ended_at_utc': ended_iso,
+            'cycles': int(state_obj.get('cycles', self.current_cycle) or self.current_cycle or 0),
+            'final_equity': float(final_equity),
+            'pnl': float(pnl),
+            'total_return': float(total_return),
+            'max_drawdown': float(max_drawdown),
+            'risk_profile': str(self.active_risk_profile or RISK_PROFILE_DEFAULT),
+            'overrides_hash': str(self.risk_profile_overrides_hash or ''),
+            'template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
+            'telemetry_paths': telemetry_paths,
+            'trade_history_path': str(reporting_cfg.get('trade_history_path', os.path.join(out_dir, 'trade_history.jsonl'))),
+            'daily_reports_dir': daily_dir,
+        }
+        return summary
+
+    def _write_run_end_artifacts(self, snapshot_last=None, engine_state=None):
+        """Write per-run summary and end registry/latest records (best effort)."""
+        if bool(getattr(self, '_run_end_written', False)):
+            return
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        out_dir = os.path.abspath(str(reporting_cfg.get('out_dir', 'outputs') or 'outputs'))
+        os.makedirs(out_dir, exist_ok=True)
+
+        summary = self.build_run_summary(snapshot_last=snapshot_last, engine_state=engine_state)
+        run_summary_path = os.path.join(out_dir, 'run_summary.json')
+        self.atomic_write_json(run_summary_path, summary)
+
+        record = self._build_run_registry_record(action="end")
+        record.update(
+            {
+                'status': str(self.status or ''),
+                'ended_at_utc': str(summary.get('ended_at_utc', '')),
+                'cycles': int(summary.get('cycles', self.current_cycle) or self.current_cycle or 0),
+                'final_equity': float(summary.get('final_equity', 0.0) or 0.0),
+                'pnl': float(summary.get('pnl', 0.0) or 0.0),
+                'total_return': float(summary.get('total_return', 0.0) or 0.0),
+                'run_summary_path': run_summary_path,
+            }
+        )
+        append_registry(base_out_dir, record)
+        write_latest_pointer(base_out_dir, record)
+        self._run_end_written = True
 
     def _resolve_runtime_control_path(self):
         """Resolve runtime control file path with config override support."""
@@ -11240,7 +11428,18 @@ class PaperTradingEngine:
             traceback.print_exc()
             self.status = "ERROR"
         finally:
-            self.save_results()
+            save_exc = None
+            try:
+                self.save_results()
+            except Exception as e:
+                save_exc = e
+                print(f"[WARN] save_results failed: {e}")
+            try:
+                self._write_run_end_artifacts()
+            except Exception as e:
+                print(f"[WARN] failed to write run end artifacts: {e}")
+            if save_exc is not None:
+                raise save_exc
 
     def save_results(self):
         """def save_results: docstring omitted (was garbled/non-ASCII)."""
