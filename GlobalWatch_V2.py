@@ -23,6 +23,7 @@ from atomic_io import atomic_write_json as io_atomic_write_json, safe_read_json 
 from ui_window_presets import WINDOW_PRESETS, get_window_preset, format_till_now
 from ui_equity_window import filter_df_by_trading_day_window
 from ui_reports_window import select_window_effective_count
+from run_analytics import summarize_range as summarize_run_periods
 
 try:
     import chromadb
@@ -6452,6 +6453,15 @@ def read_jsonl_tail(path, max_lines=5000):
         return []
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def load_period_summary_cached(base_out_dir, range_key):
+    try:
+        return summarize_run_periods(base_out_dir=base_out_dir, range_key=range_key)
+    except Exception as e:
+        log_error(f"load_period_summary_cached error: {str(e)}")
+        return {}
+
+
 def _to_float(value, default=0.0):
     try:
         if value is None:
@@ -6915,6 +6925,52 @@ def render_portfolio_monitor():
                 events_path = os.path.join(out_dir, "telemetry", "events.jsonl")
                 rows_limit = int(st.session_state.get("pm_telemetry_rows", 20))
                 level_filter = str(st.session_state.get("pm_telemetry_level", "ALL")).upper()
+
+                st.markdown("**Period Summary (Runs)**")
+                period_range = st.selectbox(
+                    "Range",
+                    ["1M", "3M", "6M", "1Y", "YTD"],
+                    index=0,
+                    key="pm_period_summary_range",
+                )
+                period_summary = load_period_summary_cached(out_dir, period_range)
+                if isinstance(period_summary, dict) and period_summary:
+                    used_cache = int(period_summary.get("used_month_cache_count", 0) or 0)
+                    fallback_scan = int(period_summary.get("fallback_month_scan_count", 0) or 0)
+                    st.success(
+                        f"Cache: used_month_cache_count={used_cache} "
+                        f"fallback_month_scan_count={fallback_scan}"
+                    )
+                    ps_col1, ps_col2, ps_col3, ps_col4, ps_col5 = st.columns(5)
+                    ps_col1.metric("Run Count", int(period_summary.get("run_count", 0) or 0))
+                    ps_col2.metric("Total PnL", safe_format_number(period_summary.get("total_pnl", 0.0), 2, "0.00"))
+                    ps_col3.metric("Start Equity", safe_format_number(period_summary.get("start_equity", None), 2, "-"))
+                    ps_col4.metric("End Equity", safe_format_number(period_summary.get("end_equity", None), 2, "-"))
+                    ps_col5.metric("Max Drawdown", safe_format_number(period_summary.get("max_drawdown", None), 4, "-"))
+
+                    by_profile = period_summary.get("by_risk_profile", {})
+                    if isinstance(by_profile, dict) and by_profile:
+                        profile_rows = []
+                        for profile_key in sorted(by_profile.keys()):
+                            item = by_profile.get(profile_key, {})
+                            if not isinstance(item, dict):
+                                item = {}
+                            profile_rows.append(
+                                {
+                                    "risk_profile": str(profile_key),
+                                    "run_count": int(item.get("run_count", 0) or 0),
+                                    "total_pnl": _to_float(item.get("total_pnl", 0.0), 0.0),
+                                    "avg_total_return": _to_float(item.get("avg_total_return", 0.0), 0.0),
+                                }
+                            )
+                        st.dataframe(pd.DataFrame(profile_rows), width="stretch", hide_index=True)
+
+                    missing_ids = period_summary.get("missing_run_ids", [])
+                    if isinstance(missing_ids, list) and missing_ids:
+                        missing_text = ", ".join([str(x) for x in missing_ids[:10]])
+                        st.warning(f"Missing summaries: {len(missing_ids)} ({missing_text})")
+                else:
+                    st.info("Period summary unavailable.")
 
                 def _safe_int(value, default=None):
                     try:

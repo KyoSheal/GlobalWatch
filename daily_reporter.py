@@ -11,6 +11,7 @@ import tempfile
 import argparse
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from atomic_io import safe_read_json as io_safe_read_json
 
@@ -23,9 +24,14 @@ except Exception:  # pragma: no cover
 DEFAULT_TZ = "America/Vancouver"
 MARKET_TZ = "America/New_York"
 DEFAULT_MAIN_REPORT_DIR = os.path.join("outputs", "Daily Report")
-DEFAULT_MIRROR_REPORT_DIR = r"C:\Users\kyosh\Desktop\Project\News\outputs\Daily Report"
 INDEX_FILENAME = "daily_reports_index.json"
 REPORT_SCHEMA_VERSION = 1
+
+
+def get_daily_report_dir(base_out_dir: str = "outputs") -> Path:
+    """Return the canonical Daily Report directory under the given base output root."""
+    root = Path(str(base_out_dir or "outputs")).resolve()
+    return root / "Daily Report"
 
 
 def _norm_text(value: Any) -> str:
@@ -181,7 +187,7 @@ def _ensure_report_meta_fields(report: Dict[str, Any], snapshot: Optional[Dict[s
 
 
 def _normalize_report_dirs(report_dirs: Optional[List[str]]) -> List[str]:
-    raw = report_dirs or [DEFAULT_MAIN_REPORT_DIR, DEFAULT_MIRROR_REPORT_DIR]
+    raw = report_dirs or [str(get_daily_report_dir("outputs"))]
     if isinstance(raw, str):  # type: ignore[unreachable]
         raw = [raw]  # type: ignore[assignment]
     dedup: List[str] = []
@@ -196,22 +202,22 @@ def _normalize_report_dirs(report_dirs: Optional[List[str]]) -> List[str]:
         seen.add(key)
         dedup.append(abspath)
     if not dedup:
-        dedup = [os.path.abspath(DEFAULT_MAIN_REPORT_DIR)]
+        dedup = [str(get_daily_report_dir("outputs"))]
     return dedup
 
 
 def _resolve_run_reports_dir(snapshot_path: str, snapshot: Optional[Dict[str, Any]] = None) -> str:
-    """Resolve per-run reports dir: <reporting.out_dir>/reports (derived from snapshot path)."""
+    """Resolve canonical Daily Report dir under the snapshot's base output root."""
     snap_obj = snapshot if isinstance(snapshot, dict) else {}
-    candidate_out_dir = _norm_text(snap_obj.get("out_dir"))
-    if candidate_out_dir:
-        return os.path.abspath(os.path.join(candidate_out_dir, "reports"))
+    candidate_base_dir = _norm_text(snap_obj.get("base_out_dir"))
+    if candidate_base_dir:
+        return str(get_daily_report_dir(candidate_base_dir))
     snap_path = _norm_text(snapshot_path)
     if snap_path:
         snap_dir = os.path.dirname(os.path.abspath(snap_path))
         if snap_dir:
-            return os.path.abspath(os.path.join(snap_dir, "reports"))
-    return os.path.abspath(DEFAULT_MAIN_REPORT_DIR)
+            return str(get_daily_report_dir(snap_dir))
+    return str(get_daily_report_dir("outputs"))
 
 
 def _find_existing_report(date_str: str, report_dirs: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -1126,7 +1132,7 @@ def write_daily_report(report_dict: Dict[str, Any], report_dirs: List[str]) -> L
     if meta_reports_dir:
         raw_dirs = [meta_reports_dir]
     else:
-        raw_dirs = report_dirs or [DEFAULT_MAIN_REPORT_DIR, DEFAULT_MIRROR_REPORT_DIR]
+        raw_dirs = report_dirs or [str(get_daily_report_dir("outputs"))]
     if isinstance(raw_dirs, str):  # type: ignore[unreachable]
         raw_dirs = [raw_dirs]  # type: ignore[assignment]
 

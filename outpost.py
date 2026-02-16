@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -20,6 +21,9 @@ except Exception:  # pragma: no cover
 
 SCHEMA_VERSION = 1
 _REGISTRY_LOCK = threading.Lock()
+RUN_KIND_CHOICES = ("live", "dryrun", "diagnostics", "test")
+_RUN_KIND_SET = set(RUN_KIND_CHOICES)
+_DRYRUN_HINT_RE = re.compile(r"dryrun|debug[-_]?system[-_]?s1[-_]?s5|gw_dryrun", re.IGNORECASE)
 
 
 def _utc_now(now_utc: Optional[datetime] = None) -> datetime:
@@ -56,6 +60,114 @@ def _coerce_record(record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def normalize_run_kind(value: Any, default: str = "live") -> str:
+    kind = str(value or "").strip().lower()
+    if kind in _RUN_KIND_SET:
+        return kind
+    return default
+
+
+def resolve_base_out_dir(run_kind: Any, base_out_dir: str = "outputs") -> str:
+    """
+    Route non-live runs into outputs/test to avoid polluting live artifacts.
+
+    live         -> <base_out_dir>
+    dryrun/test/diagnostics -> <base_out_dir>/test
+    """
+    kind = normalize_run_kind(run_kind, default="live")
+    root = Path(str(base_out_dir or "outputs")).resolve()
+    if kind == "live":
+        return str(root)
+    return str((root / "test").resolve())
+
+
+def is_candidate_run_dir(p: Path) -> bool:
+    """Conservative candidate detector for formal run-like directories."""
+    if not isinstance(p, Path) or not p.is_dir():
+        return False
+    checks = [
+        p / "run_summary.json",
+        p / "trade_history",
+        p / "paper_trades",
+        p / "trade_history.jsonl",
+        p / "paper_trades.jsonl",
+    ]
+    return any(x.exists() for x in checks)
+
+
+def _looks_dryrun_meta(*objs: Any) -> bool:
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        fields = [
+            obj.get("run_kind"),
+            obj.get("mode"),
+            obj.get("argv"),
+            obj.get("status"),
+            obj.get("source"),
+            obj.get("out_dir"),
+            obj.get("run_id"),
+            obj.get("session_id"),
+        ]
+        haystack = " ".join(str(v or "") for v in fields)
+        if _DRYRUN_HINT_RE.search(haystack):
+            return True
+        if bool(obj.get("is_dryrun", False)):
+            return True
+    return False
+
+
+def infer_run_kind(
+    run_dir: Path,
+    run_summary: Optional[Dict[str, Any]] = None,
+    registry_entry: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Best-effort run_kind inference for legacy rows/files."""
+    summary = run_summary if isinstance(run_summary, dict) else {}
+    entry = registry_entry if isinstance(registry_entry, dict) else {}
+
+    # 1) explicit metadata wins
+    explicit = normalize_run_kind(summary.get("run_kind"), default="")
+    if explicit:
+        return explicit
+    explicit = normalize_run_kind(entry.get("run_kind"), default="")
+    if explicit:
+        return explicit
+
+    # 2) dryrun hints
+    if _looks_dryrun_meta(summary, entry):
+        return "dryrun"
+    if _DRYRUN_HINT_RE.search(str(run_dir or "")):
+        return "dryrun"
+
+    # 3) trade artifacts => live
+    trade_markers = [
+        run_dir / "trade_history",
+        run_dir / "paper_trades",
+        run_dir / "trade_history.jsonl",
+        run_dir / "paper_trades.jsonl",
+        run_dir / "paper_trades.csv",
+    ]
+    if any(m.exists() for m in trade_markers):
+        return "live"
+
+    # For old summaries: if summary resembles paper_trading run summary, treat as live.
+    if isinstance(summary, dict):
+        if any(k in summary for k in ("risk_profile", "template_version", "overrides_hash", "final_equity", "cycles")):
+            return "live"
+
+    # 4) telemetry-only folders are diagnostics
+    tele_markers = [
+        run_dir / "telemetry" / "events.jsonl",
+        run_dir / "telemetry" / "metrics.jsonl",
+    ]
+    if any(m.exists() for m in tele_markers):
+        return "diagnostics"
+
+    # 5) fallback
+    return "test"
+
+
 def _load_registry_rows(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -78,9 +190,10 @@ def _load_registry_rows(path: Path) -> list[dict]:
 
 
 def make_run_id(now_utc: Optional[datetime] = None) -> str:
-    dt = _utc_now(now_utc)
-    stamp = dt.strftime("%Y%m%d-%H%M%S")
-    suffix = uuid.uuid4().hex[:8]
+    # Minute-level sortable stamp + random suffix for same-minute uniqueness.
+    dt = _to_local_dt(now_utc)
+    stamp = dt.strftime("%Y%m%d-%H%M")
+    suffix = uuid.uuid4().hex[:6]
     return f"{stamp}-{suffix}"
 
 
@@ -115,6 +228,24 @@ def append_registry(base_dir: str, record: Dict[str, Any]) -> None:
         "ts_utc": _utc_now().isoformat(),
     }
     row.update(_coerce_record(record))
+    run_kind = normalize_run_kind(row.get("run_kind"), default="")
+    if run_kind:
+        row["run_kind"] = run_kind
+    else:
+        out_dir = str(row.get("out_dir") or "").strip()
+        if out_dir:
+            try:
+                run_dir = Path(out_dir)
+                summary = safe_read_json(str(run_dir / "run_summary.json"), retries=1, sleep_ms=5)
+                row["run_kind"] = infer_run_kind(
+                    run_dir,
+                    run_summary=summary if isinstance(summary, dict) else None,
+                    registry_entry=row,
+                )
+            except Exception:
+                row["run_kind"] = "live"
+        else:
+            row["run_kind"] = "live"
     with _REGISTRY_LOCK:
         rows = _load_registry_rows(registry_path)
         action = str(row.get("action", "") or "").strip().lower()

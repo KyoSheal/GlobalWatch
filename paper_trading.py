@@ -18,14 +18,20 @@ from typing import Dict, List, Tuple
 import matplotlib
 matplotlib.use('Agg')  # NOTE: comment omitted (was garbled/non-ASCII).
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from atomic_io import (
     atomic_write_json as io_atomic_write_json,
     atomic_write_jsonl as io_atomic_write_jsonl,
     atomic_write_text as io_atomic_write_text,
     safe_read_json as io_safe_read_json,
 )
-from outpost import make_run_id, resolve_out_dir, write_latest_pointer, append_registry
+from outpost import (
+    append_registry,
+    make_run_id,
+    normalize_run_kind,
+    resolve_base_out_dir,
+    resolve_out_dir,
+    write_latest_pointer,
+)
 from price_service import PriceService
 try:
     from telemetry import TelemetryLogger, resolve_telemetry_out_dir
@@ -976,12 +982,13 @@ class PaperTradingEngine:
         if configured_session_id:
             self.session_id = configured_session_id
         else:
-            self.session_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            self.session_id = make_run_id(self._now())
         reporting_run_id = str(reporting_cfg.get('run_id', '') or '').strip()
         env_run_id = str(os.environ.get('GW_RUN_ID', '') or '').strip()
         self.run_id = env_run_id or reporting_run_id or make_run_id(self._now())
         self.schema_version = int(LIVE_SCHEMA_VERSION)
         self.run_started_at = self._now().isoformat()
+        self.run_kind = self._determine_run_kind(reporting_cfg=reporting_cfg)
         self._configure_run_output_paths()
         self.config_hash = self._compute_config_hash(self.config)
         
@@ -1413,17 +1420,16 @@ class PaperTradingEngine:
         reporting_config.setdefault('base_out_dir', 'outputs')
         reporting_config.setdefault('scoreboard_path', 'outputs/scoreboard.jsonl')
         reporting_config.setdefault('snapshot_live_path', 'outputs/snapshot_live.json')
+        reporting_config.setdefault('run_snapshot_path', '')
         reporting_config.setdefault('trade_history_path', 'outputs/trade_history.jsonl')
         reporting_config.setdefault('account_id', 'paper_main')
         reporting_config.setdefault('env', 'live')
         reporting_config.setdefault('daily_report_tz', 'America/Vancouver')
-        reporting_config.setdefault('daily_report_dirs', [
-            'outputs/Daily Report',
-            r'C:\Users\kyosh\Desktop\Project\News\outputs\Daily Report'
-        ])
+        reporting_config.setdefault('daily_report_dirs', ['outputs/Daily Report'])
         reporting_config.setdefault('daily_report_stale_ratio_threshold', 0.8)
         reporting_config.setdefault('daily_report_stale_streak_threshold', 3)
         reporting_config.setdefault('max_price_debug_items', 50)
+        reporting_config.setdefault('equity_curve_filter_trading_hours', True)
         reporting_config.setdefault('runtime_control_path', '')
         reporting_config.setdefault('write_snapshot_on_profile_apply', True)
 
@@ -1601,19 +1607,43 @@ class PaperTradingEngine:
     def _configure_run_output_paths(self):
         """Configure per-run output paths, respecting explicit reporting.out_dir."""
         reporting_cfg = self.config.setdefault('reporting', {}) if isinstance(self.config, dict) else {}
-        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        base_out_dir_raw = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        base_out_dir = str(resolve_base_out_dir(self.run_kind, base_out_dir_raw))
+        reporting_cfg['base_out_dir'] = base_out_dir
         explicit_out_dir = bool(reporting_cfg.get('_out_dir_explicit', False))
         configured_out_dir = str(reporting_cfg.get('out_dir', '') or '').strip()
+        base_out_dir_abs = os.path.abspath(base_out_dir)
 
         if explicit_out_dir and configured_out_dir:
-            out_dir_abs = os.path.abspath(configured_out_dir)
+            configured_out_abs = os.path.abspath(configured_out_dir)
+            if str(self.run_kind or "live") == "live":
+                out_dir_abs = configured_out_abs
+            else:
+                try:
+                    in_allowed_tree = os.path.commonpath([configured_out_abs, base_out_dir_abs]) == base_out_dir_abs
+                except Exception:
+                    in_allowed_tree = False
+                if in_allowed_tree:
+                    out_dir_abs = configured_out_abs
+                else:
+                    out_dir_abs = str(resolve_out_dir(base_out_dir, run_id=self.run_id))
         else:
             out_dir_abs = str(resolve_out_dir(base_out_dir, run_id=self.run_id))
-            reporting_cfg['out_dir'] = out_dir_abs
 
         os.makedirs(out_dir_abs, exist_ok=True)
+        reporting_cfg['out_dir'] = out_dir_abs
 
-        reporting_cfg['snapshot_live_path'] = os.path.join(out_dir_abs, 'snapshot_live.json')
+        configured_snapshot_live = str(reporting_cfg.get('snapshot_live_path', '') or '').strip()
+        if str(self.run_kind or "live") == "live":
+            if configured_snapshot_live:
+                snapshot_live_abs = os.path.abspath(configured_snapshot_live)
+            else:
+                snapshot_live_abs = os.path.abspath(os.path.join(base_out_dir, 'snapshot_live.json'))
+        else:
+            # Non-live runs must never update the live UI alias under outputs/.
+            snapshot_live_abs = os.path.abspath(os.path.join(base_out_dir, 'snapshot_live.json'))
+        reporting_cfg['snapshot_live_path'] = snapshot_live_abs
+        reporting_cfg['run_snapshot_path'] = os.path.join(out_dir_abs, 'snapshot_live.json')
         reporting_cfg['runtime_control_path'] = os.path.join(out_dir_abs, 'runtime_control.json')
         reporting_cfg['trade_history_path'] = os.path.join(out_dir_abs, 'trade_history.jsonl')
         reporting_cfg['trades_log_path'] = os.path.join(out_dir_abs, 'paper_trades.csv')
@@ -1621,7 +1651,8 @@ class PaperTradingEngine:
         reporting_cfg['summary_report_path'] = os.path.join(out_dir_abs, 'paper_summary.txt')
         reporting_cfg['equity_curve_path'] = os.path.join(out_dir_abs, 'equity_curve.png')
         reporting_cfg['scoreboard_path'] = os.path.join(out_dir_abs, 'scoreboard.jsonl')
-        reporting_cfg['daily_report_dirs'] = [os.path.join(out_dir_abs, 'reports')]
+        reporting_cfg['daily_report_dirs'] = [os.path.join(base_out_dir, 'Daily Report')]
+        self._maybe_migrate_legacy_daily_report_dirs()
 
         telemetry_dir = os.path.join(out_dir_abs, 'telemetry')
         os.makedirs(telemetry_dir, exist_ok=True)
@@ -1638,6 +1669,27 @@ class PaperTradingEngine:
                 io_atomic_write_json(runtime_control_stub_path, stub_payload, indent=2)
             except Exception as e:
                 print(f"[WARN] Failed to initialize runtime_control stub: {e}")
+
+    def _determine_run_kind(self, reporting_cfg=None):
+        """Determine run_kind for registry/run_summary metadata."""
+        rep = reporting_cfg if isinstance(reporting_cfg, dict) else {}
+        explicit = normalize_run_kind(rep.get("run_kind"), default="")
+        if explicit:
+            return explicit
+        mode_hint = str(self.config.get("run_mode", "") if isinstance(self.config, dict) else "").strip().lower()
+        if mode_hint in {"dryrun", "debug", "test", "diagnostics"}:
+            if mode_hint == "test":
+                return "test"
+            if mode_hint == "diagnostics":
+                return "diagnostics"
+            return "dryrun"
+        if str(self.runtime_env or "").strip().lower() in {"dryrun", "debug", "test"}:
+            return "dryrun"
+
+        session_hint = f"{self.session_id} {self.run_id} {rep.get('out_dir', '')}"
+        if "dryrun" in str(session_hint or "").lower():
+            return "dryrun"
+        return "live"
 
     def _build_run_registry_record(self, action):
         reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
@@ -1661,6 +1713,7 @@ class PaperTradingEngine:
             "out_dir": out_dir_abs,
             "month_dir": str(month_dir or ""),
             "action": str(action or "start"),
+            "run_kind": str(self.run_kind or "live"),
             "risk_profile": str(self.active_risk_profile or RISK_PROFILE_DEFAULT),
             "overrides_hash": str(self.risk_profile_overrides_hash or ""),
             "requested_risk_profile": str(self.requested_risk_profile or self.active_risk_profile or RISK_PROFILE_DEFAULT),
@@ -1729,6 +1782,7 @@ class PaperTradingEngine:
             'run_id': str(self.run_id or ''),
             'session_id': str(self.session_id or ''),
             'status': str(self.status or ''),
+            'run_kind': str(self.run_kind or 'live'),
             'started_at_utc': started_iso,
             'ended_at_utc': ended_iso,
             'cycles': int(state_obj.get('cycles', self.current_cycle) or self.current_cycle or 0),
@@ -2094,9 +2148,11 @@ class PaperTradingEngine:
         """def resume_from_checkpoint: docstring omitted (was garbled/non-ASCII)."""
         snapshots_path = self.config['reporting']['portfolio_snapshots_path']
         trades_path = self.config['reporting']['trades_log_path']
-        
+
         # NOTE: comment omitted (was garbled/non-ASCII).
         if not os.path.exists(snapshots_path):
+            if self._resume_from_ui_snapshot():
+                return
             print("[INFO] No checkpoint found - starting fresh")
             return
         
@@ -2109,6 +2165,8 @@ class PaperTradingEngine:
             with open(snapshots_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
                 if not lines:
+                    if self._resume_from_ui_snapshot():
+                        return
                     print("[WARN] Checkpoint file is empty - starting fresh")
                     return
                 
@@ -2201,7 +2259,86 @@ class PaperTradingEngine:
             raise
         except Exception as e:
             print(f"[WARN] Failed to resume from checkpoint: {e}")
+            if self._resume_from_ui_snapshot():
+                return
             print("   Starting fresh...")
+
+    def _resume_from_ui_snapshot(self):
+        """Best-effort resume from UI stable snapshot path."""
+        snapshot_path = str(self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json') or '').strip()
+        if not snapshot_path:
+            return False
+        payload = io_safe_read_json(snapshot_path, retries=3, sleep_ms=30)
+        if not isinstance(payload, dict):
+            return False
+        try:
+            cash = float(payload.get('cash', self.cash) or self.cash)
+            total_equity = float(payload.get('total_equity', cash) or cash)
+            positions_value = float(payload.get('positions_value', max(0.0, total_equity - cash)) or max(0.0, total_equity - cash))
+            positions_detail = payload.get('positions_detail', {})
+            restored_positions = {}
+            if isinstance(positions_detail, dict):
+                for ticker, pos in positions_detail.items():
+                    t = str(ticker or '').strip().upper()
+                    if not t or t == 'CASH':
+                        continue
+                    qty = 0.0
+                    if isinstance(pos, dict):
+                        try:
+                            qty = float(pos.get('quantity', pos.get('qty', 0.0)) or 0.0)
+                        except Exception:
+                            qty = 0.0
+                    if qty > 0:
+                        restored_positions[t] = qty
+
+            self.cash = float(cash)
+            self.positions = dict(restored_positions)
+            try:
+                self.current_cycle = int(payload.get('cycle', self.current_cycle) or self.current_cycle) + 1
+            except Exception:
+                self.current_cycle = int(self.current_cycle)
+            self.status = "RESUMED"
+            self.run_id = str(payload.get('run_id', self.run_id) or self.run_id)
+            self.session_id = str(payload.get('session_id', self.session_id) or self.session_id)
+            self.active_risk_profile = str(payload.get('active_risk_profile', self.active_risk_profile or RISK_PROFILE_DEFAULT) or RISK_PROFILE_DEFAULT).strip().lower()
+            self.requested_risk_profile = str(payload.get('requested_risk_profile', self.active_risk_profile) or self.active_risk_profile).strip().lower()
+            self.risk_profile_overrides_hash = str(payload.get('risk_profile_overrides_hash', self.risk_profile_overrides_hash or '') or '')
+            try:
+                self.risk_profile_template_version = int(payload.get('risk_profile_template_version', self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION)
+            except Exception:
+                self.risk_profile_template_version = int(RISK_PROFILE_TEMPLATE_VERSION)
+            self.risk_profile_applied_cycle_id = payload.get('risk_profile_applied_cycle_id', self.risk_profile_applied_cycle_id)
+            self.risk_profile_applied_at_utc = payload.get('risk_profile_applied_at_utc', self.risk_profile_applied_at_utc)
+            self.peak_equity = max(float(self.peak_equity or 0.0), float(total_equity))
+
+            ts_raw = payload.get('timestamp', self._now().isoformat())
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+            except Exception:
+                ts = self._now()
+            self.equity_curve = [(ts, float(total_equity), float(cash), float(positions_value))]
+            self.portfolio_snapshots = [{
+                'timestamp': ts.isoformat(),
+                'cycle': int(max(0, self.current_cycle - 1)),
+                'cash': float(cash),
+                'positions': positions_detail if isinstance(positions_detail, dict) else {},
+                'positions_value': float(positions_value),
+                'total_equity': float(total_equity),
+                'total_return': float(payload.get('return', payload.get('total_return', 0.0)) or 0.0),
+                'drawdown': float(payload.get('drawdown', 0.0) or 0.0),
+                'run_id': self.run_id,
+                'session_id': self.session_id,
+            }]
+
+            print(f"[RESUME] loaded from {snapshot_path}")
+            print(f"   Cycle: {max(0, self.current_cycle - 1)} -> next={self.current_cycle}")
+            print(f"   Cash: ${self.cash:,.2f}")
+            print(f"   Positions: {len(self.positions)} holdings")
+            print(f"   Total equity: ${total_equity:,.2f}")
+            return True
+        except Exception as e:
+            print(f"[WARN] Failed to resume from UI snapshot ({snapshot_path}): {e}")
+            return False
 
     def prompt_checkpoint_choice(self):
         """def prompt_checkpoint_choice: docstring omitted (was garbled/non-ASCII)."""
@@ -4017,6 +4154,7 @@ class PaperTradingEngine:
         """Write UI-friendly live snapshot to outputs/snapshot_live.json."""
         try:
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
+            run_snapshot_path = self.config.get('reporting', {}).get('run_snapshot_path', '')
             payload = self._build_live_snapshot_payload(snapshot) if bool(lightweight) else self.build_live_snapshot(snapshot)
             if isinstance(payload, dict):
                 payload['source'] = str(source)
@@ -4038,6 +4176,13 @@ class PaperTradingEngine:
                 payload["price_diagnostics_summary"] = dict(price_diag_summary)
                 self.current_price_diagnostics_summary = dict(price_diag_summary)
             self.atomic_write_json(live_snapshot_path, payload)
+            run_snapshot_path = str(run_snapshot_path or '').strip()
+            if run_snapshot_path:
+                try:
+                    if os.path.abspath(run_snapshot_path) != os.path.abspath(str(live_snapshot_path)):
+                        self.atomic_write_json(run_snapshot_path, payload)
+                except Exception as e:
+                    print(f"[WARN] Failed to write run snapshot copy: {e}")
             payload_text = json.dumps(payload, ensure_ascii=False, allow_nan=False) if isinstance(payload, dict) else "{}"
             cycle_id_for_event = int(payload.get('cycle_id', payload.get('cycle', self.current_cycle)) if isinstance(payload, dict) else self.current_cycle)
             if bool(emit_telemetry):
@@ -4047,6 +4192,7 @@ class PaperTradingEngine:
                     status="ok",
                     payload={
                         "path": str(live_snapshot_path),
+                        "run_snapshot_path": str(run_snapshot_path or ""),
                         "source": str(source),
                         "bytes": len(payload_text.encode("utf-8")),
                     },
@@ -4508,7 +4654,8 @@ class PaperTradingEngine:
     def _resolve_daily_report_dirs(self):
         """Resolve and deduplicate Daily Report output directories."""
         reporting_cfg = self.config.get('reporting', {})
-        raw_dirs = reporting_cfg.get('daily_report_dirs', ['outputs/Daily Report'])
+        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        raw_dirs = reporting_cfg.get('daily_report_dirs', [os.path.join(base_out_dir, 'Daily Report')])
         if isinstance(raw_dirs, str):
             raw_dirs = [raw_dirs]
         resolved = []
@@ -4523,8 +4670,59 @@ class PaperTradingEngine:
             seen.add(key)
             resolved.append(full)
         if not resolved:
-            resolved = [os.path.abspath('outputs/Daily Report')]
+            resolved = [os.path.abspath(os.path.join(base_out_dir, 'Daily Report'))]
         return resolved
+
+    def _maybe_migrate_legacy_daily_report_dirs(self):
+        """
+        Best-effort one-time migration:
+        <base_out_dir>/reports or <base_out_dir>/Reports -> <base_out_dir>/Daily Report
+        Keeps the newest copy by mtime when files overlap.
+        """
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        base_abs = os.path.abspath(base_out_dir)
+        target_dir = os.path.abspath(os.path.join(base_abs, 'Daily Report'))
+        legacy_dirs = [
+            os.path.abspath(os.path.join(base_abs, 'reports')),
+            os.path.abspath(os.path.join(base_abs, 'Reports')),
+        ]
+        if not any(os.path.isdir(d) for d in legacy_dirs):
+            return
+
+        os.makedirs(target_dir, exist_ok=True)
+        flag_path = os.path.join(target_dir, '.migrated_from_reports.flag')
+        if os.path.exists(flag_path):
+            return
+
+        moved = 0
+        skipped = 0
+        try:
+            for src_dir in legacy_dirs:
+                if not os.path.isdir(src_dir):
+                    continue
+                for name in os.listdir(src_dir):
+                    if not name.lower().endswith('.json'):
+                        continue
+                    src_path = os.path.join(src_dir, name)
+                    if not os.path.isfile(src_path):
+                        continue
+                    dst_path = os.path.join(target_dir, name)
+                    if os.path.exists(dst_path):
+                        try:
+                            if os.path.getmtime(src_path) <= os.path.getmtime(dst_path):
+                                skipped += 1
+                                continue
+                        except Exception:
+                            skipped += 1
+                            continue
+                    shutil.copy2(src_path, dst_path)
+                    moved += 1
+            with open(flag_path, 'w', encoding='utf-8') as f:
+                f.write(f"migrated_at={self._now().isoformat()} moved={moved} skipped={skipped}\n")
+            print(f"[DAILY REPORT MIGRATE] target={target_dir} moved={moved} skipped={skipped}")
+        except Exception as e:
+            print(f"[WARN] Daily Report legacy migration skipped due to error: {e}")
 
     def _update_live_snapshot_daily_report_ref(self, report_date, report_path):
         """Attach latest Daily Report pointer into snapshot_live.json for UI."""
@@ -11467,17 +11665,110 @@ class PaperTradingEngine:
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.generate_equity_curve()
         self.generate_summary_report()
+
+    def _to_market_datetime(self, ts):
+        """Convert timestamp into America/New_York aware datetime if possible."""
+        dt_utc = self._parse_datetime_utc_safe(ts)
+        if not isinstance(dt_utc, datetime):
+            return None
+        if ZoneInfo is not None:
+            try:
+                return dt_utc.astimezone(ZoneInfo("America/New_York"))
+            except Exception:
+                return dt_utc.astimezone()
+        return dt_utc.astimezone()
+
+    def _prepare_equity_curve_points(self):
+        """
+        Build plotting points with optional market-hours filtering.
+        Returns list[(dt_et, equity, cash, positions)].
+        """
+        points = []
+        for entry in self.equity_curve:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 4:
+                continue
+            dt_et = self._to_market_datetime(entry[0])
+            if not isinstance(dt_et, datetime):
+                continue
+            try:
+                points.append((dt_et, float(entry[1]), float(entry[2]), float(entry[3])))
+            except Exception:
+                continue
+        if not points:
+            return []
+
+        points.sort(key=lambda x: x[0])
+
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        filter_trading_hours = bool(reporting_cfg.get('equity_curve_filter_trading_hours', True))
+        if not filter_trading_hours:
+            return points
+
+        def _in_trading_hours(dt_et):
+            if dt_et.weekday() >= 5:
+                return False
+            minute_of_day = dt_et.hour * 60 + dt_et.minute
+            return (9 * 60 + 30) <= minute_of_day <= (16 * 60)
+
+        filtered = [row for row in points if _in_trading_hours(row[0])]
+        if not filtered:
+            return []
+
+        # Ensure each trading day keeps at least first and last observed point.
+        grouped = {}
+        for row in filtered:
+            d = row[0].date().isoformat()
+            grouped.setdefault(d, []).append(row)
+        stitched = []
+        for day in sorted(grouped.keys()):
+            rows = grouped.get(day, [])
+            if not rows:
+                continue
+            if len(rows) == 1:
+                stitched.append(rows[0])
+            else:
+                stitched.extend(rows)
+        return stitched
+
+    def _build_equity_xticks(self, timestamps):
+        """Build sparse x ticks for compressed trading-time axis."""
+        if not timestamps:
+            return [], []
+        day_first = []
+        day_last_map = {}
+        prev_day = None
+        for idx, ts in enumerate(timestamps):
+            day_key = ts.date().isoformat()
+            if day_key != prev_day:
+                day_first.append(idx)
+                prev_day = day_key
+            day_last_map[day_key] = idx
+        day_last = [day_last_map[k] for k in sorted(day_last_map.keys())]
+        anchors = sorted(set(day_first + day_last))
+        if len(anchors) > 14:
+            stride = max(1, len(anchors) // 14)
+            anchors = anchors[::stride]
+            if anchors[-1] != len(timestamps) - 1:
+                anchors.append(len(timestamps) - 1)
+        labels = [timestamps[i].strftime('%m-%d %H:%M') for i in anchors]
+        return anchors, labels
     
     def generate_equity_curve(self):
         """def generate_equity_curve: docstring omitted (was garbled/non-ASCII)."""
         if not self.equity_curve:
             print("[WARN] No equity curve data to plot")
             return
-        
-        timestamps = [ec[0] for ec in self.equity_curve]
-        equity = [ec[1] for ec in self.equity_curve]
-        cash = [ec[2] for ec in self.equity_curve]
-        positions = [ec[3] for ec in self.equity_curve]
+
+        points = self._prepare_equity_curve_points()
+        if not points:
+            print("[WARN] No market-hours equity points available to plot")
+            return
+
+        timestamps = [p[0] for p in points]
+        equity = [p[1] for p in points]
+        cash = [p[2] for p in points]
+        positions = [p[3] for p in points]
+        x_idx = list(range(len(points)))
         
         drawdowns = []
         peak = equity[0]
@@ -11489,25 +11780,27 @@ class PaperTradingEngine:
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
         
-        ax1.plot(timestamps, equity, label='Total Equity', linewidth=2, color='blue')
-        ax1.plot(timestamps, cash, label='Cash', linewidth=1, linestyle='--', color='green')
-        ax1.plot(timestamps, positions, label='Positions Value', linewidth=1, linestyle='--', color='orange')
+        ax1.plot(x_idx, equity, label='Total Equity', linewidth=2, color='blue')
+        ax1.plot(x_idx, cash, label='Cash', linewidth=1, linestyle='--', color='green')
+        ax1.plot(x_idx, positions, label='Positions Value', linewidth=1, linestyle='--', color='orange')
         ax1.axhline(y=self.initial_cash, color='red', linestyle=':', label='Initial Cash')
         ax1.set_ylabel('Value (USD)', fontsize=12)
         ax1.set_title('Paper Trading Equity Curve', fontsize=14, fontweight='bold')
         ax1.legend(loc='best')
         ax1.grid(True, alpha=0.3)
         
-        ax2.fill_between(timestamps, 0, drawdowns, color='red', alpha=0.3)
-        ax2.plot(timestamps, drawdowns, color='red', linewidth=1)
+        ax2.fill_between(x_idx, 0, drawdowns, color='red', alpha=0.3)
+        ax2.plot(x_idx, drawdowns, color='red', linewidth=1)
         ax2.set_ylabel('Drawdown (%)', fontsize=12)
-        ax2.set_xlabel('Time', fontsize=12)
+        ax2.set_xlabel('Trading Time (compressed)', fontsize=12)
         ax2.set_title('Drawdown', fontsize=12)
         ax2.grid(True, alpha=0.3)
         ax2.invert_yaxis()
-        
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-        plt.xticks(rotation=45)
+
+        tick_pos, tick_labels = self._build_equity_xticks(timestamps)
+        if tick_pos:
+            ax2.set_xticks(tick_pos)
+            ax2.set_xticklabels(tick_labels, rotation=45, ha='right')
         
         plt.tight_layout()
         
