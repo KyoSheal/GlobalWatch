@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 import os
 from atomic_io import atomic_write_json as io_atomic_write_json, safe_read_json as io_safe_read_json
+from market_time_filter import parse_iso_to_utc, sanitize_equity_rows
 from ui_window_presets import WINDOW_PRESETS, get_window_preset, format_till_now
 from ui_equity_window import filter_df_by_trading_day_window
 from ui_reports_window import select_window_effective_count
@@ -6509,7 +6510,14 @@ def _theme_colorize(text):
 
 
 @st.cache_data(ttl=30)
-def _parse_equity_history_cached(history_payload):
+def _parse_equity_history_cached(
+    history_payload,
+    market_tz="America/New_York",
+    open_time_et="09:30",
+    close_time_et="16:00",
+    open_grace_min=15,
+    close_grace_min=10,
+):
     """Parse equity_history payload into a clean DataFrame."""
     try:
         raw = json.loads(history_payload)
@@ -6518,53 +6526,51 @@ def _parse_equity_history_cached(history_payload):
     if not isinstance(raw, list) or not raw:
         return pd.DataFrame(columns=["time", "equity"])
 
+    clean_rows, _sanitize_stats = sanitize_equity_rows(
+        raw,
+        market_tz=str(market_tz or "America/New_York"),
+        open_time_et=str(open_time_et or "09:30"),
+        close_time_et=str(close_time_et or "16:00"),
+        open_grace_min=int(open_grace_min or 15),
+        close_grace_min=int(close_grace_min or 10),
+        drop_weekends=True,
+        drop_offhours=True,
+        blackout_dates_market={"2026-02-15"},
+    )
+
     rows = []
-    for point in raw:
+    for point in clean_rows:
         if not isinstance(point, dict):
             continue
-        rows.append(
-            {
-                "time": point.get("time"),
-                "equity": _to_float(point.get("equity", 0.0)),
-            }
-        )
+        ts_val = point.get("time", point.get("ts", point.get("timestamp")))
+        rows.append({"time": ts_val, "equity": _to_float(point.get("equity", 0.0))})
 
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["time", "equity"])
 
-    # Parse mixed timestamp formats robustly:
-    # - old rows may be naive ISO strings
-    # - newer rows are timezone-aware ISO strings (e.g. +00:00)
-    # Parse row-by-row first to avoid pandas mixed-format inference dropping aware rows.
     def _parse_mixed_time(value):
-        if value is None:
+        if value is None or str(value).strip() == "":
             return pd.NaT
-        text = str(value).strip()
-        if not text:
-            return pd.NaT
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
         try:
-            dt = datetime.fromisoformat(text)
-            if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
-            return pd.Timestamp(dt)
+            dt = parse_iso_to_utc(value)
+            return pd.Timestamp(dt.astimezone(timezone.utc))
         except Exception:
             try:
-                return pd.to_datetime(text, errors="coerce", utc=True)
+                return pd.to_datetime(value, errors="coerce", utc=True)
             except Exception:
                 return pd.NaT
 
     parsed_points = [_parse_mixed_time(v) for v in df["time"].tolist()]
     time_utc = pd.to_datetime(pd.Series(parsed_points), errors="coerce", utc=True)
-    local_tz = datetime.now().astimezone().tzinfo
-    if local_tz is not None:
-        df["time"] = time_utc.dt.tz_convert(local_tz).dt.tz_localize(None)
-    else:
-        df["time"] = time_utc.dt.tz_localize(None)
+    try:
+        df["time"] = time_utc.dt.tz_convert(str(market_tz or "America/New_York")).dt.tz_localize(None)
+    except Exception:
+        local_tz = datetime.now().astimezone().tzinfo
+        if local_tz is not None:
+            df["time"] = time_utc.dt.tz_convert(local_tz).dt.tz_localize(None)
+        else:
+            df["time"] = time_utc.dt.tz_localize(None)
     df = df.dropna(subset=["time"]).sort_values("time")
     if df.empty:
         return pd.DataFrame(columns=["time", "equity"])
@@ -6572,9 +6578,25 @@ def _parse_equity_history_cached(history_payload):
 
 
 @st.cache_data(ttl=30)
-def _prepare_equity_curve_cached(history_payload, window_key, resample_rule):
+def _prepare_equity_curve_cached(
+    history_payload,
+    window_key,
+    resample_rule,
+    market_tz="America/New_York",
+    open_time_et="09:30",
+    close_time_et="16:00",
+    open_grace_min=15,
+    close_grace_min=10,
+):
     """Apply optional resampling for equity curve data."""
-    df = _parse_equity_history_cached(history_payload)
+    df = _parse_equity_history_cached(
+        history_payload,
+        market_tz=str(market_tz or "America/New_York"),
+        open_time_et=str(open_time_et or "09:30"),
+        close_time_et=str(close_time_et or "16:00"),
+        open_grace_min=int(open_grace_min or 15),
+        close_grace_min=int(close_grace_min or 10),
+    )
     if df.empty:
         return df
 
@@ -7359,7 +7381,7 @@ def render_portfolio_monitor():
                         trade_df = trade_df.drop(columns=["time_sort", "time_str", "_row_order"]).reset_index(drop=True)
                         st.dataframe(trade_df, width="stretch", hide_index=True)
                 else:
-                    st.info("No trade history found in outputs/trade_history.jsonl")
+                    st.info(f"No trade history found in {trades_path}")
 
             def _render_reports_statistics_section():
                 st.subheader("Reports / Statistics")
@@ -7594,10 +7616,26 @@ def render_portfolio_monitor():
     
                     history_payload = json.dumps(equity_history, ensure_ascii=False, sort_keys=True)
                     pm_window_key = str(st.session_state.get("pm_window_key", "1M")).strip().upper()
+                    market_tz_name = str(_paper_reporting_cfg.get("market_tz", "America/New_York"))
+                    market_open_time_et = str(_paper_reporting_cfg.get("market_open_time_et", "09:30"))
+                    market_close_time_et = str(_paper_reporting_cfg.get("market_close_time_et", "16:00"))
+                    try:
+                        market_open_grace_min = int(_paper_reporting_cfg.get("market_open_grace_min", 15) or 15)
+                    except Exception:
+                        market_open_grace_min = 15
+                    try:
+                        market_close_grace_min = int(_paper_reporting_cfg.get("market_close_grace_min", 10) or 10)
+                    except Exception:
+                        market_close_grace_min = 10
                     equity_df_base = _prepare_equity_curve_cached(
                         history_payload,
                         pm_window_key,
                         str(st.session_state.get("pm_resample_rule", "15min")),
+                        market_tz_name,
+                        market_open_time_et,
+                        market_close_time_et,
+                        market_open_grace_min,
+                        market_close_grace_min,
                     )
                     equity_df, available_days, required_days = filter_df_by_trading_day_window(
                         equity_df_base,
@@ -7709,8 +7747,24 @@ def render_portfolio_monitor():
                                         "tickformat": tick_fmt,
                                     }
                                 )
+                            def _hour_float(hhmm_text, fallback):
+                                raw = str(hhmm_text or fallback).strip()
+                                if ":" not in raw:
+                                    raw = fallback
+                                try:
+                                    hh_s, mm_s = raw.split(":", 1)
+                                    hh = max(0, min(23, int(hh_s)))
+                                    mm = max(0, min(59, int(mm_s)))
+                                    return float(hh) + float(mm) / 60.0
+                                except Exception:
+                                    fh, fm = fallback.split(":")
+                                    return float(int(fh)) + float(int(fm)) / 60.0
+                            open_hour = _hour_float(market_open_time_et, "09:30")
+                            close_hour = _hour_float(market_close_time_et, "16:00")
+                            rangebreaks_cfg = [{"bounds": ["sat", "mon"]}]
                             if bool(st.session_state.get("pm_hide_off_hours", True)):
-                                xaxis_config["rangebreaks"] = [{"bounds": [13, 6], "pattern": "hour"}]
+                                rangebreaks_cfg.append({"bounds": [close_hour, open_hour], "pattern": "hour"})
+                            xaxis_config["rangebreaks"] = rangebreaks_cfg
                             range_end = plot_df["time"].max()
                             range_start = range_end - pd.Timedelta(days=int(calendar_days))
                             if pd.notna(range_start) and pd.notna(range_end):
@@ -7739,12 +7793,15 @@ def render_portfolio_monitor():
                         if not plot_rendered:
                             try:
                                 import altair as alt
-    
+                                plot_df_alt = plot_df.copy()
+                                plot_df_alt["idx"] = np.arange(len(plot_df_alt), dtype=int)
+                                plot_df_alt["time_str"] = pd.to_datetime(plot_df_alt["time"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+
                                 y_scale = alt.Scale()
                                 if str(st.session_state.get("pm_y_mode", "auto")) == "manual":
                                     y_scale = alt.Scale(domain=[float(min(y_min, y_max)), float(max(y_min, y_max))])
-    
-                                x_axis = alt.Axis(title="Time")
+
+                                x_axis = alt.Axis(title="Time (compressed)")
                                 if x_tick_mode == "fixed":
                                     tick_count = max(
                                         2,
@@ -7760,13 +7817,13 @@ def render_portfolio_monitor():
                                     y_axis = alt.Axis(title=y_title, tickMinStep=float(y_dtick))
     
                                 chart = (
-                                    alt.Chart(plot_df)
+                                    alt.Chart(plot_df_alt)
                                     .mark_line()
                                     .encode(
-                                        x=alt.X("time:T", axis=x_axis),
+                                        x=alt.X("idx:Q", axis=x_axis),
                                         y=alt.Y("y:Q", axis=y_axis, scale=y_scale),
                                         tooltip=[
-                                            alt.Tooltip("time:T", title="Time"),
+                                            alt.Tooltip("time_str:N", title="Time"),
                                             alt.Tooltip("y:Q", title=y_title, format=",.2f"),
                                         ],
                                     )

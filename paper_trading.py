@@ -24,6 +24,7 @@ from atomic_io import (
     atomic_write_text as io_atomic_write_text,
     safe_read_json as io_safe_read_json,
 )
+from market_time_filter import sanitize_equity_rows
 from outpost import (
     append_registry,
     make_run_id,
@@ -2311,30 +2312,150 @@ class PaperTradingEngine:
             self.risk_profile_applied_at_utc = payload.get('risk_profile_applied_at_utc', self.risk_profile_applied_at_utc)
             self.peak_equity = max(float(self.peak_equity or 0.0), float(total_equity))
 
-            ts_raw = payload.get('timestamp', self._now().isoformat())
-            try:
-                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-            except Exception:
-                ts = self._now()
-            self.equity_curve = [(ts, float(total_equity), float(cash), float(positions_value))]
-            self.portfolio_snapshots = [{
-                'timestamp': ts.isoformat(),
-                'cycle': int(max(0, self.current_cycle - 1)),
-                'cash': float(cash),
-                'positions': positions_detail if isinstance(positions_detail, dict) else {},
-                'positions_value': float(positions_value),
-                'total_equity': float(total_equity),
-                'total_return': float(payload.get('return', payload.get('total_return', 0.0)) or 0.0),
-                'drawdown': float(payload.get('drawdown', 0.0) or 0.0),
-                'run_id': self.run_id,
-                'session_id': self.session_id,
-            }]
+            # Prefer explicit equity_history from live snapshot, then fallback to legacy snapshots.
+            history_rows = payload.get('equity_history', [])
+            if isinstance(history_rows, list):
+                reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+                market_tz = str(reporting_cfg.get('market_tz', 'America/New_York') or 'America/New_York')
+                open_time_et = str(reporting_cfg.get('market_open_time_et', '09:30') or '09:30')
+                close_time_et = str(reporting_cfg.get('market_close_time_et', '16:00') or '16:00')
+                try:
+                    open_grace_min = int(reporting_cfg.get('market_open_grace_min', 15) or 15)
+                except Exception:
+                    open_grace_min = 15
+                try:
+                    close_grace_min = int(reporting_cfg.get('market_close_grace_min', 10) or 10)
+                except Exception:
+                    close_grace_min = 10
+                history_rows, _ = sanitize_equity_rows(
+                    history_rows,
+                    market_tz=market_tz,
+                    open_time_et=open_time_et,
+                    close_time_et=close_time_et,
+                    open_grace_min=open_grace_min,
+                    close_grace_min=close_grace_min,
+                    drop_weekends=True,
+                    drop_offhours=True,
+                    blackout_dates_market={'2026-02-15'},
+                )
+            reconstructed_curve = []
+            if isinstance(history_rows, list):
+                cash_ratio = (float(cash) / float(total_equity)) if float(total_equity) > 1e-12 else 0.0
+                for row in history_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    dt_obj = self._parse_datetime_utc_safe(row.get('time'))
+                    if not isinstance(dt_obj, datetime):
+                        continue
+                    try:
+                        eq_val = float(row.get('equity', np.nan))
+                    except Exception:
+                        continue
+                    if not np.isfinite(eq_val):
+                        continue
+                    try:
+                        c_val = float(row.get('cash', np.nan))
+                    except Exception:
+                        c_val = np.nan
+                    try:
+                        p_val = float(row.get('positions_value', np.nan))
+                    except Exception:
+                        p_val = np.nan
+                    if not np.isfinite(c_val):
+                        c_val = float(eq_val * cash_ratio)
+                    if not np.isfinite(p_val):
+                        p_val = float(max(0.0, eq_val - c_val))
+                    reconstructed_curve.append((dt_obj, float(eq_val), float(c_val), float(p_val)))
+
+            # Legacy backfill: when equity_history is sparse, try base_out_dir/portfolio_snapshots.jsonl.
+            if len(reconstructed_curve) < 10:
+                try:
+                    reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+                    base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+                    legacy_path = os.path.abspath(os.path.join(base_out_dir, 'portfolio_snapshots.jsonl'))
+                    if os.path.exists(legacy_path):
+                        legacy_curve = []
+                        with open(legacy_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                text = line.strip()
+                                if not text:
+                                    continue
+                                try:
+                                    snap = json.loads(text)
+                                except Exception:
+                                    continue
+                                if not isinstance(snap, dict):
+                                    continue
+                                snap_run = str(snap.get('run_id', '') or '').strip()
+                                snap_sess = str(snap.get('session_id', '') or '').strip()
+                                if self.run_id and snap_run and snap_run != self.run_id:
+                                    if self.session_id and snap_sess and snap_sess != self.session_id:
+                                        continue
+                                dt_obj = self._parse_datetime_utc_safe(snap.get('timestamp'))
+                                if not isinstance(dt_obj, datetime):
+                                    continue
+                                try:
+                                    eq_val = float(snap.get('total_equity', np.nan))
+                                    c_val = float(snap.get('cash', np.nan))
+                                    p_val = float(snap.get('positions_value', np.nan))
+                                except Exception:
+                                    continue
+                                if not (np.isfinite(eq_val) and np.isfinite(c_val) and np.isfinite(p_val)):
+                                    continue
+                                legacy_curve.append((dt_obj, eq_val, c_val, p_val))
+                        if legacy_curve:
+                            legacy_curve.sort(key=lambda x: x[0])
+                            if len(legacy_curve) > len(reconstructed_curve):
+                                reconstructed_curve = legacy_curve[-800:]
+                except Exception:
+                    pass
+
+            if reconstructed_curve:
+                reconstructed_curve.sort(key=lambda x: x[0])
+                self.equity_curve = list(reconstructed_curve[-800:])
+                snapshots = []
+                base_cycle = max(0, int(self.current_cycle) - len(self.equity_curve))
+                for idx, (dt_obj, eq_val, c_val, p_val) in enumerate(self.equity_curve):
+                    snapshots.append({
+                        'timestamp': dt_obj.isoformat(),
+                        'cycle': int(base_cycle + idx),
+                        'cash': float(c_val),
+                        'positions': positions_detail if isinstance(positions_detail, dict) else {},
+                        'positions_value': float(p_val),
+                        'total_equity': float(eq_val),
+                        'total_return': float(payload.get('return', payload.get('total_return', 0.0)) or 0.0),
+                        'drawdown': float(payload.get('drawdown', 0.0) or 0.0),
+                        'run_id': self.run_id,
+                        'session_id': self.session_id,
+                    })
+                self.portfolio_snapshots = snapshots
+                self.peak_equity = max(float(self.peak_equity or 0.0), max(v[1] for v in self.equity_curve))
+            else:
+                ts_raw = payload.get('timestamp', self._now().isoformat())
+                try:
+                    ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                except Exception:
+                    ts = self._now()
+                self.equity_curve = [(ts, float(total_equity), float(cash), float(positions_value))]
+                self.portfolio_snapshots = [{
+                    'timestamp': ts.isoformat(),
+                    'cycle': int(max(0, self.current_cycle - 1)),
+                    'cash': float(cash),
+                    'positions': positions_detail if isinstance(positions_detail, dict) else {},
+                    'positions_value': float(positions_value),
+                    'total_equity': float(total_equity),
+                    'total_return': float(payload.get('return', payload.get('total_return', 0.0)) or 0.0),
+                    'drawdown': float(payload.get('drawdown', 0.0) or 0.0),
+                    'run_id': self.run_id,
+                    'session_id': self.session_id,
+                }]
 
             print(f"[RESUME] loaded from {snapshot_path}")
             print(f"   Cycle: {max(0, self.current_cycle - 1)} -> next={self.current_cycle}")
             print(f"   Cash: ${self.cash:,.2f}")
             print(f"   Positions: {len(self.positions)} holdings")
             print(f"   Total equity: ${total_equity:,.2f}")
+            print(f"   Equity history points: {len(self.equity_curve)}")
             return True
         except Exception as e:
             print(f"[WARN] Failed to resume from UI snapshot ({snapshot_path}): {e}")
@@ -2590,7 +2711,9 @@ class PaperTradingEngine:
             time_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
             equity_history.append({
                 'time': time_str,
-                'equity': float(equity)
+                'equity': float(equity),
+                'cash': float(_cash),
+                'positions_value': float(_posv),
             })
 
         cov_diag = {"enabled": True, "status": "error", "error": "cov_diag_uninitialized"}
@@ -2937,6 +3060,64 @@ class PaperTradingEngine:
             ),
         }
         return payload
+
+    def _sanitize_snapshot_equity_history(self, payload):
+        """Remove weekend/off-hours/blackout points from snapshot equity_history."""
+        if not isinstance(payload, dict):
+            return payload, {
+                "total_in": 0,
+                "kept": 0,
+                "dropped_blackout": 0,
+                "dropped_weekend": 0,
+                "dropped_offhours": 0,
+                "dropped_invalid_ts": 0,
+            }
+        history_rows = payload.get('equity_history', [])
+        if not isinstance(history_rows, list):
+            return payload, {
+                "total_in": 0,
+                "kept": 0,
+                "dropped_blackout": 0,
+                "dropped_weekend": 0,
+                "dropped_offhours": 0,
+                "dropped_invalid_ts": 0,
+            }
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        if not bool(reporting_cfg.get('equity_curve_filter_trading_hours', True)):
+            return payload, {
+                "total_in": int(len(history_rows)),
+                "kept": int(len(history_rows)),
+                "dropped_blackout": 0,
+                "dropped_weekend": 0,
+                "dropped_offhours": 0,
+                "dropped_invalid_ts": 0,
+            }
+
+        market_tz = str(reporting_cfg.get('market_tz', 'America/New_York') or 'America/New_York')
+        open_time_et = str(reporting_cfg.get('market_open_time_et', '09:30') or '09:30')
+        close_time_et = str(reporting_cfg.get('market_close_time_et', '16:00') or '16:00')
+        try:
+            open_grace_min = int(reporting_cfg.get('market_open_grace_min', 15) or 15)
+        except Exception:
+            open_grace_min = 15
+        try:
+            close_grace_min = int(reporting_cfg.get('market_close_grace_min', 10) or 10)
+        except Exception:
+            close_grace_min = 10
+
+        clean_rows, stats = sanitize_equity_rows(
+            history_rows,
+            market_tz=market_tz,
+            open_time_et=open_time_et,
+            close_time_et=close_time_et,
+            open_grace_min=open_grace_min,
+            close_grace_min=close_grace_min,
+            drop_weekends=True,
+            drop_offhours=True,
+            blackout_dates_market={'2026-02-15'},
+        )
+        payload['equity_history'] = clean_rows
+        return payload, stats
 
     def atomic_write_text(self, path, content):
         """Atomically write text content using the shared production-safe helper."""
@@ -4158,6 +4339,23 @@ class PaperTradingEngine:
             payload = self._build_live_snapshot_payload(snapshot) if bool(lightweight) else self.build_live_snapshot(snapshot)
             if isinstance(payload, dict):
                 payload['source'] = str(source)
+            payload, sanitize_stats = self._sanitize_snapshot_equity_history(payload)
+            if isinstance(sanitize_stats, dict):
+                dropped_total = int(
+                    sanitize_stats.get('dropped_blackout', 0)
+                    + sanitize_stats.get('dropped_weekend', 0)
+                    + sanitize_stats.get('dropped_offhours', 0)
+                    + sanitize_stats.get('dropped_invalid_ts', 0)
+                )
+                if dropped_total > 0:
+                    print(
+                        "[SANITIZE] ui equity_history "
+                        f"kept={int(sanitize_stats.get('kept', 0))} "
+                        f"dropped_blackout={int(sanitize_stats.get('dropped_blackout', 0))} "
+                        f"dropped_weekend={int(sanitize_stats.get('dropped_weekend', 0))} "
+                        f"dropped_offhours={int(sanitize_stats.get('dropped_offhours', 0))} "
+                        f"dropped_invalid_ts={int(sanitize_stats.get('dropped_invalid_ts', 0))}"
+                    )
             price_debug_items = 0
             if isinstance(payload, dict) and isinstance(payload.get('price_debug'), dict):
                 price_debug_items = len(payload.get('price_debug', {}))
@@ -4849,7 +5047,10 @@ class PaperTradingEngine:
 
     def save_trade_history_jsonl(self):
         """Write trade history JSONL for Streamlit portfolio monitor."""
-        trade_history_path = self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        trade_history_path = reporting_cfg.get('trade_history_path', 'outputs/trade_history.jsonl')
+        base_out_dir = str(reporting_cfg.get('base_out_dir', 'outputs') or 'outputs').strip() or 'outputs'
+        legacy_trade_history_path = os.path.join(base_out_dir, 'trade_history.jsonl')
 
         def _sanitize(value):
             if isinstance(value, dict):
@@ -4885,6 +5086,12 @@ class PaperTradingEngine:
                     trade_clean['risk_profile_template_version'] = int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION)
                 trade_rows.append(trade_clean)
             self.atomic_write_jsonl(trade_history_path, trade_rows)
+            # Backward-compatible mirror for UI/legacy readers.
+            try:
+                if os.path.abspath(str(legacy_trade_history_path)) != os.path.abspath(str(trade_history_path)):
+                    self.atomic_write_jsonl(legacy_trade_history_path, trade_rows)
+            except Exception as mirror_err:
+                print(f"[WARN] Failed to mirror trade history JSONL: {mirror_err}")
         except Exception as e:
             print(f"[WARN] Failed to write trade history JSONL: {e}")
     
@@ -12362,7 +12569,14 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("CASE1-E", isinstance(snap1.get("price_debug"), dict) and len(snap1.get("price_debug", {})) > 0, "PRE_OPEN with holdings still writes non-empty price_debug")
     case1_live_price_debug_ok = False
     try:
-        with open(reporting_cfg["snapshot_live_path"], "r", encoding="utf-8") as f:
+        reporting_cfg_case1 = engine.config.get("reporting", {}) if isinstance(engine.config, dict) else {}
+        if not isinstance(reporting_cfg_case1, dict):
+            reporting_cfg_case1 = {}
+        base_out_dir_case1 = str(reporting_cfg_case1.get("base_out_dir", "outputs") or "outputs").strip() or "outputs"
+        case1_snapshot_path = str(
+            reporting_cfg_case1.get("snapshot_live_path") or os.path.join(base_out_dir_case1, "snapshot_live.json")
+        )
+        with open(case1_snapshot_path, "r", encoding="utf-8") as f:
             case1_live_payload = json.load(f)
         case1_live_price_debug_ok = isinstance(case1_live_payload.get("price_debug"), dict) and len(case1_live_payload.get("price_debug", {})) > 0
     except Exception:
@@ -12465,8 +12679,12 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("S3-E", age_diff_ok, "age_min matches now_ts - price_ts in UTC")
 
     # S5 checks.
-    snapshot_path = reporting_cfg["snapshot_live_path"]
-    trade_history_path = reporting_cfg["trade_history_path"]
+    reporting_cfg_s5 = engine.config.get("reporting", {}) if isinstance(engine.config, dict) else {}
+    if not isinstance(reporting_cfg_s5, dict):
+        reporting_cfg_s5 = {}
+    base_out_dir_s5 = str(reporting_cfg_s5.get("base_out_dir", "outputs") or "outputs").strip() or "outputs"
+    snapshot_path = str(reporting_cfg_s5.get("snapshot_live_path") or os.path.join(base_out_dir_s5, "snapshot_live.json"))
+    trade_history_path = str(reporting_cfg_s5.get("trade_history_path") or os.path.join(base_out_dir_s5, "trade_history.jsonl"))
     _check("S5-A", os.path.exists(snapshot_path), "snapshot_live.json exists")
     _check("S5-B", os.path.exists(trade_history_path), "trade_history.jsonl exists")
 
