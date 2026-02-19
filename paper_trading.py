@@ -1655,6 +1655,26 @@ class PaperTradingEngine:
         reporting_cfg['daily_report_dirs'] = [os.path.join(base_out_dir, 'Daily Report')]
         self._maybe_migrate_legacy_daily_report_dirs()
 
+        # Ensure parent directories/files exist even before first successful trade.
+        # This keeps diagnostics/UI stable on zero-trade days.
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(snapshot_live_abs)) or ".", exist_ok=True)
+        except Exception:
+            pass
+        try:
+            run_trade_history_path = str(reporting_cfg.get('trade_history_path', '') or '').strip()
+            legacy_trade_history_path = os.path.join(base_out_dir, 'trade_history.jsonl')
+            for th_path in [run_trade_history_path, legacy_trade_history_path]:
+                if not th_path:
+                    continue
+                th_abs = os.path.abspath(th_path)
+                os.makedirs(os.path.dirname(th_abs) or ".", exist_ok=True)
+                if not os.path.exists(th_abs):
+                    with open(th_abs, 'a', encoding='utf-8'):
+                        pass
+        except Exception:
+            pass
+
         telemetry_dir = os.path.join(out_dir_abs, 'telemetry')
         os.makedirs(telemetry_dir, exist_ok=True)
         self.runtime_control_path = self._resolve_runtime_control_path()
@@ -4593,6 +4613,16 @@ class PaperTradingEngine:
         total_return = (total_equity - self.initial_cash) / self.initial_cash if self.initial_cash > 0 else 0.0
         peak_base = max(float(self.peak_equity or 0.0), total_equity)
         drawdown = (peak_base - total_equity) / peak_base if peak_base > 0 else 0.0
+        risk_info = dict(self.current_risk_check_info) if isinstance(self.current_risk_check_info, dict) else {}
+        cov_diag = risk_info.get('cov_risk_diag', {})
+        if not isinstance(cov_diag, dict):
+            cov_diag = {}
+        cov_current_summary = risk_info.get('cov_risk_current_summary', {})
+        if not isinstance(cov_current_summary, dict):
+            cov_current_summary = {}
+        cov_target_summary = risk_info.get('cov_risk_target_summary', {})
+        if not isinstance(cov_target_summary, dict):
+            cov_target_summary = {}
         last_attempt_time = self.last_rebalance_attempt_time.isoformat() if isinstance(self.last_rebalance_attempt_time, datetime) else self.last_rebalance_attempt_time
         success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
         last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
@@ -4654,6 +4684,29 @@ class PaperTradingEngine:
             'turnover_limit': self.current_turnover_info.get('turnover_limit', 0.0),
             'turnover_scale': self.current_turnover_info.get('turnover_scale', 1.0),
             'turnover_capped': self.current_turnover_info.get('turnover_capped', False),
+            'risk_check_checked': risk_info.get('checked', False),
+            'risk_check_abort': risk_info.get('abort', False),
+            'risk_check_reason': risk_info.get('abort_reason', ''),
+            'portfolio_weighted_volatility': risk_info.get('weighted_volatility', 0.0),
+            'portfolio_volatility_limit': risk_info.get('max_portfolio_volatility'),
+            'portfolio_volatility_known_weight': risk_info.get('volatility_known_weight', 0.0),
+            'portfolio_volatility_confident': risk_info.get('volatility_confident', False),
+            'portfolio_vol_min_coverage': risk_info.get('min_coverage'),
+            'gate_vol_method': risk_info.get('gate_vol_method', ''),
+            'cov_gate_used': risk_info.get('cov_gate_used'),
+            'cov_gate_coverage': risk_info.get('cov_gate_coverage'),
+            'cov_gate_vol': risk_info.get('cov_gate_vol'),
+            'cov_gate_max_rc': risk_info.get('cov_gate_max_rc'),
+            'cov_gate_pass': risk_info.get('cov_gate_pass'),
+            'cov_gate_reason': risk_info.get('cov_gate_reason', ''),
+            'rc_limit': risk_info.get('rc_limit'),
+            'cov_risk_diag': dict(cov_diag),
+            'cov_risk_current_summary': dict(cov_current_summary),
+            'cov_risk_target_summary': dict(cov_target_summary),
+            'portfolio_vol_cov_annualized': cov_diag.get('portfolio_vol_annualized') if isinstance(cov_diag, dict) else None,
+            'max_rc_fraction_cov': cov_diag.get('max_rc_fraction') if isinstance(cov_diag, dict) else None,
+            'max_rc_ticker_cov': cov_diag.get('max_rc_ticker') if isinstance(cov_diag, dict) else None,
+            'rc_fraction_top5_cov': cov_diag.get('rc_fraction_top5') if isinstance(cov_diag, dict) else None,
             'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {'enabled': False, 'total': 0.0, 'fee': 0.0, 'slippage': 0.0, 'impact': 0.0, 'num_trades': 0},
             'trade_planner': dict(self.current_planner_info) if isinstance(self.current_planner_info, dict) else {'enabled': False, 'status': 'disabled', 'dropped': [], 'scaled': []},
             'vol_target_diag': dict(self.current_vol_target_diag_info) if isinstance(self.current_vol_target_diag_info, dict) else {
@@ -9363,6 +9416,7 @@ class PaperTradingEngine:
         attempt_cooldown_minutes = float(
             execution_config.get('rebalance_attempt_cooldown_minutes', cooldown_minutes) or cooldown_minutes
         )
+        self.current_rebalance_skipped_reason = ""
         min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
         enable_exit_signals = bool(execution_config.get('enable_exit_signals', True))
         exit_signal_action = str(execution_config.get('exit_signal_action', 'reduce')).lower()
@@ -9563,6 +9617,7 @@ class PaperTradingEngine:
             time_since_last = (now_rebalance - last_success_ref).total_seconds() / 60
             if time_since_last < cooldown_minutes:
                 remaining = cooldown_minutes - time_since_last
+                self.current_rebalance_skipped_reason = 'cooldown'
                 self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
                 print(f"[COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
                 return []
@@ -9952,6 +10007,7 @@ class PaperTradingEngine:
         )
         
         if stale_abort_allowed and candidate_count_policy_pass > 0 and stale_ratio_candidates > max_stale_ratio:
+            self.current_rebalance_skipped_reason = 'stale_abort'
             print(f"[STALE ABORT] STALE ratio {stale_ratio_candidates:.1%} > threshold {max_stale_ratio:.1%}, aborting rebalance")
             if stale_count_policy_pass == candidate_count_policy_pass:
                 print("[INFO] All candidate trades depend on STALE prices. "
@@ -10033,6 +10089,7 @@ class PaperTradingEngine:
 
         if risk_gate.get('abort', False):
             reason = str(risk_gate.get('abort_reason', 'risk_gate'))
+            self.current_rebalance_skipped_reason = f"risk_gate:{reason}"
             if reason == 'portfolio_volatility':
                 print(f"[RISK CHECK] Portfolio volatility = {risk_gate['weighted_volatility']:.2f} -> aborting rebalance")
             elif reason == 'diversity_hhi':
@@ -10691,6 +10748,7 @@ class PaperTradingEngine:
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         if trades:
+            self.current_rebalance_skipped_reason = ''
             self.trades_log.extend(trades)
             self.save_trades_immediately()
             self.last_rebalance_success_time = self._now()
@@ -10698,7 +10756,9 @@ class PaperTradingEngine:
             print(f"[COOLDOWN] Next rebalance allowed after {cooldown_minutes} minutes")
             self._write_post_rebalance_live_snapshot(len(trades), source="execute_rebalance")
         else:
-            print(f"[INFO] No trades executed (all filtered by protections)")
+            if not str(self.current_rebalance_skipped_reason or '').strip():
+                self.current_rebalance_skipped_reason = 'already_balanced_or_filtered'
+            print(f"[INFO] No trades executed ({self.current_rebalance_skipped_reason})")
         
         return trades
     
@@ -11747,8 +11807,16 @@ class PaperTradingEngine:
                 print(f"No trades executed (market_closed_gate, session={session_state})")
             elif self.current_rebalance_skipped_reason == 'attempt_cooldown':
                 print("No trades executed (attempt_cooldown)")
+            elif str(self.current_rebalance_skipped_reason or '').startswith('risk_gate:'):
+                print(f"No trades executed ({self.current_rebalance_skipped_reason})")
+            elif self.current_rebalance_skipped_reason == 'cooldown':
+                print("No trades executed (cooldown)")
+            elif self.current_rebalance_skipped_reason == 'stale_abort':
+                print("No trades executed (stale_abort)")
+            elif self.current_rebalance_skipped_reason == 'already_balanced_or_filtered':
+                print("No trades executed (already_balanced_or_filtered)")
             else:
-                print("No trades executed (portfolio already balanced)")
+                print(f"No trades executed ({self.current_rebalance_skipped_reason or 'already_balanced_or_filtered'})")
 
         self.current_cycle += 1
 
