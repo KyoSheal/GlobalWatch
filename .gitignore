@@ -54,6 +54,7 @@ scripts/**/ci_artifacts/
 
 memory_db/
 backup/
+tools/
 
 
 # Any scratch dirs you might have
