@@ -1,53 +1,71 @@
-########################################
-# Python / common
-########################################
+# =========================
+# Python / general
+# =========================
 __pycache__/
 *.py[cod]
 *$py.class
-
 .venv/
 venv/
 ENV/
 env/
 pip-wheel-metadata/
-*.egg-info/
-.eggs/
-build/
-dist/
-.cache/
+pip-log.txt
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
+.pytype/
 coverage.xml
+.coverage
 htmlcov/
+*.log
 
-# 你的本地记忆数据库 (不要上传这个！)
-memory_db/
-chroma_db/
+# =========================
+# OS / editors
+# =========================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# =========================
+# Project outputs (global)
+# =========================
 outputs/
-backup/
-globalwatch/
-papertrader/
-tools/
-debug/
+*.bak
+*.tmp
+
+# If you want to keep outputs/Daily Report/*.json tracked, comment the line above
+# and instead ignore only heavy subfolders you don't commit.
+
+# =========================
+# scripts/ should be committed, but ignore junk inside
+# =========================
 scripts/**/__pycache__/
 scripts/**/.pytest_cache/
 scripts/**/.mypy_cache/
 scripts/**/.ruff_cache/
+
+# Generated test outputs inside scripts tree
 scripts/**/outputs/
-scripts/**/outputs/**
+scripts/**/output/
+scripts/**/artifacts/
+scripts/**/ci_artifacts/
 
-# 如果你有虚拟环境
-venv/
-.env
+memory_db/
+backup/
 
-# IDE配置
-.vscode/
-.idea/
 
-########################################
-# GitHub Actions artifacts (local)
-########################################
-outputs/ci_artifacts/
-outputs/ci_artifacts/**
+# Any scratch dirs you might have
+scripts/**/tmp/
+scripts/**/temp/
+scripts/**/.tmp/
+
+# =========================
+# Optional: notebooks / data caches
+# =========================
+.ipynb_checkpoints/
+*.parquet
+*.feather
+*.pkl
+*.pickle
