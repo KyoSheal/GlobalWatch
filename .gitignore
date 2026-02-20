@@ -1,6 +1,26 @@
-# Python 缓存
+########################################
+# Python / common
+########################################
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+build/
+dist/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # 你的本地记忆数据库 (不要上传这个！)
 memory_db/
@@ -11,7 +31,12 @@ globalwatch/
 papertrader/
 tools/
 debug/
-scripts/
+scripts/**/__pycache__/
+scripts/**/.pytest_cache/
+scripts/**/.mypy_cache/
+scripts/**/.ruff_cache/
+scripts/**/outputs/
+scripts/**/outputs/**
 
 # 如果你有虚拟环境
 venv/
@@ -20,3 +45,9 @@ venv/
 # IDE配置
 .vscode/
 .idea/
+
+########################################
+# GitHub Actions artifacts (local)
+########################################
+outputs/ci_artifacts/
+outputs/ci_artifacts/**
