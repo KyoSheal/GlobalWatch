@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      strict_replay:
+        description: "Enable strict replay drift hard gate (1 to enable)"
+        required: false
+        default: "0"
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      GW_CI_STRICT_REPLAY: ${{ github.event.inputs.strict_replay || vars.GW_CI_STRICT_REPLAY || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run diagnostics suite (T00..T46)
+        id: run_tests
+        run: |
+          python scripts/diagnostics/run_all_tests.py
+
+      - name: Optional strict replay drift hard gate
+        id: strict_replay
+        if: env.GW_CI_STRICT_REPLAY == '1'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, json
+          from pathlib import Path
+
+          base = Path(".ci_replay_window_strict")
+          replay = base / "replay_window" / "strict_demo"
+          per = replay / "per_cycle" / "99"
+          per.mkdir(parents=True, exist_ok=True)
+
+          with (replay / "replay_window_manifest.json").open("w", encoding="utf-8") as f:
+              json.dump({"schema_version": 1, "status": "ok", "warnings": []}, f, ensure_ascii=False, indent=2)
+
+          cols = [
+              "cycle", "time_utc", "price_rows", "num_trades", "target_hash", "trades_hash",
+              "gate_fail", "warnings_count", "ref_status", "attribution_tags",
+              "weights_l1", "trades_notional_delta", "diff_path", "decision_path",
+          ]
+          with (replay / "replay_window_summary.csv").open("w", encoding="utf-8", newline="") as f:
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerow({
+                  "cycle": 99,
+                  "time_utc": "2026-02-20T12:00:00+00:00",
+                  "price_rows": 2,
+                  "num_trades": 0,
+                  "target_hash": "h1",
+                  "trades_hash": "h2",
+                  "gate_fail": "False",
+                  "warnings_count": 0,
+                  "ref_status": "ok",
+                  "attribution_tags": "",
+                  "weights_l1": "0.000000",
+                  "trades_notional_delta": "0",
+                  "diff_path": "per_cycle/99/diff.json",
+                  "decision_path": "per_cycle/99/replay_decision.md",
+              })
+
+          with (per / "diff.json").open("w", encoding="utf-8") as f:
+              json.dump(
+                  {"weights_diff": {"weights_l1": 0.0, "top_deltas": []}, "trades_diff": {"notional_delta": 0.0}, "attribution_tags": []},
+                  f,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+          with (per / "replay_manifest.json").open("w", encoding="utf-8") as f:
+              json.dump({"snapshot": {"total_equity": 100000.0}}, f, ensure_ascii=False, indent=2)
+          print(f"REPLAY_DIR={replay.resolve()}")
+          PY
+
+          mkdir -p outputs/ci_artifacts/STRICT_REPLAY
+
+          python scripts/quant/a11_replay_drift_gate.py \
+            --replay-window-dir ".ci_replay_window_strict/replay_window/strict_demo" \
+            --out-dir "outputs/ci_artifacts/STRICT_REPLAY" \
+            --strict \
+            --fail-on-drift \
+            --forbid-tags NONDETERMINISM_WARNING,macro_not_frozen
+
+      - name: Write job summary
+        if: always()
+        env:
+          GW_CI_TESTS_STATUS: ${{ steps.run_tests.outcome }}
+          GW_CI_STRICT_REPLAY_STATUS: ${{ steps.strict_replay.outcome }}
+          GW_CI_STRICT_REPLAY: ${{ env.GW_CI_STRICT_REPLAY }}
+        run: |
+          python scripts/diagnostics/ci_write_job_summary.py --artifacts-dir outputs/ci_artifacts
+
+      - name: Upload quant CI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quant-ci-artifacts
+          path: outputs/ci_artifacts
+          if-no-files-found: warn

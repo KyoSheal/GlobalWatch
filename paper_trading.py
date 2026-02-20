@@ -25,6 +25,7 @@ from atomic_io import (
     safe_read_json as io_safe_read_json,
 )
 from market_time_filter import sanitize_equity_rows
+from vol_target_stabilizer import stabilize_vol_target_scale
 from outpost import (
     append_registry,
     make_run_id,
@@ -1043,14 +1044,24 @@ class PaperTradingEngine:
         self.current_vol_target_diag_info = {
             'status': 'unavailable',
             'a5_scale': 1.0,
+            'a5_raw_scale': 1.0,
+            'a5_smooth_scale': 1.0,
+            'a5_applied_scale': 1.0,
+            'a5_hold_reason': 'no_change',
+            'a5_release_counter': 0,
             'a5_target_vol': None,
             'a5_cfg_target_vol': None,
             'a5_vol_method': 'unavailable',
             'a5_cov_coverage': None,
-            'a5_reason': 'uninitialized',
+            'a5_reason': 'not_evaluated',
             'applied': False,
             'forced': False,
         }
+        self._vol_target_prev_smooth_scale = 1.0
+        self._vol_target_release_counter = 0
+        self._vol_target_last_applied_scale = 1.0
+        self._vol_target_last_raw_scale = 1.0
+        self._vol_target_last_update_utc = None
         self.current_cost_est_info = {
             'enabled': False,
             'total': 0.0,
@@ -1097,6 +1108,12 @@ class PaperTradingEngine:
             'skipped_small_count': 0,
             'min_keep_trades': 0,
             'kept_due_to_min_keep_count': 0,
+            'min_keep_turnover_ratio_cfg': 0.0,
+            'planner_turnover_ratio_before': 0.0,
+            'planner_turnover_ratio_after': 0.0,
+            'min_keep_turnover_triggered': False,
+            'min_keep_turnover_added': 0,
+            'min_keep_turnover_reason': 'disabled',
             'top_selected_by_score': [],
         }
         self.current_news_overlay_info = {
@@ -2213,6 +2230,7 @@ class PaperTradingEngine:
             self.cash = last_snapshot['cash']
             self.current_cycle = last_snapshot['cycle'] + 1  # NOTE: comment omitted (was garbled/non-ASCII).
             self.status = "RESUMED"
+            self._restore_vol_target_state_from_snapshot(last_snapshot)
             print(
                 f"[CHECKPOINT] resume run_id={self.run_id} "
                 f"session_id={self.session_id} next_cycle={self.current_cycle}"
@@ -2330,6 +2348,7 @@ class PaperTradingEngine:
                 self.risk_profile_template_version = int(RISK_PROFILE_TEMPLATE_VERSION)
             self.risk_profile_applied_cycle_id = payload.get('risk_profile_applied_cycle_id', self.risk_profile_applied_cycle_id)
             self.risk_profile_applied_at_utc = payload.get('risk_profile_applied_at_utc', self.risk_profile_applied_at_utc)
+            self._restore_vol_target_state_from_snapshot(payload)
             self.peak_equity = max(float(self.peak_equity or 0.0), float(total_equity))
 
             # Prefer explicit equity_history from live snapshot, then fallback to legacy snapshots.
@@ -2853,12 +2872,46 @@ class PaperTradingEngine:
             vt_diag_meta = {
                 'status': 'unavailable',
                 'a5_scale': 1.0,
+                'a5_raw_scale': 1.0,
+                'a5_smooth_scale': 1.0,
+                'a5_applied_scale': 1.0,
+                'a5_hold_reason': 'no_change',
+                'a5_release_counter': 0,
                 'a5_target_vol': None,
                 'a5_cfg_target_vol': None,
                 'a5_vol_method': 'unavailable',
                 'a5_cov_coverage': None,
                 'a5_reason': 'unavailable',
             }
+        try:
+            vt_release_counter = int(vt_diag_meta.get('a5_release_counter', 0) or 0)
+            if vt_release_counter < 0:
+                vt_release_counter = 0
+        except Exception:
+            vt_release_counter = 0
+        vt_hold_reason = str(vt_diag_meta.get('a5_hold_reason', '') or '').strip() or 'no_change'
+        if vt_hold_reason == 'uninitialized':
+            vt_hold_reason = 'no_change'
+        vt_state_meta = snapshot.get('vol_target_state')
+        if not isinstance(vt_state_meta, dict):
+            vt_state_meta = self._get_vol_target_state_payload()
+        if not isinstance(vt_state_meta, dict):
+            vt_state_meta = {}
+        vt_state_meta = dict(vt_state_meta)
+        vt_state_meta['smooth_scale'] = float(np.clip(float(vt_state_meta.get('smooth_scale', self._vol_target_prev_smooth_scale) or self._vol_target_prev_smooth_scale), 0.0, 1.0))
+        try:
+            vt_state_meta['release_counter'] = max(0, int(vt_state_meta.get('release_counter', vt_release_counter) or vt_release_counter))
+        except Exception:
+            vt_state_meta['release_counter'] = int(vt_release_counter)
+        vt_state_meta['last_applied_scale'] = float(np.clip(float(vt_state_meta.get('last_applied_scale', self._vol_target_last_applied_scale) or self._vol_target_last_applied_scale), 0.0, 1.0))
+        vt_state_meta['last_raw_scale'] = float(np.clip(float(vt_state_meta.get('last_raw_scale', self._vol_target_last_raw_scale) or self._vol_target_last_raw_scale), 0.0, 1.0))
+        vt_last_update = vt_state_meta.get('last_update_utc', self._vol_target_last_update_utc)
+        if isinstance(vt_last_update, datetime):
+            vt_last_update = vt_last_update.astimezone(timezone.utc).isoformat()
+        elif vt_last_update is not None:
+            vt_last_update = str(vt_last_update)
+        vt_state_meta['last_update_utc'] = vt_last_update
+        vt_state_meta['initialized'] = True
         rebalance_cost_diag_meta = None
         if isinstance(snapshot.get('rebalance_cost_diag'), dict):
             rebalance_cost_diag_meta = dict(snapshot.get('rebalance_cost_diag'))
@@ -2915,6 +2968,12 @@ class PaperTradingEngine:
                 'skipped_small_count': 0,
                 'min_keep_trades': 0,
                 'kept_due_to_min_keep_count': 0,
+                'min_keep_turnover_ratio_cfg': 0.0,
+                'planner_turnover_ratio_before': 0.0,
+                'planner_turnover_ratio_after': 0.0,
+                'min_keep_turnover_triggered': False,
+                'min_keep_turnover_added': 0,
+                'min_keep_turnover_reason': 'disabled',
                 'top_selected_by_score': [],
             }
         cost_est_meta = snapshot.get('cost_est')
@@ -3064,6 +3123,33 @@ class PaperTradingEngine:
             'vol_targeting_vol_before': vt_meta.get('vol_before') if isinstance(vt_meta, dict) else None,
             'vol_targeting_cash_after': vt_meta.get('cash_after') if isinstance(vt_meta, dict) else None,
             'vol_target_diag': vt_diag_meta,
+            'vol_target_raw_scale': (
+                float(vt_diag_meta.get('a5_raw_scale'))
+                if vt_diag_meta.get('a5_raw_scale') is not None
+                else (
+                    float(vt_diag_meta.get('a5_scale'))
+                    if vt_diag_meta.get('a5_scale') is not None else None
+                )
+            ),
+            'vol_target_smooth_scale': (
+                float(vt_diag_meta.get('a5_smooth_scale'))
+                if vt_diag_meta.get('a5_smooth_scale') is not None
+                else (
+                    float(vt_diag_meta.get('a5_scale'))
+                    if vt_diag_meta.get('a5_scale') is not None else None
+                )
+            ),
+            'vol_target_applied_scale': (
+                float(vt_diag_meta.get('a5_applied_scale'))
+                if vt_diag_meta.get('a5_applied_scale') is not None
+                else (
+                    float(vt_diag_meta.get('a5_scale'))
+                    if vt_diag_meta.get('a5_scale') is not None else None
+                )
+            ),
+            'vol_target_hold_reason': str(vt_hold_reason),
+            'vol_target_release_counter': int(vt_release_counter),
+            'vol_target_state': dict(vt_state_meta),
             'rebalance_cost_diag': rebalance_cost_diag_meta,
             'rebalance_cost_diag_filtered': rebalance_cost_diag_filtered_meta,
             'rebalance_plan_filter_diag': rebalance_plan_filter_diag_meta,
@@ -3369,6 +3455,11 @@ class PaperTradingEngine:
             "status": "ok",
             "reason_tag": str(reason_tag),
             "a5_scale": 1.0,
+            "a5_raw_scale": 1.0,
+            "a5_smooth_scale": 1.0,
+            "a5_applied_scale": 1.0,
+            "a5_hold_reason": "diag_only",
+            "a5_release_counter": int(getattr(self, "_vol_target_release_counter", 0) or 0),
             "a5_target_vol": None,
             "a5_cfg_target_vol": float(cfg_target),
             "a5_vol_method": "unavailable",
@@ -3457,12 +3548,22 @@ class PaperTradingEngine:
                 diag["status"] = "unavailable"
                 diag["a5_reason"] = "vol_unavailable"
                 diag["a5_scale"] = 1.0
+                diag["a5_raw_scale"] = 1.0
+                diag["a5_smooth_scale"] = float(getattr(self, "_vol_target_prev_smooth_scale", 1.0) or 1.0)
+                diag["a5_applied_scale"] = 1.0
+                diag["a5_hold_reason"] = "vol_unavailable"
+                diag["a5_release_counter"] = int(getattr(self, "_vol_target_release_counter", 0) or 0)
                 return diag
 
             scale = float(min(1.0, float(cfg_target) / float(vol)))
             scale = float(np.clip(scale, 0.0, 1.0))
             diag["a5_target_vol"] = float(vol)
             diag["a5_scale"] = float(scale)
+            diag["a5_raw_scale"] = float(scale)
+            diag["a5_smooth_scale"] = float(scale)
+            diag["a5_applied_scale"] = float(scale)
+            diag["a5_hold_reason"] = "diag_only"
+            diag["a5_release_counter"] = int(getattr(self, "_vol_target_release_counter", 0) or 0)
             if scale < 0.999999:
                 diag["a5_reason"] = "above_target"
             else:
@@ -3476,6 +3577,133 @@ class PaperTradingEngine:
             diag["a5_reason"] = "error"
             diag["error"] = str(e)
             return diag
+
+    def _stabilize_vol_target_scale(self, raw_scale: float) -> dict:
+        """Apply A5 hysteresis + asymmetric EMA smoothing to reduce boundary churn."""
+        prev_smooth = float(getattr(self, "_vol_target_prev_smooth_scale", 1.0) or 1.0)
+        release_counter = int(getattr(self, "_vol_target_release_counter", 0) or 0)
+        result = stabilize_vol_target_scale(
+            raw_scale=float(raw_scale),
+            prev_smooth_scale=prev_smooth,
+            release_counter=release_counter,
+            deadzone_release_eps=0.01,
+            deadzone_reduce_eps=0.00,
+            ema_alpha_down=0.60,
+            ema_alpha_up=0.20,
+            release_confirm_cycles=3,
+        )
+        try:
+            self._vol_target_prev_smooth_scale = float(result.get("smooth_scale", prev_smooth) or prev_smooth)
+            self._vol_target_release_counter = int(result.get("release_counter", release_counter) or 0)
+        except Exception:
+            self._vol_target_prev_smooth_scale = float(prev_smooth)
+            self._vol_target_release_counter = int(release_counter)
+        return result
+
+    def _get_vol_target_state_payload(self) -> dict:
+        """Return normalized persisted state for vol-target stabilizer."""
+        last_update = getattr(self, "_vol_target_last_update_utc", None)
+        if isinstance(last_update, datetime):
+            last_update = last_update.astimezone(timezone.utc).isoformat()
+        elif last_update is not None:
+            last_update = str(last_update)
+        return {
+            "smooth_scale": float(np.clip(float(getattr(self, "_vol_target_prev_smooth_scale", 1.0) or 1.0), 0.0, 1.0)),
+            "release_counter": int(max(0, int(getattr(self, "_vol_target_release_counter", 0) or 0))),
+            "last_applied_scale": float(np.clip(float(getattr(self, "_vol_target_last_applied_scale", 1.0) or 1.0), 0.0, 1.0)),
+            "last_raw_scale": float(np.clip(float(getattr(self, "_vol_target_last_raw_scale", 1.0) or 1.0), 0.0, 1.0)),
+            "last_update_utc": last_update,
+            "initialized": True,
+        }
+
+    def _restore_vol_target_state_from_snapshot(self, payload: dict) -> None:
+        """Best-effort restore of persisted vol-target stabilizer state from snapshot payload."""
+        if not isinstance(payload, dict):
+            return
+
+        diag = payload.get("vol_target_diag", {})
+        if not isinstance(diag, dict):
+            diag = {}
+        state = payload.get("vol_target_state", {})
+        if not isinstance(state, dict):
+            state = {}
+
+        def _pick_float(*vals, default=1.0):
+            for v in vals:
+                try:
+                    if v is None:
+                        continue
+                    fv = float(v)
+                    if np.isfinite(fv):
+                        return float(np.clip(fv, 0.0, 1.0))
+                except Exception:
+                    continue
+            return float(default)
+
+        def _pick_int(*vals, default=0):
+            for v in vals:
+                try:
+                    if v is None:
+                        continue
+                    return max(0, int(v))
+                except Exception:
+                    continue
+            return int(default)
+
+        smooth = _pick_float(
+            state.get("smooth_scale"),
+            payload.get("vol_target_smooth_scale"),
+            diag.get("a5_smooth_scale"),
+            diag.get("a5_scale"),
+            default=1.0,
+        )
+        applied = _pick_float(
+            state.get("last_applied_scale"),
+            payload.get("vol_target_applied_scale"),
+            diag.get("a5_applied_scale"),
+            diag.get("a5_scale"),
+            default=smooth,
+        )
+        raw = _pick_float(
+            state.get("last_raw_scale"),
+            payload.get("vol_target_raw_scale"),
+            diag.get("a5_raw_scale"),
+            diag.get("a5_scale"),
+            default=applied,
+        )
+        release_counter = _pick_int(
+            state.get("release_counter"),
+            payload.get("vol_target_release_counter"),
+            diag.get("a5_release_counter"),
+            default=0,
+        )
+        hold_reason = str(
+            diag.get("a5_hold_reason")
+            or payload.get("vol_target_hold_reason")
+            or "no_change"
+        ).strip() or "no_change"
+        if hold_reason == "uninitialized":
+            hold_reason = "no_change"
+
+        last_update_utc = state.get("last_update_utc")
+        if last_update_utc is None:
+            last_update_utc = payload.get("timestamp")
+        if last_update_utc is not None:
+            last_update_utc = str(last_update_utc)
+
+        self._vol_target_prev_smooth_scale = float(smooth)
+        self._vol_target_release_counter = int(release_counter)
+        self._vol_target_last_applied_scale = float(applied)
+        self._vol_target_last_raw_scale = float(raw)
+        self._vol_target_last_update_utc = last_update_utc
+
+        if not isinstance(self.current_vol_target_diag_info, dict):
+            self.current_vol_target_diag_info = {}
+        self.current_vol_target_diag_info["a5_smooth_scale"] = float(smooth)
+        self.current_vol_target_diag_info["a5_applied_scale"] = float(applied)
+        self.current_vol_target_diag_info["a5_raw_scale"] = float(raw)
+        self.current_vol_target_diag_info["a5_release_counter"] = int(release_counter)
+        self.current_vol_target_diag_info["a5_hold_reason"] = str(hold_reason)
 
     def apply_vol_target_scale_to_weights(
         self,
@@ -3756,6 +3984,12 @@ class PaperTradingEngine:
             "skipped_small_count": int(info.get("skipped_small_count", 0) or 0),
             "min_keep_trades": int(info.get("min_keep_trades", 0) or 0),
             "kept_due_to_min_keep_count": int(info.get("kept_due_to_min_keep_count", 0) or 0),
+            "min_keep_turnover_ratio_cfg": float(info.get("min_keep_turnover_ratio_cfg", 0.0) or 0.0),
+            "planner_turnover_ratio_before": float(info.get("planner_turnover_ratio_before", 0.0) or 0.0),
+            "planner_turnover_ratio_after": float(info.get("planner_turnover_ratio_after", 0.0) or 0.0),
+            "min_keep_turnover_triggered": bool(info.get("min_keep_turnover_triggered", False)),
+            "min_keep_turnover_added": int(info.get("min_keep_turnover_added", 0) or 0),
+            "min_keep_turnover_reason": str(info.get("min_keep_turnover_reason", "disabled")),
         }
 
     def _default_greedy_hard_predicate(self, trade, *, total_equity=0.0, hard_sell_overweight=True):
@@ -3796,6 +4030,7 @@ class PaperTradingEngine:
         turnover_cap=None,
         max_trades_per_cycle=25,
         min_keep_trades=0,
+        min_keep_turnover_ratio=0.0,
         min_trade_notional=200.0,
         min_trade_delta_w=0.002,
         cost_bps=0.0008,
@@ -3857,13 +4092,17 @@ class PaperTradingEngine:
         soft_slots = max(0, int(max_trades_per_cycle) - len(hard_selected))
         cap_notional = float(turnover_cap) if turnover_cap is not None else None
         min_keep_trades = max(0, int(min_keep_trades))
+        min_keep_turnover_ratio = max(0.0, float(min_keep_turnover_ratio or 0.0))
         kept_due_to_min_keep_count = 0
+        kept_due_to_min_keep_turnover_count = 0
+        blocked_by_cap = False
 
         for row in soft_rows:
             if len(selected_soft) >= soft_slots:
                 break
             n = abs(float(row.get("_trade", {}).get("desired_trade_value", row.get("est_dollar", 0.0)) or 0.0))
             if cap_notional is not None and cap_notional > 0 and (selected_notional + n) > cap_notional:
+                blocked_by_cap = True
                 continue
             selected_soft.append(row)
             selected_soft_uids.add(int(row.get("_row_uid", -1)))
@@ -3886,6 +4125,7 @@ class PaperTradingEngine:
                     break
                 n = abs(float(row.get("_trade", {}).get("desired_trade_value", row.get("est_dollar", 0.0)) or 0.0))
                 if cap_notional is not None and cap_notional > 0 and (selected_notional + n) > cap_notional:
+                    blocked_by_cap = True
                     continue
                 row["_kept_due_to_min_keep"] = True
                 tr_ref = row.get("_trade")
@@ -3897,13 +4137,56 @@ class PaperTradingEngine:
                 kept_due_to_min_keep_count += 1
                 need -= 1
 
+        total_eq = float(total_equity or 0.0)
+        turnover_ratio_before = float(selected_notional / total_eq) if total_eq > 0 else 0.0
+        min_keep_turnover_triggered = bool(
+            min_keep_turnover_ratio > 0 and total_eq > 0 and turnover_ratio_before + 1e-12 < min_keep_turnover_ratio
+        )
+        min_keep_turnover_reason = "disabled"
+        if min_keep_turnover_ratio > 0:
+            if min_keep_turnover_triggered:
+                min_keep_turnover_reason = "below_threshold"
+                fallback_candidates_turnover = [
+                    r for r in soft_scored_all
+                    if int(r.get("_row_uid", -1)) not in selected_soft_uids
+                ]
+                fallback_candidates_turnover.sort(
+                    key=lambda x: (float(x.get("score", 0.0) or 0.0), float(x.get("benefit", 0.0) or 0.0)),
+                    reverse=True,
+                )
+                for row in fallback_candidates_turnover:
+                    if len(selected_soft) >= soft_slots:
+                        break
+                    if total_eq > 0 and (selected_notional / total_eq) + 1e-12 >= min_keep_turnover_ratio:
+                        break
+                    n = abs(float(row.get("_trade", {}).get("desired_trade_value", row.get("est_dollar", 0.0)) or 0.0))
+                    if cap_notional is not None and cap_notional > 0 and (selected_notional + n) > cap_notional:
+                        blocked_by_cap = True
+                        continue
+                    row["_kept_due_to_min_keep_turnover"] = True
+                    tr_ref = row.get("_trade")
+                    if isinstance(tr_ref, dict):
+                        tr_ref["kept_due_to_min_keep_turnover"] = True
+                    selected_soft.append(row)
+                    selected_soft_uids.add(int(row.get("_row_uid", -1)))
+                    selected_notional += n
+                    kept_due_to_min_keep_turnover_count += 1
+                turnover_ratio_after_probe = float(selected_notional / total_eq) if total_eq > 0 else 0.0
+                if turnover_ratio_after_probe + 1e-12 < min_keep_turnover_ratio:
+                    if blocked_by_cap and cap_notional is not None and cap_notional > 0:
+                        min_keep_turnover_reason = "blocked_by_cap"
+                    else:
+                        min_keep_turnover_reason = "no_candidates"
+            else:
+                min_keep_turnover_reason = "disabled"
+
         selected_rows = list(hard_selected) + list(selected_soft)
         filtered_trades = [dict(r.get("_trade", {})) for r in selected_rows if isinstance(r.get("_trade", {}), dict)]
         est_cost_filtered = float(sum(float(r.get("est_cost", 0.0) or 0.0) for r in selected_rows))
         turnover_filtered_notional = float(sum(abs(float(t.get("desired_trade_value", t.get("notional", 0.0)) or 0.0)) for t in filtered_trades))
-        total_eq = float(total_equity or 0.0)
         turnover_raw = float(0.5 * (turnover_raw_notional / total_eq)) if total_eq > 0 else 0.0
         turnover_filtered = float(0.5 * (turnover_filtered_notional / total_eq)) if total_eq > 0 else 0.0
+        planner_turnover_ratio_after = float(turnover_filtered_notional / total_eq) if total_eq > 0 else 0.0
 
         top_selected = sorted(
             selected_rows,
@@ -3919,6 +4202,7 @@ class PaperTradingEngine:
                 "abs_delta_w": float(r.get("abs_delta_w", 0.0) or 0.0),
                 "hard": bool(r.get("_is_hard", False)),
                 "kept_due_to_min_keep": bool(r.get("_kept_due_to_min_keep", False)),
+                "kept_due_to_min_keep_turnover": bool(r.get("_kept_due_to_min_keep_turnover", False)),
             }
             for r in top_selected
         ]
@@ -3942,6 +4226,12 @@ class PaperTradingEngine:
             "max_trades_per_cycle": int(max_trades_per_cycle),
             "min_keep_trades": int(min_keep_trades),
             "kept_due_to_min_keep_count": int(kept_due_to_min_keep_count),
+            "min_keep_turnover_ratio_cfg": float(min_keep_turnover_ratio),
+            "planner_turnover_ratio_before": float(turnover_ratio_before),
+            "planner_turnover_ratio_after": float(planner_turnover_ratio_after),
+            "min_keep_turnover_triggered": bool(min_keep_turnover_triggered),
+            "min_keep_turnover_added": int(kept_due_to_min_keep_turnover_count),
+            "min_keep_turnover_reason": str(min_keep_turnover_reason),
             "min_trade_notional": float(min_trade_notional),
             "min_trade_delta_w": float(min_trade_delta_w),
             "cost_bps": float(cost_bps),
@@ -4315,6 +4605,31 @@ class PaperTradingEngine:
                 float(vol_target_diag.get('a5_scale'))
                 if vol_target_diag.get('a5_scale') is not None else None
             ),
+            'vol_target_raw_scale': (
+                float(vol_target_diag.get('a5_raw_scale'))
+                if vol_target_diag.get('a5_raw_scale') is not None
+                else (
+                    float(vol_target_diag.get('a5_scale'))
+                    if vol_target_diag.get('a5_scale') is not None else None
+                )
+            ),
+            'vol_target_smooth_scale': (
+                float(vol_target_diag.get('a5_smooth_scale'))
+                if vol_target_diag.get('a5_smooth_scale') is not None
+                else (
+                    float(vol_target_diag.get('a5_scale'))
+                    if vol_target_diag.get('a5_scale') is not None else None
+                )
+            ),
+            'vol_target_applied_scale': (
+                float(vol_target_diag.get('a5_applied_scale'))
+                if vol_target_diag.get('a5_applied_scale') is not None
+                else (
+                    float(vol_target_diag.get('a5_scale'))
+                    if vol_target_diag.get('a5_scale') is not None else None
+                )
+            ),
+            'vol_target_hold_reason': str(vol_target_diag.get('a5_hold_reason', '')),
             'vol_target_method': str(vol_target_diag.get('a5_vol_method', 'unavailable')),
             'vol_target_target_vol': (
                 float(vol_target_diag.get('a5_target_vol'))
@@ -4339,6 +4654,12 @@ class PaperTradingEngine:
             'rebalance_est_cost_filtered': float(rebalance_plan_filter_diag.get('est_cost_filtered', 0.0) or 0.0),
             'rebalance_skipped_small': int(rebalance_plan_filter_diag.get('skipped_small_count', 0) or 0),
             'rebalance_kept_due_to_min_keep': int(rebalance_plan_filter_diag.get('kept_due_to_min_keep_count', 0) or 0),
+            'rebalance_min_keep_turnover_cfg': float(rebalance_plan_filter_diag.get('min_keep_turnover_ratio_cfg', 0.0) or 0.0),
+            'rebalance_planner_turnover_ratio_before': float(rebalance_plan_filter_diag.get('planner_turnover_ratio_before', 0.0) or 0.0),
+            'rebalance_planner_turnover_ratio_after': float(rebalance_plan_filter_diag.get('planner_turnover_ratio_after', 0.0) or 0.0),
+            'rebalance_min_keep_turnover_triggered': bool(rebalance_plan_filter_diag.get('min_keep_turnover_triggered', False)),
+            'rebalance_min_keep_turnover_added': int(rebalance_plan_filter_diag.get('min_keep_turnover_added', 0) or 0),
+            'rebalance_min_keep_turnover_reason': str(rebalance_plan_filter_diag.get('min_keep_turnover_reason', 'disabled')),
             'rebalance_cost_diag_filtered': self._summarize_rebalance_cost_diag_for_metrics(payload, key='rebalance_cost_diag_filtered'),
             'rebalance_plan_filter_diag': self._summarize_rebalance_plan_filter_for_metrics(payload),
         }
@@ -4712,12 +5033,59 @@ class PaperTradingEngine:
             'vol_target_diag': dict(self.current_vol_target_diag_info) if isinstance(self.current_vol_target_diag_info, dict) else {
                 'status': 'unavailable',
                 'a5_scale': 1.0,
+                'a5_raw_scale': 1.0,
+                'a5_smooth_scale': 1.0,
+                'a5_applied_scale': 1.0,
+                'a5_hold_reason': 'no_change',
+                'a5_release_counter': 0,
                 'a5_target_vol': None,
                 'a5_cfg_target_vol': None,
                 'a5_vol_method': 'unavailable',
                 'a5_cov_coverage': None,
                 'a5_reason': 'unavailable',
             },
+            'vol_target_raw_scale': (
+                float(self.current_vol_target_diag_info.get('a5_raw_scale'))
+                if isinstance(self.current_vol_target_diag_info, dict)
+                and self.current_vol_target_diag_info.get('a5_raw_scale') is not None
+                else (
+                    float(self.current_vol_target_diag_info.get('a5_scale'))
+                    if isinstance(self.current_vol_target_diag_info, dict)
+                    and self.current_vol_target_diag_info.get('a5_scale') is not None
+                    else 1.0
+                )
+            ),
+            'vol_target_smooth_scale': (
+                float(self.current_vol_target_diag_info.get('a5_smooth_scale'))
+                if isinstance(self.current_vol_target_diag_info, dict)
+                and self.current_vol_target_diag_info.get('a5_smooth_scale') is not None
+                else (
+                    float(self.current_vol_target_diag_info.get('a5_scale'))
+                    if isinstance(self.current_vol_target_diag_info, dict)
+                    and self.current_vol_target_diag_info.get('a5_scale') is not None
+                    else 1.0
+                )
+            ),
+            'vol_target_applied_scale': (
+                float(self.current_vol_target_diag_info.get('a5_applied_scale'))
+                if isinstance(self.current_vol_target_diag_info, dict)
+                and self.current_vol_target_diag_info.get('a5_applied_scale') is not None
+                else (
+                    float(self.current_vol_target_diag_info.get('a5_scale'))
+                    if isinstance(self.current_vol_target_diag_info, dict)
+                    and self.current_vol_target_diag_info.get('a5_scale') is not None
+                    else 1.0
+                )
+            ),
+            'vol_target_hold_reason': (
+                str(self.current_vol_target_diag_info.get('a5_hold_reason', ''))
+                if isinstance(self.current_vol_target_diag_info, dict) else ''
+            ),
+            'vol_target_release_counter': (
+                int(self.current_vol_target_diag_info.get('a5_release_counter', 0) or 0)
+                if isinstance(self.current_vol_target_diag_info, dict) else 0
+            ),
+            'vol_target_state': self._get_vol_target_state_payload(),
             'rebalance_cost_diag': dict(self.current_rebalance_cost_diag_info) if isinstance(self.current_rebalance_cost_diag_info, dict) else {
                 'status': 'unavailable',
                 'n_trades_raw': 0,
@@ -4756,6 +5124,12 @@ class PaperTradingEngine:
                 'skipped_small_count': 0,
                 'min_keep_trades': 0,
                 'kept_due_to_min_keep_count': 0,
+                'min_keep_turnover_ratio_cfg': 0.0,
+                'planner_turnover_ratio_before': 0.0,
+                'planner_turnover_ratio_after': 0.0,
+                'min_keep_turnover_triggered': False,
+                'min_keep_turnover_added': 0,
+                'min_keep_turnover_reason': 'disabled',
                 'top_selected_by_score': [],
             },
             'trade_planner_num_dropped': int((self.current_planner_info or {}).get('num_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
@@ -6270,6 +6644,7 @@ class PaperTradingEngine:
             "min_trade_delta_w": 0.002,
             "max_trades_per_cycle": 25,
             "min_keep_trades": 0,
+            "min_keep_turnover_ratio": 0.0,
             "cost_bps": 0.0008,
             "hard_sell_overweight": True,
         }
@@ -6284,6 +6659,7 @@ class PaperTradingEngine:
             cfg["min_trade_delta_w"] = max(0.0, float(exec_cfg.get("min_trade_delta_w", cfg.get("min_trade_delta_w", 0.002))))
             cfg["max_trades_per_cycle"] = max(1, int(exec_cfg.get("max_trades_per_cycle", cfg.get("max_trades_per_cycle", 25))))
             cfg["min_keep_trades"] = max(0, int(exec_cfg.get("min_keep_trades", cfg.get("min_keep_trades", 0))))
+            cfg["min_keep_turnover_ratio"] = max(0.0, float(exec_cfg.get("min_keep_turnover_ratio", cfg.get("min_keep_turnover_ratio", 0.0)) or 0.0))
             cfg["cost_bps"] = max(0.0, float(exec_cfg.get("cost_bps", cfg.get("cost_bps", 0.0008))))
             cfg["hard_sell_overweight"] = bool(exec_cfg.get("hard_sell_overweight", cfg.get("hard_sell_overweight", True)))
             return cfg
@@ -9274,6 +9650,10 @@ class PaperTradingEngine:
         self.current_vol_target_diag_info = dict(vol_target_diag) if isinstance(vol_target_diag, dict) else {
             'status': 'invalid_diag',
             'a5_scale': 1.0,
+            'a5_raw_scale': 1.0,
+            'a5_smooth_scale': 1.0,
+            'a5_applied_scale': 1.0,
+            'a5_hold_reason': 'invalid_diag',
             'a5_target_vol': None,
             'a5_cfg_target_vol': None,
             'a5_vol_method': 'unavailable',
@@ -9296,7 +9676,15 @@ class PaperTradingEngine:
             f"reason={self.current_vol_target_diag_info.get('a5_reason')}"
         )
 
-        a5_scale = float(self.current_vol_target_diag_info.get('a5_scale', 1.0) or 1.0)
+        raw_a5_scale = float(self.current_vol_target_diag_info.get('a5_scale', 1.0) or 1.0)
+        self.current_vol_target_diag_info['a5_raw_scale'] = float(raw_a5_scale)
+        smooth_info = {
+            "smooth_scale": float(getattr(self, "_vol_target_prev_smooth_scale", 1.0) or 1.0),
+            "applied_scale": float(raw_a5_scale),
+            "hold_reason": "not_applied",
+            "release_counter": int(getattr(self, "_vol_target_release_counter", 0) or 0),
+        }
+        a5_scale = float(raw_a5_scale)
         force_raw = str(os.getenv("GW_VOL_TARGET_FORCE", "") or "").strip()
         forced_scale = None
         if force_raw:
@@ -9311,11 +9699,42 @@ class PaperTradingEngine:
                 self.current_vol_target_diag_info["forced"] = True
                 self.current_vol_target_diag_info["forced_scale"] = float(forced_scale)
                 self.current_vol_target_diag_info["force_source"] = "env"
+                smooth_info = {
+                    "smooth_scale": float(forced_scale),
+                    "applied_scale": float(forced_scale),
+                    "hold_reason": "forced_env",
+                    "release_counter": 0,
+                }
+                self._vol_target_prev_smooth_scale = float(forced_scale)
+                self._vol_target_release_counter = 0
                 print(f"[VOL TARGET FORCE] scale_forced={forced_scale:.2f} (env GW_VOL_TARGET_FORCE)")
         else:
             self.current_vol_target_diag_info["forced"] = False
             self.current_vol_target_diag_info.pop("forced_scale", None)
             self.current_vol_target_diag_info.pop("force_source", None)
+
+        if forced_scale is None:
+            smooth_info = self._stabilize_vol_target_scale(raw_a5_scale)
+            a5_scale = float(smooth_info.get("applied_scale", raw_a5_scale) or raw_a5_scale)
+
+        self.current_vol_target_diag_info["a5_smooth_scale"] = float(
+            smooth_info.get("smooth_scale", getattr(self, "_vol_target_prev_smooth_scale", 1.0))
+        )
+        self.current_vol_target_diag_info["a5_applied_scale"] = float(
+            smooth_info.get("applied_scale", a5_scale)
+        )
+        self.current_vol_target_diag_info["a5_hold_reason"] = str(
+            smooth_info.get("hold_reason", "unknown")
+        )
+        if self.current_vol_target_diag_info["a5_hold_reason"] == "uninitialized":
+            self.current_vol_target_diag_info["a5_hold_reason"] = "no_change"
+        self.current_vol_target_diag_info["a5_release_counter"] = int(
+            smooth_info.get("release_counter", getattr(self, "_vol_target_release_counter", 0) or 0)
+        )
+        self.current_vol_target_diag_info["a5_scale"] = float(a5_scale)
+        self._vol_target_last_raw_scale = float(raw_a5_scale)
+        self._vol_target_last_applied_scale = float(a5_scale)
+        self._vol_target_last_update_utc = self._now().astimezone(timezone.utc).isoformat()
         adjusted_weights, a5_apply_info = self.apply_vol_target_scale_to_weights(
             adjusted_weights,
             a5_scale,
@@ -9335,6 +9754,8 @@ class PaperTradingEngine:
         alloc_diag['vol_target_diag'] = dict(self.current_vol_target_diag_info)
         print(
             "[VOL TARGET APPLY] "
+            f"raw={float(self.current_vol_target_diag_info.get('a5_raw_scale', 1.0) or 1.0):.4f} "
+            f"smooth={float(self.current_vol_target_diag_info.get('a5_smooth_scale', 1.0) or 1.0):.4f} "
             f"scale={float(a5_apply_info.get('scale_used', 1.0) or 1.0):.4f} "
             f"cash:{float(a5_apply_info.get('cash_before', 0.0) or 0.0):.2%}->"
             f"{float(a5_apply_info.get('cash_after', 0.0) or 0.0):.2%} "
@@ -9342,6 +9763,7 @@ class PaperTradingEngine:
             f"method={self.current_vol_target_diag_info.get('a5_vol_method')} "
             f"target_vol={self.current_vol_target_diag_info.get('a5_target_vol')} "
             f"cfg={self.current_vol_target_diag_info.get('a5_cfg_target_vol')} "
+            f"hold={self.current_vol_target_diag_info.get('a5_hold_reason', '')} "
             f"reason={a5_apply_info.get('reason', '')}"
         )
 
@@ -9502,6 +9924,12 @@ class PaperTradingEngine:
             'skipped_small_count': 0,
             'min_keep_trades': 0,
             'kept_due_to_min_keep_count': 0,
+            'min_keep_turnover_ratio_cfg': 0.0,
+            'planner_turnover_ratio_before': 0.0,
+            'planner_turnover_ratio_after': 0.0,
+            'min_keep_turnover_triggered': False,
+            'min_keep_turnover_added': 0,
+            'min_keep_turnover_reason': 'disabled',
             'top_selected_by_score': [],
         }
         try:
@@ -10309,6 +10737,7 @@ class PaperTradingEngine:
                     turnover_cap=float(turnover_limit) if turnover_limit is not None else None,
                     max_trades_per_cycle=int(greedy_filter_cfg.get("max_trades_per_cycle", 25)),
                     min_keep_trades=int(greedy_filter_cfg.get("min_keep_trades", 0)),
+                    min_keep_turnover_ratio=float(greedy_filter_cfg.get("min_keep_turnover_ratio", 0.0) or 0.0),
                     min_trade_notional=float(greedy_filter_cfg.get("min_trade_notional", 200.0)),
                     min_trade_delta_w=float(greedy_filter_cfg.get("min_trade_delta_w", 0.002)),
                     cost_bps=float(greedy_filter_cfg.get("cost_bps", 0.0008)),
@@ -10326,9 +10755,14 @@ class PaperTradingEngine:
                     f"[REBALANCE FILTER] enabled=true raw={int(filter_diag.get('n_raw', 0))} "
                     f"filtered={int(filter_diag.get('n_filtered', 0))} "
                     f"turnover={float(filter_diag.get('turnover_raw', 0.0) or 0.0):.2%}->{float(filter_diag.get('turnover_filtered', 0.0) or 0.0):.2%} "
+                    f"min_keep_turnover={float(filter_diag.get('planner_turnover_ratio_before', 0.0) or 0.0):.2%}->"
+                    f"{float(filter_diag.get('planner_turnover_ratio_after', 0.0) or 0.0):.2%} "
                     f"cost=${float(filter_diag.get('est_cost_raw', 0.0) or 0.0):,.2f}->${float(filter_diag.get('est_cost_filtered', 0.0) or 0.0):,.2f} "
                     f"skipped_small={int(filter_diag.get('skipped_small_count', 0))} "
-                    f"kept_min_keep={int(filter_diag.get('kept_due_to_min_keep_count', 0))}"
+                    f"kept_min_keep={int(filter_diag.get('kept_due_to_min_keep_count', 0))} "
+                    f"keep_turnover_triggered={bool(filter_diag.get('min_keep_turnover_triggered', False))} "
+                    f"keep_turnover_added={int(filter_diag.get('min_keep_turnover_added', 0) or 0)} "
+                    f"reason={str(filter_diag.get('min_keep_turnover_reason', ''))}"
                 )
             except Exception as e:
                 self.current_rebalance_plan_filter_info = {
@@ -10350,6 +10784,12 @@ class PaperTradingEngine:
                     "skipped_small_count": 0,
                     "min_keep_trades": int(greedy_filter_cfg.get("min_keep_trades", 0) or 0),
                     "kept_due_to_min_keep_count": 0,
+                    "min_keep_turnover_ratio_cfg": float(greedy_filter_cfg.get("min_keep_turnover_ratio", 0.0) or 0.0),
+                    "planner_turnover_ratio_before": 0.0,
+                    "planner_turnover_ratio_after": 0.0,
+                    "min_keep_turnover_triggered": False,
+                    "min_keep_turnover_added": 0,
+                    "min_keep_turnover_reason": "disabled",
                     "top_selected_by_score": [],
                 }
                 try:
@@ -10377,6 +10817,18 @@ class PaperTradingEngine:
                 "skipped_small_count": 0,
                 "min_keep_trades": int(greedy_filter_cfg.get("min_keep_trades", 0) or 0),
                 "kept_due_to_min_keep_count": 0,
+                "min_keep_turnover_ratio_cfg": float(greedy_filter_cfg.get("min_keep_turnover_ratio", 0.0) or 0.0),
+                "planner_turnover_ratio_before": float(
+                    (sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict)) / float(total_equity))
+                    if float(total_equity or 0.0) > 0 else 0.0
+                ),
+                "planner_turnover_ratio_after": float(
+                    (sum(abs(float(t.get('desired_trade_value', 0.0) or 0.0)) for t in planned_trades if isinstance(t, dict)) / float(total_equity))
+                    if float(total_equity or 0.0) > 0 else 0.0
+                ),
+                "min_keep_turnover_triggered": False,
+                "min_keep_turnover_added": 0,
+                "min_keep_turnover_reason": "disabled",
                 "top_selected_by_score": [],
             }
             try:
@@ -11333,12 +11785,59 @@ class PaperTradingEngine:
             'vol_target_diag': dict(self.current_vol_target_diag_info) if isinstance(self.current_vol_target_diag_info, dict) else {
                 'status': 'unavailable',
                 'a5_scale': 1.0,
+                'a5_raw_scale': 1.0,
+                'a5_smooth_scale': 1.0,
+                'a5_applied_scale': 1.0,
+                'a5_hold_reason': 'no_change',
+                'a5_release_counter': 0,
                 'a5_target_vol': None,
                 'a5_cfg_target_vol': None,
                 'a5_vol_method': 'unavailable',
                 'a5_cov_coverage': None,
                 'a5_reason': 'unavailable',
             },
+            'vol_target_raw_scale': (
+                float(self.current_vol_target_diag_info.get('a5_raw_scale'))
+                if isinstance(self.current_vol_target_diag_info, dict)
+                and self.current_vol_target_diag_info.get('a5_raw_scale') is not None
+                else (
+                    float(self.current_vol_target_diag_info.get('a5_scale'))
+                    if isinstance(self.current_vol_target_diag_info, dict)
+                    and self.current_vol_target_diag_info.get('a5_scale') is not None
+                    else 1.0
+                )
+            ),
+            'vol_target_smooth_scale': (
+                float(self.current_vol_target_diag_info.get('a5_smooth_scale'))
+                if isinstance(self.current_vol_target_diag_info, dict)
+                and self.current_vol_target_diag_info.get('a5_smooth_scale') is not None
+                else (
+                    float(self.current_vol_target_diag_info.get('a5_scale'))
+                    if isinstance(self.current_vol_target_diag_info, dict)
+                    and self.current_vol_target_diag_info.get('a5_scale') is not None
+                    else 1.0
+                )
+            ),
+            'vol_target_applied_scale': (
+                float(self.current_vol_target_diag_info.get('a5_applied_scale'))
+                if isinstance(self.current_vol_target_diag_info, dict)
+                and self.current_vol_target_diag_info.get('a5_applied_scale') is not None
+                else (
+                    float(self.current_vol_target_diag_info.get('a5_scale'))
+                    if isinstance(self.current_vol_target_diag_info, dict)
+                    and self.current_vol_target_diag_info.get('a5_scale') is not None
+                    else 1.0
+                )
+            ),
+            'vol_target_hold_reason': (
+                str(self.current_vol_target_diag_info.get('a5_hold_reason', ''))
+                if isinstance(self.current_vol_target_diag_info, dict) else ''
+            ),
+            'vol_target_release_counter': (
+                int(self.current_vol_target_diag_info.get('a5_release_counter', 0) or 0)
+                if isinstance(self.current_vol_target_diag_info, dict) else 0
+            ),
+            'vol_target_state': self._get_vol_target_state_payload(),
             'rebalance_cost_diag': dict(self.current_rebalance_cost_diag_info) if isinstance(self.current_rebalance_cost_diag_info, dict) else {
                 'status': 'unavailable',
                 'n_trades_raw': 0,
@@ -11377,6 +11876,12 @@ class PaperTradingEngine:
                 'skipped_small_count': 0,
                 'min_keep_trades': 0,
                 'kept_due_to_min_keep_count': 0,
+                'min_keep_turnover_ratio_cfg': 0.0,
+                'planner_turnover_ratio_before': 0.0,
+                'planner_turnover_ratio_after': 0.0,
+                'min_keep_turnover_triggered': False,
+                'min_keep_turnover_added': 0,
+                'min_keep_turnover_reason': 'disabled',
                 'top_selected_by_score': [],
             },
             'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {
