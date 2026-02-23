@@ -30,6 +30,17 @@ This release updates the engine fingerprint to `v3.2.4` and adds the latest exec
 4. Default behavior remains backward-compatible:
    - target-cov gate stays off unless enabled
    - exposure cap remains 90% unless changed
+5. Daily Quant Pack now writes execution/no-trade diagnostics:
+   - `quant_packs/<date>/execution_blockers/exec_blockers.json`
+   - `quant_packs/<date>/no_trade/no_trade.json`
+   - embedded into flat daily JSON as `quant_pack.execution_blockers` and `quant_pack.no_trade`
+6. Daily index synchronization now includes execution blocker summaries:
+   - `exec_blocker_top1_reason`, `exec_blocker_top1_ratio`, `exec_blocked_ratio`
+   - `no_trade_flag`, `no_trade_primary_reason`, merged warnings count
+7. Alert rules were expanded with:
+   - `exec_blocker_dominant_cyclelevel`
+   - `no_trade_day`
+8. CI installs dependencies from root `requirements.txt` before diagnostics.
 
 ## Functional Capabilities
 ### Quant Layer
@@ -156,6 +167,16 @@ Only high-level meaning is listed below.
 python -m py_compile paper_trading.py
 python -m py_compile GlobalWatch_V2.py
 ```
+
+## New Quant CLIs (Execution/No-Trade Attribution)
+```bash
+python scripts/quant/a19_compute_exec_blockers.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD
+python scripts/quant/a20_attach_exec_blockers_to_daily.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD
+```
+
+These commands generate and embed:
+- cycle-level blocker distribution (`market_closed`, `attempt_cooldown`, `risk/cov gate`, etc.)
+- day-level no-trade reason inference
 
 ## Notes
 - Paper trading only.

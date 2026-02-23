@@ -33,6 +33,11 @@ GlobalWatch Paper Trading 是一个本地优先的量化研究与纸面交易系
 - stale 策略、会话时段 gate、换手预算路径保持有效
 - post-rebalance 快照刷新更及时，UI 持仓同步更快
 - planner/cost/overlay 调试字段更完整，便于逐轮回溯
+- 新增“执行阻塞分布 + 无交易原因”量化链路：
+  - `quant_packs/<date>/execution_blockers/exec_blockers.json`
+  - `quant_packs/<date>/no_trade/no_trade.json`
+  - 平铺日报写回：`quant_pack.execution_blockers`、`quant_pack.no_trade`
+  - 索引同步字段：`exec_blocker_top1_reason`、`exec_blocked_ratio`、`no_trade_flag` 等
 
 ### UI 与交互
 - Macro/FX 支持“仅分析当前选中目标”的轻量交互模式
@@ -104,6 +109,12 @@ Streamlit 主要包含：
 4. `python paper_trading.py --debug-system-s1-5 --debug-outdir outputs/gw_dryrun paper_config.json`  
    对应：系统级总体验收，快速确认主链路是否可运行。
 
+### 3) Quant Pack 执行阻塞/无交易归因
+1. `python scripts/quant/a19_compute_exec_blockers.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD`  
+   对应：生成 cycle 级执行阻塞分布与 day-level 无交易原因产物。
+2. `python scripts/quant/a20_attach_exec_blockers_to_daily.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD`  
+   对应：把 execution_blockers / no_trade 写回平铺日报 JSON（幂等覆盖）。
+
 ## 关键配置速查（paper_config.json）
 这里只写用途，不展开具体阈值调参细节。
 
@@ -173,8 +184,14 @@ python -m py_compile paper_trading.py
 python -m py_compile GlobalWatch_V2.py
 ```
 
+## CI 依赖说明
+CI 现已通过根目录 `requirements.txt` 安装基础依赖后再跑诊断：
+- `pandas`
+- `numpy`
+- `matplotlib`
+- `yfinance`
+
 ## 说明
 - 仅用于模拟交易。
 - 不连接真实券商。
 - 不构成投资建议。
-

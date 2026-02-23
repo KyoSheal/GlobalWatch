@@ -22,6 +22,14 @@ From a systems angle, it provides checkpoint resume, structured snapshots, deter
 4. Portfolio exposure cap is now configurable instead of hardcoded:
    - `execution.portfolio_exposure_cap` (default `0.90`)
    - invalid values auto-fallback with warning and clamp to `[0.0, 1.0]`
+5. Daily Quant Pack now includes cycle-level execution blocker attribution:
+   - quant artifacts: `execution_blockers/exec_blockers.json`, `no_trade/no_trade.json`
+   - daily JSON fields: `quant_pack.execution_blockers`, `quant_pack.no_trade`
+   - index sync fields: `exec_blocker_top1_reason`, `exec_blocked_ratio`, `no_trade_flag`
+6. Quant alerts now support execution-side operational warnings:
+   - `exec_blocker_dominant_cyclelevel`
+   - `no_trade_day`
+7. CI now installs Python dependencies from `requirements.txt` before running diagnostics.
 
 ## Documentation
 - Detailed English documentation: `README.en.md`
@@ -35,4 +43,11 @@ python -u paper_trading.py paper_config.json
 ```bash
 streamlit run GlobalWatch_V2.py
 ```
+
+## CI Dependencies
+The repository now includes a root `requirements.txt` used by CI:
+- `pandas`
+- `numpy`
+- `matplotlib`
+- `yfinance`
 
