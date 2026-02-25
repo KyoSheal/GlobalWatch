@@ -183,6 +183,9 @@ def _ensure_report_meta_fields(report: Dict[str, Any], snapshot: Optional[Dict[s
     if patched.get("risk_profile_overrides_hash", None) in (None, ""):
         patched["risk_profile_overrides_hash"] = str(snapshot_obj.get("risk_profile_overrides_hash") or "")
         changed = True
+    if not str(patched.get("risk_profile_source") or "").strip():
+        patched["risk_profile_source"] = str(snapshot_obj.get("risk_profile_source") or "unknown")
+        changed = True
     return patched, changed
 
 
@@ -1079,6 +1082,7 @@ def generate_daily_report(
         "generated_at_local": generated_at,
         "run_id": snapshot_run_id or None,
         "active_risk_profile": str(snapshot.get("active_risk_profile") or snapshot.get("requested_risk_profile") or "mid").strip().lower() or "mid",
+        "risk_profile_source": str(snapshot.get("risk_profile_source") or "unknown"),
         "schema_version": snapshot_schema_version,
         "cycle_id": snapshot_cycle_id,
         "risk_profile": str(snapshot.get("active_risk_profile") or snapshot.get("requested_risk_profile") or "mid").strip().lower() or "mid",

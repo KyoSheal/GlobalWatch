@@ -5,6 +5,11 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 from atomic_io import safe_read_json as io_safe_read_json
+from risk_profile_state import (
+    normalize_risk_profile,
+    read_risk_profile_state,
+    resolve_risk_profile_state_path,
+)
 
 _CHOICES = {"low", "mid", "high", "ultra"}
 
@@ -50,6 +55,13 @@ def get_active_risk_profile(
     if not isinstance(reporting_cfg, dict):
         reporting_cfg = {}
 
+    state_path = resolve_risk_profile_state_path(reporting_cfg)
+    state_obj = read_risk_profile_state(state_path)
+    if isinstance(state_obj, dict):
+        requested_from_state = _raw_profile(state_obj.get("requested"))
+        if requested_from_state:
+            return requested_from_state
+
     runtime_path = str(runtime_control_path or "").strip() or _resolve_runtime_control_path(reporting_cfg)
     runtime_obj = io_safe_read_json(runtime_path, retries=2, sleep_ms=15) or {}
     if isinstance(runtime_obj, dict):
@@ -75,6 +87,23 @@ def get_active_risk_profile(
     if config_profile:
         return config_profile
     return "mid"
+
+
+def resolve_widget_profile_default(
+    *,
+    source_profile: Any,
+    current_widget_value: Any,
+    previous_source_profile: Any,
+) -> str:
+    """Pure helper for deciding widget default without writing widget key after creation."""
+    source_norm = normalize_risk_profile(source_profile, default="mid")
+    current_norm = str(current_widget_value or "").strip().lower()
+    prev_norm = str(previous_source_profile or "").strip().lower()
+    if current_norm not in _CHOICES:
+        return source_norm
+    if prev_norm in _CHOICES and prev_norm != source_norm and current_norm == prev_norm:
+        return source_norm
+    return current_norm
 
 
 def format_risk_profile_status(active: Any, requested: Any) -> Dict[str, Any]:
@@ -105,4 +134,9 @@ def set_filter_to_active(session_state: Dict[str, Any], snapshot: Dict[str, Any]
     return active
 
 
-__all__ = ["format_risk_profile_status", "set_filter_to_active", "get_active_risk_profile"]
+__all__ = [
+    "format_risk_profile_status",
+    "set_filter_to_active",
+    "get_active_risk_profile",
+    "resolve_widget_profile_default",
+]

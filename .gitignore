@@ -55,6 +55,8 @@ scripts/**/ci_artifacts/
 memory_db/
 backup/
 tools/
+!tools/
+!tools/verify_risk_profile_ssot.py
 
 
 # Any scratch dirs you might have

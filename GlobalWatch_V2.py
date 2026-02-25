@@ -25,7 +25,15 @@ from ui_window_presets import WINDOW_PRESETS, get_window_preset, format_till_now
 from ui_equity_window import filter_df_by_trading_day_window
 from ui_reports_window import select_window_effective_count
 from run_analytics import summarize_range as summarize_run_periods
-from risk_profile_ui_utils import get_active_risk_profile as _ui_get_active_risk_profile
+from risk_profile_ui_utils import (
+    get_active_risk_profile as _ui_get_active_risk_profile,
+    resolve_widget_profile_default as _ui_resolve_widget_profile_default,
+)
+from risk_profile_state import (
+    ensure_risk_profile_state as _ensure_risk_profile_state,
+    resolve_risk_profile_state_path as _resolve_risk_profile_state_path,
+    write_risk_profile_state as _write_risk_profile_state,
+)
 
 try:
     import chromadb
@@ -7918,6 +7926,7 @@ else:
         _runtime_control_path = os.path.abspath(os.path.join(_reporting_out_dir, "runtime_control.json"))
     else:
         _runtime_control_path = os.path.abspath(os.path.join("outputs", "runtime_control.json"))
+_risk_profile_state_path = _resolve_risk_profile_state_path(_paper_reporting_cfg)
 
 _source_active_risk_profile = str(
     get_active_risk_profile(
@@ -7933,20 +7942,40 @@ _active_risk_profile = str(_snapshot_live_obj.get("active_risk_profile", "") or 
 if _active_risk_profile not in _risk_profile_choices:
     _active_risk_profile = "mid"
 
+_risk_profile_state_obj = {}
+try:
+    _risk_profile_state_obj = _ensure_risk_profile_state(
+        _risk_profile_state_path,
+        default_requested=_source_active_risk_profile,
+        set_by="ui_bootstrap",
+    )
+except Exception as _rp_state_err:
+    log_error(f"risk profile state ensure failed: {_rp_state_err}")
+if not isinstance(_risk_profile_state_obj, dict):
+    _risk_profile_state_obj = {}
+
 _runtime_control_obj = _safe_read_json(_runtime_control_path)
 if not isinstance(_runtime_control_obj, dict):
     _runtime_control_obj = {}
-_requested_risk_profile = str(_runtime_control_obj.get("requested_risk_profile", "") or "").strip().lower()
+_requested_risk_profile = str(_risk_profile_state_obj.get("requested", "") or "").strip().lower()
+_requested_source = "state_file"
+_runtime_control_updated_at = str(_risk_profile_state_obj.get("set_at", "") or "").strip()
+if _requested_risk_profile not in _risk_profile_choices:
+    _requested_risk_profile = str(_runtime_control_obj.get("requested_risk_profile", "") or "").strip().lower()
+    _requested_source = "runtime_control"
+    _runtime_control_updated_at = str(_runtime_control_obj.get("updated_at_utc", "") or "").strip()
 if _requested_risk_profile not in _risk_profile_choices:
     _requested_risk_profile = str(_snapshot_live_obj.get("requested_risk_profile", "") or "").strip().lower()
+    _requested_source = "snapshot"
 if _requested_risk_profile not in _risk_profile_choices:
     _requested_risk_profile = _active_risk_profile
-_runtime_control_updated_at = str(_runtime_control_obj.get("updated_at_utc", "") or "").strip()
+    _requested_source = "snapshot_active"
 
 _risk_profile_template_version = _snapshot_live_obj.get("risk_profile_template_version")
 _risk_profile_overrides_hash = str(_snapshot_live_obj.get("risk_profile_overrides_hash", "") or "").strip()
 _applied_cycle = _snapshot_live_obj.get("risk_profile_applied_cycle_id")
 _applied_time = _snapshot_live_obj.get("risk_profile_applied_at_utc")
+_snapshot_risk_profile_source = str(_snapshot_live_obj.get("risk_profile_source", "") or "").strip()
 
 st.sidebar.markdown("**Risk Profile**")
 st.sidebar.caption(f"Active Risk Profile: {_active_risk_profile.upper()}")
@@ -7954,6 +7983,10 @@ if _requested_risk_profile != _active_risk_profile:
     st.sidebar.caption(f"Requested Risk Profile: {_requested_risk_profile.upper()} (pending, will apply next cycle)")
 else:
     st.sidebar.caption(f"Requested Risk Profile: {_requested_risk_profile.upper()} (active)")
+st.sidebar.caption(
+    f"Requested source: {_requested_source}"
+    + (f" / Applied source: {_snapshot_risk_profile_source}" if _snapshot_risk_profile_source else "")
+)
 st.sidebar.caption(
     f"Applied at cycle: {str(_applied_cycle) if _applied_cycle not in (None, '') else '-'} / "
     f"time: {str(_applied_time) if _applied_time not in (None, '') else '-'}"
@@ -7968,28 +8001,27 @@ if _runtime_control_updated_at:
     st.sidebar.caption(f"Last request at: {_runtime_control_updated_at}")
 
 _risk_profile_prev_source = st.session_state.get("_risk_profile_source_default")
-_risk_profile_current_selected = st.session_state.get("risk_profile_selected")
-if _risk_profile_current_selected not in _risk_profile_choices:
-    st.session_state["risk_profile_selected"] = _source_active_risk_profile
-elif (
-    _risk_profile_prev_source in _risk_profile_choices
-    and _risk_profile_prev_source != _source_active_risk_profile
-    and _risk_profile_current_selected == _risk_profile_prev_source
-):
-    # Keep widget default aligned with external source-of-truth when user has not diverged.
-    st.session_state["risk_profile_selected"] = _source_active_risk_profile
+_risk_profile_widget_key = "risk_profile_widget"
+_risk_profile_current_selected = st.session_state.get(_risk_profile_widget_key)
+_risk_profile_resolved_widget = _ui_resolve_widget_profile_default(
+    source_profile=_requested_risk_profile,
+    current_widget_value=_risk_profile_current_selected,
+    previous_source_profile=_risk_profile_prev_source,
+)
+if _risk_profile_current_selected != _risk_profile_resolved_widget:
+    st.session_state[_risk_profile_widget_key] = _risk_profile_resolved_widget
 st.session_state["_risk_profile_source_default"] = _source_active_risk_profile
 
 _selected_runtime_profile = st.sidebar.selectbox(
     "Set risk profile",
     _risk_profile_choices,
-    index=_risk_profile_choices.index(st.session_state.get("risk_profile_selected", _source_active_risk_profile)),
-    key="risk_profile_selected",
+    index=_risk_profile_choices.index(st.session_state.get(_risk_profile_widget_key, _requested_risk_profile)),
+    key=_risk_profile_widget_key,
 )
 
 if st.sidebar.button("Apply next cycle", key="runtime_risk_profile_apply_btn"):
     try:
-        _selected_profile_norm = str(_selected_runtime_profile).strip().lower()
+        _selected_profile_norm = str(st.session_state.get(_risk_profile_widget_key, _selected_runtime_profile) or "").strip().lower()
         if _selected_profile_norm == _requested_risk_profile:
             st.session_state["runtime_risk_profile_notice"] = {
                 "ok": True,
@@ -7998,6 +8030,12 @@ if st.sidebar.button("Apply next cycle", key="runtime_risk_profile_apply_btn"):
             }
         else:
             _request_id = uuid.uuid4().hex[:12]
+            _state_payload = _write_risk_profile_state(
+                _risk_profile_state_path,
+                requested=_selected_profile_norm,
+                set_by="ui",
+                extra={"request_id": _request_id},
+            )
             _runtime_payload = {
                 "schema_version": 1,
                 "updated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -8005,11 +8043,12 @@ if st.sidebar.button("Apply next cycle", key="runtime_risk_profile_apply_btn"):
                 "requested_risk_profile": _selected_profile_norm,
             }
             io_atomic_write_json(_runtime_control_path, _runtime_payload, indent=2)
-            st.session_state["risk_profile_selected"] = _selected_profile_norm
+            st.session_state["pending_requested_profile"] = _selected_profile_norm
             st.session_state["runtime_risk_profile_notice"] = {
                 "ok": True,
                 "request_id": _request_id,
                 "requested": _runtime_payload["requested_risk_profile"],
+                "version": str(_state_payload.get("version", "") or ""),
             }
             try:
                 if hasattr(st, "rerun"):
