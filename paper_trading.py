@@ -1058,6 +1058,13 @@ class PaperTradingEngine:
         self.current_returns_coverage_diag = {"schema_version": 1, "items": []}
         self.current_ticker_proxy_used = False
         self.current_ticker_proxy_map_used = []
+        self.current_execution_proxy_info = {"used": False, "map_used": []}
+        self.current_execution_summary = {
+            "orders_total": 0,
+            "orders_place": 0,
+            "orders_skip": 0,
+            "skip_reasons": {},
+        }
         self.current_regime = {}
         self.current_macro = {}
         self.current_stale_info = {}
@@ -3517,6 +3524,10 @@ class PaperTradingEngine:
             'market_session': snapshot.get('market_session', dict(self.current_market_session) if isinstance(self.current_market_session, dict) else {}),
             'rebalance_gate': snapshot.get('rebalance_gate', dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {}),
             'rebalance_skipped_reason': snapshot.get('rebalance_skipped_reason', self.current_rebalance_skipped_reason),
+            'execution_summary': snapshot.get(
+                'execution_summary',
+                dict(self.current_execution_summary) if isinstance(self.current_execution_summary, dict) else self._new_execution_summary()
+            ),
             'price_debug': snapshot.get('price_debug', dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {}),
             'price_fetch_stats': snapshot.get(
                 'price_fetch_stats',
@@ -3562,6 +3573,14 @@ class PaperTradingEngine:
             'ticker_proxy_map_used': snapshot.get(
                 'ticker_proxy_map_used',
                 self.current_risk_check_info.get('ticker_proxy_map_used') if isinstance(self.current_risk_check_info, dict) else []
+            ),
+            'execution_proxy_used': snapshot.get(
+                'execution_proxy_used',
+                bool((self.current_execution_proxy_info or {}).get('used', False)),
+            ),
+            'execution_proxy_map_used': snapshot.get(
+                'execution_proxy_map_used',
+                list((self.current_execution_proxy_info or {}).get('map_used', [])),
             ),
             'cov_gate_coverage': snapshot.get('cov_gate_coverage', self.current_risk_check_info.get('cov_gate_coverage') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_vol': snapshot.get('cov_gate_vol', self.current_risk_check_info.get('cov_gate_vol') if isinstance(self.current_risk_check_info, dict) else None),
@@ -3949,6 +3968,120 @@ class PaperTradingEngine:
                 continue
             out[t_from] = t_to
         return out
+
+    def _get_ticker_proxy_scope(self):
+        risk_cfg = self._get_risk_model_cfg()
+        scope = str(risk_cfg.get("ticker_proxy_scope", "risk_only") or "risk_only").strip().lower()
+        if scope not in {"off", "risk_only", "risk_and_execution"}:
+            scope = "risk_only"
+        return scope
+
+    def _apply_target_proxy_for_execution(self, target_weights):
+        if not isinstance(target_weights, dict):
+            return {}, []
+        risk_cfg = self._get_risk_model_cfg()
+        scope = self._get_ticker_proxy_scope()
+        enabled = bool(risk_cfg.get("enable_ticker_proxy_for_returns", False))
+        if not enabled or scope != "risk_and_execution":
+            return dict(target_weights), []
+
+        proxy_map = self._get_ticker_proxy_map()
+        mapped_weights = {}
+        proxy_rows = []
+        seen_rows = set()
+        for raw_ticker, raw_weight in target_weights.items():
+            ticker = str(raw_ticker).upper().strip()
+            if not ticker:
+                continue
+            try:
+                weight = float(raw_weight if raw_weight is not None else 0.0)
+            except Exception:
+                weight = 0.0
+            if not np.isfinite(weight):
+                weight = 0.0
+            if ticker == "CASH":
+                mapped_weights["CASH"] = float(mapped_weights.get("CASH", 0.0) + weight)
+                continue
+            mapped_ticker = str(proxy_map.get(ticker, ticker)).upper().strip() or ticker
+            mapped_weights[mapped_ticker] = float(mapped_weights.get(mapped_ticker, 0.0) + weight)
+            if mapped_ticker != ticker and abs(weight) > 1e-12:
+                row_key = (ticker, mapped_ticker)
+                if row_key not in seen_rows:
+                    seen_rows.add(row_key)
+                    proxy_rows.append({"from": ticker, "to": mapped_ticker, "reason": "execution_scope"})
+        return mapped_weights, proxy_rows
+
+    def _new_execution_summary(self):
+        return {
+            "orders_total": 0,
+            "orders_place": 0,
+            "orders_skip": 0,
+            "skip_reasons": {},
+        }
+
+    def _emit_exec_decision(
+        self,
+        summary,
+        *,
+        action,
+        reason,
+        ticker,
+        from_ticker=None,
+        to_ticker=None,
+        target_w=None,
+        current_w=None,
+        delta=None,
+        price_status=None,
+        cash_after=None,
+        cooldown_blocked=False,
+    ):
+        action_s = str(action or "SKIP").upper()
+        if action_s not in {"PLACE", "SKIP"}:
+            action_s = "SKIP"
+        reason_s = str(reason or "OTHER").upper()
+        allowed_reasons = {
+            "WEIGHT_DELTA_TOO_SMALL",
+            "PRICE_MISSING",
+            "PRICE_STALE",
+            "CASH_CONSTRAINT",
+            "COOLDOWN",
+            "MARKET_CLOSED",
+            "RISK_GATE",
+            "OTHER",
+        }
+        if reason_s not in allowed_reasons:
+            reason_s = "OTHER"
+        ticker_s = str(ticker or "").upper().strip() or "UNKNOWN"
+        from_s = str(from_ticker or ticker_s).upper().strip() or ticker_s
+        to_s = str(to_ticker or ticker_s).upper().strip() or ticker_s
+        target_w_val = float(target_w) if target_w is not None else 0.0
+        current_w_val = float(current_w) if current_w is not None else 0.0
+        delta_val = float(delta) if delta is not None else float(target_w_val - current_w_val)
+        price_status_s = str(price_status or "NA").upper()
+        cash_after_val = float(cash_after) if cash_after is not None else float(self.cash)
+        cooldown_blocked_b = bool(cooldown_blocked)
+
+        print(
+            "[EXEC_DECISION] "
+            f"action={action_s} reason={reason_s} ticker={ticker_s} "
+            f"from={from_s} to={to_s} "
+            f"target_w={target_w_val:.6f} current_w={current_w_val:.6f} delta={delta_val:.6f} "
+            f"price_status={price_status_s} cash_after={cash_after_val:.2f} "
+            f"cooldown_blocked={str(cooldown_blocked_b).lower()}"
+        )
+
+        if not isinstance(summary, dict):
+            return
+        summary["orders_total"] = int(summary.get("orders_total", 0) or 0) + 1
+        if action_s == "PLACE":
+            summary["orders_place"] = int(summary.get("orders_place", 0) or 0) + 1
+        else:
+            summary["orders_skip"] = int(summary.get("orders_skip", 0) or 0) + 1
+            reasons = summary.get("skip_reasons", {})
+            if not isinstance(reasons, dict):
+                reasons = {}
+            reasons[reason_s] = int(reasons.get(reason_s, 0) or 0) + 1
+            summary["skip_reasons"] = reasons
 
     def _build_returns_coverage_diag(self, cov_coverage):
         exec_cfg = self.config.get("execution", {}) if isinstance(self.config, dict) else {}
@@ -7361,6 +7494,8 @@ class PaperTradingEngine:
             "vol_target_use_cov_only": True,
             "enable_ticker_proxy_for_returns": False,
             "ticker_proxy_map": {"XIU.TO": "EWC", "FTS.TO": "FTS"},
+            "ticker_proxy_scope": "risk_only",
+            "proxy_scope": "risk_only",
         }
         try:
             raw_cfg = self.config.get("risk_model", {})
@@ -7391,6 +7526,20 @@ class PaperTradingEngine:
             cfg["vol_target_max_scale"] = float(cfg.get("vol_target_max_scale", 1.00))
             cfg["vol_target_use_cov_only"] = bool(cfg.get("vol_target_use_cov_only", True))
             cfg["enable_ticker_proxy_for_returns"] = bool(cfg.get("enable_ticker_proxy_for_returns", False))
+            env_scope_raw = str(os.environ.get("GW_PROXY_SCOPE", "") or "").strip().lower()
+            if "proxy_scope" in raw_cfg:
+                proxy_scope_raw = raw_cfg.get("proxy_scope")
+            elif "ticker_proxy_scope" in raw_cfg:
+                proxy_scope_raw = raw_cfg.get("ticker_proxy_scope")
+            else:
+                proxy_scope_raw = cfg.get("proxy_scope", cfg.get("ticker_proxy_scope", "risk_only"))
+            if env_scope_raw:
+                proxy_scope_raw = env_scope_raw
+            scope_raw = str(proxy_scope_raw or "risk_only").strip().lower()
+            if scope_raw not in {"off", "risk_only", "risk_and_execution"}:
+                scope_raw = "risk_only"
+            cfg["ticker_proxy_scope"] = scope_raw
+            cfg["proxy_scope"] = scope_raw
 
             proxy_map_raw = cfg.get("ticker_proxy_map", {})
             if not isinstance(proxy_map_raw, dict):
@@ -10939,6 +11088,9 @@ class PaperTradingEngine:
         # NOTE: comment omitted (was garbled/non-ASCII).
         execution_config = self.config.get('execution', {})
         self.current_rebalance_skipped_reason = ""
+        execution_summary = self._new_execution_summary()
+        self.current_execution_summary = execution_summary
+        self.current_execution_proxy_info = {"used": False, "map_used": []}
         if not isinstance(self.current_cooldown_info, dict):
             self.current_cooldown_info = {}
         self.current_cov_refresh_info = {}
@@ -11035,6 +11187,36 @@ class PaperTradingEngine:
             'min_keep_turnover_reason': 'disabled',
             'top_selected_by_score': [],
         }
+        target_weights = dict(target_weights) if isinstance(target_weights, dict) else {}
+        risk_cfg_now = self._get_risk_model_cfg()
+        proxy_enabled_now = bool(risk_cfg_now.get("enable_ticker_proxy_for_returns", False))
+        proxy_scope_now = self._get_ticker_proxy_scope()
+        execution_proxy_enabled = bool(proxy_enabled_now and proxy_scope_now == "risk_and_execution")
+        execution_proxy_map = self._get_ticker_proxy_map() if execution_proxy_enabled else {}
+        execution_proxy_rows = []
+        execution_proxy_seen = set()
+        proxy_source_by_to = {}
+
+        def _record_exec_proxy(from_ticker, to_ticker, reason):
+            from_u = str(from_ticker or "").upper().strip()
+            to_u = str(to_ticker or "").upper().strip()
+            if not from_u or not to_u:
+                return
+            reason_s = str(reason or "PRICE_MISSING")
+            key = (from_u, to_u, reason_s)
+            if key in execution_proxy_seen:
+                return
+            execution_proxy_seen.add(key)
+            execution_proxy_rows.append({"from": from_u, "to": to_u, "reason": reason_s})
+            proxy_source_by_to.setdefault(to_u, []).append(from_u)
+            print(f"[EXEC_PROXY] from={from_u} to={to_u} reason={reason_s}")
+
+        def _exec_from_ticker(to_ticker):
+            to_u = str(to_ticker or "").upper().strip()
+            src_list = proxy_source_by_to.get(to_u, [])
+            if isinstance(src_list, list) and src_list:
+                return str(src_list[0]).upper().strip()
+            return to_u
         try:
             rebalance_targets = []
             for _t, _w in (target_weights or {}).items():
@@ -11104,6 +11286,21 @@ class PaperTradingEngine:
             self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
             gate_detail = str((gate or {}).get('reason_detail', 'unknown'))
             self.current_rebalance_skipped_reason = 'market_closed_gate'
+            self._emit_exec_decision(
+                execution_summary,
+                action="SKIP",
+                reason="MARKET_CLOSED",
+                ticker="ALL",
+                from_ticker="ALL",
+                to_ticker="ALL",
+                target_w=0.0,
+                current_w=0.0,
+                delta=0.0,
+                price_status="NA",
+                cash_after=self.cash,
+                cooldown_blocked=False,
+            )
+            self.current_execution_summary = execution_summary
             try:
                 self._apply_cooldown_outcome(
                     now_utc=now_rebalance,
@@ -11141,6 +11338,21 @@ class PaperTradingEngine:
             self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
             last_reason = str((self.current_cooldown_info or {}).get('reason', 'unknown'))
             last_outcome = str((self.current_cooldown_info or {}).get('outcome', 'UNKNOWN'))
+            self._emit_exec_decision(
+                execution_summary,
+                action="SKIP",
+                reason="COOLDOWN",
+                ticker="ALL",
+                from_ticker="ALL",
+                to_ticker="ALL",
+                target_w=0.0,
+                current_w=0.0,
+                delta=0.0,
+                price_status="NA",
+                cash_after=self.cash,
+                cooldown_blocked=True,
+            )
+            self.current_execution_summary = execution_summary
             print(
                 "[COOLDOWN] "
                 f"gate=blocked reason={last_reason} outcome={last_outcome} "
@@ -11366,6 +11578,20 @@ class PaperTradingEngine:
             
             if weight_diff < weight_threshold:
                 print(f"[SKIP] {ticker} weight diff {weight_diff:.4f} < threshold {weight_threshold:.4f}")
+                self._emit_exec_decision(
+                    execution_summary,
+                    action="SKIP",
+                    reason="WEIGHT_DELTA_TOO_SMALL",
+                    ticker=ticker,
+                    from_ticker=_exec_from_ticker(ticker),
+                    to_ticker=ticker,
+                    target_w=target_weight,
+                    current_w=current_weight,
+                    delta=(target_weight - current_weight),
+                    price_status="NA",
+                    cash_after=self.cash,
+                    cooldown_blocked=False,
+                )
                 continue
             
             tickers_to_trade.append(ticker)
@@ -11401,6 +11627,8 @@ class PaperTradingEngine:
             current_value = current_values.get(ticker, 0.0)
             target_value = target_values.get(ticker, 0.0)
             side = 'BUY' if target_value > current_value else 'SELL'
+            current_weight = (current_value / total_equity) if total_equity > 0 else 0.0
+            target_weight = (target_value / total_equity) if total_equity > 0 else 0.0
 
             if side == 'SELL' and min_holding_cycles > 0:
                 entry_cycle = self.position_entry_cycle.get(str(ticker).upper())
@@ -11421,14 +11649,60 @@ class PaperTradingEngine:
             # NOTE: comment omitted (was garbled/non-ASCII).
             if desired_trade_value < min_notional:
                 print(f"[SKIP] {ticker} trade notional ${desired_trade_value:.2f} < min ${min_notional}")
+                self._emit_exec_decision(
+                    execution_summary,
+                    action="SKIP",
+                    reason="OTHER",
+                    ticker=ticker,
+                    from_ticker=_exec_from_ticker(ticker),
+                    to_ticker=ticker,
+                    target_w=target_weight,
+                    current_w=current_weight,
+                    delta=(target_weight - current_weight),
+                    price_status="NA",
+                    cash_after=self.cash,
+                    cooldown_blocked=False,
+                )
                 continue
             
+            execution_ticker = str(ticker).upper().strip()
+            proxy_reason = ""
+
             # NOTE: comment omitted (was garbled/non-ASCII).
-            if ticker not in price_info:
-                print(f"[SKIP] {ticker} no price info")
-                continue
+            if execution_ticker not in price_info:
+                # risk_and_execution: for BUY side only, map missing source to proxy ticker.
+                mapped_ticker = str(execution_proxy_map.get(execution_ticker, "")).upper().strip() if execution_proxy_enabled else ""
+                if side == 'BUY' and mapped_ticker and mapped_ticker != execution_ticker:
+                    if mapped_ticker not in price_info:
+                        p2, a2, s2, d2 = self.get_current_price(mapped_ticker, return_debug=True)
+                        if p2 is not None:
+                            price_info[mapped_ticker] = (p2, a2, s2)
+                        if isinstance(d2, dict):
+                            price_debug_cache[mapped_ticker] = d2
+                    if mapped_ticker in price_info:
+                        execution_ticker = mapped_ticker
+                        proxy_reason = "PRICE_MISSING"
+                        _record_exec_proxy(ticker, execution_ticker, proxy_reason)
+
+                if execution_ticker not in price_info:
+                    print(f"[SKIP] {ticker} no price info")
+                    self._emit_exec_decision(
+                        execution_summary,
+                        action="SKIP",
+                        reason="PRICE_MISSING",
+                        ticker=ticker,
+                        from_ticker=_exec_from_ticker(ticker),
+                        to_ticker=ticker,
+                        target_w=target_weight,
+                        current_w=current_weight,
+                        delta=(target_weight - current_weight),
+                        price_status="MISSING",
+                        cash_after=self.cash,
+                        cooldown_blocked=False,
+                    )
+                    continue
             
-            price, age, status = price_info[ticker]
+            price, age, status = price_info[execution_ticker]
             
             status = str(status).upper()
 
@@ -11436,10 +11710,38 @@ class PaperTradingEngine:
             if side == 'BUY' and status not in allow_buy_status:
                 policy_skip_count += 1
                 print(f"[SKIP] {ticker} BUY status={status} not in allow_buy={sorted(allow_buy_status)}")
+                self._emit_exec_decision(
+                    execution_summary,
+                    action="SKIP",
+                    reason="PRICE_STALE" if status == "STALE" else "OTHER",
+                    ticker=ticker,
+                    from_ticker=_exec_from_ticker(ticker),
+                    to_ticker=ticker,
+                    target_w=target_weight,
+                    current_w=current_weight,
+                    delta=(target_weight - current_weight),
+                    price_status=status,
+                    cash_after=self.cash,
+                    cooldown_blocked=False,
+                )
                 continue
             if side == 'SELL' and status not in allow_sell_status:
                 policy_skip_count += 1
                 print(f"[SKIP] {ticker} SELL status={status} not in allow_sell={sorted(allow_sell_status)}")
+                self._emit_exec_decision(
+                    execution_summary,
+                    action="SKIP",
+                    reason="PRICE_STALE" if status == "STALE" else "OTHER",
+                    ticker=ticker,
+                    from_ticker=_exec_from_ticker(ticker),
+                    to_ticker=ticker,
+                    target_w=target_weight,
+                    current_w=current_weight,
+                    delta=(target_weight - current_weight),
+                    price_status=status,
+                    cash_after=self.cash,
+                    cooldown_blocked=False,
+                )
                 continue
 
             # Candidate for stale-ratio only after policy pass.
@@ -11485,12 +11787,16 @@ class PaperTradingEngine:
             is_forced = (force_reason is not None) or hard_trade
             
             planned_trades.append({
-                'ticker': ticker,
+                'ticker': execution_ticker,
+                'source_ticker': str(ticker).upper().strip(),
+                'execution_proxy_reason': proxy_reason,
                 'side': side,
                 'current_value': current_value,
                 'target_value': target_value,
                 'desired_trade_value': desired_trade_value,
                 'delta_weight': (desired_trade_value / total_equity) if total_equity > 0 else 0.0,
+                'current_weight': current_weight,
+                'target_weight': target_weight,
                 'price': price,
                 'age': age,
                 'status': status,
@@ -11582,6 +11888,21 @@ class PaperTradingEngine:
             if isinstance(self.current_risk_check_info, dict):
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             print(f"[DECISION] {abort_trace}")
+            self._emit_exec_decision(
+                execution_summary,
+                action="SKIP",
+                reason="PRICE_STALE",
+                ticker="ALL",
+                from_ticker="ALL",
+                to_ticker="ALL",
+                target_w=0.0,
+                current_w=0.0,
+                delta=0.0,
+                price_status="STALE",
+                cash_after=self.cash,
+                cooldown_blocked=False,
+            )
+            self.current_execution_summary = execution_summary
             try:
                 self._apply_cooldown_outcome(
                     now_utc=now_rebalance,
@@ -11694,6 +12015,21 @@ class PaperTradingEngine:
             if isinstance(self.current_risk_check_info, dict):
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             self.current_stale_info['decision_trace'] = f"{self.current_stale_info.get('decision_trace', '')}|risk_gate_abort_{reason}"
+            self._emit_exec_decision(
+                execution_summary,
+                action="SKIP",
+                reason="RISK_GATE",
+                ticker="ALL",
+                from_ticker="ALL",
+                to_ticker="ALL",
+                target_w=0.0,
+                current_w=0.0,
+                delta=0.0,
+                price_status="NA",
+                cash_after=self.cash,
+                cooldown_blocked=False,
+            )
+            self.current_execution_summary = execution_summary
             try:
                 self._apply_cooldown_outcome(
                     now_utc=now_rebalance,
@@ -11704,6 +12040,104 @@ class PaperTradingEngine:
             except Exception as e:
                 print(f"[WARN] cooldown apply failed (risk_gate): {e}")
             return []
+
+        # risk_and_execution: also proxy execution ticker when returns diag says source ticker has PRICE_MISSING.
+        if execution_proxy_enabled and planned_trades:
+            returns_price_missing = set()
+            returns_diag = risk_gate.get('returns_coverage_diag', {}) if isinstance(risk_gate, dict) else {}
+            if isinstance(returns_diag, dict):
+                for item in (returns_diag.get('items', []) if isinstance(returns_diag.get('items', []), list) else []):
+                    if not isinstance(item, dict):
+                        continue
+                    ticker_u = str(item.get('ticker', '')).upper().strip()
+                    reason_code_u = str(item.get('reason_code', '')).upper().strip()
+                    if ticker_u and reason_code_u == 'PRICE_MISSING':
+                        returns_price_missing.add(ticker_u)
+            if returns_price_missing:
+                remapped_trades = []
+                for trade in planned_trades:
+                    if not isinstance(trade, dict):
+                        continue
+                    source_ticker = str(trade.get('source_ticker', trade.get('ticker', ''))).upper().strip()
+                    side_u = str(trade.get('side', '')).upper().strip()
+                    exec_ticker_u = str(trade.get('ticker', '')).upper().strip()
+                    if (
+                        side_u == 'BUY'
+                        and source_ticker
+                        and source_ticker in returns_price_missing
+                        and source_ticker == exec_ticker_u
+                    ):
+                        proxy_ticker = str(execution_proxy_map.get(source_ticker, '')).upper().strip()
+                        if proxy_ticker and proxy_ticker != source_ticker:
+                            if proxy_ticker not in price_info:
+                                p2, a2, s2, d2 = self.get_current_price(proxy_ticker, return_debug=True)
+                                if p2 is not None:
+                                    price_info[proxy_ticker] = (p2, a2, s2)
+                                if isinstance(d2, dict):
+                                    price_debug_cache[proxy_ticker] = d2
+                            if proxy_ticker in price_info:
+                                p2, a2, s2 = price_info[proxy_ticker]
+                                s2_u = str(s2).upper().strip()
+                                if s2_u in allow_buy_status:
+                                    trade['ticker'] = proxy_ticker
+                                    trade['price'] = p2
+                                    trade['age'] = a2
+                                    trade['status'] = s2_u
+                                    trade['execution_proxy_reason'] = 'PRICE_MISSING'
+                                    _record_exec_proxy(source_ticker, proxy_ticker, 'PRICE_MISSING')
+                    remapped_trades.append(trade)
+                planned_trades = remapped_trades
+
+        # Merge multiple source trades mapped to the same execution ticker.
+        if planned_trades and execution_proxy_rows:
+            merged = {}
+            for trade in planned_trades:
+                if not isinstance(trade, dict):
+                    continue
+                key = (str(trade.get('ticker', '')).upper().strip(), str(trade.get('side', '')).upper().strip())
+                if not key[0]:
+                    continue
+                src = str(trade.get('source_ticker', key[0])).upper().strip() or key[0]
+                if key not in merged:
+                    item = dict(trade)
+                    item['_merge_sources'] = {src}
+                    merged[key] = item
+                    continue
+                cur = merged[key]
+                cur['desired_trade_value'] = float(cur.get('desired_trade_value', 0.0) or 0.0) + float(trade.get('desired_trade_value', 0.0) or 0.0)
+                cur['current_value'] = float(cur.get('current_value', 0.0) or 0.0) + float(trade.get('current_value', 0.0) or 0.0)
+                cur['target_value'] = float(cur.get('target_value', 0.0) or 0.0) + float(trade.get('target_value', 0.0) or 0.0)
+                cur['_merge_sources'].add(src)
+                cur['is_forced'] = bool(cur.get('is_forced', False) or trade.get('is_forced', False))
+                cur['hard'] = bool(cur.get('hard', False) or trade.get('hard', False))
+                if not cur.get('force_reason') and trade.get('force_reason'):
+                    cur['force_reason'] = trade.get('force_reason')
+                if not cur.get('hard_reason') and trade.get('hard_reason'):
+                    cur['hard_reason'] = trade.get('hard_reason')
+
+            merged_trades = []
+            for key, trade in merged.items():
+                sources = sorted(list(trade.pop('_merge_sources', set())))
+                if sources:
+                    trade['source_ticker'] = "|".join(sources)
+                cur_v = float(trade.get('current_value', 0.0) or 0.0)
+                tar_v = float(trade.get('target_value', 0.0) or 0.0)
+                if total_equity > 0:
+                    trade['current_weight'] = float(cur_v / total_equity)
+                    trade['target_weight'] = float(tar_v / total_equity)
+                    trade['delta_weight'] = float(abs(tar_v - cur_v) / total_equity)
+                if len(sources) > 1:
+                    print(
+                        "[EXEC_PROXY_MERGE] "
+                        f"to={key[0]} side={key[1]} merged={len(sources)} sources={','.join(sources)}"
+                    )
+                merged_trades.append(trade)
+            planned_trades = merged_trades
+
+        self.current_execution_proxy_info = {
+            "used": bool(len(execution_proxy_rows) > 0),
+            "map_used": list(execution_proxy_rows[:50]),
+        }
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         turnover_notional_pre = sum(abs(t['desired_trade_value']) for t in planned_trades)
@@ -12063,6 +12497,20 @@ class PaperTradingEngine:
             sell_qty = min(sell_qty, current_qty)
             
             if sell_qty <= 0:
+                self._emit_exec_decision(
+                    execution_summary,
+                    action="SKIP",
+                    reason="WEIGHT_DELTA_TOO_SMALL",
+                    ticker=ticker,
+                    from_ticker=trade.get('source_ticker', ticker),
+                    to_ticker=ticker,
+                    target_w=trade.get('target_weight', None),
+                    current_w=trade.get('current_weight', None),
+                    delta=(float(trade.get('target_weight', 0.0) or 0.0) - float(trade.get('current_weight', 0.0) or 0.0)),
+                    price_status=trade.get('status', 'NA'),
+                    cash_after=self.cash,
+                    cooldown_blocked=False,
+                )
                 continue
             
             # NOTE: comment omitted (was garbled/non-ASCII).
@@ -12161,6 +12609,20 @@ class PaperTradingEngine:
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
             })
+            self._emit_exec_decision(
+                execution_summary,
+                action="PLACE",
+                reason="OTHER",
+                ticker=ticker,
+                from_ticker=trade.get('source_ticker', ticker),
+                to_ticker=ticker,
+                target_w=trade.get('target_weight', None),
+                current_w=trade.get('current_weight', None),
+                delta=(float(trade.get('target_weight', 0.0) or 0.0) - float(trade.get('current_weight', 0.0) or 0.0)),
+                price_status=trade.get('status', 'NA'),
+                cash_after=self.cash,
+                cooldown_blocked=False,
+            )
             
             print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price:.2f} (notional: ${proceeds:.2f}, {trade['status']})")
         
@@ -12174,6 +12636,20 @@ class PaperTradingEngine:
             buy_qty = int(desired_notional / price)
             
             if buy_qty <= 0:
+                self._emit_exec_decision(
+                    execution_summary,
+                    action="SKIP",
+                    reason="WEIGHT_DELTA_TOO_SMALL",
+                    ticker=ticker,
+                    from_ticker=trade.get('source_ticker', ticker),
+                    to_ticker=ticker,
+                    target_w=trade.get('target_weight', None),
+                    current_w=trade.get('current_weight', None),
+                    delta=(float(trade.get('target_weight', 0.0) or 0.0) - float(trade.get('current_weight', 0.0) or 0.0)),
+                    price_status=trade.get('status', 'NA'),
+                    cash_after=self.cash,
+                    cooldown_blocked=False,
+                )
                 continue
             
             # NOTE: comment omitted (was garbled/non-ASCII).
@@ -12188,6 +12664,20 @@ class PaperTradingEngine:
                 
                 if buy_qty <= 0:
                     print(f"[SKIP] {ticker} insufficient cash")
+                    self._emit_exec_decision(
+                        execution_summary,
+                        action="SKIP",
+                        reason="CASH_CONSTRAINT",
+                        ticker=ticker,
+                        from_ticker=trade.get('source_ticker', ticker),
+                        to_ticker=ticker,
+                        target_w=trade.get('target_weight', None),
+                        current_w=trade.get('current_weight', None),
+                        delta=(float(trade.get('target_weight', 0.0) or 0.0) - float(trade.get('current_weight', 0.0) or 0.0)),
+                        price_status=trade.get('status', 'NA'),
+                        cash_after=self.cash,
+                        cooldown_blocked=False,
+                    )
                     continue
                 
                 required_cash = buy_qty * price
@@ -12292,6 +12782,20 @@ class PaperTradingEngine:
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
             })
+            self._emit_exec_decision(
+                execution_summary,
+                action="PLACE",
+                reason="OTHER",
+                ticker=ticker,
+                from_ticker=trade.get('source_ticker', ticker),
+                to_ticker=ticker,
+                target_w=trade.get('target_weight', None),
+                current_w=trade.get('current_weight', None),
+                delta=(float(trade.get('target_weight', 0.0) or 0.0) - float(trade.get('current_weight', 0.0) or 0.0)),
+                price_status=trade.get('status', 'NA'),
+                cash_after=self.cash,
+                cooldown_blocked=False,
+            )
             
             print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f}, {trade['status']})")
 
@@ -12857,6 +13361,7 @@ class PaperTradingEngine:
             'market_session': dict(self.current_market_session) if isinstance(self.current_market_session, dict) else {},
             'rebalance_gate': dict(self.current_rebalance_gate) if isinstance(self.current_rebalance_gate, dict) else {},
             'rebalance_skipped_reason': self.current_rebalance_skipped_reason,
+            'execution_summary': dict(self.current_execution_summary) if isinstance(self.current_execution_summary, dict) else self._new_execution_summary(),
             'price_debug': dict(self.current_price_debug) if isinstance(self.current_price_debug, dict) else {},
             'price_fetch_stats': dict(self.current_price_fetch_stats) if isinstance(self.current_price_fetch_stats, dict) else {},
             'price_diagnostics_summary': dict(self.current_price_diagnostics_summary) if isinstance(self.current_price_diagnostics_summary, dict) else {},
@@ -12950,6 +13455,8 @@ class PaperTradingEngine:
             'risk_gate_stub_name': self.current_risk_check_info.get('risk_gate_stub_name', None),
             'ticker_proxy_used': bool(self.current_risk_check_info.get('ticker_proxy_used', False)),
             'ticker_proxy_map_used': self.current_risk_check_info.get('ticker_proxy_map_used', []),
+            'execution_proxy_used': bool((self.current_execution_proxy_info or {}).get('used', False)),
+            'execution_proxy_map_used': list((self.current_execution_proxy_info or {}).get('map_used', [])),
             'cov_coverage': self.current_risk_check_info.get('cov_coverage', default_cov_coverage()),
             'cov_coverage_debug_inputs': self.current_risk_check_info.get('cov_coverage_debug_inputs', {}),
             'returns_coverage_diag': self.current_risk_check_info.get('returns_coverage_diag', {"schema_version": 1, "items": []}),
@@ -14118,6 +14625,7 @@ def debug_run_system_s1_s5(
     outdir: str = "outputs/gw_dryrun",
     turnover_limit: float | None = None,
     dryrun_real_risk_gate: bool = False,
+    proxy_scope: str | None = None,
 ) -> int:
     """Offline deterministic acceptance dry-run for S1..S5."""
     pass_count = 0
@@ -14263,17 +14771,46 @@ def debug_run_system_s1_s5(
         risk_cfg_live["min_cov_gate_coverage"] = 0.60
         risk_cfg_live["cov_gate_fallback_to_weighted"] = True
         outdir_lc = str(outdir or "").lower()
-        enable_proxy_dryrun = ("step3_proxy" in outdir_lc) or bool(
+        env_enable_proxy = bool(
             str(os.environ.get("GW_DRYRUN_ENABLE_PROXY", "")).strip().lower() in {"1", "true", "yes", "on"}
         )
-        risk_cfg_live["enable_ticker_proxy_for_returns"] = bool(enable_proxy_dryrun)
+        cli_scope_raw = str(proxy_scope or "").strip().lower()
+        if cli_scope_raw not in {"off", "risk_only", "risk_and_execution"}:
+            cli_scope_raw = ""
+        env_scope_raw = str(os.environ.get("GW_DRYRUN_PROXY_SCOPE", "")).strip().lower()
+        if env_scope_raw not in {"off", "risk_only", "risk_and_execution"}:
+            env_scope_raw = ""
+        enable_proxy_dryrun = bool(
+            ("step3_proxy" in outdir_lc)
+            or ("proxy_risk_only" in outdir_lc)
+            or ("proxy_risk_and_execution" in outdir_lc)
+            or ("proxy_risk_and_exec" in outdir_lc)
+            or env_enable_proxy
+        )
+        proxy_scope_dryrun = "risk_only"
+        if "proxy_risk_and_execution" in outdir_lc:
+            proxy_scope_dryrun = "risk_and_execution"
+        elif "proxy_risk_only" in outdir_lc or "step3_proxy" in outdir_lc:
+            proxy_scope_dryrun = "risk_only"
+        if env_scope_raw:
+            proxy_scope_dryrun = env_scope_raw
+        if cli_scope_raw:
+            proxy_scope_dryrun = cli_scope_raw
+        if cli_scope_raw and cli_scope_raw != "off":
+            enable_proxy_dryrun = True
+        risk_cfg_live["enable_ticker_proxy_for_returns"] = bool(enable_proxy_dryrun and proxy_scope_dryrun != "off")
+        risk_cfg_live["ticker_proxy_scope"] = str(proxy_scope_dryrun)
+        risk_cfg_live["proxy_scope"] = str(proxy_scope_dryrun)
         proxy_map_live = risk_cfg_live.get("ticker_proxy_map", {})
         if not isinstance(proxy_map_live, dict):
             proxy_map_live = {}
         proxy_map_live.setdefault("XIU.TO", "EWC")
         proxy_map_live.setdefault("FTS.TO", "FTS")
         risk_cfg_live["ticker_proxy_map"] = proxy_map_live
-        print(f"[DRYRUN_PROXY] enabled={str(bool(enable_proxy_dryrun)).lower()}")
+        print(
+            f"[DRYRUN_PROXY] enabled={str(bool(risk_cfg_live.get('enable_ticker_proxy_for_returns', False))).lower()} "
+            f"scope={risk_cfg_live.get('ticker_proxy_scope', 'risk_only')}"
+        )
         exec_cfg_live["enable_target_cov_gate"] = True
         exec_cfg_live["target_cov_gate_min_coverage"] = 0.60
         exec_cfg_live["target_cov_gate_require_ok"] = True
@@ -14425,6 +14962,9 @@ def debug_run_system_s1_s5(
                 return (price, 180.0, "STALE", dbg)
 
             if self.mode == "live_buy":
+                if t.endswith(".TO"):
+                    dbg = self._mk_debug(t, "MISSING", None, "stub_missing_to", tz_ok=False, notes="source_unsupported")
+                    return (None, 99999.0, "MISSING", dbg)
                 price = {"AAA": 100.0, "BBB": 110.0, "CCC": 120.0}.get(t, 95.0)
                 dbg = self._mk_debug(t, "LIVE", 1.0, "stub_live", tz_ok=True, notes=None)
                 return (price, 1.0, "LIVE", dbg)
@@ -14769,6 +15309,16 @@ def debug_run_system_s1_s5(
             isinstance(first_trade, dict) and bool(first_trade.get("session_id")) and bool(first_trade.get("config_hash")),
             "trade rows include session_id and config_hash",
         )
+
+    # Export latest runtime artifacts to debug outdir for easy inspection.
+    try:
+        shutil.copy2(snapshot_path, os.path.join(outdir_abs, "snapshot_live.json"))
+    except Exception:
+        pass
+    try:
+        shutil.copy2(trade_history_path, os.path.join(outdir_abs, "trade_history.jsonl"))
+    except Exception:
+        pass
 
     print(f"DRYRUN_SUMMARY pass={pass_count} fail={fail_count}")
     return 1 if fail_count > 0 else 0
@@ -15637,6 +16187,13 @@ def main():
         help="Output directory for debug artifacts.",
     )
     parser.add_argument(
+        "--proxy-scope",
+        type=str,
+        default=None,
+        choices=["off", "risk_only", "risk_and_execution"],
+        help="Override proxy scope for execution/risk mapping.",
+    )
+    parser.add_argument(
         "--debug-news-overlay-phase2",
         action="store_true",
         help="Run deterministic Phase 2 news overlay consumption dry-run and exit.",
@@ -15695,12 +16252,16 @@ def main():
     if bool(args.debug_planner_once or debug_env):
         debug_run_planner_once(args.config_path, turnover_limit=args.debug_turnover_limit)
         return 0
+    if isinstance(args.proxy_scope, str) and args.proxy_scope.strip():
+        os.environ["GW_PROXY_SCOPE"] = str(args.proxy_scope).strip().lower()
+
     if bool(args.debug_system_s1_5 or debug_system_env):
         return debug_run_system_s1_s5(
             config_path=args.config_path,
             outdir=args.debug_outdir,
             turnover_limit=args.debug_turnover_limit,
             dryrun_real_risk_gate=bool(args.dryrun_real_risk_gate or debug_real_gate_env),
+            proxy_scope=args.proxy_scope,
         )
     config_path = args.config if isinstance(args.config, str) and args.config.strip() else args.config_path
 
