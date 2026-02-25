@@ -39,8 +39,9 @@ from risk_profile_state import (
     RiskProfileStateManager,
     ensure_risk_profile_state,
     normalize_risk_profile as normalize_risk_profile_state,
+    request_risk_profile_change,
+    resolve_risk_profile_events_path,
     resolve_risk_profile_state_path,
-    write_risk_profile_state,
 )
 try:
     from telemetry import TelemetryLogger, resolve_telemetry_out_dir
@@ -984,10 +985,15 @@ class PaperTradingEngine:
         self._last_runtime_control_result_key = None
         self.runtime_control_path = self._resolve_runtime_control_path()
         self.risk_profile_state_path = ""
+        self.risk_profile_events_path = ""
         self.risk_profile_source = "bootstrap"
         self.risk_profile_state_mtime = None
         self.risk_profile_state_version = ""
         self.risk_profile_state_set_at = ""
+        self.last_risk_profile_change_ts = ""
+        self.last_risk_profile_change_old = ""
+        self.last_risk_profile_change_new = ""
+        self.last_risk_profile_change_source = ""
         self.risk_profile_state_manager = None
         self._run_end_written = False
         self._run_start_written = False
@@ -1678,6 +1684,7 @@ class PaperTradingEngine:
         reporting_cfg['run_snapshot_path'] = os.path.join(out_dir_abs, 'snapshot_live.json')
         reporting_cfg['runtime_control_path'] = os.path.join(out_dir_abs, 'runtime_control.json')
         reporting_cfg['risk_profile_state_path'] = resolve_risk_profile_state_path(reporting_cfg)
+        reporting_cfg['risk_profile_events_path'] = resolve_risk_profile_events_path(reporting_cfg, state_path=reporting_cfg['risk_profile_state_path'])
         reporting_cfg['trade_history_path'] = os.path.join(out_dir_abs, 'trade_history.jsonl')
         reporting_cfg['trades_log_path'] = os.path.join(out_dir_abs, 'paper_trades.csv')
         reporting_cfg['portfolio_snapshots_path'] = os.path.join(out_dir_abs, 'portfolio_snapshots.jsonl')
@@ -1711,6 +1718,7 @@ class PaperTradingEngine:
         os.makedirs(telemetry_dir, exist_ok=True)
         self.runtime_control_path = self._resolve_runtime_control_path()
         self.risk_profile_state_path = self._resolve_risk_profile_state_path()
+        self.risk_profile_events_path = resolve_risk_profile_events_path(state_path=self.risk_profile_state_path)
         runtime_control_stub_path = str(self.runtime_control_path or "").strip()
         if runtime_control_stub_path and not os.path.exists(runtime_control_stub_path):
             try:
@@ -1892,7 +1900,8 @@ class PaperTradingEngine:
 
     def _resolve_runtime_control_path(self):
         """Resolve runtime control file path with config override support."""
-        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        cfg_obj = getattr(self, "config", {})
+        reporting_cfg = cfg_obj.get('reporting', {}) if isinstance(cfg_obj, dict) else {}
         configured = str(reporting_cfg.get('runtime_control_path', '') or '').strip()
         if configured:
             return os.path.abspath(configured)
@@ -1903,7 +1912,8 @@ class PaperTradingEngine:
 
     def _resolve_risk_profile_state_path(self):
         """Resolve single-source-of-truth risk profile state file path."""
-        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        cfg_obj = getattr(self, "config", {})
+        reporting_cfg = cfg_obj.get('reporting', {}) if isinstance(cfg_obj, dict) else {}
         return resolve_risk_profile_state_path(reporting_cfg if isinstance(reporting_cfg, dict) else {})
 
     def _sync_requested_risk_profile_from_state(self, *, force_reload=False):
@@ -1911,6 +1921,7 @@ class PaperTradingEngine:
         manager = getattr(self, "risk_profile_state_manager", None)
         if manager is None:
             return None
+        old_requested = str(getattr(self, "requested_risk_profile", "") or "").strip().lower()
         try:
             if force_reload or not isinstance(getattr(manager, "state", None), dict) or not manager.state:
                 state_obj = manager.load(ensure=True)
@@ -1929,12 +1940,49 @@ class PaperTradingEngine:
         self.risk_profile_state_version = str((state_obj or {}).get("version", "") or "").strip()
         self.risk_profile_state_set_at = str((state_obj or {}).get("set_at", "") or "").strip()
         self.risk_profile_state_mtime = getattr(manager, "last_mtime", None)
+        self.risk_profile_events_path = resolve_risk_profile_events_path(state_path=self.risk_profile_state_path or manager.state_path)
+        self.last_risk_profile_change_ts = str((state_obj or {}).get("last_change_ts", self.last_risk_profile_change_ts) or "")
+        self.last_risk_profile_change_old = str((state_obj or {}).get("last_change_old", self.last_risk_profile_change_old) or "")
+        self.last_risk_profile_change_new = str((state_obj or {}).get("last_change_new", self.last_risk_profile_change_new) or "")
+        self.last_risk_profile_change_source = str((state_obj or {}).get("last_change_source", self.last_risk_profile_change_source) or "")
+        if not self.last_risk_profile_change_ts and os.path.exists(str(self.risk_profile_events_path or "")):
+            try:
+                with open(str(self.risk_profile_events_path), "r", encoding="utf-8") as f:
+                    last_event = None
+                    for line in f:
+                        raw = str(line or "").strip()
+                        if not raw:
+                            continue
+                        try:
+                            obj = json.loads(raw)
+                        except Exception:
+                            continue
+                        if isinstance(obj, dict):
+                            last_event = obj
+                if isinstance(last_event, dict):
+                    self.last_risk_profile_change_ts = str(last_event.get("ts", "") or "")
+                    self.last_risk_profile_change_old = str(last_event.get("old", "") or "")
+                    self.last_risk_profile_change_new = str(last_event.get("new", "") or "")
+                    self.last_risk_profile_change_source = str(last_event.get("source", "") or "")
+            except Exception:
+                pass
+        new_requested = str(self.requested_risk_profile or "").strip().lower()
+        if old_requested and new_requested and old_requested != new_requested:
+            change_ts = self.last_risk_profile_change_ts or str((state_obj or {}).get("set_at", "") or self._now().isoformat())
+            change_source = self.last_risk_profile_change_source or str((state_obj or {}).get("set_by", "state_file") or "state_file")
+            print(
+                "[RISK_PROFILE_CHANGE] "
+                f"old={old_requested} new={new_requested} "
+                f"source={change_source} ts={change_ts} "
+                f"version={self.risk_profile_state_version}"
+            )
         return state_obj
 
     def _init_risk_profile_state_sync(self):
         """Initialize risk profile state manager and load requested profile from SSOT."""
         state_path = self._resolve_risk_profile_state_path()
         self.risk_profile_state_path = str(state_path)
+        self.risk_profile_events_path = resolve_risk_profile_events_path(state_path=state_path)
         default_requested = str(self.active_risk_profile or RISK_PROFILE_DEFAULT)
         manager = RiskProfileStateManager(state_path, default_requested=default_requested)
         self.risk_profile_state_manager = manager
@@ -1951,6 +1999,7 @@ class PaperTradingEngine:
         reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
         if isinstance(reporting_cfg, dict):
             reporting_cfg['risk_profile_state_path'] = str(state_path)
+            reporting_cfg['risk_profile_events_path'] = str(self.risk_profile_events_path)
 
     def _emit_risk_profile_log(self):
         """Emit one concise risk-profile status line for traceability."""
@@ -1999,33 +2048,57 @@ class PaperTradingEngine:
 
     def write_runtime_control_request(self, requested_risk_profile, request_id=None):
         """Best-effort helper for writing runtime control request atomically."""
+        active_profile_default = str(getattr(self, "active_risk_profile", "") or "").strip().lower() or RISK_PROFILE_DEFAULT
         profile = normalize_risk_profile_state(
             requested_risk_profile,
-            default=(self.active_risk_profile or RISK_PROFILE_DEFAULT),
+            default=active_profile_default,
         )
         rid = str(request_id or uuid.uuid4().hex[:12]).strip() or uuid.uuid4().hex[:12]
+        now_utc = None
+        try:
+            now_fn = getattr(self, "_now", None)
+            if callable(now_fn):
+                now_utc = now_fn()
+        except Exception:
+            now_utc = None
+        if not isinstance(now_utc, datetime):
+            now_utc = datetime.now(timezone.utc)
         payload = {
             'schema_version': 1,
-            'updated_at_utc': self._now().isoformat(),
+            'updated_at_utc': now_utc.isoformat(),
             'request_id': rid,
             'requested_risk_profile': profile,
         }
-        path = self.runtime_control_path
+        path = getattr(self, "runtime_control_path", None) or self._resolve_runtime_control_path()
         self.atomic_write_json(path, payload)
         try:
             manager = getattr(self, "risk_profile_state_manager", None)
             if manager is not None:
-                manager.update_requested(profile, set_by="runtime_control")
+                manager.update_requested(
+                    profile,
+                    set_by="runtime_control",
+                    actor="engine_runtime_control",
+                    run_id=str(getattr(self, "run_id", "") or ""),
+                    cycle_id=int(getattr(self, "current_cycle", 0) or 0),
+                    extra_state={"request_id": rid},
+                )
                 self.risk_profile_state_mtime = getattr(manager, "last_mtime", None)
                 self.risk_profile_state_version = str((manager.state or {}).get("version", "") or "").strip()
                 self.risk_profile_state_set_at = str((manager.state or {}).get("set_at", "") or "").strip()
+                self.last_risk_profile_change_ts = str((manager.state or {}).get("last_change_ts", getattr(self, "last_risk_profile_change_ts", "")) or "")
+                self.last_risk_profile_change_old = str((manager.state or {}).get("last_change_old", getattr(self, "last_risk_profile_change_old", "")) or "")
+                self.last_risk_profile_change_new = str((manager.state or {}).get("last_change_new", getattr(self, "last_risk_profile_change_new", "")) or "")
+                self.last_risk_profile_change_source = str((manager.state or {}).get("last_change_source", getattr(self, "last_risk_profile_change_source", "")) or "")
             else:
                 state_path = self._resolve_risk_profile_state_path()
-                write_risk_profile_state(
+                request_risk_profile_change(
                     state_path,
                     requested=profile,
-                    set_by="runtime_control",
-                    extra={"request_id": rid},
+                    source="runtime_control",
+                    actor="engine_runtime_control",
+                    run_id=str(getattr(self, "run_id", "") or ""),
+                    cycle_id=int(getattr(self, "current_cycle", 0) or 0),
+                    extra_state={"request_id": rid},
                 )
                 self.risk_profile_state_path = str(state_path)
         except Exception:
@@ -2062,6 +2135,26 @@ class PaperTradingEngine:
         if isinstance(control, dict):
             control_requested = str(control.get('requested_risk_profile', '') or '').strip().lower()
             control_request_id = str(control.get('request_id', '') or '').strip()
+        if control_requested and control_requested not in RISK_PROFILE_CHOICES:
+            invalid_key = f"runtime_control_invalid:{control_request_id}:{control_requested}"
+            if self._last_runtime_control_result_key != f"reject:{invalid_key}":
+                self._telemetry_log_event(
+                    "RISK_PROFILE_APPLY_REJECTED",
+                    cycle_id=int(cycle_id),
+                    status="rejected",
+                    payload={
+                        "requested": control_requested,
+                        "request_id": control_request_id,
+                        "reason": "invalid_profile",
+                        "control_path": path,
+                        "state_path": str(state_path),
+                        "source": "runtime_control",
+                    },
+                )
+                self._last_runtime_control_result_key = f"reject:{invalid_key}"
+            # Keep requested sourced from state file; do not apply invalid runtime control.
+            self._emit_risk_profile_log()
+            return
         if control_requested in RISK_PROFILE_CHOICES and control_requested != requested:
             requested = str(control_requested)
             request_id = control_request_id or request_id
@@ -2069,16 +2162,30 @@ class PaperTradingEngine:
             try:
                 manager = getattr(self, "risk_profile_state_manager", None)
                 if manager is not None:
-                    manager.update_requested(requested, set_by="runtime_control_fallback")
+                    manager.update_requested(
+                        requested,
+                        set_by="runtime_control_fallback",
+                        actor="engine_runtime_control_fallback",
+                        run_id=str(self.run_id or ""),
+                        cycle_id=int(cycle_id),
+                        extra_state={"request_id": request_id},
+                    )
                     self.risk_profile_state_mtime = getattr(manager, "last_mtime", None)
                     self.risk_profile_state_version = str((manager.state or {}).get("version", "") or "").strip()
                     self.risk_profile_state_set_at = str((manager.state or {}).get("set_at", "") or "").strip()
+                    self.last_risk_profile_change_ts = str((manager.state or {}).get("last_change_ts", self.last_risk_profile_change_ts) or "")
+                    self.last_risk_profile_change_old = str((manager.state or {}).get("last_change_old", self.last_risk_profile_change_old) or "")
+                    self.last_risk_profile_change_new = str((manager.state or {}).get("last_change_new", self.last_risk_profile_change_new) or "")
+                    self.last_risk_profile_change_source = str((manager.state or {}).get("last_change_source", self.last_risk_profile_change_source) or "")
                 else:
-                    write_risk_profile_state(
+                    request_risk_profile_change(
                         str(state_path),
                         requested=requested,
-                        set_by="runtime_control_fallback",
-                        extra={"request_id": request_id},
+                        source="runtime_control_fallback",
+                        actor="engine_runtime_control_fallback",
+                        run_id=str(self.run_id or ""),
+                        cycle_id=int(cycle_id),
+                        extra_state={"request_id": request_id},
                     )
             except Exception:
                 pass
@@ -2246,6 +2353,10 @@ class PaperTradingEngine:
             'active_risk_profile': str(self.active_risk_profile or RISK_PROFILE_DEFAULT),
             'requested_risk_profile': str(self.requested_risk_profile or self.active_risk_profile or RISK_PROFILE_DEFAULT),
             'risk_profile_source': str(self.risk_profile_source or "state_file"),
+            'last_risk_profile_change_ts': str(self.last_risk_profile_change_ts or ""),
+            'last_risk_profile_change_old': str(self.last_risk_profile_change_old or ""),
+            'last_risk_profile_change_new': str(self.last_risk_profile_change_new or ""),
+            'last_risk_profile_change_source': str(self.last_risk_profile_change_source or ""),
             'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
             'risk_profile_applied_cycle_id': self.risk_profile_applied_cycle_id,
             'risk_profile_applied_at_utc': self.risk_profile_applied_at_utc,
@@ -3206,6 +3317,10 @@ class PaperTradingEngine:
             'active_risk_profile': str(snapshot.get('active_risk_profile', self.active_risk_profile or '')),
             'requested_risk_profile': str(snapshot.get('requested_risk_profile', self.requested_risk_profile or '')),
             'risk_profile_source': str(snapshot.get('risk_profile_source', self.risk_profile_source or "state_file")),
+            'last_risk_profile_change_ts': str(snapshot.get('last_risk_profile_change_ts', self.last_risk_profile_change_ts or "")),
+            'last_risk_profile_change_old': str(snapshot.get('last_risk_profile_change_old', self.last_risk_profile_change_old or "")),
+            'last_risk_profile_change_new': str(snapshot.get('last_risk_profile_change_new', self.last_risk_profile_change_new or "")),
+            'last_risk_profile_change_source': str(snapshot.get('last_risk_profile_change_source', self.last_risk_profile_change_source or "")),
             'risk_profile_template_version': int(snapshot.get('risk_profile_template_version', self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION),
             'risk_profile_applied_cycle_id': snapshot.get('risk_profile_applied_cycle_id', self.risk_profile_applied_cycle_id),
             'risk_profile_applied_at_utc': snapshot.get('risk_profile_applied_at_utc', self.risk_profile_applied_at_utc),
@@ -4734,6 +4849,10 @@ class PaperTradingEngine:
             'active_risk_profile': str(payload.get('active_risk_profile', self.active_risk_profile or RISK_PROFILE_DEFAULT)).strip().lower(),
             'requested_risk_profile': str(payload.get('requested_risk_profile', self.requested_risk_profile or self.active_risk_profile or RISK_PROFILE_DEFAULT)).strip().lower(),
             'risk_profile_source': str(payload.get('risk_profile_source', self.risk_profile_source or "state_file")),
+            'last_risk_profile_change_ts': str(payload.get('last_risk_profile_change_ts', self.last_risk_profile_change_ts or "")),
+            'last_risk_profile_change_old': str(payload.get('last_risk_profile_change_old', self.last_risk_profile_change_old or "")),
+            'last_risk_profile_change_new': str(payload.get('last_risk_profile_change_new', self.last_risk_profile_change_new or "")),
+            'last_risk_profile_change_source': str(payload.get('last_risk_profile_change_source', self.last_risk_profile_change_source or "")),
             'risk_profile_overrides_hash': str(payload.get('risk_profile_overrides_hash', self.risk_profile_overrides_hash or '')),
             'risk_profile_template_version': int(payload.get('risk_profile_template_version', self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION) or RISK_PROFILE_TEMPLATE_VERSION),
             'risk_profile_applied_cycle_id': payload.get('risk_profile_applied_cycle_id', self.risk_profile_applied_cycle_id),
@@ -5135,6 +5254,10 @@ class PaperTradingEngine:
             'active_risk_profile': str(self.active_risk_profile or ''),
             'requested_risk_profile': str(self.requested_risk_profile or ''),
             'risk_profile_source': str(self.risk_profile_source or "state_file"),
+            'last_risk_profile_change_ts': str(self.last_risk_profile_change_ts or ""),
+            'last_risk_profile_change_old': str(self.last_risk_profile_change_old or ""),
+            'last_risk_profile_change_new': str(self.last_risk_profile_change_new or ""),
+            'last_risk_profile_change_source': str(self.last_risk_profile_change_source or ""),
             'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
             'risk_profile_applied_cycle_id': self.risk_profile_applied_cycle_id,
             'risk_profile_applied_at_utc': self.risk_profile_applied_at_utc,
@@ -11847,6 +11970,10 @@ class PaperTradingEngine:
             'active_risk_profile': str(self.active_risk_profile or ''),
             'requested_risk_profile': str(self.requested_risk_profile or ''),
             'risk_profile_source': str(self.risk_profile_source or "state_file"),
+            'last_risk_profile_change_ts': str(self.last_risk_profile_change_ts or ""),
+            'last_risk_profile_change_old': str(self.last_risk_profile_change_old or ""),
+            'last_risk_profile_change_new': str(self.last_risk_profile_change_new or ""),
+            'last_risk_profile_change_source': str(self.last_risk_profile_change_source or ""),
             'risk_profile_template_version': int(self.risk_profile_template_version or RISK_PROFILE_TEMPLATE_VERSION),
             'risk_profile_applied_cycle_id': self.risk_profile_applied_cycle_id,
             'risk_profile_applied_at_utc': self.risk_profile_applied_at_utc,

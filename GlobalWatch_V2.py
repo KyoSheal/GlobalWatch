@@ -31,8 +31,8 @@ from risk_profile_ui_utils import (
 )
 from risk_profile_state import (
     ensure_risk_profile_state as _ensure_risk_profile_state,
+    request_risk_profile_change as _request_risk_profile_change,
     resolve_risk_profile_state_path as _resolve_risk_profile_state_path,
-    write_risk_profile_state as _write_risk_profile_state,
 )
 
 try:
@@ -8030,12 +8030,16 @@ if st.sidebar.button("Apply next cycle", key="runtime_risk_profile_apply_btn"):
             }
         else:
             _request_id = uuid.uuid4().hex[:12]
-            _state_payload = _write_risk_profile_state(
+            _state_change = _request_risk_profile_change(
                 _risk_profile_state_path,
                 requested=_selected_profile_norm,
-                set_by="ui",
-                extra={"request_id": _request_id},
+                source="ui",
+                actor="streamlit_sidebar",
+                run_id=str(_snapshot_live_obj.get("run_id", "") or ""),
+                cycle_id=_snapshot_live_obj.get("cycle_id", _snapshot_live_obj.get("cycle")),
+                extra_state={"request_id": _request_id},
             )
+            _state_payload = _state_change.get("state", {}) if isinstance(_state_change, dict) else {}
             _runtime_payload = {
                 "schema_version": 1,
                 "updated_at_utc": datetime.now(timezone.utc).isoformat(),

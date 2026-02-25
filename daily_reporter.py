@@ -186,6 +186,18 @@ def _ensure_report_meta_fields(report: Dict[str, Any], snapshot: Optional[Dict[s
     if not str(patched.get("risk_profile_source") or "").strip():
         patched["risk_profile_source"] = str(snapshot_obj.get("risk_profile_source") or "unknown")
         changed = True
+    if not str(patched.get("last_risk_profile_change_ts") or "").strip():
+        patched["last_risk_profile_change_ts"] = str(snapshot_obj.get("last_risk_profile_change_ts") or "")
+        changed = True
+    if not str(patched.get("last_risk_profile_change_old") or "").strip():
+        patched["last_risk_profile_change_old"] = str(snapshot_obj.get("last_risk_profile_change_old") or "")
+        changed = True
+    if not str(patched.get("last_risk_profile_change_new") or "").strip():
+        patched["last_risk_profile_change_new"] = str(snapshot_obj.get("last_risk_profile_change_new") or "")
+        changed = True
+    if not str(patched.get("last_risk_profile_change_source") or "").strip():
+        patched["last_risk_profile_change_source"] = str(snapshot_obj.get("last_risk_profile_change_source") or "")
+        changed = True
     return patched, changed
 
 
@@ -1083,6 +1095,10 @@ def generate_daily_report(
         "run_id": snapshot_run_id or None,
         "active_risk_profile": str(snapshot.get("active_risk_profile") or snapshot.get("requested_risk_profile") or "mid").strip().lower() or "mid",
         "risk_profile_source": str(snapshot.get("risk_profile_source") or "unknown"),
+        "last_risk_profile_change_ts": str(snapshot.get("last_risk_profile_change_ts") or ""),
+        "last_risk_profile_change_old": str(snapshot.get("last_risk_profile_change_old") or ""),
+        "last_risk_profile_change_new": str(snapshot.get("last_risk_profile_change_new") or ""),
+        "last_risk_profile_change_source": str(snapshot.get("last_risk_profile_change_source") or ""),
         "schema_version": snapshot_schema_version,
         "cycle_id": snapshot_cycle_id,
         "risk_profile": str(snapshot.get("active_risk_profile") or snapshot.get("requested_risk_profile") or "mid").strip().lower() or "mid",

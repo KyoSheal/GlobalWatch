@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -36,6 +38,19 @@ def resolve_risk_profile_state_path(reporting_cfg: Optional[Dict[str, Any]] = No
     return os.path.abspath(os.path.join(base_out_dir, "state", "risk_profile_state.json"))
 
 
+def resolve_risk_profile_events_path(
+    reporting_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    state_path: str = "",
+) -> str:
+    """Resolve absolute risk profile events jsonl path."""
+    if str(state_path or "").strip():
+        base_dir = os.path.dirname(os.path.abspath(str(state_path)))
+    else:
+        base_dir = os.path.dirname(resolve_risk_profile_state_path(reporting_cfg))
+    return os.path.abspath(os.path.join(base_dir, "risk_profile_events.jsonl"))
+
+
 def _normalize_state_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     requested = normalize_risk_profile(payload.get("requested"), default=RISK_PROFILE_DEFAULT)
     set_at = str(payload.get("set_at", "") or "").strip() or _now_utc_iso()
@@ -56,6 +71,74 @@ def read_risk_profile_state(path: str) -> Optional[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return None
     return _normalize_state_payload(obj)
+
+
+@contextmanager
+def _exclusive_file_lock(lock_path: str):
+    """Best-effort cross-platform lock for append operations."""
+    lock_abs = os.path.abspath(str(lock_path))
+    os.makedirs(os.path.dirname(lock_abs) or ".", exist_ok=True)
+    with open(lock_abs, "a+b") as lock_f:
+        if os.name == "nt":
+            import msvcrt  # type: ignore
+
+            lock_f.seek(0, os.SEEK_END)
+            if lock_f.tell() <= 0:
+                lock_f.write(b"0")
+                lock_f.flush()
+                os.fsync(lock_f.fileno())
+            lock_f.seek(0)
+            msvcrt.locking(lock_f.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_f.seek(0)
+                msvcrt.locking(lock_f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl  # type: ignore
+
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
+def append_risk_profile_event(events_path: str, event: Dict[str, Any]) -> None:
+    """Append one audit event line atomically with lock."""
+    target = os.path.abspath(str(events_path))
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    payload = dict(event or {})
+    line = json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n"
+    lock_path = f"{target}.lock"
+    with _exclusive_file_lock(lock_path):
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def read_last_risk_profile_event(events_path: str) -> Optional[Dict[str, Any]]:
+    """Read last valid JSON line from risk profile events file."""
+    target = os.path.abspath(str(events_path))
+    if not os.path.exists(target):
+        return None
+    last: Optional[Dict[str, Any]] = None
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = str(line or "").strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    last = obj
+    except Exception:
+        return None
+    return last
 
 
 def write_risk_profile_state(
@@ -105,11 +188,84 @@ def ensure_risk_profile_state(
     )
 
 
+def request_risk_profile_change(
+    state_path: str,
+    *,
+    requested: Any,
+    source: str = "ui",
+    actor: str = "",
+    run_id: str = "",
+    cycle_id: Any = None,
+    ts: str = "",
+    extra_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Update requested risk profile with append-only audit event.
+    Strategy: only write event when old != new; same-value request is a no-op.
+    """
+    state_abs = os.path.abspath(str(state_path))
+    old_state = ensure_risk_profile_state(state_abs, default_requested=RISK_PROFILE_DEFAULT, set_by="system_default")
+    old_requested = normalize_risk_profile(old_state.get("requested"), default=RISK_PROFILE_DEFAULT)
+    new_requested = normalize_risk_profile(requested, default=old_requested or RISK_PROFILE_DEFAULT)
+    events_path = resolve_risk_profile_events_path(state_path=state_abs)
+    source_norm = str(source or "unknown").strip() or "unknown"
+    ts_iso = str(ts or "").strip() or _now_utc_iso()
+
+    if old_requested == new_requested:
+        return {
+            "changed": False,
+            "state": dict(old_state),
+            "event": None,
+            "events_path": events_path,
+        }
+
+    new_version = uuid.uuid4().hex[:16]
+    event = {
+        "ts": ts_iso,
+        "old": old_requested,
+        "new": new_requested,
+        "source": source_norm,
+        "actor": str(actor or "").strip(),
+        "run_id": str(run_id or "").strip(),
+        "cycle_id": cycle_id,
+        "state_version": new_version,
+    }
+    state_extra = dict(extra_state or {})
+    state_extra.update(
+        {
+            "last_change_ts": ts_iso,
+            "last_change_old": old_requested,
+            "last_change_new": new_requested,
+            "last_change_source": source_norm,
+            "request_id": state_extra.get("request_id", ""),
+            "actor": str(actor or "").strip(),
+            "run_id": str(run_id or "").strip(),
+            "cycle_id": cycle_id,
+        }
+    )
+    new_state = write_risk_profile_state(
+        state_abs,
+        requested=new_requested,
+        set_by=source_norm,
+        version=new_version,
+        set_at=ts_iso,
+        extra=state_extra,
+    )
+    append_risk_profile_event(events_path, event)
+    return {
+        "changed": True,
+        "state": dict(new_state),
+        "event": event,
+        "events_path": events_path,
+    }
+
+
 class RiskProfileStateManager:
     """Small file-backed manager with mtime/version change detection."""
 
     def __init__(self, state_path: str, *, default_requested: Any = RISK_PROFILE_DEFAULT):
         self.state_path = os.path.abspath(str(state_path))
+        self.events_path = resolve_risk_profile_events_path(state_path=self.state_path)
         self.default_requested = normalize_risk_profile(default_requested, default=RISK_PROFILE_DEFAULT)
         self.state: Dict[str, Any] = {}
         self.last_mtime: Optional[float] = None
@@ -162,13 +318,27 @@ class RiskProfileStateManager:
         self.last_version = new_version
         return bool(changed)
 
-    def update_requested(self, requested: Any, *, set_by: str = "ui") -> Dict[str, Any]:
-        new_state = write_risk_profile_state(
+    def update_requested(
+        self,
+        requested: Any,
+        *,
+        set_by: str = "ui",
+        actor: str = "",
+        run_id: str = "",
+        cycle_id: Any = None,
+        extra_state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        result = request_risk_profile_change(
             self.state_path,
             requested=normalize_risk_profile(requested, default=self.default_requested),
-            set_by=str(set_by or "ui"),
+            source=str(set_by or "ui"),
+            actor=actor,
+            run_id=run_id,
+            cycle_id=cycle_id,
+            extra_state=extra_state,
         )
-        self.state = dict(new_state)
+        new_state = result.get("state", {}) if isinstance(result, dict) else {}
+        self.state = dict(new_state if isinstance(new_state, dict) else {})
         self.last_mtime = self._get_mtime()
         self.last_version = str(self.state.get("version", "") or "").strip()
         return dict(self.state)
@@ -177,4 +347,3 @@ class RiskProfileStateManager:
         if not isinstance(self.state, dict) or not self.state:
             self.load(ensure=True)
         return normalize_risk_profile((self.state or {}).get("requested"), default=self.default_requested)
-
