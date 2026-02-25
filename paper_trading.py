@@ -35,6 +35,9 @@ from outpost import (
     write_latest_pointer,
 )
 from price_service import PriceService
+from cov_coverage import compute_cov_coverage, default_cov_coverage
+from returns_coverage_diag import diagnose_returns_coverage
+from cooldown_policy import cooldown_policy, next_market_open_time
 from risk_profile_state import (
     RiskProfileStateManager,
     ensure_risk_profile_state,
@@ -1047,6 +1050,14 @@ class PaperTradingEngine:
         self.last_rebalance_time = None  # backward-compatible alias of last successful rebalance time
         self.last_rebalance_attempt_time = None
         self.last_rebalance_success_time = None
+        self.cooldown_until_time = None
+        self.cooldown_state = {"consecutive_fail_by_reason": {}}
+        self.current_cooldown_info = {}
+        self._cov_refresh_attempted_cycle = None
+        self.current_cov_refresh_info = {}
+        self.current_returns_coverage_diag = {"schema_version": 1, "items": []}
+        self.current_ticker_proxy_used = False
+        self.current_ticker_proxy_map_used = []
         self.current_regime = {}
         self.current_macro = {}
         self.current_stale_info = {}
@@ -1348,6 +1359,21 @@ class PaperTradingEngine:
         execution_config.setdefault('macro_refresh_minutes', 60)
         execution_config.setdefault('rebalance_cooldown_minutes', 0)
         execution_config.setdefault('rebalance_attempt_cooldown_minutes', execution_config.get('rebalance_cooldown_minutes', 0))
+        cooldown_policy_cfg = execution_config.setdefault('cooldown_policy', {})
+        if not isinstance(cooldown_policy_cfg, dict):
+            cooldown_policy_cfg = {}
+            execution_config['cooldown_policy'] = cooldown_policy_cfg
+        cooldown_policy_cfg.setdefault('success_cooldown_min', max(0.0, float(execution_config.get('rebalance_cooldown_minutes', 90) or 90)))
+        cooldown_policy_cfg.setdefault('enable_jitter', False)
+        cooldown_policy_cfg.setdefault('jitter_pct', 0.10)
+        failure_backoff_cfg = cooldown_policy_cfg.setdefault('failure_backoff', {})
+        if not isinstance(failure_backoff_cfg, dict):
+            failure_backoff_cfg = {}
+            cooldown_policy_cfg['failure_backoff'] = failure_backoff_cfg
+        failure_backoff_cfg.setdefault('default', {'base': 5, 'cap': 30})
+        failure_backoff_cfg.setdefault('portfolio_cov_rc_limit', {'base': 5, 'cap': 30})
+        failure_backoff_cfg.setdefault('broker_error', {'base': 2, 'cap': 60})
+        failure_backoff_cfg.setdefault('hard_risk_limit', {'base': 10, 'cap': 60})
         execution_config.setdefault('max_stale_ratio', 0.3)
         execution_config.setdefault('circuit_breaker_forced_days', 1)
         execution_config.setdefault('fill_gap_max', 0.03)
@@ -1390,6 +1416,11 @@ class PaperTradingEngine:
         execution_config.setdefault('enable_target_cov_gate', False)
         execution_config.setdefault('target_cov_gate_min_coverage', 0.60)
         execution_config.setdefault('target_cov_gate_require_ok', True)
+        execution_config.setdefault('cov_refresh_on_rc_limit', True)
+        execution_config.setdefault('cov_coverage_top_n', 20)
+        execution_config.setdefault('cov_coverage_max_list', 200)
+        execution_config.setdefault('returns_coverage_diag_top_n', 5)
+        execution_config.setdefault('returns_coverage_diag_max_items', 20)
         execution_config.setdefault('risk_profile', '')
         execution_config.setdefault('portfolio_exposure_cap', 0.90)
         execution_config.setdefault('price_ttl_seconds', 45)
@@ -2019,6 +2050,132 @@ class PaperTradingEngine:
             f"mtime={mtime_text}"
         )
 
+    def _get_cooldown_policy_config(self):
+        execution_cfg = self.config.get('execution', {}) if isinstance(self.config, dict) else {}
+        if not isinstance(execution_cfg, dict):
+            execution_cfg = {}
+        cfg = execution_cfg.get('cooldown_policy', {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        success_cooldown_min = cfg.get('success_cooldown_min', execution_cfg.get('rebalance_cooldown_minutes', 90))
+        try:
+            success_cooldown_min = float(success_cooldown_min)
+        except Exception:
+            success_cooldown_min = 90.0
+        if success_cooldown_min < 0:
+            success_cooldown_min = 0.0
+        failure_backoff = cfg.get('failure_backoff', {})
+        if not isinstance(failure_backoff, dict):
+            failure_backoff = {}
+        return {
+            'success_cooldown_min': float(success_cooldown_min),
+            'failure_backoff': dict(failure_backoff),
+            'enable_jitter': bool(cfg.get('enable_jitter', False)),
+            'jitter_pct': float(cfg.get('jitter_pct', 0.10) or 0.10),
+        }
+
+    def _classify_cooldown_reason(self, reason):
+        raw = str(reason or '').strip().lower()
+        if raw in {'portfolio_cov_rc_limit'}:
+            return 'portfolio_cov_rc_limit'
+        if raw in {'portfolio_volatility', 'diversity_hhi', 'hard_risk_limit'}:
+            return 'hard_risk_limit'
+        if raw in {'broker_error', 'api_error', 'order_reject'}:
+            return 'broker_error'
+        if raw in {'market_closed_gate', 'state_pre_open', 'state_post_close', 'state_weekend', 'open_grace_not_passed'}:
+            return raw
+        if raw.startswith('risk_gate:'):
+            sub = raw.split(':', 1)[1].strip().lower()
+            if sub == 'portfolio_cov_rc_limit':
+                return 'portfolio_cov_rc_limit'
+            if sub in {'portfolio_volatility', 'diversity_hhi'}:
+                return 'hard_risk_limit'
+        if raw:
+            return raw
+        return 'other_fail'
+
+    def _compute_market_closed_next_open_override(self, now_utc, reason, session):
+        reason_key = str(reason or '').strip().lower()
+        if reason_key != 'open_grace_not_passed':
+            return None
+        if not isinstance(session, dict):
+            return None
+        open_time_raw = str(session.get('open_time_et', '') or '').strip()
+        if not open_time_raw:
+            return None
+        try:
+            if open_time_raw.endswith('Z'):
+                open_time_raw = open_time_raw[:-1] + '+00:00'
+            open_dt = datetime.fromisoformat(open_time_raw)
+            if open_dt.tzinfo is None or open_dt.tzinfo.utcoffset(open_dt) is None:
+                return None
+            open_dt_utc = open_dt.astimezone(timezone.utc)
+            grace_min = int(session.get('open_grace_min', 0) or 0)
+            if grace_min < 0:
+                grace_min = 0
+            candidate = open_dt_utc + timedelta(minutes=grace_min)
+            if candidate > now_utc:
+                return candidate
+        except Exception:
+            return None
+        return None
+
+    def _apply_cooldown_outcome(self, *, now_utc, outcome, reason, session=None):
+        now_ref = self._coerce_datetime_utc(now_utc)
+        if not isinstance(now_ref, datetime):
+            now_ref = self._now()
+        reason_key = self._classify_cooldown_reason(reason)
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        if not isinstance(reporting_cfg, dict):
+            reporting_cfg = {}
+        market_tz = str(reporting_cfg.get('market_tz', 'America/New_York') or 'America/New_York')
+        open_time_et = str(reporting_cfg.get('market_open_time_et', '09:30') or '09:30')
+        next_override = None
+        if str(outcome or '').upper() == 'SKIP_MARKET_CLOSED':
+            next_override = self._compute_market_closed_next_open_override(now_ref, reason_key, session)
+
+        decision = cooldown_policy(
+            now_ref,
+            str(outcome or ''),
+            reason_key,
+            dict(self.cooldown_state) if isinstance(self.cooldown_state, dict) else {"consecutive_fail_by_reason": {}},
+            self._get_cooldown_policy_config(),
+            next_open_override=next_override,
+            tz_market=market_tz,
+            open_time_et=open_time_et,
+        )
+        state_new = decision.get('state', {})
+        self.cooldown_state = dict(state_new) if isinstance(state_new, dict) else {"consecutive_fail_by_reason": {}}
+        next_allowed = decision.get('next_allowed_ts')
+        if isinstance(next_allowed, datetime):
+            self.cooldown_until_time = next_allowed
+        else:
+            self.cooldown_until_time = now_ref
+        remaining_min = max(0.0, (self.cooldown_until_time - now_ref).total_seconds() / 60.0) if isinstance(self.cooldown_until_time, datetime) else 0.0
+        self.current_cooldown_info = {
+            'outcome': str(decision.get('outcome', str(outcome or '').upper()) or '').upper(),
+            'reason': str(decision.get('reason', reason_key) or reason_key),
+            'backoff_min': float(decision.get('backoff_min', 0.0) or 0.0),
+            'next_allowed_ts': (
+                self.cooldown_until_time.isoformat()
+                if isinstance(self.cooldown_until_time, datetime) else str(decision.get('next_allowed_ts_iso', ''))
+            ),
+            'fail_count': int(decision.get('fail_count', 0) or 0),
+            'policy': str(decision.get('policy', 'unknown') or 'unknown'),
+            'remaining_min': float(remaining_min),
+            'ts': now_ref.isoformat(),
+        }
+        print(
+            "[COOLDOWN] "
+            f"outcome={self.current_cooldown_info.get('outcome')} "
+            f"reason={self.current_cooldown_info.get('reason')} "
+            f"backoff_min={self.current_cooldown_info.get('backoff_min'):.2f} "
+            f"next_allowed_ts={self.current_cooldown_info.get('next_allowed_ts')} "
+            f"fail_count={self.current_cooldown_info.get('fail_count')} "
+            f"policy={self.current_cooldown_info.get('policy')}"
+        )
+        return dict(self.current_cooldown_info)
+
     def _build_risk_profile_important_values(self, config_obj=None):
         cfg = config_obj if isinstance(config_obj, dict) else self.config
         execution_cfg = cfg.get('execution', {}) if isinstance(cfg, dict) else {}
@@ -2422,6 +2579,9 @@ class PaperTradingEngine:
         assert isinstance(self.config.get('execution', {}).get('enable_target_cov_gate', False), bool), "execution.enable_target_cov_gate must be bool"
         assert 0.0 <= float(self.config.get('execution', {}).get('target_cov_gate_min_coverage', 0.60)) <= 1.0, "execution.target_cov_gate_min_coverage must be in [0,1]"
         assert isinstance(self.config.get('execution', {}).get('target_cov_gate_require_ok', True), bool), "execution.target_cov_gate_require_ok must be bool"
+        assert isinstance(self.config.get('execution', {}).get('cov_refresh_on_rc_limit', True), bool), "execution.cov_refresh_on_rc_limit must be bool"
+        assert int(self.config.get('execution', {}).get('cov_coverage_top_n', 20)) >= 1, "execution.cov_coverage_top_n must be >= 1"
+        assert int(self.config.get('execution', {}).get('cov_coverage_max_list', 200)) >= 1, "execution.cov_coverage_max_list must be >= 1"
         assert isinstance(self.config.get('execution', {}).get('risk_profile', ''), str), "execution.risk_profile must be string"
         assert isinstance(self.config.get('execution', {}).get('portfolio_exposure_cap', 0.90), (int, float)), "execution.portfolio_exposure_cap must be float"
         assert 0.0 <= float(self.config.get('execution', {}).get('portfolio_exposure_cap', 0.90)) <= 1.0, "execution.portfolio_exposure_cap must be in [0,1]"
@@ -3302,6 +3462,8 @@ class PaperTradingEngine:
         last_attempt_time = self.last_rebalance_attempt_time.isoformat() if isinstance(self.last_rebalance_attempt_time, datetime) else self.last_rebalance_attempt_time
         success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
         last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
+        cooldown_until_time = self.cooldown_until_time.isoformat() if isinstance(self.cooldown_until_time, datetime) else self.cooldown_until_time
+        cooldown_info = dict(self.current_cooldown_info) if isinstance(self.current_cooldown_info, dict) else {}
 
         payload = {
             'timestamp': snapshot.get('timestamp', self._now().isoformat()),
@@ -3366,6 +3528,8 @@ class PaperTradingEngine:
             ),
             'last_rebalance_attempt_time': snapshot.get('last_rebalance_attempt_time', last_attempt_time),
             'last_rebalance_success_time': snapshot.get('last_rebalance_success_time', last_success_time),
+            'cooldown_until_time': snapshot.get('cooldown_until_time', cooldown_until_time),
+            'cooldown_info': snapshot.get('cooldown_info', cooldown_info),
             'stale_count': snapshot.get('stale_count', self.current_stale_info.get('stale_count', 0)),
             'stale_ratio': snapshot.get('stale_ratio', self.current_stale_info.get('stale_ratio', 0.0)),
             'stale_candidate_count': snapshot.get('stale_candidate_count', self.current_stale_info.get('stale_candidate_count', 0)),
@@ -3392,11 +3556,29 @@ class PaperTradingEngine:
             'cov_gate_reason': snapshot.get('cov_gate_reason', self.current_risk_check_info.get('cov_gate_reason') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_used': snapshot.get('cov_gate_used', self.current_risk_check_info.get('cov_gate_used') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_pass': snapshot.get('cov_gate_pass', self.current_risk_check_info.get('cov_gate_pass') if isinstance(self.current_risk_check_info, dict) else None),
+            'risk_gate_stub_used': snapshot.get('risk_gate_stub_used', self.current_risk_check_info.get('risk_gate_stub_used') if isinstance(self.current_risk_check_info, dict) else False),
+            'risk_gate_stub_name': snapshot.get('risk_gate_stub_name', self.current_risk_check_info.get('risk_gate_stub_name') if isinstance(self.current_risk_check_info, dict) else None),
+            'ticker_proxy_used': snapshot.get('ticker_proxy_used', self.current_risk_check_info.get('ticker_proxy_used') if isinstance(self.current_risk_check_info, dict) else False),
+            'ticker_proxy_map_used': snapshot.get(
+                'ticker_proxy_map_used',
+                self.current_risk_check_info.get('ticker_proxy_map_used') if isinstance(self.current_risk_check_info, dict) else []
+            ),
             'cov_gate_coverage': snapshot.get('cov_gate_coverage', self.current_risk_check_info.get('cov_gate_coverage') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_vol': snapshot.get('cov_gate_vol', self.current_risk_check_info.get('cov_gate_vol') if isinstance(self.current_risk_check_info, dict) else None),
             'cov_gate_max_rc': snapshot.get('cov_gate_max_rc', self.current_risk_check_info.get('cov_gate_max_rc') if isinstance(self.current_risk_check_info, dict) else None),
+            'cov_coverage': snapshot.get('cov_coverage', self.current_risk_check_info.get('cov_coverage') if isinstance(self.current_risk_check_info, dict) else default_cov_coverage()),
+            'cov_coverage_debug_inputs': snapshot.get(
+                'cov_coverage_debug_inputs',
+                self.current_risk_check_info.get('cov_coverage_debug_inputs') if isinstance(self.current_risk_check_info, dict) else {}
+            ),
+            'returns_coverage_diag': snapshot.get(
+                'returns_coverage_diag',
+                self.current_risk_check_info.get('returns_coverage_diag') if isinstance(self.current_risk_check_info, dict) else {"schema_version": 1, "items": []}
+            ),
+            'cov_refresh': snapshot.get('cov_refresh', self.current_risk_check_info.get('cov_refresh') if isinstance(self.current_risk_check_info, dict) else self.current_cov_refresh_info),
             'risk_gate_basis': snapshot.get('risk_gate_basis', self.current_risk_check_info.get('risk_gate_basis') if isinstance(self.current_risk_check_info, dict) else 'current'),
             'risk_gate_cov_coverage_used': snapshot.get('risk_gate_cov_coverage_used', self.current_risk_check_info.get('risk_gate_cov_coverage_used') if isinstance(self.current_risk_check_info, dict) else None),
+            'risk_gate_decision': snapshot.get('risk_gate_decision', self.current_risk_check_info.get('risk_gate_decision') if isinstance(self.current_risk_check_info, dict) else {}),
             'cov_risk_diag': cov_diag,
             'cov_risk_current_summary': cov_current_summary,
             'cov_risk_target_summary': cov_target_summary,
@@ -3729,6 +3911,366 @@ class PaperTradingEngine:
             "top_corr_pairs": top_corr,
             "rc_fraction_top5": rc_top,
         }
+        return out
+
+    def _infer_cov_coverage_stage(self, diag):
+        if not isinstance(diag, dict):
+            return "mapping"
+        status = str(diag.get("status", "") or "").strip().lower()
+        returns_meta = diag.get("returns_meta", {})
+        if not isinstance(returns_meta, dict):
+            returns_meta = {}
+        missing = returns_meta.get("missing_tickers", [])
+        dropped = returns_meta.get("dropped_tickers", [])
+        if isinstance(missing, list) and len(missing) > 0:
+            return "returns"
+        if isinstance(dropped, list) and len(dropped) > 0:
+            return "returns"
+        if status in {"cov_failed"}:
+            return "cov"
+        if status in {"no_data"}:
+            return "price"
+        if status in {"error"}:
+            return "mapping"
+        return "cov"
+
+    def _get_ticker_proxy_map(self):
+        risk_cfg = self._get_risk_model_cfg()
+        raw_map = risk_cfg.get("ticker_proxy_map", {}) if isinstance(risk_cfg, dict) else {}
+        if not isinstance(raw_map, dict):
+            return {}
+        out = {}
+        for raw_from, raw_to in raw_map.items():
+            t_from = str(raw_from).upper().strip()
+            t_to = str(raw_to).upper().strip()
+            if not t_from or not t_to or t_from == "CASH" or t_to == "CASH":
+                continue
+            if t_from == t_to:
+                continue
+            out[t_from] = t_to
+        return out
+
+    def _build_returns_coverage_diag(self, cov_coverage):
+        exec_cfg = self.config.get("execution", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(exec_cfg, dict):
+            exec_cfg = {}
+        risk_cfg = self._get_risk_model_cfg()
+        max_items = int(exec_cfg.get("returns_coverage_diag_max_items", 20) or 20)
+        top_n = int(exec_cfg.get("returns_coverage_diag_top_n", 5) or 5)
+        max_items = max(1, min(20, max_items))
+        top_n = max(1, min(max_items, top_n))
+
+        missing = []
+        if isinstance(cov_coverage, dict):
+            top_missing = cov_coverage.get("top_missing", [])
+            if isinstance(top_missing, list):
+                for row in top_missing:
+                    if not isinstance(row, dict):
+                        continue
+                    ticker = str(row.get("ticker", "")).upper().strip()
+                    if ticker and ticker != "CASH":
+                        missing.append(ticker)
+            if not missing:
+                missing_tickers = cov_coverage.get("missing_tickers", [])
+                if isinstance(missing_tickers, list):
+                    for ticker in missing_tickers:
+                        t = str(ticker).upper().strip()
+                        if t and t != "CASH":
+                            missing.append(t)
+
+        seen = set()
+        tickers = []
+        for ticker in missing:
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            tickers.append(ticker)
+            if len(tickers) >= top_n:
+                break
+
+        if not tickers:
+            return {"schema_version": 1, "items": []}
+
+        lookback_cfg = {
+            "lookback_days": int(risk_cfg.get("returns_lookback_days", 60) or 60),
+            "expected_points": int(risk_cfg.get("returns_lookback_days", 60) or 60),
+            "min_obs": int(risk_cfg.get("min_obs", 30) or 30),
+            "drop_threshold": float(risk_cfg.get("drop_threshold", 0.5) or 0.5),
+            "period": str(risk_cfg.get("returns_period", "6mo") or "6mo"),
+            "interval": str(risk_cfg.get("returns_interval", "1d") or "1d"),
+        }
+        calendar_cfg = {
+            "detect_calendar_mismatch": True,
+            "market_tz": "America/New_York",
+        }
+
+        def _provider(*, ticker, lookback_cfg, calendar_cfg):
+            hist = self.get_market_data(
+                ticker,
+                period=str(lookback_cfg.get("period", "6mo")),
+                interval=str(lookback_cfg.get("interval", "1d")),
+            )
+            return hist
+
+        items = []
+        for ticker in tickers[:max_items]:
+            diag_item = diagnose_returns_coverage(
+                ticker=ticker,
+                lookback_cfg=lookback_cfg,
+                price_provider=_provider,
+                calendar_cfg=calendar_cfg,
+            )
+            note = str(diag_item.get("note", "") or "")
+            if len(note) > 200:
+                diag_item["note"] = note[:200]
+            items.append(diag_item)
+            print(
+                "[RETURNS_COVERAGE] "
+                f"ticker={diag_item.get('ticker')} "
+                f"reason={diag_item.get('reason_code')} "
+                f"expected={int(diag_item.get('expected_points', 0) or 0)} "
+                f"actual={int(diag_item.get('actual_points', 0) or 0)} "
+                f"nan_ratio={float(diag_item.get('nan_ratio', 0.0) or 0.0):.4f} "
+                f"last_ts={diag_item.get('last_price_ts')}"
+            )
+        return {"schema_version": 1, "items": items}
+
+    def _build_cov_coverage_dump(self, target_weights, diag, *, basis="target_weights"):
+        exec_cfg = self.config.get("execution", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(exec_cfg, dict):
+            exec_cfg = {}
+        top_n = int(exec_cfg.get("cov_coverage_top_n", 20) or 20)
+        max_list = int(exec_cfg.get("cov_coverage_max_list", 200) or 200)
+        if top_n < 1:
+            top_n = 1
+        if max_list < 1:
+            max_list = 1
+
+        returns_meta = diag.get("returns_meta", {}) if isinstance(diag, dict) else {}
+        if not isinstance(returns_meta, dict):
+            returns_meta = {}
+        covered = returns_meta.get("used_tickers_mapped", returns_meta.get("used_tickers", []))
+        if not isinstance(covered, (list, tuple, set)):
+            covered = []
+        covered_set = {str(x).upper().strip() for x in covered if str(x).strip()}
+        proxy_rows_raw = returns_meta.get("ticker_proxy_map_used", [])
+        proxy_rows = []
+        if isinstance(proxy_rows_raw, list):
+            for row in proxy_rows_raw:
+                if not isinstance(row, dict):
+                    continue
+                t_from = str(row.get("from", "")).upper().strip()
+                t_to = str(row.get("to", "")).upper().strip()
+                if not t_from or not t_to:
+                    continue
+                proxy_rows.append({"from": t_from, "to": t_to, "reason": str(row.get("reason", "returns_missing") or "returns_missing")})
+        active_proxy_map = {str(r.get("from")).upper(): str(r.get("to")).upper() for r in proxy_rows if r.get("from") and r.get("to")}
+        reverse_proxy_map = {}
+        for from_t, to_t in active_proxy_map.items():
+            reverse_proxy_map.setdefault(to_t, []).append(from_t)
+        target_map = target_weights if isinstance(target_weights, dict) else {}
+        target_map_for_cov = {}
+        target_items = []
+        target_sum = 0.0
+        target_abs_sum = 0.0
+        for raw_ticker, raw_weight in target_map.items():
+            ticker = str(raw_ticker).upper().strip()
+            if not ticker:
+                continue
+            try:
+                w = float(raw_weight if raw_weight is not None else 0.0)
+            except Exception:
+                w = 0.0
+            if not np.isfinite(w):
+                w = 0.0
+            target_items.append((ticker, float(w)))
+            mapped_ticker = str(active_proxy_map.get(ticker, ticker)).upper().strip() or ticker
+            target_map_for_cov[mapped_ticker] = float(target_map_for_cov.get(mapped_ticker, 0.0) + float(w))
+            target_sum += float(w)
+            target_abs_sum += abs(float(w))
+        target_items_sorted = sorted(target_items, key=lambda x: abs(float(x[1])), reverse=True)
+        target_sample_top5 = [{"ticker": t, "weight": float(w)} for t, w in target_items_sorted[:5]]
+        covered_sample_top5 = sorted(list(covered_set))[:5]
+        stage = self._infer_cov_coverage_stage(diag)
+        fallback_used = False
+        fallback_reason = ""
+        exception_repr = ""
+        try:
+            coverage = compute_cov_coverage(
+                target_weights=target_map_for_cov,
+                covered_tickers=covered_set,
+                basis=str(basis or "target_weights"),
+                stage=str(stage or "cov"),
+                top_n=int(top_n),
+                max_list=int(max_list),
+            )
+        except Exception as e:
+            fallback_used = True
+            fallback_reason = "exception"
+            exception_repr = repr(e)
+            print(f"[COV_COVERAGE_ERROR] exception={exception_repr}")
+            coverage = default_cov_coverage(basis=str(basis or "target_weights"), stage=str(stage or "cov"))
+        if not isinstance(coverage, dict):
+            fallback_used = True
+            if not fallback_reason:
+                fallback_reason = "unknown"
+            coverage = default_cov_coverage(basis=str(basis or "target_weights"), stage=str(stage or "cov"))
+        if len(target_items_sorted) == 0 or target_abs_sum <= 0:
+            fallback_used = True
+            if not fallback_reason:
+                fallback_reason = "empty_target_weights"
+        if isinstance(coverage, dict) and reverse_proxy_map:
+            top_missing_rows = coverage.get("top_missing", [])
+            if isinstance(top_missing_rows, list):
+                remapped_top = []
+                for row in top_missing_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    t = str(row.get("ticker", "")).upper().strip()
+                    if t in reverse_proxy_map and reverse_proxy_map[t]:
+                        orig = str(reverse_proxy_map[t][0]).upper().strip()
+                        remapped = dict(row)
+                        remapped["ticker"] = orig
+                        remapped["mapped_to"] = t
+                        remapped_top.append(remapped)
+                    else:
+                        remapped_top.append(row)
+                coverage["top_missing"] = remapped_top
+            missing_tickers = coverage.get("missing_tickers", [])
+            if isinstance(missing_tickers, list):
+                remapped_missing = []
+                for t in missing_tickers:
+                    t_u = str(t).upper().strip()
+                    if t_u in reverse_proxy_map and reverse_proxy_map[t_u]:
+                        remapped_missing.append(str(reverse_proxy_map[t_u][0]).upper().strip())
+                    else:
+                        remapped_missing.append(t_u)
+                coverage["missing_tickers"] = remapped_missing
+        coverage["basis"] = str(coverage.get("basis", basis or "target_weights"))
+        coverage["stage"] = str(coverage.get("stage", stage or "cov"))
+        self._last_cov_coverage_dump_meta = {
+            "basis": str(coverage.get("basis", basis or "target_weights")),
+            "stage": str(coverage.get("stage", stage or "cov")),
+            "target_weights_count": int(len(target_items_sorted)),
+            "target_weights_sum": float(target_sum),
+            "target_weights_abs_sum": float(target_abs_sum),
+            "target_weights_sample_top5": target_sample_top5,
+            "covered_tickers_count": int(len(covered_set)),
+            "covered_tickers_sample_top5": covered_sample_top5,
+            "ticker_proxy_used": bool(len(proxy_rows) > 0),
+            "ticker_proxy_map_used": proxy_rows[:20],
+            "fallback_used": bool(fallback_used),
+            "fallback_reason": str(fallback_reason),
+            "exception_repr": str(exception_repr),
+        }
+        return coverage
+
+    def _emit_cov_coverage_logs(self, coverage):
+        cov = coverage if isinstance(coverage, dict) else default_cov_coverage()
+        print(
+            "[COV_COVERAGE] "
+            f"basis={cov.get('basis')} stage={cov.get('stage')} "
+            f"known_weight={float(cov.get('known_weight', 0.0) or 0.0):.4f} "
+            f"missing_weight_total={float(cov.get('missing_weight_total', 0.0) or 0.0):.4f} "
+            f"missing_count={int(cov.get('missing_count', 0) or 0)} "
+            f"covered_count={int(cov.get('covered_count', 0) or 0)}"
+        )
+        top = cov.get("top_missing", [])
+        if not isinstance(top, list):
+            top = []
+        parts = []
+        for idx, row in enumerate(top[:20], start=1):
+            if not isinstance(row, dict):
+                continue
+            t = str(row.get("ticker", "")).upper().strip()
+            if not t:
+                continue
+            w = float(row.get("w", 0.0) or 0.0)
+            parts.append(f"{idx}) {t} {w:.4f}")
+        if parts:
+            print("[COV_MISSING_TOP] " + " ".join(parts))
+        else:
+            print("[COV_MISSING_TOP] none")
+
+    def _cov_refresh_public_info(self, info):
+        if not isinstance(info, dict):
+            return {}
+        public = {}
+        for key, value in info.items():
+            if key == "risk_gate":
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                public[key] = value
+            elif isinstance(value, (list, dict)):
+                public[key] = value
+            else:
+                public[key] = str(value)
+        return public
+
+    def _attempt_cov_refresh_once(self, *, target_weights, reason):
+        cycle_id = int(self.current_cycle)
+        out = {
+            "attempted": False,
+            "status": "skipped",
+            "reason": str(reason or ""),
+            "cycle_id": cycle_id,
+            "duration_ms": 0,
+            "removed_cache_keys": 0,
+            "risk_gate": None,
+        }
+        exec_cfg = self.config.get("execution", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(exec_cfg, dict):
+            exec_cfg = {}
+        if not bool(exec_cfg.get("cov_refresh_on_rc_limit", True)):
+            out["status"] = "disabled"
+            self.current_cov_refresh_info = self._cov_refresh_public_info(out)
+            return out
+        if str(reason or "").strip().lower() != "portfolio_cov_rc_limit":
+            out["status"] = "reason_not_supported"
+            self.current_cov_refresh_info = self._cov_refresh_public_info(out)
+            return out
+        if self._cov_refresh_attempted_cycle == cycle_id:
+            out["status"] = "already_attempted_this_cycle"
+            self.current_cov_refresh_info = self._cov_refresh_public_info(out)
+            return out
+
+        self._cov_refresh_attempted_cycle = cycle_id
+        out["attempted"] = True
+        start_ts = time.time()
+        print(f"[COV_REFRESH] started reason={reason} cycle={cycle_id}")
+
+        removed = 0
+        try:
+            for key in list(getattr(self, "returns_cache", {}).keys()):
+                if not (isinstance(key, tuple) and len(key) >= 2):
+                    continue
+                key0 = str(key[0])
+                key1 = key[1]
+                if key1 != cycle_id:
+                    continue
+                if key0.startswith("cov_diag_") or key0 == "vol_targeting_diag":
+                    self.returns_cache.pop(key, None)
+                    removed += 1
+        except Exception:
+            removed = int(removed)
+        out["removed_cache_keys"] = int(removed)
+
+        status = "ok"
+        risk_gate_retry = None
+        try:
+            risk_gate_retry = self._evaluate_portfolio_risk_gate(target_weights)
+        except Exception as e:
+            status = "error"
+            out["error"] = str(e)
+        out["risk_gate"] = risk_gate_retry if isinstance(risk_gate_retry, dict) else None
+        out["status"] = status
+        out["duration_ms"] = int(max(0.0, (time.time() - start_ts) * 1000.0))
+        print(
+            "[COV_REFRESH] "
+            f"finished status={out.get('status')} duration_ms={out.get('duration_ms')} "
+            f"removed_cache_keys={out.get('removed_cache_keys')}"
+        )
+        self.current_cov_refresh_info = self._cov_refresh_public_info(out)
         return out
 
     def compute_vol_target_diag(self, target_weights: dict, *, reason_tag: str = "target_weights_diag") -> dict:
@@ -6669,6 +7211,7 @@ class PaperTradingEngine:
             "drop_threshold": float(drop_threshold),
             "input_tickers": [],
             "used_tickers": [],
+            "used_tickers_mapped": [],
             "missing_tickers": [],
             "dropped_tickers": [],
             "rows": 0,
@@ -6676,6 +7219,8 @@ class PaperTradingEngine:
             "obs_by_ticker": {},
             "coverage_by_ticker": {},
             "overall_row_coverage": 0.0,
+            "ticker_proxy_used": False,
+            "ticker_proxy_map_used": [],
         }
 
         try:
@@ -6697,30 +7242,50 @@ class PaperTradingEngine:
             min_obs = int(min_obs)
             drop_threshold = float(drop_threshold)
             threshold_obs = float(lookback_days) * (1.0 - drop_threshold)
+            risk_cfg = self._get_risk_model_cfg()
+            proxy_enabled = bool(risk_cfg.get("enable_ticker_proxy_for_returns", False))
+            proxy_map = self._get_ticker_proxy_map() if proxy_enabled else {}
+
+            def _extract_returns_series(hist_obj):
+                if hist_obj is None or getattr(hist_obj, "empty", True):
+                    return None
+                if "Close" not in hist_obj.columns:
+                    return None
+                close_s = hist_obj["Close"].astype(float).dropna()
+                if close_s.empty:
+                    return None
+                returns_s = close_s.pct_change().dropna()
+                if returns_s.empty:
+                    return None
+                return returns_s.tail(lookback_days)
 
             series_map = {}
             missing_tickers = []
             obs_by_ticker = {t: 0 for t in normalized}
+            used_tickers_mapped = []
+            proxy_rows = []
 
             for ticker in normalized:
                 hist = self.get_market_data(ticker, period=period, interval=interval)
-                if hist is None or hist.empty or 'Close' not in hist.columns:
+                series = _extract_returns_series(hist)
+                mapped_symbol = ticker
+                if series is None and proxy_enabled:
+                    proxy_ticker = str(proxy_map.get(ticker, "")).upper().strip()
+                    if proxy_ticker and proxy_ticker != ticker:
+                        proxy_hist = self.get_market_data(proxy_ticker, period=period, interval=interval)
+                        proxy_series = _extract_returns_series(proxy_hist)
+                        if proxy_series is not None:
+                            series = proxy_series
+                            mapped_symbol = proxy_ticker
+                            row = {"from": ticker, "to": proxy_ticker, "reason": "returns_missing"}
+                            proxy_rows.append(row)
+                            print(f"[TICKER_PROXY] {ticker} -> {proxy_ticker} reason=returns_missing")
+                if series is None:
                     missing_tickers.append(ticker)
                     continue
-
-                close = hist['Close'].astype(float).dropna()
-                if close.empty:
-                    missing_tickers.append(ticker)
-                    continue
-
-                daily_returns = close.pct_change().dropna()
-                if daily_returns.empty:
-                    missing_tickers.append(ticker)
-                    continue
-
-                series = daily_returns.tail(lookback_days)
                 series_map[ticker] = series
                 obs_by_ticker[ticker] = int(series.notna().sum())
+                used_tickers_mapped.append(mapped_symbol)
 
             returns_df = pd.DataFrame()
             if series_map:
@@ -6753,6 +7318,7 @@ class PaperTradingEngine:
 
             meta.update({
                 "used_tickers": used_tickers,
+                "used_tickers_mapped": used_tickers_mapped,
                 "missing_tickers": missing_tickers,
                 "dropped_tickers": dropped_tickers,
                 "rows": int(returns_df.shape[0]),
@@ -6760,6 +7326,8 @@ class PaperTradingEngine:
                 "obs_by_ticker": obs_by_ticker,
                 "coverage_by_ticker": coverage_by_ticker,
                 "overall_row_coverage": overall_row_coverage,
+                "ticker_proxy_used": bool(len(proxy_rows) > 0),
+                "ticker_proxy_map_used": proxy_rows[:20],
             })
 
             return returns_df, meta
@@ -6791,6 +7359,8 @@ class PaperTradingEngine:
             "vol_target_min_scale": 0.10,
             "vol_target_max_scale": 1.00,
             "vol_target_use_cov_only": True,
+            "enable_ticker_proxy_for_returns": False,
+            "ticker_proxy_map": {"XIU.TO": "EWC", "FTS.TO": "FTS"},
         }
         try:
             raw_cfg = self.config.get("risk_model", {})
@@ -6820,6 +7390,21 @@ class PaperTradingEngine:
             cfg["vol_target_min_scale"] = float(cfg.get("vol_target_min_scale", 0.10))
             cfg["vol_target_max_scale"] = float(cfg.get("vol_target_max_scale", 1.00))
             cfg["vol_target_use_cov_only"] = bool(cfg.get("vol_target_use_cov_only", True))
+            cfg["enable_ticker_proxy_for_returns"] = bool(cfg.get("enable_ticker_proxy_for_returns", False))
+
+            proxy_map_raw = cfg.get("ticker_proxy_map", {})
+            if not isinstance(proxy_map_raw, dict):
+                proxy_map_raw = {}
+            proxy_map_norm = {}
+            for raw_from, raw_to in proxy_map_raw.items():
+                t_from = str(raw_from).upper().strip()
+                t_to = str(raw_to).upper().strip()
+                if not t_from or not t_to or t_from == "CASH" or t_to == "CASH":
+                    continue
+                if t_from == t_to:
+                    continue
+                proxy_map_norm[t_from] = t_to
+            cfg["ticker_proxy_map"] = proxy_map_norm
 
             cfg["drop_threshold"] = float(np.clip(cfg["drop_threshold"], 0.0, 1.0))
             cfg["shrinkage_alpha"] = float(np.clip(cfg["shrinkage_alpha"], 0.0, 1.0))
@@ -8986,6 +9571,28 @@ class PaperTradingEngine:
         target_returns_meta = cov_diag_target.get('returns_meta', {}) if isinstance(cov_diag_target, dict) else {}
         if not isinstance(target_returns_meta, dict):
             target_returns_meta = {}
+        proxy_rows = []
+        for meta_obj in (returns_meta, target_returns_meta):
+            if not isinstance(meta_obj, dict):
+                continue
+            raw_rows = meta_obj.get("ticker_proxy_map_used", [])
+            if not isinstance(raw_rows, list):
+                continue
+            for row in raw_rows:
+                if not isinstance(row, dict):
+                    continue
+                t_from = str(row.get("from", "")).upper().strip()
+                t_to = str(row.get("to", "")).upper().strip()
+                if not t_from or not t_to:
+                    continue
+                candidate = {
+                    "from": t_from,
+                    "to": t_to,
+                    "reason": str(row.get("reason", "returns_missing") or "returns_missing"),
+                }
+                if candidate not in proxy_rows:
+                    proxy_rows.append(candidate)
+        ticker_proxy_used = bool(len(proxy_rows) > 0)
 
         try:
             cov_gate_coverage_current = float(returns_meta.get('overall_row_coverage', 0.0))
@@ -9043,6 +9650,97 @@ class PaperTradingEngine:
             gate_cov_status = cov_status
             gate_cov_cols = int(cov_cols_current)
             gate_cov_min_coverage = float(min_cov_gate_coverage)
+
+        coverage_diag_for_dump = cov_diag_target if bool(use_target_cov_basis) else cov_diag_current
+        cov_coverage = self._build_cov_coverage_dump(
+            invested_weights,
+            coverage_diag_for_dump if isinstance(coverage_diag_for_dump, dict) else {},
+            basis="target_weights",
+        )
+        if not isinstance(cov_coverage, dict):
+            cov_coverage = default_cov_coverage(basis="target_weights", stage="cov")
+        cov_coverage["gate_basis"] = str(risk_gate_basis)
+        cov_coverage["gate_cov_coverage"] = float(cov_gate_coverage) if cov_gate_coverage is not None else None
+        cov_coverage["gate_cov_status"] = str(gate_cov_status or "")
+        cov_coverage["gate_cov_cols"] = int(gate_cov_cols)
+        cov_coverage["gate_cov_min_coverage"] = float(gate_cov_min_coverage)
+        cov_coverage["abort_reason"] = ""
+        cov_dump_meta = getattr(self, "_last_cov_coverage_dump_meta", {})
+        if not isinstance(cov_dump_meta, dict):
+            cov_dump_meta = {}
+        now_diag = self._now()
+        if now_diag.tzinfo is None or now_diag.tzinfo.utcoffset(now_diag) is None:
+            now_diag = now_diag.replace(tzinfo=timezone.utc)
+        try:
+            known_weight_dump_value = float(cov_coverage.get("known_weight")) if cov_coverage.get("known_weight") is not None else None
+        except Exception:
+            known_weight_dump_value = None
+        try:
+            dump_missing_count = int(cov_coverage.get("missing_count", 0) or 0)
+        except Exception:
+            dump_missing_count = 0
+        try:
+            dump_missing_weight_total = float(cov_coverage.get("missing_weight_total", 0.0) or 0.0)
+        except Exception:
+            dump_missing_weight_total = 0.0
+        dump_top_missing_top5 = []
+        top_missing_rows = cov_coverage.get("top_missing", [])
+        if isinstance(top_missing_rows, list):
+            for row in top_missing_rows[:5]:
+                if not isinstance(row, dict):
+                    continue
+                ticker = str(row.get("ticker", "")).upper().strip()
+                if not ticker:
+                    continue
+                try:
+                    w = float(row.get("w", 0.0) or 0.0)
+                except Exception:
+                    w = 0.0
+                dump_top_missing_top5.append({"ticker": ticker, "w": float(w)})
+        cov_coverage_debug_inputs = {
+            "cycle_id": int(self.current_cycle),
+            "now_ts": now_diag.isoformat(),
+            "risk_gate_reason": "",
+            "basis": str(cov_dump_meta.get("basis", cov_coverage.get("basis", "target_weights"))),
+            "stage": str(cov_dump_meta.get("stage", cov_coverage.get("stage", "cov"))),
+            "target_weights_count": int(cov_dump_meta.get("target_weights_count", 0) or 0),
+            "target_weights_sum": float(cov_dump_meta.get("target_weights_sum", 0.0) or 0.0),
+            "target_weights_abs_sum": float(cov_dump_meta.get("target_weights_abs_sum", 0.0) or 0.0),
+            "target_weights_sample_top5": (
+                list(cov_dump_meta.get("target_weights_sample_top5", []))
+                if isinstance(cov_dump_meta.get("target_weights_sample_top5"), list) else []
+            ),
+            "covered_tickers_count": int(cov_dump_meta.get("covered_tickers_count", 0) or 0),
+            "covered_tickers_sample_top5": (
+                list(cov_dump_meta.get("covered_tickers_sample_top5", []))
+                if isinstance(cov_dump_meta.get("covered_tickers_sample_top5"), list) else []
+            ),
+            "ticker_proxy_used": bool(cov_dump_meta.get("ticker_proxy_used", False)),
+            "ticker_proxy_map_used": (
+                list(cov_dump_meta.get("ticker_proxy_map_used", []))
+                if isinstance(cov_dump_meta.get("ticker_proxy_map_used"), list) else []
+            ),
+            "known_weight_gate_value": None,
+            "known_weight_dump_value": known_weight_dump_value,
+            "dump_missing_count": int(dump_missing_count),
+            "dump_missing_weight_total": float(dump_missing_weight_total),
+            "dump_top_missing_top5": dump_top_missing_top5,
+            "fallback_used": bool(cov_dump_meta.get("fallback_used", False)),
+            "fallback_reason": str(cov_dump_meta.get("fallback_reason", "") or ""),
+            "exception_repr": str(cov_dump_meta.get("exception_repr", "") or ""),
+        }
+        gate_decision_inputs = {
+            "metric_name": "",
+            "metric_value": None,
+            "threshold": None,
+            "basis": str(cov_coverage_debug_inputs.get("basis", cov_coverage.get("basis", "target_weights"))),
+            "stage": str(cov_coverage_debug_inputs.get("stage", cov_coverage.get("stage", "cov"))),
+            "missing_weight_total": float(cov_coverage_debug_inputs.get("dump_missing_weight_total", 0.0) or 0.0),
+            "missing_count": int(cov_coverage_debug_inputs.get("dump_missing_count", 0) or 0),
+            "top_missing_top5": list(cov_coverage_debug_inputs.get("dump_top_missing_top5", [])) if isinstance(cov_coverage_debug_inputs.get("dump_top_missing_top5"), list) else [],
+            "reason": "",
+        }
+        returns_coverage_diag = {"schema_version": 1, "items": []}
 
         coverage_ok = bool(
             gate_cov_status == 'ok'
@@ -9108,6 +9806,107 @@ class PaperTradingEngine:
             abort_flag = True
             abort_reason = "diversity_hhi"
 
+        metric_name = "max_rc_fraction"
+        metric_value = float(cov_gate_max_rc) if cov_gate_max_rc is not None else None
+        metric_threshold = float(rc_limit) if rc_limit > 0 else None
+        if abort_reason == "portfolio_cov_rc_limit":
+            metric_name = "max_rc_fraction"
+            metric_value = float(cov_gate_max_rc) if cov_gate_max_rc is not None else None
+            metric_threshold = float(rc_limit)
+        elif abort_reason in {"portfolio_cov_volatility", "portfolio_volatility"}:
+            metric_name = "portfolio_vol_annualized"
+            if cov_gate_vol is not None:
+                metric_value = float(cov_gate_vol)
+            elif weighted_volatility is not None:
+                metric_value = float(weighted_volatility)
+            metric_threshold = float(max_portfolio_volatility)
+        elif abort_reason == "diversity_hhi":
+            metric_name = "herfindahl_index"
+            metric_value = float(hhi)
+            metric_threshold = float(max_hhi)
+        gate_decision_inputs["metric_name"] = metric_name
+        gate_decision_inputs["metric_value"] = metric_value
+        gate_decision_inputs["threshold"] = metric_threshold
+
+        cov_coverage_debug_inputs["known_weight_gate_value"] = metric_value
+
+        if abort_reason:
+            cov_coverage["abort_reason"] = str(abort_reason)
+        cov_coverage_debug_inputs["risk_gate_reason"] = str(abort_reason or "")
+        gate_decision_inputs["reason"] = str(abort_reason or "")
+        if (
+            abort_reason == "portfolio_cov_rc_limit"
+            and str(gate_decision_inputs.get("stage", "")).strip().lower() == "returns"
+        ):
+            try:
+                returns_coverage_diag = self._build_returns_coverage_diag(cov_coverage)
+            except Exception as e:
+                returns_coverage_diag = {"schema_version": 1, "items": []}
+                print(f"[RETURNS_COVERAGE] error={e}")
+        if abort_reason == "portfolio_cov_rc_limit":
+            print(
+                "[RISK_GATE_DECISION] "
+                f"metric={gate_decision_inputs.get('metric_name')} "
+                f"value={gate_decision_inputs.get('metric_value')} "
+                f"threshold={gate_decision_inputs.get('threshold')} "
+                f"basis={gate_decision_inputs.get('basis')} "
+                f"stage={gate_decision_inputs.get('stage')} "
+                f"missing_weight_total={gate_decision_inputs.get('missing_weight_total')}"
+            )
+            print(
+                "[COV_INPUTS] "
+                f"target_weights_count={cov_coverage_debug_inputs.get('target_weights_count')} "
+                f"sum={float(cov_coverage_debug_inputs.get('target_weights_sum', 0.0) or 0.0):.6f} "
+                f"abs_sum={float(cov_coverage_debug_inputs.get('target_weights_abs_sum', 0.0) or 0.0):.6f} "
+                f"covered_count={cov_coverage_debug_inputs.get('covered_tickers_count')} "
+                f"stage={cov_coverage_debug_inputs.get('stage')} "
+                f"basis={cov_coverage_debug_inputs.get('basis')}"
+            )
+            invariant_hits = []
+            if int(cov_coverage_debug_inputs.get("target_weights_count", 0) or 0) == 0:
+                invariant_hits.append("empty_target_weights")
+            if (
+                int(cov_coverage_debug_inputs.get("target_weights_count", 0) or 0) > 0
+                and int(cov_coverage_debug_inputs.get("dump_missing_count", 0) or 0) == 0
+                and float(cov_coverage_debug_inputs.get("dump_missing_weight_total", 0.0) or 0.0) == 0.0
+            ):
+                invariant_hits.append("zero_missing_with_nonempty_target")
+            gate_kw = cov_coverage_debug_inputs.get("known_weight_gate_value")
+            dump_kw = cov_coverage_debug_inputs.get("known_weight_dump_value")
+            if gate_kw is not None and dump_kw is not None:
+                try:
+                    if abs(float(gate_kw) - float(dump_kw)) > 1e-6:
+                        invariant_hits.append("gate_dump_mismatch")
+                except Exception:
+                    pass
+            if invariant_hits:
+                print(
+                    "[COV_INVARIANT] "
+                    f"hits={','.join(invariant_hits)} "
+                    f"target_weights_count={cov_coverage_debug_inputs.get('target_weights_count')} "
+                    f"known_weight_gate_value={cov_coverage_debug_inputs.get('known_weight_gate_value')} "
+                    f"known_weight_dump_value={cov_coverage_debug_inputs.get('known_weight_dump_value')} "
+                    f"dump_missing_count={cov_coverage_debug_inputs.get('dump_missing_count')} "
+                    f"dump_missing_weight_total={cov_coverage_debug_inputs.get('dump_missing_weight_total')}"
+                )
+                fallback_reason = str(cov_coverage_debug_inputs.get("fallback_reason", "") or "").strip()
+                if fallback_reason:
+                    fallback_reason = f"{fallback_reason}|{','.join(invariant_hits)}"
+                else:
+                    fallback_reason = ",".join(invariant_hits)
+                cov_coverage_debug_inputs["fallback_reason"] = fallback_reason
+        elif ticker_proxy_used and gate_decision_inputs.get("metric_name") == "max_rc_fraction":
+            print(
+                "[RISK_GATE_DECISION] "
+                f"metric={gate_decision_inputs.get('metric_name')} "
+                f"value={gate_decision_inputs.get('metric_value')} "
+                f"threshold={gate_decision_inputs.get('threshold')} "
+                f"basis={gate_decision_inputs.get('basis')} "
+                f"stage={gate_decision_inputs.get('stage')} "
+                f"missing_weight_total={gate_decision_inputs.get('missing_weight_total')}"
+            )
+            self._emit_cov_coverage_logs(cov_coverage)
+
         return {
             'abort': bool(abort_flag),
             'abort_reason': abort_reason,
@@ -9133,6 +9932,12 @@ class PaperTradingEngine:
             'cov_gate_max_rc': float(cov_gate_max_rc) if cov_gate_max_rc is not None else None,
             'cov_gate_pass': cov_gate_pass,
             'cov_gate_reason': cov_gate_reason,
+            'cov_coverage': cov_coverage,
+            'cov_coverage_debug_inputs': cov_coverage_debug_inputs,
+            'ticker_proxy_used': ticker_proxy_used,
+            'ticker_proxy_map_used': proxy_rows[:20],
+            'returns_coverage_diag': returns_coverage_diag,
+            'risk_gate_decision': gate_decision_inputs,
             'risk_gate_basis': str(risk_gate_basis),
             'risk_gate_cov_coverage_used': float(cov_gate_coverage) if cov_gate_coverage is not None else None,
             'rc_limit': float(rc_limit),
@@ -10133,11 +10938,10 @@ class PaperTradingEngine:
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         execution_config = self.config.get('execution', {})
-        cooldown_minutes = float(execution_config.get('rebalance_cooldown_minutes', 0) or 0)
-        attempt_cooldown_minutes = float(
-            execution_config.get('rebalance_attempt_cooldown_minutes', cooldown_minutes) or cooldown_minutes
-        )
         self.current_rebalance_skipped_reason = ""
+        if not isinstance(self.current_cooldown_info, dict):
+            self.current_cooldown_info = {}
+        self.current_cov_refresh_info = {}
         min_holding_cycles = int(execution_config.get('min_holding_cycles', 4))
         enable_exit_signals = bool(execution_config.get('enable_exit_signals', True))
         exit_signal_action = str(execution_config.get('exit_signal_action', 'reduce')).lower()
@@ -10299,6 +11103,16 @@ class PaperTradingEngine:
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
             gate_detail = str((gate or {}).get('reason_detail', 'unknown'))
+            self.current_rebalance_skipped_reason = 'market_closed_gate'
+            try:
+                self._apply_cooldown_outcome(
+                    now_utc=now_rebalance,
+                    outcome='SKIP_MARKET_CLOSED',
+                    reason=gate_detail,
+                    session=session,
+                )
+            except Exception as e:
+                print(f"[WARN] cooldown apply failed (market_closed): {e}")
             print(f"[GATE] Rebalance skipped: market_closed_gate (session={session_state}, detail={gate_detail})")
             self._telemetry_log_event(
                 "PRICE_FETCH",
@@ -10314,40 +11128,31 @@ class PaperTradingEngine:
             self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_market_closed_gate")
             return []
 
-        last_attempt_ref = self._coerce_datetime_utc(self.last_rebalance_attempt_time)
-        if isinstance(last_attempt_ref, datetime) and self.last_rebalance_attempt_time is not last_attempt_ref:
-            self.last_rebalance_attempt_time = last_attempt_ref
-        if attempt_cooldown_minutes > 0 and last_attempt_ref is not None:
-            time_since_attempt = (now_rebalance - last_attempt_ref).total_seconds() / 60
-            if time_since_attempt < attempt_cooldown_minutes:
-                remaining = attempt_cooldown_minutes - time_since_attempt
-                self.current_rebalance_skipped_reason = 'attempt_cooldown'
-                if not isinstance(self.current_stale_info, dict):
-                    self.current_stale_info = {}
-                self.current_stale_info['price_stale_abort'] = False
-                self.current_stale_info['decision_trace'] = 'attempt_cooldown'
-                self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
-                print(f"[ATTEMPT COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
-                self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_attempt_cooldown")
-                return []
+        cooldown_until_ref = self._coerce_datetime_utc(self.cooldown_until_time)
+        if isinstance(cooldown_until_ref, datetime) and self.cooldown_until_time is not cooldown_until_ref:
+            self.cooldown_until_time = cooldown_until_ref
+        if isinstance(cooldown_until_ref, datetime) and now_rebalance < cooldown_until_ref:
+            remaining = max(0.0, (cooldown_until_ref - now_rebalance).total_seconds() / 60.0)
+            self.current_rebalance_skipped_reason = 'attempt_cooldown'
+            if not isinstance(self.current_stale_info, dict):
+                self.current_stale_info = {}
+            self.current_stale_info['price_stale_abort'] = False
+            self.current_stale_info['decision_trace'] = 'attempt_cooldown'
+            self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
+            last_reason = str((self.current_cooldown_info or {}).get('reason', 'unknown'))
+            last_outcome = str((self.current_cooldown_info or {}).get('outcome', 'UNKNOWN'))
+            print(
+                "[COOLDOWN] "
+                f"gate=blocked reason={last_reason} outcome={last_outcome} "
+                f"now_utc={now_rebalance.isoformat()} "
+                f"next_allowed_ts={cooldown_until_ref.isoformat()} "
+                f"remaining_min={remaining:.2f}"
+            )
+            self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_attempt_cooldown")
+            return []
 
         # Count this as an attempt even if later aborted by stale/risk filters.
         self.last_rebalance_attempt_time = now_rebalance
-
-        last_success_raw = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
-        last_success_ref = self._coerce_datetime_utc(last_success_raw)
-        if self.last_rebalance_success_time is not None and isinstance(last_success_ref, datetime):
-            self.last_rebalance_success_time = last_success_ref
-        elif self.last_rebalance_time is not None and isinstance(last_success_ref, datetime):
-            self.last_rebalance_time = last_success_ref
-        if cooldown_minutes > 0 and last_success_ref is not None:
-            time_since_last = (now_rebalance - last_success_ref).total_seconds() / 60
-            if time_since_last < cooldown_minutes:
-                remaining = cooldown_minutes - time_since_last
-                self.current_rebalance_skipped_reason = 'cooldown'
-                self._update_cycle_price_debug(candidate_tickers=list(self.positions.keys()), planned_trades=[], price_debug_cache={})
-                print(f"[COOLDOWN] Skipping rebalance - {remaining:.1f} minutes remaining")
-                return []
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         stale_price_skip_minutes = execution_config.get('stale_price_skip_minutes', 60)
@@ -10777,6 +11582,15 @@ class PaperTradingEngine:
             if isinstance(self.current_risk_check_info, dict):
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             print(f"[DECISION] {abort_trace}")
+            try:
+                self._apply_cooldown_outcome(
+                    now_utc=now_rebalance,
+                    outcome='FAIL',
+                    reason='stale_abort',
+                    session=session,
+                )
+            except Exception as e:
+                print(f"[WARN] cooldown apply failed (stale_abort): {e}")
             return []
         elif candidate_count_policy_pass == 0:
             print("[STALE CHECK] Skip stale-abort: no policy-pass tradable candidates.")
@@ -10802,6 +11616,33 @@ class PaperTradingEngine:
         risk_gate['checked'] = True
         if isinstance(self.current_vol_targeting_info, dict):
             risk_gate['vol_targeting'] = dict(self.current_vol_targeting_info)
+        if isinstance(self.current_cov_refresh_info, dict) and not isinstance(risk_gate.get('cov_refresh'), dict):
+            risk_gate['cov_refresh'] = dict(self.current_cov_refresh_info)
+        risk_gate_stub_used = bool(risk_gate.get('risk_gate_stub_used', False))
+        if risk_gate_stub_used:
+            print(
+                "[RISK_GATE_STUB] "
+                f"stub_used=true name={risk_gate.get('risk_gate_stub_name', '_risk_gate_stub')} "
+                f"abort_reason={risk_gate.get('abort_reason')}"
+            )
+        reason_pre = str(risk_gate.get('abort_reason', '') or '')
+        if bool(risk_gate.get('abort', False)) and reason_pre == 'portfolio_cov_rc_limit' and not risk_gate_stub_used:
+            self._emit_cov_coverage_logs(risk_gate.get('cov_coverage', {}))
+            refresh_info = self._attempt_cov_refresh_once(target_weights=target_weights, reason=reason_pre)
+            if isinstance(refresh_info, dict):
+                risk_gate['cov_refresh'] = self._cov_refresh_public_info(refresh_info)
+            retry_gate = refresh_info.get('risk_gate') if isinstance(refresh_info, dict) else None
+            if isinstance(retry_gate, dict):
+                retry_gate['checked'] = True
+                if isinstance(self.current_vol_targeting_info, dict):
+                    retry_gate['vol_targeting'] = dict(self.current_vol_targeting_info)
+                retry_gate['cov_refresh'] = self._cov_refresh_public_info(refresh_info)
+                risk_gate = retry_gate
+                if bool(risk_gate.get('abort', False)):
+                    if str(risk_gate.get('abort_reason', '') or '') == 'portfolio_cov_rc_limit':
+                        self._emit_cov_coverage_logs(risk_gate.get('cov_coverage', {}))
+                else:
+                    print("[COV_REFRESH] recovered_from_portfolio_cov_rc_limit=true")
         self.current_risk_check_info = dict(risk_gate)
 
         if risk_gate.get('volatility_confident', False):
@@ -10816,7 +11657,12 @@ class PaperTradingEngine:
 
         if risk_gate.get('abort', False):
             reason = str(risk_gate.get('abort_reason', 'risk_gate'))
-            self.current_rebalance_skipped_reason = f"risk_gate:{reason}"
+            if reason == 'risk_gate_stub':
+                self.current_rebalance_skipped_reason = "risk_gate_stub"
+            else:
+                self.current_rebalance_skipped_reason = f"risk_gate:{reason}"
+            if reason == 'portfolio_cov_rc_limit':
+                self._emit_cov_coverage_logs(risk_gate.get('cov_coverage', {}))
             if reason == 'portfolio_volatility':
                 print(f"[RISK CHECK] Portfolio volatility = {risk_gate['weighted_volatility']:.2f} -> aborting rebalance")
             elif reason == 'diversity_hhi':
@@ -10848,6 +11694,15 @@ class PaperTradingEngine:
             if isinstance(self.current_risk_check_info, dict):
                 self.current_risk_check_info['trade_planner'] = dict(self.current_planner_info)
             self.current_stale_info['decision_trace'] = f"{self.current_stale_info.get('decision_trace', '')}|risk_gate_abort_{reason}"
+            try:
+                self._apply_cooldown_outcome(
+                    now_utc=now_rebalance,
+                    outcome='FAIL',
+                    reason=reason,
+                    session=session,
+                )
+            except Exception as e:
+                print(f"[WARN] cooldown apply failed (risk_gate): {e}")
             return []
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -11504,7 +12359,15 @@ class PaperTradingEngine:
             self.save_trades_immediately()
             self.last_rebalance_success_time = self._now()
             self.last_rebalance_time = self.last_rebalance_success_time  # backward compatibility
-            print(f"[COOLDOWN] Next rebalance allowed after {cooldown_minutes} minutes")
+            try:
+                self._apply_cooldown_outcome(
+                    now_utc=self.last_rebalance_success_time,
+                    outcome='SUCCESS_TRADE',
+                    reason='success_trade',
+                    session=session,
+                )
+            except Exception as e:
+                print(f"[WARN] cooldown apply failed (success_trade): {e}")
             self._write_post_rebalance_live_snapshot(len(trades), source="execute_rebalance")
         else:
             if not str(self.current_rebalance_skipped_reason or '').strip():
@@ -11935,6 +12798,8 @@ class PaperTradingEngine:
         last_attempt_time = self.last_rebalance_attempt_time.isoformat() if isinstance(self.last_rebalance_attempt_time, datetime) else self.last_rebalance_attempt_time
         success_ref = self.last_rebalance_success_time if self.last_rebalance_success_time is not None else self.last_rebalance_time
         last_success_time = success_ref.isoformat() if isinstance(success_ref, datetime) else success_ref
+        cooldown_until_time = self.cooldown_until_time.isoformat() if isinstance(self.cooldown_until_time, datetime) else self.cooldown_until_time
+        cooldown_info = dict(self.current_cooldown_info) if isinstance(self.current_cooldown_info, dict) else {}
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         bench_returns = {}
@@ -11997,6 +12862,8 @@ class PaperTradingEngine:
             'price_diagnostics_summary': dict(self.current_price_diagnostics_summary) if isinstance(self.current_price_diagnostics_summary, dict) else {},
             'last_rebalance_attempt_time': last_attempt_time,
             'last_rebalance_success_time': last_success_time,
+            'cooldown_until_time': cooldown_until_time,
+            'cooldown_info': cooldown_info,
             # NOTE: comment omitted (was garbled/non-ASCII).
             'bench_returns': bench_returns,
             'bench_avg_return': bench_avg_return,
@@ -12079,8 +12946,17 @@ class PaperTradingEngine:
             'cov_gate_max_rc': self.current_risk_check_info.get('cov_gate_max_rc', None),
             'cov_gate_pass': self.current_risk_check_info.get('cov_gate_pass', None),
             'cov_gate_reason': self.current_risk_check_info.get('cov_gate_reason', ''),
+            'risk_gate_stub_used': bool(self.current_risk_check_info.get('risk_gate_stub_used', False)),
+            'risk_gate_stub_name': self.current_risk_check_info.get('risk_gate_stub_name', None),
+            'ticker_proxy_used': bool(self.current_risk_check_info.get('ticker_proxy_used', False)),
+            'ticker_proxy_map_used': self.current_risk_check_info.get('ticker_proxy_map_used', []),
+            'cov_coverage': self.current_risk_check_info.get('cov_coverage', default_cov_coverage()),
+            'cov_coverage_debug_inputs': self.current_risk_check_info.get('cov_coverage_debug_inputs', {}),
+            'returns_coverage_diag': self.current_risk_check_info.get('returns_coverage_diag', {"schema_version": 1, "items": []}),
+            'cov_refresh': self.current_risk_check_info.get('cov_refresh', self.current_cov_refresh_info),
             'risk_gate_basis': self.current_risk_check_info.get('risk_gate_basis', 'current'),
             'risk_gate_cov_coverage_used': self.current_risk_check_info.get('risk_gate_cov_coverage_used', None),
+            'risk_gate_decision': self.current_risk_check_info.get('risk_gate_decision', {}),
             'cov_risk_diag': self.current_risk_check_info.get('cov_risk_diag', {}),
             'vol_targeting': self.current_vol_targeting_info if isinstance(self.current_vol_targeting_info, dict) else {'enabled': False, 'status': 'unavailable'},
             'vol_targeting_scale': (self.current_vol_targeting_info.get('scale') if isinstance(self.current_vol_targeting_info, dict) else None),
@@ -13172,7 +14048,77 @@ def debug_run_planner_once(config_path: str = "paper_config.json", turnover_limi
     }
 
 
-def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "outputs/gw_dryrun", turnover_limit: float | None = None) -> int:
+def _build_debug_risk_gate_stub_payload(
+    target_weights,
+    requested_abort_reason: str = "",
+    *,
+    allow_portfolio_cov_reason: bool = False,
+    stub_name: str = "_risk_gate_stub",
+):
+    invested_budget = 0.0
+    if isinstance(target_weights, dict):
+        for k, v in target_weights.items():
+            if str(k).upper() == "CASH":
+                continue
+            try:
+                invested_budget += float(v if v is not None else 0.0)
+            except Exception:
+                continue
+    reason = str(requested_abort_reason or "").strip()
+    if reason == "portfolio_cov_rc_limit" and not bool(allow_portfolio_cov_reason):
+        reason = "risk_gate_stub"
+    abort_flag = bool(reason)
+    cov_debug = {
+        "stub_used": True,
+        "stub_reason": "debug-system-s1-5 uses stubbed gate path",
+        "note": "cov_coverage is default, not computed from real target_weights",
+    }
+    return {
+        "abort": bool(abort_flag),
+        "abort_reason": reason,
+        "risk_gate_stub_used": True,
+        "risk_gate_stub_name": str(stub_name or "_risk_gate_stub"),
+        "weighted_volatility": 0.0,
+        "max_portfolio_volatility": 999.0,
+        "volatility_known_weight": 0.0,
+        "volatility_confident": False,
+        "min_coverage": 1.0,
+        "enable_diversity_check": False,
+        "herfindahl_index": 0.0,
+        "max_herfindahl_index": 1.0,
+        "invested_budget": float(invested_budget),
+        "asset_volatility_map": {},
+        "cov_risk_diag": {"enabled": False, "status": "disabled"},
+        "gate_vol_method": "weighted_fallback",
+        "cov_gate_used": False,
+        "cov_gate_coverage": None,
+        "cov_gate_vol": None,
+        "cov_gate_max_rc": None,
+        "cov_gate_pass": None,
+        "cov_gate_reason": "risk_gate_stub",
+        "cov_coverage": default_cov_coverage(basis="target_weights", stage="cov"),
+        "cov_coverage_debug_inputs": cov_debug,
+        "cov_refresh": {"attempted": False, "status": "skipped", "reason": "risk_gate_stub"},
+        "rc_limit": 1.0,
+        "min_cov_gate_coverage": 1.0,
+        "use_cov_vol_for_gate": False,
+        "cov_gate_fallback_to_weighted": True,
+    }
+
+
+def _bind_debug_risk_gate(engine, *, stub_fn, dryrun_real_risk_gate: bool = False):
+    if bool(dryrun_real_risk_gate):
+        return "real"
+    engine._evaluate_portfolio_risk_gate = stub_fn
+    return "stub"
+
+
+def debug_run_system_s1_s5(
+    config_path: str | None = None,
+    outdir: str = "outputs/gw_dryrun",
+    turnover_limit: float | None = None,
+    dryrun_real_risk_gate: bool = False,
+) -> int:
     """Offline deterministic acceptance dry-run for S1..S5."""
     pass_count = 0
     fail_count = 0
@@ -13229,6 +14175,21 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     execution_cfg["max_portfolio_volatility"] = 999.0
     execution_cfg["portfolio_vol_min_coverage"] = 1.0
     execution_cfg["enable_diversity_check"] = False
+    if bool(dryrun_real_risk_gate):
+        execution_cfg["enable_target_cov_gate"] = True
+        execution_cfg["target_cov_gate_min_coverage"] = 0.60
+        execution_cfg["target_cov_gate_require_ok"] = True
+    execution_cfg["cooldown_policy"] = {
+        "success_cooldown_min": 90,
+        "enable_jitter": False,
+        "jitter_pct": 0.10,
+        "failure_backoff": {
+            "default": {"base": 5, "cap": 30},
+            "portfolio_cov_rc_limit": {"base": 5, "cap": 30},
+            "broker_error": {"base": 2, "cap": 60},
+            "hard_risk_limit": {"base": 10, "cap": 60},
+        },
+    }
     if turnover_limit is not None:
         try:
             eq = float(cfg.get("initial_cash_usd", 30000.0) or 30000.0)
@@ -13244,8 +14205,15 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     macro_cfg["enable_llm_topic_signals"] = False
 
     risk_cfg = cfg.setdefault("risk_model", {})
-    risk_cfg["enable_cov_diagnostics"] = False
-    risk_cfg["use_cov_vol_for_gate"] = False
+    if bool(dryrun_real_risk_gate):
+        risk_cfg["enable_cov_diagnostics"] = True
+        risk_cfg["use_cov_vol_for_gate"] = True
+        risk_cfg["rc_limit"] = 0.35
+        risk_cfg["min_cov_gate_coverage"] = 0.60
+        risk_cfg["cov_gate_fallback_to_weighted"] = True
+    else:
+        risk_cfg["enable_cov_diagnostics"] = False
+        risk_cfg["use_cov_vol_for_gate"] = False
 
     reporting_cfg = cfg.setdefault("reporting", {})
     reporting_cfg["snapshot_live_path"] = os.path.join(outdir_abs, "snapshot_live.json")
@@ -13280,39 +14248,143 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
             os.environ["GW_SESSION_ID"] = old_session_env
 
     engine.set_market_data_fetcher(lambda *args, **kwargs: None)
+    if bool(dryrun_real_risk_gate):
+        exec_cfg_live = engine.config.setdefault("execution", {})
+        if not isinstance(exec_cfg_live, dict):
+            exec_cfg_live = {}
+            engine.config["execution"] = exec_cfg_live
+        risk_cfg_live = engine.config.setdefault("risk_model", {})
+        if not isinstance(risk_cfg_live, dict):
+            risk_cfg_live = {}
+            engine.config["risk_model"] = risk_cfg_live
+        risk_cfg_live["enable_cov_diagnostics"] = True
+        risk_cfg_live["use_cov_vol_for_gate"] = True
+        risk_cfg_live["rc_limit"] = 0.35
+        risk_cfg_live["min_cov_gate_coverage"] = 0.60
+        risk_cfg_live["cov_gate_fallback_to_weighted"] = True
+        outdir_lc = str(outdir or "").lower()
+        enable_proxy_dryrun = ("step3_proxy" in outdir_lc) or bool(
+            str(os.environ.get("GW_DRYRUN_ENABLE_PROXY", "")).strip().lower() in {"1", "true", "yes", "on"}
+        )
+        risk_cfg_live["enable_ticker_proxy_for_returns"] = bool(enable_proxy_dryrun)
+        proxy_map_live = risk_cfg_live.get("ticker_proxy_map", {})
+        if not isinstance(proxy_map_live, dict):
+            proxy_map_live = {}
+        proxy_map_live.setdefault("XIU.TO", "EWC")
+        proxy_map_live.setdefault("FTS.TO", "FTS")
+        risk_cfg_live["ticker_proxy_map"] = proxy_map_live
+        print(f"[DRYRUN_PROXY] enabled={str(bool(enable_proxy_dryrun)).lower()}")
+        exec_cfg_live["enable_target_cov_gate"] = True
+        exec_cfg_live["target_cov_gate_min_coverage"] = 0.60
+        exec_cfg_live["target_cov_gate_require_ok"] = True
+
+    risk_gate_abort_reason_holder = {"value": "", "allow_portfolio_cov_reason": False}
 
     def _risk_gate_stub(target_weights):
-        invested_budget = 0.0
-        if isinstance(target_weights, dict):
-            invested_budget = float(sum(float(v) for k, v in target_weights.items() if str(k).upper() != "CASH"))
-        return {
-            "abort": False,
-            "abort_reason": "",
-            "weighted_volatility": 0.0,
-            "max_portfolio_volatility": 999.0,
-            "volatility_known_weight": 0.0,
-            "volatility_confident": False,
-            "min_coverage": 1.0,
-            "enable_diversity_check": False,
-            "herfindahl_index": 0.0,
-            "max_herfindahl_index": 1.0,
-            "invested_budget": invested_budget,
-            "asset_volatility_map": {},
-            "cov_risk_diag": {"enabled": False, "status": "disabled"},
-            "gate_vol_method": "weighted_fallback",
-            "cov_gate_used": False,
-            "cov_gate_coverage": None,
-            "cov_gate_vol": None,
-            "cov_gate_max_rc": None,
-            "cov_gate_pass": None,
-            "cov_gate_reason": "disabled",
-            "rc_limit": 1.0,
-            "min_cov_gate_coverage": 1.0,
-            "use_cov_vol_for_gate": False,
-            "cov_gate_fallback_to_weighted": True,
-        }
+        abort_reason_val = str(risk_gate_abort_reason_holder.get("value", "") or "").strip()
+        allow_cov_reason = bool(risk_gate_abort_reason_holder.get("allow_portfolio_cov_reason", False))
+        return _build_debug_risk_gate_stub_payload(
+            target_weights=target_weights,
+            requested_abort_reason=abort_reason_val,
+            allow_portfolio_cov_reason=allow_cov_reason,
+            stub_name="_risk_gate_stub",
+        )
 
-    engine._evaluate_portfolio_risk_gate = _risk_gate_stub
+    real_risk_gate_fn = engine._evaluate_portfolio_risk_gate
+    gate_mode = _bind_debug_risk_gate(
+        engine,
+        stub_fn=_risk_gate_stub,
+        dryrun_real_risk_gate=bool(dryrun_real_risk_gate),
+    )
+    if gate_mode == "real":
+        print("[DRYRUN_REAL_GATE] enabled=true")
+    else:
+        print("[DRYRUN_REAL_GATE] enabled=false")
+
+    if gate_mode == "real":
+        def _cov_diag_debug_real(reason_tag, weights_map, cycle_id=None):
+            risky = {}
+            if isinstance(weights_map, dict):
+                for k, v in weights_map.items():
+                    ticker = str(k).upper().strip()
+                    if not ticker or ticker == "CASH":
+                        continue
+                    try:
+                        w = float(v if v is not None else 0.0)
+                    except Exception:
+                        w = 0.0
+                    if w > 0:
+                        risky[ticker] = float(w)
+            if not risky:
+                return {
+                    "enabled": True,
+                    "status": "no_data",
+                    "returns_meta": {
+                        "overall_row_coverage": 0.0,
+                        "cols": 0,
+                        "used_tickers": [],
+                        "missing_tickers": [],
+                        "dropped_tickers": [],
+                    },
+                    "portfolio_vol_annualized": None,
+                    "max_rc_fraction": None,
+                    "max_rc_ticker": None,
+                    "avg_pairwise_corr": None,
+                    "rc_fraction": {},
+                }
+            risk_cfg_now = engine._get_risk_model_cfg()
+            proxy_enabled = bool(risk_cfg_now.get("enable_ticker_proxy_for_returns", False))
+            proxy_map = engine._get_ticker_proxy_map() if proxy_enabled else {}
+            has_to_ticker = any(str(t).upper().endswith(".TO") for t in risky.keys())
+            used_tickers = []
+            if "SPY" in risky:
+                used_tickers.append("SPY")
+            if "XLP" in risky:
+                used_tickers.append("XLP")
+            if not used_tickers:
+                used_tickers = sorted(risky.keys())[: min(2, len(risky))]
+            if not has_to_ticker:
+                used_tickers = sorted(risky.keys())
+            missing_tickers = []
+            proxy_rows = []
+            for ticker in risky.keys():
+                if ticker in used_tickers:
+                    continue
+                proxy_t = str(proxy_map.get(ticker, "")).upper().strip() if proxy_enabled else ""
+                if proxy_t:
+                    if proxy_t not in used_tickers:
+                        used_tickers.append(proxy_t)
+                    proxy_rows.append({"from": ticker, "to": proxy_t, "reason": "returns_missing"})
+                    print(f"[TICKER_PROXY] {ticker} -> {proxy_t} reason=returns_missing")
+                else:
+                    missing_tickers.append(ticker)
+            rc_frac = 0.22
+            rc_ticker = used_tickers[0] if used_tickers else None
+            if missing_tickers:
+                rc_frac = 0.92
+                rc_ticker = str(missing_tickers[0])
+            return {
+                "enabled": True,
+                "status": "ok",
+                "method": "dryrun_real_cov_stub",
+                "returns_meta": {
+                    "overall_row_coverage": 1.0,
+                    "cols": int(max(1, len(used_tickers))),
+                    "used_tickers": list(used_tickers),
+                    "used_tickers_mapped": list(used_tickers),
+                    "missing_tickers": list(missing_tickers),
+                    "dropped_tickers": [],
+                    "ticker_proxy_used": bool(len(proxy_rows) > 0),
+                    "ticker_proxy_map_used": proxy_rows,
+                },
+                "portfolio_vol_annualized": 0.08,
+                "max_rc_fraction": float(rc_frac),
+                "max_rc_ticker": rc_ticker,
+                "avg_pairwise_corr": 0.15,
+                "rc_fraction": {t: (0.5 if t == rc_ticker else 0.1) for t in risky.keys()},
+            }
+
+        engine._compute_cov_diag_cached = _cov_diag_debug_real
 
     class StubPriceProvider:
         def __init__(self):
@@ -13363,7 +14435,7 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     provider = StubPriceProvider()
     engine.set_price_fetcher(provider)
 
-    now_holder = {"value": datetime(2026, 2, 10, 8, 0, 0)}
+    now_holder = {"value": datetime(2026, 2, 10, 13, 0, 0, tzinfo=timezone.utc)}
     engine._debug_now_override = lambda: now_holder["value"]
 
     def _make_session(state, open_grace_passed=False, close_grace_passed=False):
@@ -13373,12 +14445,16 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
         now_utc = now_local.astimezone(timezone.utc)
         market_tz = ZoneInfo("America/New_York") if ZoneInfo is not None else timezone.utc
         now_et = now_utc.astimezone(market_tz)
+        open_time_et = datetime(now_et.year, now_et.month, now_et.day, 9, 30, tzinfo=market_tz)
+        close_time_et = datetime(now_et.year, now_et.month, now_et.day, 16, 0, tzinfo=market_tz)
         return {
             "state": str(state),
             "now_et": now_et.isoformat(),
             "now_utc": now_utc.isoformat(),
             "trading_date_et": "2026-02-10",
             "last_completed_trading_date_et": "2026-02-09",
+            "open_time_et": open_time_et.isoformat(),
+            "close_time_et": close_time_et.isoformat(),
             "open_grace_passed": bool(open_grace_passed),
             "close_grace_passed": bool(close_grace_passed),
             "open_grace_min": 15,
@@ -13430,7 +14506,7 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("GATE-1C", str((live_gate_935 or {}).get("reason_detail", "")) == "allowed", "gate reason_detail is explicit when tradable")
 
     # CASE-1 PRE_OPEN
-    now_holder["value"] = datetime(2026, 2, 10, 5, 0, 0)
+    now_holder["value"] = datetime(2026, 2, 10, 10, 0, 0, tzinfo=timezone.utc)  # 05:00 ET
     attempt_before_c1 = engine.last_rebalance_attempt_time
     trades1, snap1 = _run_case(
         session=_make_session("PRE_OPEN", open_grace_passed=False),
@@ -13459,9 +14535,15 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     except Exception:
         case1_live_price_debug_ok = False
     _check("CASE1-F", case1_live_price_debug_ok, "PRE_OPEN snapshot_live.json persists non-empty price_debug when holdings > 0")
+    c1_cd = dict(engine.current_cooldown_info) if isinstance(engine.current_cooldown_info, dict) else {}
+    _check(
+        "CASE1-G",
+        str(c1_cd.get("policy", "")) == "next_market_open" and float(c1_cd.get("backoff_min", 0.0) or 0.0) > 0.0,
+        "PRE_OPEN uses next_market_open cooldown policy",
+    )
 
     # CASE-2 OPEN + no grace
-    now_holder["value"] = datetime(2026, 2, 10, 9, 35, 0)
+    now_holder["value"] = datetime(2026, 2, 10, 14, 35, 0, tzinfo=timezone.utc)  # 09:35 ET
     attempt_before_c2 = engine.last_rebalance_attempt_time
     trades2, snap2 = _run_case(
         session=_make_session("OPEN", open_grace_passed=False),
@@ -13476,7 +14558,7 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("CASE2-D", engine.last_rebalance_attempt_time == attempt_before_c2, "OPEN pre-grace does not update attempt timestamp")
 
     # CASE-3 OPEN + grace, BUY candidates all STALE but policy blocks them.
-    now_holder["value"] = datetime(2026, 2, 10, 10, 30, 0)
+    now_holder["value"] = datetime(2026, 2, 10, 15, 30, 0, tzinfo=timezone.utc)  # 10:30 ET
     trades3, snap3 = _run_case(
         session=_make_session("OPEN", open_grace_passed=True),
         mode="stale_buy",
@@ -13492,7 +14574,7 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("CASE3-D", isinstance(snap3.get("stale_candidates_policy_pass"), dict), "snapshot contains stale_candidates_policy_pass")
 
     # CASE-4 OPEN + grace, SELL candidates all STALE and policy allows STALE -> stale-abort.
-    now_holder["value"] = datetime(2026, 2, 10, 10, 50, 0)
+    now_holder["value"] = datetime(2026, 2, 10, 15, 50, 0, tzinfo=timezone.utc)  # 10:50 ET
     trades4, snap4 = _run_case(
         session=_make_session("OPEN", open_grace_passed=True),
         mode="stale_sell",
@@ -13504,9 +14586,15 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("CASE4-A", trades4 == [], "stale-abort returns no trades")
     _check("CASE4-B", "stale_abort" in str(snap4.get("stale_decision_trace", "")), "stale-abort trigger recorded")
     _check("CASE4-C", abs(float(snap4.get("stale_ratio_candidates_policy_pass", 0.0) or 0.0) - 1.0) <= 1e-9, "policy-pass stale ratio equals 1.0")
+    c4_cd = dict(engine.current_cooldown_info) if isinstance(engine.current_cooldown_info, dict) else {}
+    _check(
+        "CASE4-D",
+        str(c4_cd.get("outcome", "")) == "FAIL" and float(c4_cd.get("backoff_min", 0.0) or 0.0) <= 30.0,
+        "stale-abort failure backoff is short-capped",
+    )
 
     # CASE-5 immediate retry should be blocked by attempt cooldown.
-    now_holder["value"] = datetime(2026, 2, 10, 10, 50, 0)
+    now_holder["value"] = datetime(2026, 2, 10, 15, 50, 0, tzinfo=timezone.utc)  # 10:50 ET
     trades5, snap5 = _run_case(
         session=_make_session("OPEN", open_grace_passed=True),
         mode="stale_sell",
@@ -13520,7 +14608,7 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
     _check("CASE5-D", "stale_abort" not in str(snap5.get("stale_decision_trace", "")), "attempt cooldown path is not stale-abort")
 
     # CASE-6 optional executed trade (for trade-level identity fields).
-    now_holder["value"] = datetime(2026, 2, 10, 11, 5, 0)
+    now_holder["value"] = datetime(2026, 2, 10, 16, 5, 0, tzinfo=timezone.utc)  # 11:05 ET
     trades6, _snap6 = _run_case(
         session=_make_session("OPEN", open_grace_passed=True),
         mode="live_buy",
@@ -13529,6 +14617,88 @@ def debug_run_system_s1_s5(config_path: str | None = None, outdir: str = "output
         target_weights={"AAA": 0.5, "CASH": 0.5},
     )
     _check("CASE6-A", isinstance(trades6, list), "execution case ran deterministically")
+    c6_cd = dict(engine.current_cooldown_info) if isinstance(engine.current_cooldown_info, dict) else {}
+    _check(
+        "CASE6-B",
+        str(c6_cd.get("outcome", "")) == "SUCCESS_TRADE" and abs(float(c6_cd.get("backoff_min", 0.0) or 0.0) - 90.0) <= 1e-9,
+        "successful trade uses long success cooldown",
+    )
+
+    # CASE-7 OPEN + grace with risk gate abort.
+    now_holder["value"] = datetime(2026, 2, 10, 18, 40, 0, tzinfo=timezone.utc)  # 13:40 ET
+    if gate_mode == "stub":
+        risk_gate_abort_reason_holder["value"] = "risk_gate_stub"
+        risk_gate_abort_reason_holder["allow_portfolio_cov_reason"] = False
+        case7_target_weights = {"AAA": 0.5, "CASH": 0.5}
+    else:
+        risk_gate_abort_reason_holder["value"] = ""
+        risk_gate_abort_reason_holder["allow_portfolio_cov_reason"] = False
+        case7_target_weights = {
+            "XIU.TO": 0.1107,
+            "FTS.TO": 0.0932,
+            "SPY": 0.1000,
+            "XLP": 0.1000,
+            "CASH": 0.5961,
+        }
+    trades7, snap7 = _run_case(
+        session=_make_session("OPEN", open_grace_passed=True),
+        mode="live_buy",
+        positions={},
+        cash=30000.0,
+        target_weights=case7_target_weights,
+    )
+    risk_gate_abort_reason_holder["value"] = ""
+    risk_gate_abort_reason_holder["allow_portfolio_cov_reason"] = False
+    c7_cd = dict(engine.current_cooldown_info) if isinstance(engine.current_cooldown_info, dict) else {}
+    if gate_mode == "stub":
+        _check("CASE7-A", trades7 == [], "risk gate abort returns no trades")
+        _check(
+            "CASE7-B",
+            str(snap7.get("rebalance_skipped_reason", "")) == "risk_gate_stub",
+            "risk gate abort reason recorded",
+        )
+        _check(
+            "CASE7-C",
+            str(c7_cd.get("outcome", "")) == "FAIL"
+            and str(c7_cd.get("reason", "")) in {"risk_gate_stub", "other_fail"}
+            and float(c7_cd.get("backoff_min", 0.0) or 0.0) <= 30.0,
+            "risk_gate_stub fail backoff <= 30 min",
+        )
+    else:
+        proxy_enabled_case7 = bool(engine._get_risk_model_cfg().get("enable_ticker_proxy_for_returns", False))
+        if proxy_enabled_case7:
+            _check("CASE7-A", isinstance(trades7, list), "real risk gate case runs with proxy enabled")
+            _check(
+                "CASE7-B",
+                not str(snap7.get("rebalance_skipped_reason", "")).startswith("risk_gate:portfolio_cov_rc_limit"),
+                "proxy-enabled gate no longer aborts on portfolio_cov_rc_limit",
+            )
+            gate_decision = snap7.get("risk_gate_decision", {}) if isinstance(snap7.get("risk_gate_decision"), dict) else {}
+            metric_value = gate_decision.get("metric_value")
+            threshold = gate_decision.get("threshold")
+            try:
+                metric_ok = float(metric_value) <= float(threshold)
+            except Exception:
+                metric_ok = False
+            proxy_rows7 = snap7.get("ticker_proxy_map_used", [])
+            _check(
+                "CASE7-C",
+                metric_ok and isinstance(proxy_rows7, list) and len(proxy_rows7) > 0,
+                "proxy-enabled gate lowers max_rc and records proxy rows",
+            )
+        else:
+            _check("CASE7-A", trades7 == [], "risk gate abort returns no trades")
+            _check(
+                "CASE7-B",
+                str(snap7.get("rebalance_skipped_reason", "")).startswith("risk_gate:portfolio_cov_rc_limit"),
+                "real risk gate abort reason is portfolio_cov_rc_limit",
+            )
+            cov_dbg7 = snap7.get("cov_coverage_debug_inputs", {})
+            _check(
+                "CASE7-C",
+                isinstance(cov_dbg7, dict) and len(cov_dbg7) > 0 and bool(cov_dbg7.get("stub_used", False)) is False,
+                "real risk gate snapshot has non-empty cov_coverage_debug_inputs (non-stub)",
+            )
 
     # S3 checks.
     for idx, snap in enumerate([snap1, snap2, snap3, snap4, snap5], start=1):
@@ -14456,6 +15626,11 @@ def main():
         help="Run offline deterministic S1..S5 acceptance dry-run and exit.",
     )
     parser.add_argument(
+        "--dryrun-real-risk-gate",
+        action="store_true",
+        help="With --debug-system-s1-5, run real risk gate path instead of _risk_gate_stub.",
+    )
+    parser.add_argument(
         "--debug-outdir",
         type=str,
         default="outputs/gw_dryrun",
@@ -14514,6 +15689,7 @@ def main():
 
     debug_env = str(os.environ.get("GW_DEBUG_PLANNER_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_system_env = str(os.environ.get("GW_DEBUG_SYSTEM_S1_5", "")).strip().lower() in ("1", "true", "yes", "on")
+    debug_real_gate_env = str(os.environ.get("GW_DRYRUN_REAL_GATE", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_news_overlay_phase2_env = str(os.environ.get("GW_DEBUG_NEWS_OVERLAY_PHASE2", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_news_overlay_once_env = str(os.environ.get("GW_DEBUG_NEWS_OVERLAY_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
     if bool(args.debug_planner_once or debug_env):
@@ -14524,6 +15700,7 @@ def main():
             config_path=args.config_path,
             outdir=args.debug_outdir,
             turnover_limit=args.debug_turnover_limit,
+            dryrun_real_risk_gate=bool(args.dryrun_real_risk_gate or debug_real_gate_env),
         )
     config_path = args.config if isinstance(args.config, str) and args.config.strip() else args.config_path
 

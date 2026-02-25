@@ -14,6 +14,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from atomic_io import safe_read_json as io_safe_read_json
+from cov_coverage import default_cov_coverage
 
 try:
     from zoneinfo import ZoneInfo
@@ -197,6 +198,42 @@ def _ensure_report_meta_fields(report: Dict[str, Any], snapshot: Optional[Dict[s
         changed = True
     if not str(patched.get("last_risk_profile_change_source") or "").strip():
         patched["last_risk_profile_change_source"] = str(snapshot_obj.get("last_risk_profile_change_source") or "")
+        changed = True
+    cov_coverage = patched.get("cov_coverage")
+    if not isinstance(cov_coverage, dict):
+        snapshot_cov = snapshot_obj.get("cov_coverage")
+        if isinstance(snapshot_cov, dict):
+            patched["cov_coverage"] = dict(snapshot_cov)
+        else:
+            patched["cov_coverage"] = default_cov_coverage()
+        changed = True
+    else:
+        if "schema_version" not in cov_coverage:
+            cov_coverage["schema_version"] = 1
+            patched["cov_coverage"] = cov_coverage
+
+    returns_cov_diag = patched.get("returns_coverage_diag")
+    if not isinstance(returns_cov_diag, dict):
+        snapshot_returns_cov_diag = snapshot_obj.get("returns_coverage_diag")
+        if isinstance(snapshot_returns_cov_diag, dict):
+            patched["returns_coverage_diag"] = dict(snapshot_returns_cov_diag)
+        else:
+            patched["returns_coverage_diag"] = {"schema_version": 1, "items": []}
+            changed = True
+    else:
+        if "schema_version" not in returns_cov_diag:
+            returns_cov_diag["schema_version"] = 1
+            patched["returns_coverage_diag"] = returns_cov_diag
+
+    if "ticker_proxy_used" not in patched:
+        patched["ticker_proxy_used"] = bool(snapshot_obj.get("ticker_proxy_used", False))
+        changed = True
+    if not isinstance(patched.get("ticker_proxy_map_used"), list):
+        snapshot_proxy_rows = snapshot_obj.get("ticker_proxy_map_used")
+        if isinstance(snapshot_proxy_rows, list):
+            patched["ticker_proxy_map_used"] = list(snapshot_proxy_rows)
+        else:
+            patched["ticker_proxy_map_used"] = []
         changed = True
     return patched, changed
 
@@ -1120,6 +1157,22 @@ def generate_daily_report(
         },
         "trades": trades,
         "positions_end": positions_end,
+        "cov_coverage": (
+            dict(snapshot.get("cov_coverage"))
+            if isinstance(snapshot.get("cov_coverage"), dict)
+            else default_cov_coverage()
+        ),
+        "returns_coverage_diag": (
+            dict(snapshot.get("returns_coverage_diag"))
+            if isinstance(snapshot.get("returns_coverage_diag"), dict)
+            else {"schema_version": 1, "items": []}
+        ),
+        "ticker_proxy_used": bool(snapshot.get("ticker_proxy_used", False)),
+        "ticker_proxy_map_used": (
+            list(snapshot.get("ticker_proxy_map_used"))
+            if isinstance(snapshot.get("ticker_proxy_map_used"), list)
+            else []
+        ),
         "risk": risk,
         "conviction": conviction,
         "meta": {
