@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import argparse
+from collections import Counter
 from datetime import date as date_cls
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -235,6 +236,102 @@ def _ensure_report_meta_fields(report: Dict[str, Any], snapshot: Optional[Dict[s
         else:
             patched["ticker_proxy_map_used"] = []
         changed = True
+    if not str(patched.get("asset_policy_mode") or "").strip():
+        patched["asset_policy_mode"] = str(snapshot_obj.get("asset_policy_mode") or "FORCE_PROXY")
+        changed = True
+    if not isinstance(patched.get("asset_policy_decisions"), list):
+        snapshot_asset_policy_rows = snapshot_obj.get("asset_policy_decisions")
+        if isinstance(snapshot_asset_policy_rows, list):
+            patched["asset_policy_decisions"] = list(snapshot_asset_policy_rows)
+        else:
+            patched["asset_policy_decisions"] = []
+        changed = True
+    if not isinstance(patched.get("asset_policy_summary"), dict):
+        snapshot_asset_policy_summary = snapshot_obj.get("asset_policy_summary")
+        if isinstance(snapshot_asset_policy_summary, dict):
+            patched["asset_policy_summary"] = dict(snapshot_asset_policy_summary)
+        else:
+            patched["asset_policy_summary"] = {
+                "counts": {"ALLOW_ORIGINAL": 0, "USE_PROXY": 0, "DISABLE": 0},
+                "top_reasons": [],
+            }
+        changed = True
+    if not isinstance(patched.get("cost_summary"), dict):
+        patched["cost_summary"] = _build_cost_summary(
+            snapshot_obj,
+            patched.get("trades", {}) if isinstance(patched.get("trades"), dict) else {},
+        )
+        changed = True
+    if not isinstance(patched.get("performance_summary"), dict):
+        patched["performance_summary"] = _build_performance_summary(
+            patched.get("equity", {}) if isinstance(patched.get("equity"), dict) else {},
+            patched.get("cost_summary", {}) if isinstance(patched.get("cost_summary"), dict) else {},
+            patched.get("trades", {}) if isinstance(patched.get("trades"), dict) else {},
+        )
+        changed = True
+
+    computed_no_trade_summary = build_no_trade_summary(
+        trades=patched.get("trades", {}) if isinstance(patched.get("trades"), dict) else {},
+        snapshot=snapshot_obj,
+        risk_gate_decision=(
+            patched.get("risk_gate_decision")
+            if isinstance(patched.get("risk_gate_decision"), dict)
+            else snapshot_obj.get("risk_gate_decision")
+        ),
+        cov_coverage=(
+            patched.get("cov_coverage")
+            if isinstance(patched.get("cov_coverage"), dict)
+            else snapshot_obj.get("cov_coverage")
+        ),
+        returns_coverage_diag=(
+            patched.get("returns_coverage_diag")
+            if isinstance(patched.get("returns_coverage_diag"), dict)
+            else snapshot_obj.get("returns_coverage_diag")
+        ),
+        asset_policy_mode=str(patched.get("asset_policy_mode") or snapshot_obj.get("asset_policy_mode") or "FORCE_PROXY"),
+        execution_proxy_used=bool(snapshot_obj.get("execution_proxy_used", snapshot_obj.get("ticker_proxy_used", False))),
+        proxy_scope=_norm_text(snapshot_obj.get("proxy_scope") or snapshot_obj.get("ticker_proxy_scope")),
+    )
+    existing_no_trade = patched.get("no_trade_summary")
+    if not isinstance(existing_no_trade, dict):
+        patched["no_trade_summary"] = computed_no_trade_summary
+        changed = True
+    else:
+        merged_no_trade = dict(computed_no_trade_summary)
+        merged_no_trade.update(existing_no_trade)
+        if merged_no_trade != existing_no_trade:
+            patched["no_trade_summary"] = merged_no_trade
+            changed = True
+    computed_health = build_risk_model_health(
+        report=patched,
+        snapshot=snapshot_obj,
+        daily_fields={
+            "no_trade_summary": patched.get("no_trade_summary"),
+            "cost_summary": patched.get("cost_summary"),
+            "execution_summary": patched.get("execution_summary"),
+            "risk_gate_decision": patched.get("risk_gate_decision"),
+            "cov_coverage": patched.get("cov_coverage"),
+            "returns_coverage_diag": patched.get("returns_coverage_diag"),
+            "asset_policy_mode": patched.get("asset_policy_mode"),
+            "execution_proxy_used": patched.get("ticker_proxy_used"),
+        },
+    )
+    existing_health = patched.get("risk_model_health")
+    if not isinstance(existing_health, dict):
+        patched["risk_model_health"] = computed_health
+        changed = True
+    else:
+        merged_health = dict(computed_health)
+        for key, value in existing_health.items():
+            if isinstance(value, dict) and isinstance(merged_health.get(key), dict):
+                merged_nested = dict(merged_health.get(key, {}))
+                merged_nested.update(value)
+                merged_health[key] = merged_nested
+            else:
+                merged_health[key] = value
+        if merged_health != existing_health:
+            patched["risk_model_health"] = merged_health
+            changed = True
     return patched, changed
 
 
@@ -784,6 +881,402 @@ def _apply_trade_data_quality_checks(trades: Dict[str, Any], equity: Dict[str, A
     return out
 
 
+def _normalize_reason_counts(raw: Any) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for reason, count in raw.items():
+        reason_key = str(reason or "").strip().upper()
+        if not reason_key:
+            continue
+        out[reason_key] = out.get(reason_key, 0) + int(_as_float(count, 0.0))
+    return out
+
+
+def _extract_gate_reason(snapshot: Dict[str, Any], gate_decision: Dict[str, Any]) -> str:
+    if isinstance(gate_decision, dict):
+        gd_reason = str(gate_decision.get("reason", "")).strip()
+        if gd_reason:
+            return gd_reason
+    skip_reason = str((snapshot or {}).get("rebalance_skipped_reason", "")).strip()
+    if skip_reason.startswith("risk_gate:"):
+        return skip_reason.split(":", 1)[1]
+    if skip_reason == "risk_gate_stub":
+        return skip_reason
+    rg_reason = str((snapshot or {}).get("risk_gate_reason", "")).strip()
+    if rg_reason:
+        return rg_reason
+    return ""
+
+
+def _infer_proxy_scope(asset_policy_mode: str, execution_proxy_used: bool, snapshot: Dict[str, Any], proxy_scope: Optional[str] = None) -> str:
+    scope_raw = _norm_text(proxy_scope or snapshot.get("proxy_scope") or snapshot.get("ticker_proxy_scope")).lower()
+    if scope_raw in {"risk_only", "risk_and_execution", "off"}:
+        return scope_raw
+    mode = str(asset_policy_mode or "").strip().upper()
+    if mode == "FORCE_PROXY":
+        return "risk_and_execution" if bool(execution_proxy_used) else "risk_only"
+    return "off"
+
+
+def _build_cost_summary(snapshot: Dict[str, Any], trades: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot_obj = snapshot if isinstance(snapshot, dict) else {}
+    trades_obj = trades if isinstance(trades, dict) else {}
+    raw_cost = snapshot_obj.get("cost_summary", {}) if isinstance(snapshot_obj.get("cost_summary"), dict) else {}
+    cost_model = snapshot_obj.get("cost_model", {}) if isinstance(snapshot_obj.get("cost_model"), dict) else {}
+    totals_raw = raw_cost.get("totals", {}) if isinstance(raw_cost.get("totals"), dict) else {}
+
+    total = _as_float(totals_raw.get("total"), _as_float(raw_cost.get("total"), 0.0))
+    fee = _as_float(totals_raw.get("fee"), _as_float(raw_cost.get("fee"), 0.0))
+    slippage = _as_float(totals_raw.get("slippage"), _as_float(raw_cost.get("slippage"), 0.0))
+    impact = _as_float(totals_raw.get("impact"), _as_float(raw_cost.get("impact"), 0.0))
+
+    traded_notional = _as_float(
+        raw_cost.get("traded_notional"),
+        abs(_as_float(trades_obj.get("buy_notional"), 0.0)) + abs(_as_float(trades_obj.get("sell_notional"), 0.0)),
+    )
+    trades_count = int(
+        _as_float(
+            raw_cost.get("trades_count"),
+            _as_float(raw_cost.get("num_trades"), _as_float(trades_obj.get("trade_count"), 0.0)),
+        )
+    )
+    cost_bps = _as_float(raw_cost.get("cost_bps"), None)  # type: ignore[arg-type]
+    if cost_bps is None:
+        cost_bps = float(total / traded_notional * 10000.0) if traded_notional > 1e-12 else 0.0
+
+    apply_to = raw_cost.get("apply_to", ["BUY", "SELL"])
+    if not isinstance(apply_to, list):
+        apply_to = ["BUY", "SELL"]
+
+    return {
+        "schema_version": 1,
+        "enabled": bool(raw_cost.get("enabled", cost_model.get("enabled", False))),
+        "currency": str(raw_cost.get("currency", "USD") or "USD"),
+        "slippage_bps": _as_float(raw_cost.get("slippage_bps"), 0.0),
+        "fee_per_trade": _as_float(raw_cost.get("fee_per_trade"), 0.0),
+        "fee_bps": _as_float(raw_cost.get("fee_bps"), 0.0),
+        "min_fee": _as_float(raw_cost.get("min_fee"), 0.0),
+        "apply_to": [str(x).upper().strip() for x in apply_to if str(x).strip()],
+        "note": str(raw_cost.get("note", "simple bps slippage + fee") or "simple bps slippage + fee"),
+        "totals": {
+            "total": float(total),
+            "fee": float(fee),
+            "slippage": float(slippage),
+            "impact": float(impact),
+        },
+        "trades_count": int(max(0, trades_count)),
+        "traded_notional": float(max(0.0, traded_notional)),
+        "cost_bps": float(cost_bps),
+    }
+
+
+def _build_performance_summary(equity: Dict[str, Any], cost_summary: Dict[str, Any], trades: Dict[str, Any]) -> Dict[str, Any]:
+    equity_obj = equity if isinstance(equity, dict) else {}
+    cost_obj = cost_summary if isinstance(cost_summary, dict) else {}
+    trades_obj = trades if isinstance(trades, dict) else {}
+    totals = cost_obj.get("totals", {}) if isinstance(cost_obj.get("totals"), dict) else {}
+
+    total_cost = _as_float(totals.get("total"), _as_float(cost_obj.get("total"), 0.0))
+    traded_notional = _as_float(
+        cost_obj.get("traded_notional"),
+        abs(_as_float(trades_obj.get("buy_notional"), 0.0)) + abs(_as_float(trades_obj.get("sell_notional"), 0.0)),
+    )
+    pnl = equity_obj.get("pnl")
+    pnl_val = _as_float(pnl, None)  # type: ignore[arg-type]
+    if pnl_val is None:
+        gross_pnl = None
+        net_pnl = None
+    else:
+        net_pnl = float(pnl_val)
+        gross_pnl = float(net_pnl + total_cost)
+    end_equity = _as_float(equity_obj.get("end_equity"), 0.0)
+    cost_to_equity_pct = float(total_cost / end_equity * 100.0) if end_equity > 1e-12 else None
+
+    return {
+        "schema_version": 1,
+        "gross_pnl_estimate": gross_pnl,
+        "net_pnl_estimate": net_pnl,
+        "traded_notional": float(max(0.0, traded_notional)),
+        "cost_total": float(total_cost),
+        "cost_bps": float(cost_obj.get("cost_bps", float(total_cost / traded_notional * 10000.0) if traded_notional > 1e-12 else 0.0)),
+        "cost_to_equity_pct": cost_to_equity_pct,
+    }
+
+
+def _extract_price_health_counts(snapshot_obj: Dict[str, Any], returns_missing_count: Optional[int] = None) -> Dict[str, Any]:
+    snap = snapshot_obj if isinstance(snapshot_obj, dict) else {}
+    missing_count = None
+    stale_count = None
+    live_count = None
+
+    price_debug = snap.get("price_debug", {}) if isinstance(snap.get("price_debug"), dict) else {}
+    if isinstance(price_debug, dict) and price_debug:
+        m = 0
+        s = 0
+        l = 0
+        for _, row in price_debug.items():
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status", "")).upper().strip()
+            if status == "MISSING":
+                m += 1
+            elif status == "STALE":
+                s += 1
+            elif status in ("LIVE", "RECENT"):
+                l += 1
+        missing_count = int(m)
+        stale_count = int(s)
+        live_count = int(l)
+    else:
+        execution_summary = snap.get("execution_summary", {}) if isinstance(snap.get("execution_summary"), dict) else {}
+        skip_reasons = execution_summary.get("skip_reasons", {}) if isinstance(execution_summary.get("skip_reasons"), dict) else {}
+        if isinstance(skip_reasons, dict) and skip_reasons:
+            missing_count = int(_as_float(skip_reasons.get("PRICE_MISSING"), 0.0))
+            stale_count = int(_as_float(skip_reasons.get("PRICE_STALE"), 0.0))
+
+    if missing_count is None and returns_missing_count is not None:
+        missing_count = int(max(0, int(returns_missing_count)))
+
+    return {
+        "missing_count": missing_count,
+        "stale_count": stale_count,
+        "live_count": live_count,
+    }
+
+
+def build_risk_model_health(
+    report: Optional[Dict[str, Any]],
+    snapshot: Optional[Dict[str, Any]] = None,
+    daily_fields: Optional[Dict[str, Any]] = None,
+    telemetry_optional: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    report_obj = report if isinstance(report, dict) else {}
+    snapshot_obj = snapshot if isinstance(snapshot, dict) else {}
+    fields = daily_fields if isinstance(daily_fields, dict) else {}
+    _ = telemetry_optional  # reserved for future expansion
+
+    date_str = str(report_obj.get("date", "")).strip()
+    no_trade = fields.get("no_trade_summary")
+    if not isinstance(no_trade, dict):
+        no_trade = report_obj.get("no_trade_summary", {}) if isinstance(report_obj.get("no_trade_summary"), dict) else {}
+    risk_gate_decision = fields.get("risk_gate_decision")
+    if not isinstance(risk_gate_decision, dict):
+        risk_gate_decision = report_obj.get("risk_gate_decision", {}) if isinstance(report_obj.get("risk_gate_decision"), dict) else {}
+    cov_coverage = fields.get("cov_coverage")
+    if not isinstance(cov_coverage, dict):
+        cov_coverage = report_obj.get("cov_coverage", {}) if isinstance(report_obj.get("cov_coverage"), dict) else {}
+    returns_diag = fields.get("returns_coverage_diag")
+    if not isinstance(returns_diag, dict):
+        returns_diag = report_obj.get("returns_coverage_diag", {}) if isinstance(report_obj.get("returns_coverage_diag"), dict) else {}
+    execution_summary = fields.get("execution_summary")
+    if not isinstance(execution_summary, dict):
+        execution_summary = (
+            report_obj.get("execution_summary", {})
+            if isinstance(report_obj.get("execution_summary"), dict)
+            else snapshot_obj.get("execution_summary", {})
+            if isinstance(snapshot_obj.get("execution_summary"), dict)
+            else {}
+        )
+    cost_summary = fields.get("cost_summary")
+    if not isinstance(cost_summary, dict):
+        cost_summary = report_obj.get("cost_summary", {}) if isinstance(report_obj.get("cost_summary"), dict) else {}
+
+    gate_reason = str(risk_gate_decision.get("reason", "")).strip()
+    if not gate_reason:
+        gate_reason = str(no_trade.get("gate_reason", "")).strip()
+    if not gate_reason:
+        skip_reason = str(snapshot_obj.get("rebalance_skipped_reason", report_obj.get("rebalance_skipped_reason", ""))).strip()
+        if skip_reason.startswith("risk_gate:"):
+            gate_reason = skip_reason.split(":", 1)[1]
+        elif skip_reason == "risk_gate_stub":
+            gate_reason = skip_reason
+
+    blockers = no_trade.get("top_blockers", []) if isinstance(no_trade.get("top_blockers"), list) else []
+    blocker_reasons = {str(x.get("reason", "")).upper().strip() for x in blockers if isinstance(x, dict)}
+    gate_triggered = bool(gate_reason) or ("RISK_GATE" in blocker_reasons)
+    if not gate_reason and gate_triggered:
+        gate_reason = "RISK_GATE"
+
+    returns_items = returns_diag.get("items", []) if isinstance(returns_diag.get("items"), list) else []
+    returns_missing_top: List[Dict[str, Any]] = []
+    for row in returns_items[:10]:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker", "")).upper().strip()
+        if not ticker:
+            continue
+        reason = str(row.get("reason_code", row.get("reason", "UNKNOWN"))).upper().strip() or "UNKNOWN"
+        returns_missing_top.append({"ticker": ticker, "reason": reason})
+    returns_missing_count = int(len(returns_items))
+
+    cov_missing_count = cov_coverage.get("missing_count", None) if isinstance(cov_coverage, dict) else None
+    if cov_missing_count is None and isinstance(cov_coverage.get("missing_tickers"), list):
+        cov_missing_count = int(len(cov_coverage.get("missing_tickers", [])))
+
+    price_counts = _extract_price_health_counts(snapshot_obj if snapshot_obj else report_obj, returns_missing_count=returns_missing_count)
+
+    skip_reasons = execution_summary.get("skip_reasons", {}) if isinstance(execution_summary.get("skip_reasons"), dict) else {}
+    skip_rows = []
+    for reason, count in sorted(skip_reasons.items(), key=lambda kv: (-int(_as_float(kv[1], 0.0)), str(kv[0]))):
+        skip_rows.append({"reason": str(reason), "count": int(_as_float(count, 0.0))})
+        if len(skip_rows) >= 8:
+            break
+
+    mode = str(
+        fields.get("asset_policy_mode")
+        or report_obj.get("asset_policy_mode")
+        or snapshot_obj.get("asset_policy_mode")
+        or "FORCE_PROXY"
+    ).strip().upper() or "FORCE_PROXY"
+    execution_proxy_used = bool(
+        fields.get("execution_proxy_used")
+        if fields.get("execution_proxy_used") is not None
+        else report_obj.get("execution_proxy_used", report_obj.get("ticker_proxy_used", snapshot_obj.get("execution_proxy_used", snapshot_obj.get("ticker_proxy_used", False))))
+    )
+
+    totals = cost_summary.get("totals", {}) if isinstance(cost_summary.get("totals"), dict) else {}
+    cost_total = _as_float(totals.get("total"), _as_float(cost_summary.get("cost_total"), _as_float(cost_summary.get("total"), 0.0)))
+    cost_bps = _as_float(cost_summary.get("cost_bps"), None)  # type: ignore[arg-type]
+    if cost_bps is None:
+        traded_notional = _as_float(cost_summary.get("traded_notional"), 0.0)
+        cost_bps = float(cost_total / traded_notional * 10000.0) if traded_notional > 1e-12 else 0.0
+    trades_count = int(
+        _as_float(
+            cost_summary.get("trades_count"),
+            _as_float(cost_summary.get("num_trades"), _as_float(execution_summary.get("orders_place"), 0.0)),
+        )
+    )
+
+    return {
+        "schema_version": 1,
+        "date": date_str,
+        "risk_gate": {
+            "triggered": bool(gate_triggered),
+            "reason": gate_reason,
+            "metric_name": str(risk_gate_decision.get("metric_name", "")).strip(),
+            "metric_value": risk_gate_decision.get("metric_value"),
+            "threshold": risk_gate_decision.get("threshold"),
+            "stage": str(risk_gate_decision.get("stage", "unknown") or "unknown"),
+        },
+        "coverage": {
+            "cov_known_weight": _as_float(cov_coverage.get("known_weight"), None),  # type: ignore[arg-type]
+            "cov_missing_weight_total": _as_float(cov_coverage.get("missing_weight_total"), None),  # type: ignore[arg-type]
+            "cov_missing_count": int(_as_float(cov_missing_count, 0.0)) if cov_missing_count is not None else None,
+            "returns_missing_count": int(returns_missing_count),
+            "returns_missing_top": returns_missing_top,
+        },
+        "prices": price_counts,
+        "execution": {
+            "orders_place": int(_as_float(execution_summary.get("orders_place"), 0.0)),
+            "orders_skip": int(_as_float(execution_summary.get("orders_skip"), 0.0)),
+            "top_skip_reasons": skip_rows,
+        },
+        "policy": {
+            "asset_policy_mode": mode,
+            "execution_proxy_used": bool(execution_proxy_used),
+        },
+        "cost": {
+            "enabled": bool(cost_summary.get("enabled", False)),
+            "cost_total": float(cost_total),
+            "cost_bps": float(cost_bps) if cost_bps is not None else None,
+            "trades_count": int(max(0, trades_count)),
+        },
+    }
+
+
+def build_no_trade_summary(
+    trades: Optional[Dict[str, Any]],
+    snapshot: Optional[Dict[str, Any]],
+    risk_gate_decision: Optional[Dict[str, Any]] = None,
+    cov_coverage: Optional[Dict[str, Any]] = None,
+    returns_coverage_diag: Optional[Dict[str, Any]] = None,
+    asset_policy_mode: Optional[str] = None,
+    execution_proxy_used: Optional[bool] = None,
+    proxy_scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    trades_obj = trades if isinstance(trades, dict) else {}
+    snapshot_obj = snapshot if isinstance(snapshot, dict) else {}
+    gate_obj = risk_gate_decision if isinstance(risk_gate_decision, dict) else {}
+    cov_obj = cov_coverage if isinstance(cov_coverage, dict) else {}
+    returns_obj = returns_coverage_diag if isinstance(returns_coverage_diag, dict) else {}
+    execution_summary = (
+        dict(snapshot_obj.get("execution_summary"))
+        if isinstance(snapshot_obj.get("execution_summary"), dict)
+        else {}
+    )
+    reason_counts = _normalize_reason_counts(execution_summary.get("skip_reasons", {}))
+    orders_place = int(_as_float(execution_summary.get("orders_place"), 0.0))
+    orders_skip = int(_as_float(execution_summary.get("orders_skip"), 0.0))
+    trade_count = int(_as_float(trades_obj.get("trade_count"), 0.0))
+    if orders_place <= 0 and trade_count > 0:
+        orders_place = trade_count
+    has_trade = bool(orders_place > 0 or trade_count > 0)
+
+    blockers = []
+    for reason_key, count in sorted(reason_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0]))):
+        blockers.append({"reason": str(reason_key), "count": int(count)})
+    blockers = blockers[:8]
+
+    gate_reason = _extract_gate_reason(snapshot_obj, gate_obj)
+    if not blockers and gate_reason and not has_trade:
+        blockers = [{"reason": "RISK_GATE", "count": 1}]
+
+    metric_name = str(gate_obj.get("metric_name", "")).strip()
+    metric_value = gate_obj.get("metric_value", None)
+    threshold_value = gate_obj.get("threshold", None)
+    metric_stage = str(gate_obj.get("stage", "")).strip()
+
+    returns_missing_top: List[Dict[str, Any]] = []
+    items = returns_obj.get("items", []) if isinstance(returns_obj.get("items"), list) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ticker = str(item.get("ticker", "")).upper().strip()
+        if not ticker:
+            continue
+        reason_code = str(item.get("reason_code", "UNKNOWN")).upper().strip() or "UNKNOWN"
+        returns_missing_top.append({"ticker": ticker, "reason": reason_code})
+        if len(returns_missing_top) >= 5:
+            break
+
+    mode = str(asset_policy_mode or snapshot_obj.get("asset_policy_mode") or "FORCE_PROXY").strip().upper() or "FORCE_PROXY"
+    proxy_used = bool(
+        execution_proxy_used
+        if execution_proxy_used is not None
+        else snapshot_obj.get("execution_proxy_used", snapshot_obj.get("ticker_proxy_used", False))
+    )
+    inferred_scope = _infer_proxy_scope(mode, proxy_used, snapshot_obj, proxy_scope=proxy_scope)
+
+    cov_known_weight = _as_float(cov_obj.get("known_weight"), None)  # type: ignore[arg-type]
+    cov_missing_weight_total = _as_float(cov_obj.get("missing_weight_total"), None)  # type: ignore[arg-type]
+
+    return {
+        "schema_version": 1,
+        "has_trade": bool(has_trade),
+        "orders_place": int(max(0, orders_place)),
+        "orders_skip": int(max(0, orders_skip)),
+        "top_blockers": blockers,
+        "gate_reason": gate_reason or "",
+        "gate_metric": {
+            "metric_name": metric_name,
+            "metric_value": metric_value,
+            "threshold": threshold_value,
+            "stage": metric_stage,
+        },
+        "data_issues": {
+            "returns_missing_top": returns_missing_top,
+            "cov_known_weight": cov_known_weight,
+            "cov_missing_weight_total": cov_missing_weight_total,
+        },
+        "policy": {
+            "asset_policy_mode": mode,
+            "execution_proxy_used": bool(proxy_used),
+            "proxy_scope": inferred_scope,
+        },
+    }
+
+
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
@@ -1005,6 +1498,7 @@ def _build_index_entry(report: Dict[str, Any], report_path: str) -> Dict[str, An
     trades = report.get("trades", {}) if isinstance(report.get("trades"), dict) else {}
     risky = report.get("risk", {}) if isinstance(report.get("risk"), dict) else {}
     conviction = report.get("conviction", {}) if isinstance(report.get("conviction"), dict) else {}
+    no_trade = report.get("no_trade_summary", {}) if isinstance(report.get("no_trade_summary"), dict) else {}
     risky_list = risky.get("risky_tickers", []) if isinstance(risky.get("risky_tickers"), list) else []
 
     return {
@@ -1028,6 +1522,16 @@ def _build_index_entry(report: Dict[str, Any], report_path: str) -> Dict[str, An
         "conviction_counts": {
             "long_term": len(conviction.get("long_term", [])) if isinstance(conviction.get("long_term"), list) else 0,
             "short_term": len(conviction.get("short_term", [])) if isinstance(conviction.get("short_term"), list) else 0,
+        },
+        "no_trade_summary": {
+            "has_trade": bool(no_trade.get("has_trade", False)),
+            "orders_place": int(_as_float(no_trade.get("orders_place"), 0.0)),
+            "orders_skip": int(_as_float(no_trade.get("orders_skip"), 0.0)),
+            "top_blockers": [
+                {"reason": str(x.get("reason", "")), "count": int(_as_float(x.get("count"), 0.0))}
+                for x in (no_trade.get("top_blockers", []) if isinstance(no_trade.get("top_blockers"), list) else [])[:3]
+                if isinstance(x, dict)
+            ],
         },
     }
 
@@ -1112,6 +1616,52 @@ def generate_daily_report(
     trades = _apply_trade_data_quality_checks(trades, equity)
     risk = _build_risk_section(positions_end, snapshot, top_n=5)
     conviction = _build_conviction_section(report_date, positions_end, trades, history)
+    risk_gate_decision = (
+        dict(snapshot.get("risk_gate_decision"))
+        if isinstance(snapshot.get("risk_gate_decision"), dict)
+        else {}
+    )
+    execution_summary = (
+        dict(snapshot.get("execution_summary"))
+        if isinstance(snapshot.get("execution_summary"), dict)
+        else {}
+    )
+    no_trade_summary = build_no_trade_summary(
+        trades=trades,
+        snapshot=snapshot,
+        risk_gate_decision=risk_gate_decision,
+        cov_coverage=snapshot.get("cov_coverage") if isinstance(snapshot.get("cov_coverage"), dict) else {},
+        returns_coverage_diag=snapshot.get("returns_coverage_diag") if isinstance(snapshot.get("returns_coverage_diag"), dict) else {},
+        asset_policy_mode=str(snapshot.get("asset_policy_mode") or "FORCE_PROXY"),
+        execution_proxy_used=bool(snapshot.get("execution_proxy_used", snapshot.get("ticker_proxy_used", False))),
+        proxy_scope=_norm_text(snapshot.get("proxy_scope") or snapshot.get("ticker_proxy_scope")),
+    )
+    cost_summary = _build_cost_summary(snapshot, trades)
+    performance_summary = _build_performance_summary(equity, cost_summary, trades)
+    risk_model_health = build_risk_model_health(
+        report={
+            "date": date_str,
+            "execution_summary": execution_summary,
+            "risk_gate_decision": risk_gate_decision,
+            "cov_coverage": snapshot.get("cov_coverage") if isinstance(snapshot.get("cov_coverage"), dict) else {},
+            "returns_coverage_diag": snapshot.get("returns_coverage_diag") if isinstance(snapshot.get("returns_coverage_diag"), dict) else {"schema_version": 1, "items": []},
+            "asset_policy_mode": str(snapshot.get("asset_policy_mode") or "FORCE_PROXY"),
+            "execution_proxy_used": bool(snapshot.get("execution_proxy_used", snapshot.get("ticker_proxy_used", False))),
+            "cost_summary": cost_summary,
+            "no_trade_summary": no_trade_summary,
+        },
+        snapshot=snapshot,
+        daily_fields={
+            "no_trade_summary": no_trade_summary,
+            "cost_summary": cost_summary,
+            "execution_summary": execution_summary,
+            "risk_gate_decision": risk_gate_decision,
+            "cov_coverage": snapshot.get("cov_coverage") if isinstance(snapshot.get("cov_coverage"), dict) else {},
+            "returns_coverage_diag": snapshot.get("returns_coverage_diag") if isinstance(snapshot.get("returns_coverage_diag"), dict) else {"schema_version": 1, "items": []},
+            "asset_policy_mode": str(snapshot.get("asset_policy_mode") or "FORCE_PROXY"),
+            "execution_proxy_used": bool(snapshot.get("execution_proxy_used", snapshot.get("ticker_proxy_used", False))),
+        },
+    )
 
     generated_at = datetime.now(_coerce_zone(tz)).isoformat()
     price_fetch_stats = snapshot.get("price_fetch_stats", {})
@@ -1157,6 +1707,11 @@ def generate_daily_report(
         },
         "trades": trades,
         "positions_end": positions_end,
+        "execution_summary": execution_summary,
+        "cost_summary": cost_summary,
+        "performance_summary": performance_summary,
+        "risk_model_health": risk_model_health,
+        "risk_gate_decision": risk_gate_decision,
         "cov_coverage": (
             dict(snapshot.get("cov_coverage"))
             if isinstance(snapshot.get("cov_coverage"), dict)
@@ -1173,6 +1728,18 @@ def generate_daily_report(
             if isinstance(snapshot.get("ticker_proxy_map_used"), list)
             else []
         ),
+        "asset_policy_mode": str(snapshot.get("asset_policy_mode") or "FORCE_PROXY"),
+        "asset_policy_decisions": (
+            list(snapshot.get("asset_policy_decisions"))
+            if isinstance(snapshot.get("asset_policy_decisions"), list)
+            else []
+        ),
+        "asset_policy_summary": (
+            dict(snapshot.get("asset_policy_summary"))
+            if isinstance(snapshot.get("asset_policy_summary"), dict)
+            else {"counts": {"ALLOW_ORIGINAL": 0, "USE_PROXY": 0, "DISABLE": 0}, "top_reasons": []}
+        ),
+        "no_trade_summary": no_trade_summary,
         "risk": risk,
         "conviction": conviction,
         "meta": {
@@ -1291,12 +1858,40 @@ def aggregate_reports(reports: List[Dict[str, Any]], window_days: int) -> Dict[s
     pnl_available = 0
     growth = 1.0
     pnl_pct_available = 0
+    cost_total_sum = 0.0
+    cost_fee_sum = 0.0
+    cost_slippage_sum = 0.0
+    cost_traded_notional_sum = 0.0
 
     risk_stat: Dict[str, Dict[str, Any]] = {}
     long_stat: Dict[str, Dict[str, Any]] = {}
     short_stat: Dict[str, Dict[str, Any]] = {}
     quality_issues: List[str] = []
     aggregate_quality = "ok"
+    nt_orders_place = 0
+    nt_orders_skip = 0
+    nt_has_trade = False
+    blocker_counter: Counter = Counter()
+    gate_reason_counter: Counter = Counter()
+    returns_missing_counter: Counter = Counter()
+    last_gate_metric: Dict[str, Any] = {"metric_name": "", "metric_value": None, "threshold": None, "stage": ""}
+    last_cov_known_weight = None
+    last_cov_missing_weight_total = None
+    latest_policy_mode = "FORCE_PROXY"
+    latest_proxy_scope = "off"
+    any_execution_proxy_used = False
+    health_triggered_any = False
+    health_trigger_count = 0
+    health_reason_counter: Counter = Counter()
+    health_metric_values: List[float] = []
+    health_orders_place = 0
+    health_orders_skip = 0
+    health_missing_count = 0
+    health_stale_count = 0
+    health_live_count = 0
+    health_cost_total = 0.0
+    health_cost_bps_vals: List[float] = []
+    health_daily_rows: List[Dict[str, Any]] = []
 
     for report in selected:
         trades = report.get("trades", {}) if isinstance(report.get("trades"), dict) else {}
@@ -1321,6 +1916,16 @@ def aggregate_reports(reports: List[Dict[str, Any]], window_days: int) -> Dict[s
         if pnl_pct is not None:
             growth *= (1.0 + _as_float(pnl_pct, 0.0) / 100.0)
             pnl_pct_available += 1
+
+        cost_summary = report.get("cost_summary", {}) if isinstance(report.get("cost_summary"), dict) else {}
+        totals = cost_summary.get("totals", {}) if isinstance(cost_summary.get("totals"), dict) else {}
+        cost_total_sum += _as_float(totals.get("total"), _as_float(cost_summary.get("total"), 0.0))
+        cost_fee_sum += _as_float(totals.get("fee"), _as_float(cost_summary.get("fee"), 0.0))
+        cost_slippage_sum += _as_float(totals.get("slippage"), _as_float(cost_summary.get("slippage"), 0.0))
+        cost_traded_notional_sum += _as_float(
+            cost_summary.get("traded_notional"),
+            abs(_as_float(trades.get("buy_notional"), 0.0)) + abs(_as_float(trades.get("sell_notional"), 0.0)),
+        )
 
         risk = report.get("risk", {}) if isinstance(report.get("risk"), dict) else {}
         for item in risk.get("risky_tickers", []) if isinstance(risk.get("risky_tickers"), list) else []:
@@ -1357,6 +1962,130 @@ def aggregate_reports(reports: List[Dict[str, Any]], window_days: int) -> Dict[s
                 info["last_why"] = why or info["last_why"]
                 info["last_date"] = str(report.get("date", ""))
 
+        no_trade = report.get("no_trade_summary")
+        if not isinstance(no_trade, dict):
+            no_trade = build_no_trade_summary(
+                trades=trades,
+                snapshot=report,
+                risk_gate_decision=report.get("risk_gate_decision") if isinstance(report.get("risk_gate_decision"), dict) else {},
+                cov_coverage=report.get("cov_coverage") if isinstance(report.get("cov_coverage"), dict) else {},
+                returns_coverage_diag=report.get("returns_coverage_diag") if isinstance(report.get("returns_coverage_diag"), dict) else {},
+                asset_policy_mode=str(report.get("asset_policy_mode") or "FORCE_PROXY"),
+                execution_proxy_used=bool(report.get("execution_proxy_used", report.get("ticker_proxy_used", False))),
+                proxy_scope=_norm_text(report.get("proxy_scope") or report.get("ticker_proxy_scope")),
+            )
+
+        nt_orders_place += int(_as_float(no_trade.get("orders_place"), 0.0))
+        nt_orders_skip += int(_as_float(no_trade.get("orders_skip"), 0.0))
+        nt_has_trade = bool(nt_has_trade or bool(no_trade.get("has_trade", False)))
+
+        blockers = no_trade.get("top_blockers", []) if isinstance(no_trade.get("top_blockers"), list) else []
+        for row in blockers:
+            if not isinstance(row, dict):
+                continue
+            reason = str(row.get("reason", "")).strip().upper()
+            if not reason:
+                continue
+            blocker_counter[reason] += int(_as_float(row.get("count"), 0.0))
+
+        gate_reason = str(no_trade.get("gate_reason", "")).strip()
+        if gate_reason:
+            gate_reason_counter[gate_reason] += 1
+
+        gate_metric = no_trade.get("gate_metric", {}) if isinstance(no_trade.get("gate_metric"), dict) else {}
+        metric_name = str(gate_metric.get("metric_name", "")).strip()
+        if metric_name:
+            last_gate_metric = {
+                "metric_name": metric_name,
+                "metric_value": gate_metric.get("metric_value"),
+                "threshold": gate_metric.get("threshold"),
+                "stage": str(gate_metric.get("stage", "")).strip(),
+            }
+
+        data_issues = no_trade.get("data_issues", {}) if isinstance(no_trade.get("data_issues"), dict) else {}
+        returns_missing_top = data_issues.get("returns_missing_top", []) if isinstance(data_issues.get("returns_missing_top"), list) else []
+        for row in returns_missing_top:
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("ticker", "")).upper().strip()
+            reason = str(row.get("reason", "")).upper().strip() or "UNKNOWN"
+            if not ticker:
+                continue
+            returns_missing_counter[(ticker, reason)] += int(max(1, _as_float(row.get("count"), 1.0)))
+
+        cov_known = _as_float(data_issues.get("cov_known_weight"), None)  # type: ignore[arg-type]
+        cov_missing = _as_float(data_issues.get("cov_missing_weight_total"), None)  # type: ignore[arg-type]
+        if cov_known is not None:
+            last_cov_known_weight = cov_known
+        if cov_missing is not None:
+            last_cov_missing_weight_total = cov_missing
+
+        policy = no_trade.get("policy", {}) if isinstance(no_trade.get("policy"), dict) else {}
+        mode = str(policy.get("asset_policy_mode", "")).strip().upper()
+        if mode:
+            latest_policy_mode = mode
+        scope = str(policy.get("proxy_scope", "")).strip().lower()
+        if scope:
+            latest_proxy_scope = scope
+        any_execution_proxy_used = bool(any_execution_proxy_used or bool(policy.get("execution_proxy_used", False)))
+
+        report_health = report.get("risk_model_health")
+        if not isinstance(report_health, dict):
+            report_health = build_risk_model_health(
+                report=report,
+                snapshot=report,
+                daily_fields={
+                    "no_trade_summary": no_trade,
+                    "execution_summary": report.get("execution_summary") if isinstance(report.get("execution_summary"), dict) else {},
+                    "risk_gate_decision": report.get("risk_gate_decision") if isinstance(report.get("risk_gate_decision"), dict) else {},
+                    "cov_coverage": report.get("cov_coverage") if isinstance(report.get("cov_coverage"), dict) else {},
+                    "returns_coverage_diag": report.get("returns_coverage_diag") if isinstance(report.get("returns_coverage_diag"), dict) else {"schema_version": 1, "items": []},
+                    "asset_policy_mode": mode or latest_policy_mode,
+                    "execution_proxy_used": bool(policy.get("execution_proxy_used", False)),
+                    "cost_summary": report.get("cost_summary") if isinstance(report.get("cost_summary"), dict) else {},
+                },
+            )
+
+        gate_obj = report_health.get("risk_gate", {}) if isinstance(report_health.get("risk_gate"), dict) else {}
+        triggered = bool(gate_obj.get("triggered", False))
+        reason = str(gate_obj.get("reason", "")).strip()
+        metric_value = _as_float(gate_obj.get("metric_value"), None)  # type: ignore[arg-type]
+        if triggered:
+            health_trigger_count += 1
+            health_triggered_any = True
+        if reason:
+            health_reason_counter[reason] += 1
+        if metric_value is not None:
+            health_metric_values.append(float(metric_value))
+
+        ex_obj = report_health.get("execution", {}) if isinstance(report_health.get("execution"), dict) else {}
+        health_orders_place += int(_as_float(ex_obj.get("orders_place"), 0.0))
+        health_orders_skip += int(_as_float(ex_obj.get("orders_skip"), 0.0))
+
+        prices_obj = report_health.get("prices", {}) if isinstance(report_health.get("prices"), dict) else {}
+        health_missing_count += int(_as_float(prices_obj.get("missing_count"), 0.0))
+        health_stale_count += int(_as_float(prices_obj.get("stale_count"), 0.0))
+        health_live_count += int(_as_float(prices_obj.get("live_count"), 0.0))
+
+        cost_obj = report_health.get("cost", {}) if isinstance(report_health.get("cost"), dict) else {}
+        health_cost_total += float(_as_float(cost_obj.get("cost_total"), 0.0))
+        cost_bps_val = _as_float(cost_obj.get("cost_bps"), None)  # type: ignore[arg-type]
+        if cost_bps_val is not None:
+            health_cost_bps_vals.append(float(cost_bps_val))
+
+        cov_obj = report_health.get("coverage", {}) if isinstance(report_health.get("coverage"), dict) else {}
+        health_daily_rows.append(
+            {
+                "date": str(report.get("date", "")),
+                "triggered": bool(triggered),
+                "reason": reason,
+                "metric_value": metric_value,
+                "returns_missing_count": int(_as_float(cov_obj.get("returns_missing_count"), 0.0)),
+                "orders_place": int(_as_float(ex_obj.get("orders_place"), 0.0)),
+                "cost_bps": cost_bps_val,
+            }
+        )
+
     top_risky = list(risk_stat.values())
     for item in top_risky:
         cnt = max(1, int(item["count"]))
@@ -1368,6 +2097,66 @@ def aggregate_reports(reports: List[Dict[str, Any]], window_days: int) -> Dict[s
     long_items.sort(key=lambda x: int(x["count"]), reverse=True)
     short_items = list(short_stat.values())
     short_items.sort(key=lambda x: int(x["count"]), reverse=True)
+    blockers_sorted = [{"reason": k, "count": int(v)} for k, v in blocker_counter.most_common(8)]
+    gate_reason_final = gate_reason_counter.most_common(1)[0][0] if gate_reason_counter else ""
+    returns_missing_top_out = []
+    for (ticker, reason), count in returns_missing_counter.most_common(5):
+        returns_missing_top_out.append({"ticker": ticker, "reason": reason, "count": int(count)})
+    if last_cov_known_weight is None:
+        last_cov_known_weight = _as_float(
+            ((selected[-1].get("cov_coverage") or {}) if isinstance(selected[-1].get("cov_coverage"), dict) else {}).get("known_weight"),
+            None,  # type: ignore[arg-type]
+        )
+    if last_cov_missing_weight_total is None:
+        last_cov_missing_weight_total = _as_float(
+            ((selected[-1].get("cov_coverage") or {}) if isinstance(selected[-1].get("cov_coverage"), dict) else {}).get("missing_weight_total"),
+            None,  # type: ignore[arg-type]
+        )
+    if not latest_proxy_scope:
+        latest_proxy_scope = "risk_and_execution" if any_execution_proxy_used else "off"
+    no_trade_summary = {
+        "schema_version": 1,
+        "has_trade": bool(nt_has_trade or nt_orders_place > 0),
+        "orders_place": int(max(0, nt_orders_place)),
+        "orders_skip": int(max(0, nt_orders_skip)),
+        "top_blockers": blockers_sorted,
+        "gate_reason": gate_reason_final,
+        "gate_metric": dict(last_gate_metric),
+        "data_issues": {
+            "returns_missing_top": returns_missing_top_out,
+            "cov_known_weight": last_cov_known_weight,
+            "cov_missing_weight_total": last_cov_missing_weight_total,
+        },
+        "policy": {
+            "asset_policy_mode": latest_policy_mode,
+            "execution_proxy_used": bool(any_execution_proxy_used),
+            "proxy_scope": latest_proxy_scope,
+        },
+    }
+    risk_model_health = {
+        "schema_version": 1,
+        "window_days": int(window_days),
+        "report_count": int(len(selected)),
+        "triggered_any": bool(health_triggered_any),
+        "trigger_count": int(health_trigger_count),
+        "gate_reason_top": [{"reason": k, "count": int(v)} for k, v in health_reason_counter.most_common(5)],
+        "metric_avg": float(sum(health_metric_values) / len(health_metric_values)) if health_metric_values else None,
+        "metric_max": float(max(health_metric_values)) if health_metric_values else None,
+        "execution": {
+            "orders_place": int(health_orders_place),
+            "orders_skip": int(health_orders_skip),
+        },
+        "prices": {
+            "missing_count": int(health_missing_count),
+            "stale_count": int(health_stale_count),
+            "live_count": int(health_live_count),
+        },
+        "cost": {
+            "cost_total": float(health_cost_total),
+            "cost_bps_avg": float(sum(health_cost_bps_vals) / len(health_cost_bps_vals)) if health_cost_bps_vals else None,
+        },
+        "daily_rows": health_daily_rows[-7:],
+    }
 
     return {
         "status": "ok",
@@ -1385,10 +2174,16 @@ def aggregate_reports(reports: List[Dict[str, Any]], window_days: int) -> Dict[s
             "pnl": float(pnl_sum) if pnl_available > 0 else None,
             "pnl_pct": float((growth - 1.0) * 100.0) if pnl_pct_available > 0 else None,
             "pnl_available_days": int(pnl_available),
+            "cost_total": float(cost_total_sum),
+            "cost_fee": float(cost_fee_sum),
+            "cost_slippage": float(cost_slippage_sum),
+            "cost_bps": float(cost_total_sum / cost_traded_notional_sum * 10000.0) if cost_traded_notional_sum > 1e-12 else 0.0,
         },
         "top_risky_tickers": top_risky,
         "long_term_stats": long_items[:10],
         "short_term_stats": short_items[:10],
+        "no_trade_summary": no_trade_summary,
+        "risk_model_health": risk_model_health,
     }
 
 

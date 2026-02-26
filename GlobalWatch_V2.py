@@ -23,7 +23,12 @@ from atomic_io import atomic_write_json as io_atomic_write_json, safe_read_json 
 from market_time_filter import parse_iso_to_utc, sanitize_equity_rows
 from ui_window_presets import WINDOW_PRESETS, get_window_preset, format_till_now
 from ui_equity_window import filter_df_by_trading_day_window
-from ui_reports_window import select_window_effective_count
+from ui_reports_window import (
+    select_window_effective_count,
+    summarize_risk_model_health,
+    build_risk_health_trend_rows,
+    format_ui_health_preview,
+)
 from run_analytics import summarize_range as summarize_run_periods
 from risk_profile_ui_utils import (
     get_active_risk_profile as _ui_get_active_risk_profile,
@@ -7494,6 +7499,150 @@ def render_portfolio_monitor():
                             f"Range: {agg.get('from', 'N/A')} -> {agg.get('to', 'N/A')} | "
                             f"Reports: {int(_to_float(agg.get('report_count'), 0.0))}"
                         )
+
+                        no_trade_summary = agg.get("no_trade_summary", {}) if isinstance(agg.get("no_trade_summary"), dict) else {}
+                        st.markdown("**Why no trade today**")
+                        if no_trade_summary:
+                            nt_has_trade = bool(no_trade_summary.get("has_trade", False))
+                            nt_orders_place = int(_to_float(no_trade_summary.get("orders_place"), 0.0))
+                            nt_orders_skip = int(_to_float(no_trade_summary.get("orders_skip"), 0.0))
+                            nt_c1, nt_c2, nt_c3 = st.columns(3)
+                            nt_c1.metric("Has Trade", "Yes" if nt_has_trade else "No")
+                            nt_c2.metric("Orders Place", f"{nt_orders_place}")
+                            nt_c3.metric("Orders Skip", f"{nt_orders_skip}")
+                            if nt_has_trade:
+                                st.success("Trades occurred in this window.")
+                            else:
+                                st.warning("No trades observed in this window.")
+
+                            blockers = no_trade_summary.get("top_blockers", []) if isinstance(no_trade_summary.get("top_blockers"), list) else []
+                            blocker_rows = []
+                            for row in blockers:
+                                if not isinstance(row, dict):
+                                    continue
+                                blocker_rows.append(
+                                    {
+                                        "reason": str(row.get("reason", "")),
+                                        "count": int(_to_float(row.get("count"), 0.0)),
+                                    }
+                                )
+                            if blocker_rows:
+                                st.dataframe(pd.DataFrame(blocker_rows), width="stretch", hide_index=True)
+                            else:
+                                st.caption("No blocker statistics.")
+
+                            gate_reason = str(no_trade_summary.get("gate_reason", "")).strip()
+                            gate_metric = no_trade_summary.get("gate_metric", {}) if isinstance(no_trade_summary.get("gate_metric"), dict) else {}
+                            metric_name = str(gate_metric.get("metric_name", "")).strip()
+                            if gate_reason or metric_name:
+                                st.markdown("**Gate Detail**")
+                                st.caption(
+                                    f"reason={gate_reason or 'N/A'} | "
+                                    f"metric={metric_name or 'N/A'} "
+                                    f"value={gate_metric.get('metric_value')} "
+                                    f"threshold={gate_metric.get('threshold')} "
+                                    f"stage={gate_metric.get('stage')}"
+                                )
+
+                            data_issues = no_trade_summary.get("data_issues", {}) if isinstance(no_trade_summary.get("data_issues"), dict) else {}
+                            returns_missing_top = data_issues.get("returns_missing_top", []) if isinstance(data_issues.get("returns_missing_top"), list) else []
+                            if returns_missing_top:
+                                rows = []
+                                for row in returns_missing_top[:5]:
+                                    if not isinstance(row, dict):
+                                        continue
+                                    rows.append(
+                                        {
+                                            "ticker": str(row.get("ticker", "")),
+                                            "reason": str(row.get("reason", "")),
+                                            "count": int(_to_float(row.get("count"), 0.0)),
+                                        }
+                                    )
+                                if rows:
+                                    st.markdown("**Returns Missing Top**")
+                                    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                            cov_known = data_issues.get("cov_known_weight", None)
+                            cov_missing = data_issues.get("cov_missing_weight_total", None)
+                            if cov_known is not None or cov_missing is not None:
+                                st.caption(
+                                    f"cov_known_weight={cov_known} | "
+                                    f"cov_missing_weight_total={cov_missing}"
+                                )
+
+                            policy = no_trade_summary.get("policy", {}) if isinstance(no_trade_summary.get("policy"), dict) else {}
+                            st.caption(
+                                f"policy_mode={policy.get('asset_policy_mode')} | "
+                                f"execution_proxy_used={policy.get('execution_proxy_used')} | "
+                                f"proxy_scope={policy.get('proxy_scope')}"
+                            )
+                        else:
+                            st.caption("No no-trade summary available.")
+
+                        st.markdown("**Risk Model & Data Health**")
+                        latest_report = selected_reports[-1] if selected_reports else {}
+                        latest_health = (
+                            latest_report.get("risk_model_health", {})
+                            if isinstance(latest_report, dict) and isinstance(latest_report.get("risk_model_health"), dict)
+                            else {}
+                        )
+                        if not isinstance(latest_health, dict) or not latest_health:
+                            if daily_reporter is not None and hasattr(daily_reporter, "build_risk_model_health") and isinstance(latest_report, dict):
+                                try:
+                                    latest_health = daily_reporter.build_risk_model_health(
+                                        report=latest_report,
+                                        snapshot=latest_report,
+                                        daily_fields={
+                                            "no_trade_summary": latest_report.get("no_trade_summary", {}),
+                                            "execution_summary": latest_report.get("execution_summary", {}),
+                                            "risk_gate_decision": latest_report.get("risk_gate_decision", {}),
+                                            "cov_coverage": latest_report.get("cov_coverage", {}),
+                                            "returns_coverage_diag": latest_report.get("returns_coverage_diag", {}),
+                                            "asset_policy_mode": latest_report.get("asset_policy_mode", "FORCE_PROXY"),
+                                            "execution_proxy_used": latest_report.get("execution_proxy_used", latest_report.get("ticker_proxy_used", False)),
+                                            "cost_summary": latest_report.get("cost_summary", {}),
+                                        },
+                                    )
+                                except Exception:
+                                    latest_health = {}
+                        latest_summary = summarize_risk_model_health(
+                            {
+                                "date": latest_report.get("date", agg.get("to", "")) if isinstance(latest_report, dict) else agg.get("to", ""),
+                                "risk_model_health": latest_health,
+                            }
+                        )
+                        print(format_ui_health_preview(latest_summary))
+
+                        h1, h2, h3, h4 = st.columns(4)
+                        h1.metric("Gate Triggered", "Yes" if bool(latest_summary.get("triggered", False)) else "No")
+                        h2.metric("Orders Place", f"{int(_to_float(latest_summary.get('orders_place'), 0.0))}")
+                        h3.metric("Returns Missing", f"{int(_to_float(latest_summary.get('returns_missing_count'), 0.0))}")
+                        h4.metric("Cost bps", "N/A" if latest_summary.get("cost_bps", None) is None else f"{_to_float(latest_summary.get('cost_bps'), 0.0):.2f}")
+                        st.caption(
+                            f"reason={latest_summary.get('reason', 'N/A')} | "
+                            f"metric={latest_summary.get('metric_name', 'N/A')}:{latest_summary.get('metric_value')} "
+                            f"threshold={latest_summary.get('metric_threshold')} "
+                            f"stage={latest_summary.get('stage', 'unknown')}"
+                        )
+
+                        health_entry_count = min(7, len(entries_sorted))
+                        health_rows = []
+                        if health_entry_count > 0:
+                            health_entries = entries_sorted[-health_entry_count:]
+                            health_paths = []
+                            for entry in health_entries:
+                                path = str(entry.get("path", "")).strip()
+                                if path:
+                                    health_paths.append(path)
+                            health_reports = load_daily_reports_by_paths(health_paths, interval_seconds, refresh_nonce)
+                            health_rows = build_risk_health_trend_rows(
+                                [x for x in health_reports if isinstance(x, dict)],
+                                max_rows=7,
+                            )
+                        if health_rows:
+                            st.markdown("**Recent 7D Health Comparison**")
+                            st.dataframe(pd.DataFrame(health_rows), width="stretch", hide_index=True)
+                        else:
+                            st.caption("No 7D health rows.")
 
                         st.markdown("**Top Risky Tickers**")
                         risky_rows = []

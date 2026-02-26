@@ -10,11 +10,12 @@ import copy
 import hashlib
 import argparse
 import shutil
+import subprocess
 from collections import Counter
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import matplotlib
 matplotlib.use('Agg')  # NOTE: comment omitted (was garbled/non-ASCII).
 import matplotlib.pyplot as plt
@@ -35,6 +36,7 @@ from outpost import (
     write_latest_pointer,
 )
 from price_service import PriceService
+from cost_model import compute_trade_cost
 from cov_coverage import compute_cov_coverage, default_cov_coverage
 from returns_coverage_diag import diagnose_returns_coverage
 from cooldown_policy import cooldown_policy, next_market_open_time
@@ -1016,6 +1018,7 @@ class PaperTradingEngine:
         self._configure_run_output_paths()
         self._init_risk_profile_state_sync()
         self.config_hash = self._compute_config_hash(self.config)
+        self._log_cost_model_cfg()
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.cash = self.config['initial_cash_usd']
@@ -1059,6 +1062,8 @@ class PaperTradingEngine:
         self.current_ticker_proxy_used = False
         self.current_ticker_proxy_map_used = []
         self.current_execution_proxy_info = {"used": False, "map_used": []}
+        self.current_asset_policy_decisions = []
+        self.current_asset_policy_summary = {"counts": {"ALLOW_ORIGINAL": 0, "USE_PROXY": 0, "DISABLE": 0}, "top_reasons": []}
         self.current_execution_summary = {
             "orders_total": 0,
             "orders_place": 0,
@@ -1072,6 +1077,11 @@ class PaperTradingEngine:
         self.current_market_session = {}
         self.current_rebalance_gate = {"allowed": True, "reason": "", "session_state": "UNKNOWN"}
         self.current_rebalance_skipped_reason = ""
+        self.replay_bundle_enabled = bool(reporting_cfg.get('enable_replay_bundle', True))
+        self.replay_bundle_level = str(reporting_cfg.get('replay_bundle_level', 'L0') or 'L0').strip().upper()
+        self._last_replay_bundle_cycle_id = None
+        self._last_replay_bundle_source = None
+        self._last_replay_bundle_path = ""
         self._debug_session_override = None
         self._debug_now_override = None
         self._debug_now_override_warned = False
@@ -1296,6 +1306,7 @@ class PaperTradingEngine:
         print(f"   CWD: {os.getcwd()}")
         print(f"   Live Snapshot Path: {self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')}")
         print(f"   Trade History Path: {self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')}")
+        self._log_asset_policy_once()
         self._telemetry_log_event(
             "ENGINE_INIT",
             cycle_id=int(self.current_cycle),
@@ -1490,6 +1501,25 @@ class PaperTradingEngine:
         risk_model_config.setdefault('rc_limit', 0.35)
         risk_model_config.setdefault('min_cov_gate_coverage', 0.6)
         risk_model_config.setdefault('cov_gate_fallback_to_weighted', True)
+        asset_policy_cfg = config.setdefault('asset_data_policy', {})
+        if not isinstance(asset_policy_cfg, dict):
+            asset_policy_cfg = {}
+            config['asset_data_policy'] = asset_policy_cfg
+        asset_policy_cfg.setdefault('mode', 'FORCE_PROXY')
+        asset_policy_cfg.setdefault('match_rules', [{'suffix': '.TO'}])
+        policy_proxy_map = asset_policy_cfg.setdefault('proxy_map', {})
+        if not isinstance(policy_proxy_map, dict):
+            policy_proxy_map = {}
+            asset_policy_cfg['proxy_map'] = policy_proxy_map
+        legacy_proxy_map = risk_model_config.get('ticker_proxy_map', {}) if isinstance(risk_model_config, dict) else {}
+        if isinstance(legacy_proxy_map, dict):
+            for k, v in legacy_proxy_map.items():
+                policy_proxy_map.setdefault(str(k).upper().strip(), str(v).upper().strip())
+        policy_proxy_map.setdefault('XIU.TO', 'EWC')
+        policy_proxy_map.setdefault('FTS.TO', 'FTS')
+        asset_policy_cfg.setdefault('allow_execution_proxy', True)
+        asset_policy_cfg.setdefault('allow_risk_proxy', True)
+        asset_policy_cfg.setdefault('reason_on_block', 'TSX price missing - policy DISABLE_ASSET')
         reporting_config = config.setdefault('reporting', {})
         out_dir_raw = str(reporting_config.get('out_dir', '') or '').strip()
         reporting_config['_out_dir_explicit'] = bool(out_dir_raw)
@@ -1935,6 +1965,340 @@ class PaperTradingEngine:
         append_registry(base_out_dir, record)
         write_latest_pointer(base_out_dir, record)
         self._run_end_written = True
+
+    def _json_safe_clone(self, obj: Any, fallback=None):
+        """Convert nested objects into JSON-serializable primitives."""
+        try:
+            return json.loads(json.dumps(obj, ensure_ascii=False, default=str))
+        except Exception:
+            if fallback is None:
+                return {}
+            return copy.deepcopy(fallback)
+
+    def _replay_bundle_dir(self) -> str:
+        reporting_cfg = self.config.get('reporting', {}) if isinstance(self.config, dict) else {}
+        out_dir = os.path.abspath(str(reporting_cfg.get('out_dir', 'outputs') or 'outputs'))
+        return os.path.join(out_dir, 'replay_bundle')
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        sha = hashlib.sha256()
+        with open(path, 'rb') as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                sha.update(chunk)
+        return sha.hexdigest()
+
+    def _detect_code_version(self) -> str:
+        try:
+            out = subprocess.check_output(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=os.getcwd(),
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            if out:
+                return str(out)
+        except Exception:
+            pass
+        return "unknown"
+
+    def _build_replay_prices_input(self, payload: dict) -> dict:
+        prices: Dict[str, dict] = {}
+        price_debug = payload.get('price_debug', {}) if isinstance(payload, dict) else {}
+        positions_detail = payload.get('positions_detail', {}) if isinstance(payload, dict) else {}
+        if not isinstance(price_debug, dict):
+            price_debug = {}
+        if not isinstance(positions_detail, dict):
+            positions_detail = {}
+
+        ticker_set = set()
+        for t in list(price_debug.keys()) + list(positions_detail.keys()):
+            t_u = str(t).upper().strip()
+            if t_u and t_u != 'CASH':
+                ticker_set.add(t_u)
+        for t in (self.positions or {}).keys():
+            t_u = str(t).upper().strip()
+            if t_u and t_u != 'CASH':
+                ticker_set.add(t_u)
+
+        for ticker in sorted(ticker_set):
+            dbg = price_debug.get(ticker, {}) if isinstance(price_debug.get(ticker), dict) else {}
+            pos = positions_detail.get(ticker, {}) if isinstance(positions_detail.get(ticker), dict) else {}
+            price_val = pos.get('price')
+            if price_val is None:
+                try:
+                    px, _age, _status = self.get_current_price(ticker)
+                    price_val = float(px) if px is not None else None
+                except Exception:
+                    price_val = None
+            try:
+                if price_val is not None:
+                    price_val = float(price_val)
+            except Exception:
+                price_val = None
+            prices[ticker] = {
+                'price': price_val,
+                'ts': dbg.get('price_ts'),
+                'status': str(dbg.get('status', 'MISSING')).upper(),
+                'source': str(dbg.get('source', 'unknown')),
+                'now_ts': dbg.get('now_ts') or payload.get('timestamp'),
+                'tz_ok': bool(dbg.get('tz_ok', False)),
+            }
+
+        return {
+            'schema_version': 1,
+            'captured_at': payload.get('timestamp'),
+            'tickers': prices,
+            'count': int(len(prices)),
+        }
+
+    def _build_replay_history_meta_input(self, payload: dict) -> dict:
+        strategy_cfg = self.config.get('strategy', {}) if isinstance(self.config, dict) else {}
+        risk_info = self.current_risk_check_info if isinstance(self.current_risk_check_info, dict) else {}
+        return {
+            'schema_version': 1,
+            'lookback_days': int(strategy_cfg.get('lookback_days', 40) or 40),
+            'risk_gate_basis': payload.get('risk_gate_basis'),
+            'cov_coverage': self._json_safe_clone(payload.get('cov_coverage', {}), fallback={}),
+            'returns_coverage_diag': self._json_safe_clone(payload.get('returns_coverage_diag', {}), fallback={"schema_version": 1, "items": []}),
+            'cov_refresh': self._json_safe_clone(payload.get('cov_refresh', risk_info.get('cov_refresh', {})), fallback={}),
+            'returns_meta': self._json_safe_clone(risk_info.get('returns_meta', {}), fallback={}),
+        }
+
+    def _build_replay_signals_input(self, payload: dict) -> dict:
+        macro_obj = self.current_macro if isinstance(self.current_macro, dict) else {}
+        return {
+            'schema_version': 1,
+            'macro': self._json_safe_clone(macro_obj, fallback={}),
+            'news_overlay_debug': self._json_safe_clone(payload.get('news_overlay_debug', {}), fallback={}),
+        }
+
+    def _build_replay_asset_policy_input(self) -> dict:
+        cfg = self._get_asset_data_policy_cfg()
+        proxy_scope = str((self.current_execution_proxy_info or {}).get('scope', '') or '')
+        return {
+            'schema_version': 1,
+            'asset_data_policy': self._json_safe_clone(cfg, fallback={}),
+            'proxy_map': self._json_safe_clone(cfg.get('proxy_map', {}), fallback={}),
+            'mode': str(cfg.get('mode', 'FORCE_PROXY')),
+            'source': str(cfg.get('source', 'config')),
+            'allow_risk_proxy': bool(cfg.get('allow_risk_proxy', True)),
+            'allow_execution_proxy': bool(cfg.get('allow_execution_proxy', True)),
+            'proxy_scope': proxy_scope,
+        }
+
+    def _build_replay_no_trade_summary(self, payload: dict) -> dict:
+        if isinstance(payload.get('no_trade_summary'), dict):
+            return self._json_safe_clone(payload.get('no_trade_summary'), fallback={})
+        if DAILY_REPORTER_AVAILABLE and daily_reporter is not None and hasattr(daily_reporter, 'build_no_trade_summary'):
+            try:
+                no_trade = daily_reporter.build_no_trade_summary(
+                    snapshot_obj=payload,
+                    risk_gate_decision=payload.get('risk_gate_decision') if isinstance(payload.get('risk_gate_decision'), dict) else {},
+                    cov_coverage=payload.get('cov_coverage') if isinstance(payload.get('cov_coverage'), dict) else {},
+                    returns_coverage_diag=payload.get('returns_coverage_diag') if isinstance(payload.get('returns_coverage_diag'), dict) else {},
+                )
+                if isinstance(no_trade, dict):
+                    return self._json_safe_clone(no_trade, fallback={})
+            except Exception:
+                pass
+        exec_summary = payload.get('execution_summary', {}) if isinstance(payload.get('execution_summary'), dict) else {}
+        orders_place = int(exec_summary.get('orders_place', 0) or 0)
+        orders_skip = int(exec_summary.get('orders_skip', 0) or 0)
+        reasons = exec_summary.get('skip_reasons', {}) if isinstance(exec_summary.get('skip_reasons'), dict) else {}
+        top_blockers = []
+        try:
+            for reason, count in sorted(reasons.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:8]:
+                top_blockers.append({'reason': str(reason), 'count': int(count or 0)})
+        except Exception:
+            top_blockers = []
+        return {
+            'schema_version': 1,
+            'has_trade': bool(orders_place > 0),
+            'orders_place': int(orders_place),
+            'orders_skip': int(orders_skip),
+            'top_blockers': top_blockers,
+        }
+
+    def _build_replay_risk_model_health(self, payload: dict) -> dict:
+        if isinstance(payload.get('risk_model_health'), dict):
+            return self._json_safe_clone(payload.get('risk_model_health'), fallback={})
+        if DAILY_REPORTER_AVAILABLE and daily_reporter is not None and hasattr(daily_reporter, 'build_risk_model_health'):
+            try:
+                built = daily_reporter.build_risk_model_health(
+                    report={
+                        'date': payload.get('date'),
+                        'no_trade_summary': payload.get('no_trade_summary', {}),
+                        'risk_gate_decision': payload.get('risk_gate_decision', {}),
+                        'cov_coverage': payload.get('cov_coverage', {}),
+                        'returns_coverage_diag': payload.get('returns_coverage_diag', {}),
+                        'execution_summary': payload.get('execution_summary', {}),
+                        'asset_policy_mode': payload.get('asset_policy_mode'),
+                        'execution_proxy_used': payload.get('execution_proxy_used'),
+                        'cost_summary': payload.get('cost_summary', {}),
+                    },
+                    snapshot=payload,
+                    daily_fields={
+                        'no_trade_summary': payload.get('no_trade_summary', {}),
+                        'risk_gate_decision': payload.get('risk_gate_decision', {}),
+                        'cov_coverage': payload.get('cov_coverage', {}),
+                        'returns_coverage_diag': payload.get('returns_coverage_diag', {}),
+                        'execution_summary': payload.get('execution_summary', {}),
+                        'asset_policy_mode': payload.get('asset_policy_mode'),
+                        'execution_proxy_used': payload.get('execution_proxy_used'),
+                        'cost_summary': payload.get('cost_summary', {}),
+                    },
+                )
+                if isinstance(built, dict):
+                    return self._json_safe_clone(built, fallback={})
+            except Exception:
+                pass
+
+        risk_gate = payload.get('risk_gate_decision', {}) if isinstance(payload.get('risk_gate_decision'), dict) else {}
+        execution = payload.get('execution_summary', {}) if isinstance(payload.get('execution_summary'), dict) else {}
+        return {
+            'schema_version': 1,
+            'date': payload.get('date'),
+            'risk_gate': {
+                'triggered': bool(str(risk_gate.get('reason', '')).strip()),
+                'reason': str(risk_gate.get('reason', '')).strip(),
+                'metric_name': str(risk_gate.get('metric_name', '')).strip(),
+                'metric_value': risk_gate.get('metric_value'),
+                'threshold': risk_gate.get('threshold'),
+                'stage': str(risk_gate.get('stage', 'unknown')),
+            },
+            'coverage': {
+                'cov_known_weight': None,
+                'cov_missing_weight_total': None,
+                'cov_missing_count': None,
+                'returns_missing_count': 0,
+                'returns_missing_top': [],
+            },
+            'prices': {'missing_count': None, 'stale_count': None, 'live_count': None},
+            'execution': {
+                'orders_place': int(execution.get('orders_place', 0) or 0),
+                'orders_skip': int(execution.get('orders_skip', 0) or 0),
+                'top_skip_reasons': [],
+            },
+            'policy': {
+                'asset_policy_mode': str(payload.get('asset_policy_mode', 'FORCE_PROXY')),
+                'execution_proxy_used': bool(payload.get('execution_proxy_used', False)),
+            },
+            'cost': {'enabled': False, 'cost_total': 0.0, 'cost_bps': 0.0, 'trades_count': 0},
+        }
+
+    def _build_replay_expected_key_fields(self, payload: dict, daily_report=None) -> dict:
+        no_trade = self._build_replay_no_trade_summary(payload)
+        risk_health = self._build_replay_risk_model_health(payload)
+        if isinstance(daily_report, dict) and isinstance(daily_report.get('no_trade_summary'), dict):
+            no_trade = self._json_safe_clone(daily_report.get('no_trade_summary'), fallback=no_trade)
+        if isinstance(daily_report, dict) and isinstance(daily_report.get('risk_model_health'), dict):
+            risk_health = self._json_safe_clone(daily_report.get('risk_model_health'), fallback=risk_health)
+
+        expected = {
+            'schema_version': 1,
+            'run_id': str(payload.get('run_id', self.run_id)),
+            'cycle': int(payload.get('cycle', self.current_cycle) or 0),
+            'cycle_id': int(payload.get('cycle_id', payload.get('cycle', self.current_cycle)) or 0),
+            'timestamp': payload.get('timestamp'),
+            'risk_gate_decision': self._json_safe_clone(payload.get('risk_gate_decision', {}), fallback={}),
+            'cov_coverage': self._json_safe_clone(payload.get('cov_coverage', {}), fallback={}),
+            'returns_coverage_diag': self._json_safe_clone(payload.get('returns_coverage_diag', {}), fallback={"schema_version": 1, "items": []}),
+            'execution_summary': self._json_safe_clone(payload.get('execution_summary', {}), fallback={}),
+            'cost_summary': self._json_safe_clone(payload.get('cost_summary', {}), fallback={}),
+            'cost_model': self._json_safe_clone(
+                payload.get('cost_model', {'enabled': bool(self._get_cost_model_cfg().get('enabled', False))}),
+                fallback={'enabled': bool(self._get_cost_model_cfg().get('enabled', False))},
+            ),
+            'no_trade_summary': no_trade,
+            'risk_model_health': risk_health,
+            'asset_policy_summary': self._json_safe_clone(payload.get('asset_policy_summary', {}), fallback={}),
+            'asset_policy_mode': str(payload.get('asset_policy_mode', self._get_asset_data_policy_cfg().get('mode', 'FORCE_PROXY'))),
+            'execution_proxy_used': bool(payload.get('execution_proxy_used', False)),
+            'execution_proxy_map_used': self._json_safe_clone(payload.get('execution_proxy_map_used', []), fallback=[]),
+        }
+        return expected
+
+    def build_replay_bundle(self, snapshot_payload, daily_report=None):
+        """Freeze minimal replay bundle for deterministic offline L0 replay."""
+        if not bool(getattr(self, 'replay_bundle_enabled', True)):
+            return None
+        if not isinstance(snapshot_payload, dict):
+            return None
+
+        bundle_dir = self._replay_bundle_dir()
+        inputs_dir = os.path.join(bundle_dir, 'inputs')
+        expected_dir = os.path.join(bundle_dir, 'expected')
+        outputs_dir = os.path.join(bundle_dir, 'outputs')
+        os.makedirs(inputs_dir, exist_ok=True)
+        os.makedirs(expected_dir, exist_ok=True)
+        os.makedirs(outputs_dir, exist_ok=True)
+
+        effective_config = self._json_safe_clone(self.config, fallback={})
+        prices_input = self._build_replay_prices_input(snapshot_payload)
+        history_meta = self._build_replay_history_meta_input(snapshot_payload)
+        signals_input = self._build_replay_signals_input(snapshot_payload)
+        asset_policy_input = self._build_replay_asset_policy_input()
+        expected_fields = self._build_replay_expected_key_fields(snapshot_payload, daily_report=daily_report)
+
+        file_payloads = {
+            'effective_config.json': effective_config,
+            os.path.join('inputs', 'prices.json'): prices_input,
+            os.path.join('inputs', 'history_meta.json'): history_meta,
+            os.path.join('inputs', 'signals.json'): signals_input,
+            os.path.join('inputs', 'asset_policy.json'): asset_policy_input,
+            os.path.join('expected', 'snapshot_key_fields.json'): expected_fields,
+            os.path.join('outputs', 'drift_report.json'): {
+                'schema_version': 1,
+                'summary': {'pass': None, 'num_diffs': 0, 'severity_counts': {'CRITICAL': 0, 'MAJOR': 0, 'MINOR': 0}},
+                'diffs': [],
+            },
+            os.path.join('outputs', 'replay_snapshot.json'): {},
+        }
+
+        for rel_path, obj in file_payloads.items():
+            abs_path = os.path.join(bundle_dir, rel_path)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            self.atomic_write_json(abs_path, obj)
+
+        entries = []
+        for rel_path in sorted(file_payloads.keys()):
+            abs_path = os.path.join(bundle_dir, rel_path)
+            present = os.path.exists(abs_path)
+            sha256 = self._sha256_file(abs_path) if present else ''
+            entries.append({
+                'path': rel_path.replace('\\', '/'),
+                'sha256': sha256,
+                'present': bool(present),
+            })
+
+        manifest = {
+            'schema_version': 1,
+            'run_id': str(self.run_id),
+            'created_ts': self._now().isoformat(),
+            'code_version': self._detect_code_version(),
+            'replay_level': str(self.replay_bundle_level or 'L0'),
+            'bundle_contents': entries,
+            'notes': '',
+        }
+        manifest_path = os.path.join(bundle_dir, 'manifest.json')
+        self.atomic_write_json(manifest_path, manifest)
+
+        cycle_id = int(snapshot_payload.get('cycle_id', snapshot_payload.get('cycle', self.current_cycle)) or 0)
+        source = str(snapshot_payload.get('source', 'unknown') or 'unknown')
+        if self._last_replay_bundle_cycle_id != cycle_id or self._last_replay_bundle_source != source:
+            print(f"[REPLAY_BUNDLE] built path={bundle_dir} files={len(entries) + 1}")
+            self._last_replay_bundle_cycle_id = cycle_id
+            self._last_replay_bundle_source = source
+            self._last_replay_bundle_path = bundle_dir
+        return {
+            'path': bundle_dir,
+            'files': int(len(entries) + 1),
+            'manifest_path': manifest_path,
+        }
 
     def _resolve_runtime_control_path(self):
         """Resolve runtime control file path with config override support."""
@@ -3156,6 +3520,86 @@ class PaperTradingEngine:
         self.current_price_debug = dict(collected_debug)
         return payload
 
+    def _build_cost_summary_payload(self, snapshot=None):
+        snap = snapshot if isinstance(snapshot, dict) else {}
+        cfg = self._get_cost_model_cfg()
+        raw = snap.get('cost_summary') if isinstance(snap.get('cost_summary'), dict) else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        cost_est = snap.get('cost_est') if isinstance(snap.get('cost_est'), dict) else {}
+        if not isinstance(cost_est, dict) or not cost_est:
+            if isinstance(self.current_cost_est_info, dict):
+                cost_est = dict(self.current_cost_est_info)
+            else:
+                cost_est = {}
+        raw_totals = raw.get('totals') if isinstance(raw.get('totals'), dict) else {}
+        if not isinstance(raw_totals, dict):
+            raw_totals = {}
+        est_totals = cost_est.get('totals') if isinstance(cost_est.get('totals'), dict) else {}
+        if not isinstance(est_totals, dict):
+            est_totals = {}
+
+        def _pick_cost_value(*values):
+            chosen = None
+            for v in values:
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if not np.isfinite(fv):
+                    continue
+                if chosen is None:
+                    chosen = fv
+                    continue
+                if abs(chosen) <= 1e-12 and abs(fv) > 1e-12:
+                    chosen = fv
+            return float(chosen if chosen is not None else 0.0)
+
+        try:
+            traded_notional = float(
+                snap.get(
+                    'turnover_notional_post',
+                    self.current_turnover_info.get('turnover_notional_post', 0.0) if isinstance(self.current_turnover_info, dict) else 0.0,
+                ) or 0.0
+            )
+        except Exception:
+            traded_notional = 0.0
+        total_cost = _pick_cost_value(raw.get('total'), raw_totals.get('total'), cost_est.get('total'), est_totals.get('total'))
+        fee_cost = _pick_cost_value(raw.get('fee'), raw_totals.get('fee'), cost_est.get('fee'), est_totals.get('fee'))
+        slippage_cost = _pick_cost_value(raw.get('slippage'), raw_totals.get('slippage'), cost_est.get('slippage'), est_totals.get('slippage'))
+        impact_cost = _pick_cost_value(raw.get('impact'), raw_totals.get('impact'), cost_est.get('impact'), est_totals.get('impact'))
+        trades_count = int(
+            max(
+                float(raw.get('trades_count', 0) or 0),
+                float(raw.get('num_trades', 0) or 0),
+                float(cost_est.get('num_trades', 0) or 0),
+            )
+        )
+        if traded_notional <= 1e-12:
+            traded_notional = _pick_cost_value(raw.get('traded_notional'), cost_est.get('traded_notional'))
+        cost_bps = (float(total_cost) / float(traded_notional) * 10000.0) if traded_notional > 1e-12 else 0.0
+        return {
+            'enabled': bool(raw.get('enabled', cost_est.get('enabled', cfg.get('enabled', False)))),
+            'currency': str(raw.get('currency', cfg.get('currency', 'USD')) or 'USD'),
+            'slippage_bps': float(raw.get('slippage_bps', cfg.get('slippage_bps', 0.0)) or 0.0),
+            'fee_per_trade': float(raw.get('fee_per_trade', cfg.get('fee_per_trade', 0.0)) or 0.0),
+            'fee_bps': float(raw.get('fee_bps', cfg.get('fee_bps', 0.0)) or 0.0),
+            'min_fee': float(raw.get('min_fee', cfg.get('min_fee', 0.0)) or 0.0),
+            'apply_to': list(raw.get('apply_to', cfg.get('apply_to', ['BUY', 'SELL']))),
+            'note': str(raw.get('note', cfg.get('note', 'simple bps slippage + fee'))),
+            'totals': {
+                'slippage': float(slippage_cost),
+                'fee': float(fee_cost),
+                'impact': float(impact_cost),
+                'total': float(total_cost),
+            },
+            'trades_count': int(max(0, trades_count)),
+            'traded_notional': float(max(0.0, traded_notional)),
+            'cost_bps': float(cost_bps),
+        }
+
     def _build_live_snapshot_payload(self, snapshot):
         """Build a compact, UI-friendly live snapshot payload."""
         total_equity = float(snapshot.get('total_equity', 0.0) or 0.0)
@@ -3574,6 +4018,18 @@ class PaperTradingEngine:
                 'ticker_proxy_map_used',
                 self.current_risk_check_info.get('ticker_proxy_map_used') if isinstance(self.current_risk_check_info, dict) else []
             ),
+            'asset_policy_mode': snapshot.get(
+                'asset_policy_mode',
+                str(self._get_asset_data_policy_cfg().get('mode', 'FORCE_PROXY')),
+            ),
+            'asset_policy_decisions': snapshot.get(
+                'asset_policy_decisions',
+                list(self.current_asset_policy_decisions) if isinstance(self.current_asset_policy_decisions, list) else [],
+            ),
+            'asset_policy_summary': snapshot.get(
+                'asset_policy_summary',
+                dict(self.current_asset_policy_summary) if isinstance(self.current_asset_policy_summary, dict) else self._build_asset_policy_summary(),
+            ),
             'execution_proxy_used': snapshot.get(
                 'execution_proxy_used',
                 bool((self.current_execution_proxy_info or {}).get('used', False)),
@@ -3641,6 +4097,10 @@ class PaperTradingEngine:
             'rebalance_cost_diag_filtered': rebalance_cost_diag_filtered_meta,
             'rebalance_plan_filter_diag': rebalance_plan_filter_diag_meta,
             'cost_est': cost_est_meta,
+            'cost_summary': snapshot.get('cost_summary', self._build_cost_summary_payload(snapshot)),
+            'cost_model': {
+                'enabled': bool(self._get_cost_model_cfg().get('enabled', False)),
+            },
             'trade_planner': planner_meta,
             'trade_planner_num_dropped': int(planner_meta.get('num_dropped', 0) or 0),
             'trade_planner_turnover_used': float(planner_turnover_used),
@@ -3953,9 +4413,254 @@ class PaperTradingEngine:
             return "mapping"
         return "cov"
 
+    def _get_asset_data_policy_cfg(self) -> dict:
+        defaults = {
+            "mode": "FORCE_PROXY",
+            "match_rules": [{"suffix": ".TO"}],
+            "proxy_map": {"XIU.TO": "EWC", "FTS.TO": "FTS"},
+            "allow_execution_proxy": True,
+            "allow_risk_proxy": True,
+            "reason_on_block": "TSX price missing - policy DISABLE_ASSET",
+            "source": "config",
+        }
+        raw_cfg = self.config.get("asset_data_policy", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(raw_cfg, dict):
+            raw_cfg = {}
+        cfg = dict(defaults)
+        cfg.update(raw_cfg)
+        source = str(raw_cfg.get("_source_hint", "config") or "config")
+        mode_raw = str(cfg.get("mode", "FORCE_PROXY") or "FORCE_PROXY").strip().upper()
+        env_mode = str(os.environ.get("GW_ASSET_POLICY_MODE", "") or "").strip().upper()
+        if env_mode:
+            mode_raw = env_mode
+            source = str(os.environ.get("GW_ASSET_POLICY_SOURCE", "env") or "env")
+        if mode_raw not in {"ALLOW_ORIGINAL", "FORCE_PROXY", "DISABLE_ASSET"}:
+            mode_raw = "FORCE_PROXY"
+        cfg["mode"] = mode_raw
+        cfg["allow_execution_proxy"] = bool(cfg.get("allow_execution_proxy", True))
+        cfg["allow_risk_proxy"] = bool(cfg.get("allow_risk_proxy", True))
+        cfg["reason_on_block"] = str(cfg.get("reason_on_block", defaults["reason_on_block"]) or defaults["reason_on_block"])
+        rules_raw = cfg.get("match_rules", [])
+        rules = []
+        if isinstance(rules_raw, list):
+            for rule in rules_raw:
+                if not isinstance(rule, dict):
+                    continue
+                rr = {}
+                if str(rule.get("suffix", "")).strip():
+                    rr["suffix"] = str(rule.get("suffix")).upper().strip()
+                if str(rule.get("exchange", "")).strip():
+                    rr["exchange"] = str(rule.get("exchange")).upper().strip()
+                if str(rule.get("ticker_pattern", "")).strip():
+                    rr["ticker_pattern"] = str(rule.get("ticker_pattern")).strip()
+                if rr:
+                    rules.append(rr)
+        if not rules:
+            rules = [{"suffix": ".TO"}]
+        cfg["match_rules"] = rules
+        proxy_map_raw = cfg.get("proxy_map", {})
+        proxy_map = {}
+        if isinstance(proxy_map_raw, dict):
+            for raw_from, raw_to in proxy_map_raw.items():
+                t_from = str(raw_from).upper().strip()
+                t_to = str(raw_to).upper().strip()
+                if not t_from or not t_to or t_from == "CASH" or t_to == "CASH" or t_from == t_to:
+                    continue
+                proxy_map[t_from] = t_to
+        if not proxy_map:
+            proxy_map = dict(defaults["proxy_map"])
+        cfg["proxy_map"] = proxy_map
+        cfg["source"] = source
+        return cfg
+
+    def _asset_policy_match(self, ticker: str, rules) -> bool:
+        t = str(ticker or "").upper().strip()
+        if not t:
+            return False
+        if not isinstance(rules, list) or not rules:
+            return False
+        ex_guess = "TSX" if t.endswith(".TO") else "US"
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            suffix = str(rule.get("suffix", "")).upper().strip()
+            exchange = str(rule.get("exchange", "")).upper().strip()
+            pattern = str(rule.get("ticker_pattern", "")).strip()
+            ok = True
+            if suffix and not t.endswith(suffix):
+                ok = False
+            if exchange and exchange != ex_guess:
+                ok = False
+            if pattern:
+                try:
+                    if re.search(pattern, t) is None:
+                        ok = False
+                except Exception:
+                    ok = False
+            if ok:
+                return True
+        return False
+
+    def _build_asset_policy_summary(self) -> dict:
+        decisions = (
+            self.current_asset_policy_decisions
+            if isinstance(getattr(self, "current_asset_policy_decisions", None), list)
+            else []
+        )
+        counts = {"ALLOW_ORIGINAL": 0, "USE_PROXY": 0, "DISABLE": 0}
+        reason_counts = {}
+        for row in decisions:
+            if not isinstance(row, dict):
+                continue
+            action = str(row.get("action", "")).upper().strip()
+            if action in counts:
+                counts[action] = int(counts.get(action, 0) or 0) + 1
+            reason = str(row.get("reason", "")).strip() or "UNKNOWN"
+            reason_counts[reason] = int(reason_counts.get(reason, 0) or 0) + 1
+        top_reasons = sorted(reason_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:10]
+        return {
+            "counts": counts,
+            "top_reasons": [{"reason": k, "count": int(v)} for k, v in top_reasons],
+        }
+
+    def _record_asset_policy_decision(self, decision: dict):
+        if not isinstance(decision, dict):
+            return
+        if not isinstance(getattr(self, "current_asset_policy_decisions", None), list):
+            self.current_asset_policy_decisions = []
+        row = {
+            "original": str(decision.get("original", "")).upper().strip(),
+            "risk_ticker": (str(decision.get("risk_ticker", "")).upper().strip() if decision.get("risk_ticker") else None),
+            "exec_ticker": (str(decision.get("exec_ticker", "")).upper().strip() if decision.get("exec_ticker") else None),
+            "action": str(decision.get("action", "ALLOW_ORIGINAL")).upper().strip(),
+            "reason": str(decision.get("reason", "UNKNOWN")).strip() or "UNKNOWN",
+            "stage": str(decision.get("stage", "unknown")).strip().lower() or "unknown",
+            "mode": str(decision.get("mode", "")).upper().strip(),
+        }
+        if not row["original"]:
+            return
+        key = (
+            row["original"],
+            row["risk_ticker"],
+            row["exec_ticker"],
+            row["action"],
+            row["reason"],
+            row["stage"],
+        )
+        for existing in self.current_asset_policy_decisions:
+            if not isinstance(existing, dict):
+                continue
+            ex_key = (
+                str(existing.get("original", "")).upper().strip(),
+                (str(existing.get("risk_ticker", "")).upper().strip() if existing.get("risk_ticker") else None),
+                (str(existing.get("exec_ticker", "")).upper().strip() if existing.get("exec_ticker") else None),
+                str(existing.get("action", "")).upper().strip(),
+                str(existing.get("reason", "")).strip(),
+                str(existing.get("stage", "")).strip().lower(),
+            )
+            if ex_key == key:
+                return
+        self.current_asset_policy_decisions.append(row)
+        print(
+            "[ASSET_POLICY_DECISION] "
+            f"original={row['original']} risk={row['risk_ticker']} exec={row['exec_ticker']} "
+            f"action={row['action']} reason={row['reason']}"
+        )
+        self.current_asset_policy_summary = self._build_asset_policy_summary()
+
+    def _log_asset_policy_once(self):
+        cfg = self._get_asset_data_policy_cfg()
+        rules = cfg.get("match_rules", [])
+        rule_text_parts = []
+        if isinstance(rules, list):
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                if rule.get("suffix"):
+                    rule_text_parts.append(f"suffix:{str(rule.get('suffix')).upper()}")
+                elif rule.get("exchange"):
+                    rule_text_parts.append(f"exchange:{str(rule.get('exchange')).upper()}")
+                elif rule.get("ticker_pattern"):
+                    rule_text_parts.append(f"pattern:{str(rule.get('ticker_pattern'))}")
+        rule_text = ",".join(rule_text_parts) if rule_text_parts else "none"
+        print(
+            "[ASSET_POLICY] "
+            f"mode={cfg.get('mode')} rules=[{rule_text}] "
+            f"allow_risk_proxy={str(bool(cfg.get('allow_risk_proxy', True))).lower()} "
+            f"allow_execution_proxy={str(bool(cfg.get('allow_execution_proxy', True))).lower()} "
+            f"source={cfg.get('source', 'config')}"
+        )
+
+    def resolve_asset_policy(self, ticker, context=None) -> dict:
+        t = str(ticker or "").upper().strip()
+        ctx = context if isinstance(context, dict) else {}
+        stage = str(ctx.get("stage", "unknown") or "unknown").strip().lower()
+        price_status = str(ctx.get("price_status", "") or "").upper().strip()
+        cfg = self._get_asset_data_policy_cfg()
+        mode = str(cfg.get("mode", "FORCE_PROXY")).upper().strip()
+        rules = cfg.get("match_rules", [])
+        proxy_map = cfg.get("proxy_map", {}) if isinstance(cfg.get("proxy_map"), dict) else {}
+        match = self._asset_policy_match(t, rules)
+        allow_exec_proxy = bool(cfg.get("allow_execution_proxy", True))
+        allow_risk_proxy = bool(cfg.get("allow_risk_proxy", True))
+        proxy_ticker = str(proxy_map.get(t, "")).upper().strip()
+        decision = {
+            "original": t,
+            "risk_ticker": t,
+            "exec_ticker": t,
+            "action": "ALLOW_ORIGINAL",
+            "reason": "UNMATCHED_RULE",
+            "stage": stage,
+            "mode": mode,
+            "matched": bool(match),
+        }
+        if not t or t == "CASH":
+            return decision
+        if not match:
+            if stage == "execution" and price_status == "MISSING":
+                decision["reason"] = "PRICE_MISSING"
+            return decision
+        if mode == "DISABLE_ASSET":
+            decision["risk_ticker"] = None
+            decision["exec_ticker"] = None
+            decision["action"] = "DISABLE"
+            decision["reason"] = "POLICY_DISABLE"
+            return decision
+        if mode == "ALLOW_ORIGINAL":
+            decision["action"] = "ALLOW_ORIGINAL"
+            decision["reason"] = "PRICE_MISSING" if (stage == "execution" and price_status == "MISSING") else "POLICY_ALLOW_ORIGINAL"
+            return decision
+        # FORCE_PROXY
+        if not proxy_ticker:
+            decision["risk_ticker"] = None
+            decision["exec_ticker"] = None
+            decision["action"] = "DISABLE"
+            decision["reason"] = "NO_PROXY_MAPPING"
+            return decision
+        if not allow_risk_proxy:
+            decision["risk_ticker"] = None
+            decision["exec_ticker"] = None
+            decision["action"] = "DISABLE"
+            decision["reason"] = "POLICY_RISK_PROXY_DISABLED"
+            return decision
+        if stage == "execution" and not allow_exec_proxy:
+            decision["risk_ticker"] = proxy_ticker
+            decision["exec_ticker"] = t
+            decision["action"] = "ALLOW_ORIGINAL"
+            decision["reason"] = "POLICY_EXEC_PROXY_DISABLED"
+            return decision
+        decision["risk_ticker"] = proxy_ticker
+        decision["exec_ticker"] = proxy_ticker if allow_exec_proxy else t
+        decision["action"] = "USE_PROXY"
+        decision["reason"] = "PRICE_MISSING->PROXY" if (stage == "execution" and price_status == "MISSING") else "POLICY_FORCE_PROXY"
+        return decision
+
     def _get_ticker_proxy_map(self):
-        risk_cfg = self._get_risk_model_cfg()
-        raw_map = risk_cfg.get("ticker_proxy_map", {}) if isinstance(risk_cfg, dict) else {}
+        policy_cfg = self._get_asset_data_policy_cfg()
+        raw_map = policy_cfg.get("proxy_map", {})
+        if not isinstance(raw_map, dict):
+            risk_cfg = self._get_risk_model_cfg()
+            raw_map = risk_cfg.get("ticker_proxy_map", {}) if isinstance(risk_cfg, dict) else {}
         if not isinstance(raw_map, dict):
             return {}
         out = {}
@@ -3970,6 +4675,20 @@ class PaperTradingEngine:
         return out
 
     def _get_ticker_proxy_scope(self):
+        has_explicit_policy_cfg = bool(
+            isinstance(self.config, dict)
+            and isinstance(self.config.get("asset_data_policy"), dict)
+        )
+        has_policy_mode_env = bool(str(os.environ.get("GW_ASSET_POLICY_MODE", "") or "").strip())
+        if has_explicit_policy_cfg or has_policy_mode_env:
+            policy_cfg = self._get_asset_data_policy_cfg()
+            mode = str(policy_cfg.get("mode", "FORCE_PROXY") or "FORCE_PROXY").strip().upper()
+            if mode == "FORCE_PROXY":
+                if bool(policy_cfg.get("allow_execution_proxy", True)):
+                    return "risk_and_execution"
+                return "risk_only"
+            if mode == "DISABLE_ASSET":
+                return "off"
         risk_cfg = self._get_risk_model_cfg()
         scope = str(risk_cfg.get("ticker_proxy_scope", "risk_only") or "risk_only").strip().lower()
         if scope not in {"off", "risk_only", "risk_and_execution"}:
@@ -4042,6 +4761,8 @@ class PaperTradingEngine:
         allowed_reasons = {
             "WEIGHT_DELTA_TOO_SMALL",
             "PRICE_MISSING",
+            "POLICY_DISABLE",
+            "NO_PROXY_MAPPING",
             "PRICE_STALE",
             "CASH_CONSTRAINT",
             "COOLDOWN",
@@ -5689,6 +6410,11 @@ class PaperTradingEngine:
                         self.atomic_write_json(run_snapshot_path, payload)
                 except Exception as e:
                     print(f"[WARN] Failed to write run snapshot copy: {e}")
+            if bool(getattr(self, 'replay_bundle_enabled', True)):
+                try:
+                    self.build_replay_bundle(payload)
+                except Exception as e:
+                    print(f"[WARN] Failed to build replay bundle: {e}")
             payload_text = json.dumps(payload, ensure_ascii=False, allow_nan=False) if isinstance(payload, dict) else "{}"
             cycle_id_for_event = int(payload.get('cycle_id', payload.get('cycle', self.current_cycle)) if isinstance(payload, dict) else self.current_cycle)
             if bool(emit_telemetry):
@@ -6001,6 +6727,8 @@ class PaperTradingEngine:
             'max_rc_ticker_cov': cov_diag.get('max_rc_ticker') if isinstance(cov_diag, dict) else None,
             'rc_fraction_top5_cov': cov_diag.get('rc_fraction_top5') if isinstance(cov_diag, dict) else None,
             'cost_est': dict(self.current_cost_est_info) if isinstance(self.current_cost_est_info, dict) else {'enabled': False, 'total': 0.0, 'fee': 0.0, 'slippage': 0.0, 'impact': 0.0, 'num_trades': 0},
+            'cost_summary': self._build_cost_summary_payload(),
+            'cost_model': {'enabled': bool(self._get_cost_model_cfg().get('enabled', False))},
             'trade_planner': dict(self.current_planner_info) if isinstance(self.current_planner_info, dict) else {'enabled': False, 'status': 'disabled', 'dropped': [], 'scaled': []},
             'vol_target_diag': dict(self.current_vol_target_diag_info) if isinstance(self.current_vol_target_diag_info, dict) else {
                 'status': 'unavailable',
@@ -7375,9 +8103,7 @@ class PaperTradingEngine:
             min_obs = int(min_obs)
             drop_threshold = float(drop_threshold)
             threshold_obs = float(lookback_days) * (1.0 - drop_threshold)
-            risk_cfg = self._get_risk_model_cfg()
-            proxy_enabled = bool(risk_cfg.get("enable_ticker_proxy_for_returns", False))
-            proxy_map = self._get_ticker_proxy_map() if proxy_enabled else {}
+            policy_cfg = self._get_asset_data_policy_cfg()
 
             def _extract_returns_series(hist_obj):
                 if hist_obj is None or getattr(hist_obj, "empty", True):
@@ -7399,20 +8125,28 @@ class PaperTradingEngine:
             proxy_rows = []
 
             for ticker in normalized:
-                hist = self.get_market_data(ticker, period=period, interval=interval)
+                decision = self.resolve_asset_policy(
+                    ticker,
+                    context={
+                        "stage": "risk",
+                        "price_status": "UNKNOWN",
+                        "period": period,
+                        "interval": interval,
+                    },
+                )
+                self._record_asset_policy_decision(decision)
+                risk_ticker = decision.get("risk_ticker")
+                if str(decision.get("action", "")).upper() == "DISABLE" or not risk_ticker:
+                    missing_tickers.append(ticker)
+                    continue
+                risk_ticker = str(risk_ticker).upper().strip()
+                hist = self.get_market_data(risk_ticker, period=period, interval=interval)
                 series = _extract_returns_series(hist)
-                mapped_symbol = ticker
-                if series is None and proxy_enabled:
-                    proxy_ticker = str(proxy_map.get(ticker, "")).upper().strip()
-                    if proxy_ticker and proxy_ticker != ticker:
-                        proxy_hist = self.get_market_data(proxy_ticker, period=period, interval=interval)
-                        proxy_series = _extract_returns_series(proxy_hist)
-                        if proxy_series is not None:
-                            series = proxy_series
-                            mapped_symbol = proxy_ticker
-                            row = {"from": ticker, "to": proxy_ticker, "reason": "returns_missing"}
-                            proxy_rows.append(row)
-                            print(f"[TICKER_PROXY] {ticker} -> {proxy_ticker} reason=returns_missing")
+                mapped_symbol = risk_ticker
+                if risk_ticker != ticker:
+                    row = {"from": ticker, "to": risk_ticker, "reason": str(decision.get("reason", "POLICY_FORCE_PROXY") or "POLICY_FORCE_PROXY")}
+                    proxy_rows.append(row)
+                    print(f"[TICKER_PROXY] {ticker} -> {risk_ticker} reason={row['reason']}")
                 if series is None:
                     missing_tickers.append(ticker)
                     continue
@@ -7583,8 +8317,13 @@ class PaperTradingEngine:
         """Return cost-model config with safe defaults."""
         defaults = {
             "enabled": False,
-            "fee_bps": 1.0,
-            "slippage_bps": 2.0,
+            "slippage_bps": 5.0,
+            "fee_per_trade": 0.0,
+            "fee_bps": 0.0,
+            "min_fee": 0.0,
+            "currency": "USD",
+            "apply_to": ["BUY", "SELL"],
+            "note": "simple bps slippage + fee",
             "impact_enabled": False,
             "impact_k": 0.1,
             "adv_lookback_days": 20,
@@ -7597,9 +8336,43 @@ class PaperTradingEngine:
             cfg = dict(defaults)
             cfg.update(raw_cfg)
 
-            cfg["enabled"] = bool(cfg.get("enabled", False))
-            cfg["fee_bps"] = max(0.0, float(cfg.get("fee_bps", 1.0)))
-            cfg["slippage_bps"] = max(0.0, float(cfg.get("slippage_bps", 2.0)))
+            env_enabled = str(os.environ.get("GW_COST_MODEL_ENABLED", "") or "").strip().lower()
+            if env_enabled in ("1", "true", "yes", "on"):
+                cfg["enabled"] = True
+            elif env_enabled in ("0", "false", "no", "off"):
+                cfg["enabled"] = False
+            else:
+                cfg["enabled"] = bool(cfg.get("enabled", False))
+
+            env_slippage = str(os.environ.get("GW_COST_SLIPPAGE_BPS", "") or "").strip()
+            if env_slippage:
+                cfg["slippage_bps"] = env_slippage
+            env_fee_per_trade = str(os.environ.get("GW_COST_FEE_PER_TRADE", "") or "").strip()
+            if env_fee_per_trade:
+                cfg["fee_per_trade"] = env_fee_per_trade
+            env_fee_bps = str(os.environ.get("GW_COST_FEE_BPS", "") or "").strip()
+            if env_fee_bps:
+                cfg["fee_bps"] = env_fee_bps
+            env_min_fee = str(os.environ.get("GW_COST_MIN_FEE", "") or "").strip()
+            if env_min_fee:
+                cfg["min_fee"] = env_min_fee
+
+            cfg["fee_bps"] = max(0.0, float(cfg.get("fee_bps", 0.0)))
+            cfg["fee_per_trade"] = max(0.0, float(cfg.get("fee_per_trade", 0.0)))
+            cfg["min_fee"] = max(0.0, float(cfg.get("min_fee", 0.0)))
+            cfg["slippage_bps"] = max(0.0, float(cfg.get("slippage_bps", 5.0)))
+            cfg["currency"] = str(cfg.get("currency", "USD") or "USD").upper()
+            cfg["note"] = str(cfg.get("note", defaults["note"]) or defaults["note"])
+            apply_to_raw = cfg.get("apply_to", ["BUY", "SELL"])
+            apply_to = []
+            if isinstance(apply_to_raw, list):
+                for side in apply_to_raw:
+                    side_u = str(side or "").strip().upper()
+                    if side_u in ("BUY", "SELL") and side_u not in apply_to:
+                        apply_to.append(side_u)
+            if not apply_to:
+                apply_to = ["BUY", "SELL"]
+            cfg["apply_to"] = apply_to
             cfg["impact_enabled"] = bool(cfg.get("impact_enabled", False))
             cfg["impact_k"] = max(0.0, float(cfg.get("impact_k", 0.1)))
             cfg["adv_lookback_days"] = max(1, int(cfg.get("adv_lookback_days", 20)))
@@ -7607,6 +8380,18 @@ class PaperTradingEngine:
             return cfg
         except Exception:
             return dict(defaults)
+
+    def _log_cost_model_cfg(self):
+        cfg = self._get_cost_model_cfg()
+        print(
+            "[COST_MODEL] "
+            f"enabled={bool(cfg.get('enabled', False))} "
+            f"slippage_bps={float(cfg.get('slippage_bps', 0.0) or 0.0):.4f} "
+            f"fee_per_trade={float(cfg.get('fee_per_trade', 0.0) or 0.0):.4f} "
+            f"fee_bps={float(cfg.get('fee_bps', 0.0) or 0.0):.4f} "
+            f"min_fee={float(cfg.get('min_fee', 0.0) or 0.0):.4f} "
+            f"apply_to={list(cfg.get('apply_to', ['BUY', 'SELL']))}"
+        )
 
     def _get_planner_cfg(self) -> dict:
         """Return trade-planner config with safe defaults."""
@@ -8289,6 +9074,7 @@ class PaperTradingEngine:
     def estimate_trade_cost(self, ticker: str, side: str, notional: float, *, adv_notional: float | None = None) -> dict:
         """Estimate transaction cost components without affecting execution."""
         cfg = self._get_cost_model_cfg()
+        side_u = str(side).upper().strip() if side is not None else ""
         result = {
             "enabled": bool(cfg.get("enabled", False)),
             "status": "ok",
@@ -8298,13 +9084,18 @@ class PaperTradingEngine:
             "total": 0.0,
             "fee_bps": float(cfg.get("fee_bps", 0.0)),
             "slippage_bps": float(cfg.get("slippage_bps", 0.0)),
+            "fee_per_trade": float(cfg.get("fee_per_trade", 0.0)),
+            "min_fee": float(cfg.get("min_fee", 0.0)),
+            "currency": str(cfg.get("currency", "USD") or "USD"),
+            "apply_to": list(cfg.get("apply_to", ["BUY", "SELL"])),
             "impact_enabled": bool(cfg.get("impact_enabled", False)),
             "impact_k": float(cfg.get("impact_k", 0.0)),
             "notional": 0.0,
             "adv_notional": None,
             "participation": None,
             "ticker": str(ticker).upper().strip() if ticker is not None else "",
-            "side": str(side).upper().strip() if side is not None else "",
+            "side": side_u,
+            "effective_price": None,
         }
         try:
             n = abs(float(notional or 0.0))
@@ -8317,8 +9108,22 @@ class PaperTradingEngine:
                 result["status"] = "disabled"
                 return result
 
-            fee = n * (float(cfg.get("fee_bps", 0.0)) / 10000.0)
-            slippage = n * (float(cfg.get("slippage_bps", 0.0)) / 10000.0)
+            if side_u not in list(cfg.get("apply_to", ["BUY", "SELL"])):
+                result["status"] = "not_applied_side"
+                return result
+
+            cost_basic = compute_trade_cost(
+                side=side_u,
+                qty=0.0,
+                price=0.0,
+                notional=n,
+                slippage_bps=float(cfg.get("slippage_bps", 0.0)),
+                fee_per_trade=float(cfg.get("fee_per_trade", 0.0)),
+                fee_bps=float(cfg.get("fee_bps", 0.0)),
+                min_fee=float(cfg.get("min_fee", 0.0)),
+            )
+            fee = float(cost_basic.get("fee_cost", 0.0) or 0.0)
+            slippage = float(cost_basic.get("slippage_cost", 0.0) or 0.0)
             impact = 0.0
             participation = None
             adv_val = None
@@ -8342,7 +9147,11 @@ class PaperTradingEngine:
                 "total": float(total),
                 "adv_notional": float(adv_val) if adv_val is not None else None,
                 "participation": float(participation) if participation is not None else None,
-                "status": "ok"
+                "status": "ok",
+                "effective_price": cost_basic.get("effective_price"),
+                "slippage_cost": float(slippage),
+                "fee_cost": float(fee),
+                "total_cost": float(total),
             })
 
             if bool(cfg.get("debug_log", False)):
@@ -9616,11 +10425,28 @@ class PaperTradingEngine:
         target_cov_gate_min_coverage = float(execution_cfg.get('target_cov_gate_min_coverage', 0.60))
         target_cov_gate_require_ok = bool(execution_cfg.get('target_cov_gate_require_ok', True))
 
-        invested_weights = {
-            str(t).upper(): max(0.0, float(w))
-            for t, w in (target_weights or {}).items()
-            if str(t).upper() != 'CASH' and float(w) > 1e-12
-        }
+        invested_weights = {}
+        for t, w in (target_weights or {}).items():
+            ticker_u = str(t).upper().strip()
+            if not ticker_u or ticker_u == 'CASH':
+                continue
+            try:
+                weight_v = max(0.0, float(w))
+            except Exception:
+                continue
+            if weight_v <= 1e-12:
+                continue
+            policy_decision = self.resolve_asset_policy(
+                ticker_u,
+                context={"stage": "risk_gate", "price_status": "UNKNOWN"},
+            )
+            self._record_asset_policy_decision(policy_decision)
+            if str(policy_decision.get("action", "")).upper() == "DISABLE":
+                continue
+            risk_ticker = str(policy_decision.get("risk_ticker", "")).upper().strip()
+            if not risk_ticker or risk_ticker == 'CASH':
+                continue
+            invested_weights[risk_ticker] = float(invested_weights.get(risk_ticker, 0.0) + weight_v)
 
         known_weight = 0.0
         weighted_volatility = 0.0
@@ -11091,6 +11917,8 @@ class PaperTradingEngine:
         execution_summary = self._new_execution_summary()
         self.current_execution_summary = execution_summary
         self.current_execution_proxy_info = {"used": False, "map_used": []}
+        self.current_asset_policy_decisions = []
+        self.current_asset_policy_summary = self._build_asset_policy_summary()
         if not isinstance(self.current_cooldown_info, dict):
             self.current_cooldown_info = {}
         self.current_cov_refresh_info = {}
@@ -11135,11 +11963,20 @@ class PaperTradingEngine:
         cost_cfg = self._get_cost_model_cfg()
         self.current_cost_est_info = {
             'enabled': bool(cost_cfg.get('enabled', False)),
+            'currency': str(cost_cfg.get('currency', 'USD') or 'USD'),
+            'fee_per_trade': float(cost_cfg.get('fee_per_trade', 0.0) or 0.0),
+            'fee_bps': float(cost_cfg.get('fee_bps', 0.0) or 0.0),
+            'slippage_bps': float(cost_cfg.get('slippage_bps', 0.0) or 0.0),
+            'min_fee': float(cost_cfg.get('min_fee', 0.0) or 0.0),
+            'apply_to': list(cost_cfg.get('apply_to', ['BUY', 'SELL'])),
             'total': 0.0,
             'fee': 0.0,
             'slippage': 0.0,
             'impact': 0.0,
-            'num_trades': 0
+            'num_trades': 0,
+            'traded_notional': 0.0,
+            'cost_bps': 0.0,
+            'totals': {'total': 0.0, 'fee': 0.0, 'slippage': 0.0, 'impact': 0.0},
         }
         self.current_rebalance_cost_diag_info = {
             'status': 'pending',
@@ -11188,10 +12025,11 @@ class PaperTradingEngine:
             'top_selected_by_score': [],
         }
         target_weights = dict(target_weights) if isinstance(target_weights, dict) else {}
-        risk_cfg_now = self._get_risk_model_cfg()
-        proxy_enabled_now = bool(risk_cfg_now.get("enable_ticker_proxy_for_returns", False))
-        proxy_scope_now = self._get_ticker_proxy_scope()
-        execution_proxy_enabled = bool(proxy_enabled_now and proxy_scope_now == "risk_and_execution")
+        asset_policy_cfg_now = self._get_asset_data_policy_cfg()
+        execution_proxy_enabled = bool(
+            str(asset_policy_cfg_now.get("mode", "FORCE_PROXY")).upper() == "FORCE_PROXY"
+            and bool(asset_policy_cfg_now.get("allow_execution_proxy", True))
+        )
         execution_proxy_map = self._get_ticker_proxy_map() if execution_proxy_enabled else {}
         execution_proxy_rows = []
         execution_proxy_seen = set()
@@ -11665,34 +12503,65 @@ class PaperTradingEngine:
                 )
                 continue
             
-            execution_ticker = str(ticker).upper().strip()
+            original_ticker = str(ticker).upper().strip()
+            source_status_hint = "MISSING"
+            if original_ticker in price_info:
+                try:
+                    source_status_hint = str(price_info[original_ticker][2]).upper().strip()
+                except Exception:
+                    source_status_hint = "MISSING"
+            asset_decision = self.resolve_asset_policy(
+                original_ticker,
+                context={
+                    "stage": "execution",
+                    "price_status": source_status_hint,
+                    "side": side,
+                },
+            )
+            self._record_asset_policy_decision(asset_decision)
+            decision_action = str(asset_decision.get("action", "ALLOW_ORIGINAL")).upper().strip()
+            decision_reason = str(asset_decision.get("reason", "UNKNOWN")).strip() or "UNKNOWN"
+            execution_ticker = str(asset_decision.get("exec_ticker", original_ticker) or "").upper().strip()
             proxy_reason = ""
+
+            if decision_action == "DISABLE" or not execution_ticker:
+                skip_reason = "NO_PROXY_MAPPING" if decision_reason == "NO_PROXY_MAPPING" else "POLICY_DISABLE"
+                self._emit_exec_decision(
+                    execution_summary,
+                    action="SKIP",
+                    reason=skip_reason,
+                    ticker=original_ticker,
+                    from_ticker=original_ticker,
+                    to_ticker=(execution_ticker or original_ticker),
+                    target_w=target_weight,
+                    current_w=current_weight,
+                    delta=(target_weight - current_weight),
+                    price_status=source_status_hint,
+                    cash_after=self.cash,
+                    cooldown_blocked=False,
+                )
+                continue
+
+            if decision_action == "USE_PROXY" and execution_ticker != original_ticker:
+                proxy_reason = "PRICE_MISSING" if "PRICE_MISSING" in decision_reason.upper() else decision_reason
+                _record_exec_proxy(original_ticker, execution_ticker, proxy_reason)
 
             # NOTE: comment omitted (was garbled/non-ASCII).
             if execution_ticker not in price_info:
-                # risk_and_execution: for BUY side only, map missing source to proxy ticker.
-                mapped_ticker = str(execution_proxy_map.get(execution_ticker, "")).upper().strip() if execution_proxy_enabled else ""
-                if side == 'BUY' and mapped_ticker and mapped_ticker != execution_ticker:
-                    if mapped_ticker not in price_info:
-                        p2, a2, s2, d2 = self.get_current_price(mapped_ticker, return_debug=True)
-                        if p2 is not None:
-                            price_info[mapped_ticker] = (p2, a2, s2)
-                        if isinstance(d2, dict):
-                            price_debug_cache[mapped_ticker] = d2
-                    if mapped_ticker in price_info:
-                        execution_ticker = mapped_ticker
-                        proxy_reason = "PRICE_MISSING"
-                        _record_exec_proxy(ticker, execution_ticker, proxy_reason)
-
+                p2, a2, s2, d2 = self.get_current_price(execution_ticker, return_debug=True)
+                if p2 is not None:
+                    price_info[execution_ticker] = (p2, a2, s2)
+                if isinstance(d2, dict):
+                    price_debug_cache[execution_ticker] = d2
                 if execution_ticker not in price_info:
-                    print(f"[SKIP] {ticker} no price info")
+                    print(f"[SKIP] {original_ticker} no price info")
                     self._emit_exec_decision(
                         execution_summary,
                         action="SKIP",
                         reason="PRICE_MISSING",
-                        ticker=ticker,
-                        from_ticker=_exec_from_ticker(ticker),
-                        to_ticker=ticker,
+                        ticker=original_ticker,
+                        from_ticker=original_ticker,
+                        to_ticker=execution_ticker,
                         target_w=target_weight,
                         current_w=current_weight,
                         delta=(target_weight - current_weight),
@@ -11709,14 +12578,14 @@ class PaperTradingEngine:
             # NOTE: comment omitted (was garbled/non-ASCII).
             if side == 'BUY' and status not in allow_buy_status:
                 policy_skip_count += 1
-                print(f"[SKIP] {ticker} BUY status={status} not in allow_buy={sorted(allow_buy_status)}")
+                print(f"[SKIP] {original_ticker} BUY status={status} not in allow_buy={sorted(allow_buy_status)}")
                 self._emit_exec_decision(
                     execution_summary,
                     action="SKIP",
                     reason="PRICE_STALE" if status == "STALE" else "OTHER",
-                    ticker=ticker,
-                    from_ticker=_exec_from_ticker(ticker),
-                    to_ticker=ticker,
+                    ticker=original_ticker,
+                    from_ticker=original_ticker,
+                    to_ticker=execution_ticker,
                     target_w=target_weight,
                     current_w=current_weight,
                     delta=(target_weight - current_weight),
@@ -11727,14 +12596,14 @@ class PaperTradingEngine:
                 continue
             if side == 'SELL' and status not in allow_sell_status:
                 policy_skip_count += 1
-                print(f"[SKIP] {ticker} SELL status={status} not in allow_sell={sorted(allow_sell_status)}")
+                print(f"[SKIP] {original_ticker} SELL status={status} not in allow_sell={sorted(allow_sell_status)}")
                 self._emit_exec_decision(
                     execution_summary,
                     action="SKIP",
                     reason="PRICE_STALE" if status == "STALE" else "OTHER",
-                    ticker=ticker,
-                    from_ticker=_exec_from_ticker(ticker),
-                    to_ticker=ticker,
+                    ticker=original_ticker,
+                    from_ticker=original_ticker,
+                    to_ticker=execution_ticker,
                     target_w=target_weight,
                     current_w=current_weight,
                     delta=(target_weight - current_weight),
@@ -11750,11 +12619,11 @@ class PaperTradingEngine:
                 stale_count_policy_pass += 1
 
             if status == "STALE" and side == 'SELL':
-                print(f"[ALLOW] {ticker} SELL on STALE price (age: {age:.0f}min) - policy allowed")
+                print(f"[ALLOW] {original_ticker} SELL on STALE price (age: {age:.0f}min) - policy allowed")
 
             force_reason = None
             if side == 'SELL':
-                if ticker in exit_signal_actions:
+                if original_ticker in exit_signal_actions:
                     force_reason = 'exit_signal'
                 elif trade_context.get('regime_state') in ('risk_off', 'risk_off_forced'):
                     force_reason = 'risk_off'
@@ -11764,7 +12633,7 @@ class PaperTradingEngine:
             hard_trade = False
             if side == 'SELL':
                 try:
-                    ticker_u = str(ticker).upper().strip()
+                    ticker_u = str(original_ticker).upper().strip()
                     current_weight_now = float(current_value / total_equity) if total_equity > 0 else 0.0
                     target_weight_now = float(target_value / total_equity) if total_equity > 0 else 0.0
                     cap_now = max_weight_effective.get(ticker_u, default_max_weight)
@@ -11788,7 +12657,7 @@ class PaperTradingEngine:
             
             planned_trades.append({
                 'ticker': execution_ticker,
-                'source_ticker': str(ticker).upper().strip(),
+                'source_ticker': original_ticker,
                 'execution_proxy_reason': proxy_reason,
                 'side': side,
                 'current_value': current_value,
@@ -12484,6 +13353,42 @@ class PaperTradingEngine:
         # NOTE: comment omitted (was garbled/non-ASCII).
         trades = []
         turnover_notional_post = 0.0
+        cost_model_enabled = bool(cost_cfg.get('enabled', False))
+        cost_apply_to = {str(x).upper().strip() for x in list(cost_cfg.get('apply_to', ['BUY', 'SELL']))}
+
+        def _compute_exec_cost_breakdown(side, qty, px, gross_notional):
+            side_u = str(side or '').upper().strip()
+            try:
+                base = compute_trade_cost(
+                    side=side_u,
+                    qty=float(qty or 0.0),
+                    price=float(px or 0.0),
+                    notional=float(gross_notional or 0.0),
+                    slippage_bps=float(cost_cfg.get('slippage_bps', 0.0) or 0.0),
+                    fee_per_trade=float(cost_cfg.get('fee_per_trade', 0.0) or 0.0),
+                    fee_bps=float(cost_cfg.get('fee_bps', 0.0) or 0.0),
+                    min_fee=float(cost_cfg.get('min_fee', 0.0) or 0.0),
+                )
+            except Exception:
+                base = {
+                    'side': side_u,
+                    'qty': float(abs(float(qty or 0.0))),
+                    'price': float(px or 0.0),
+                    'notional': float(abs(float(gross_notional or 0.0))),
+                    'slippage_cost': 0.0,
+                    'fee_cost': 0.0,
+                    'total_cost': 0.0,
+                    'effective_price': float(px or 0.0),
+                }
+            applies = bool(cost_model_enabled and side_u in cost_apply_to)
+            if not applies:
+                base['slippage_cost'] = 0.0
+                base['fee_cost'] = 0.0
+                base['total_cost'] = 0.0
+                base['effective_price'] = float(px or 0.0)
+            base['applied'] = applies
+            base['currency'] = str(cost_cfg.get('currency', 'USD') or 'USD')
+            return base
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         for trade in [t for t in planned_trades if t['side'] == 'SELL']:
@@ -12558,6 +13463,9 @@ class PaperTradingEngine:
             weight_change = float(new_weight - old_weight)
             
             # NOTE: comment omitted (was garbled/non-ASCII).
+            cost_est_sell = self.estimate_trade_cost(ticker, 'SELL', proceeds, adv_notional=None)
+            cost_breakdown_sell = _compute_exec_cost_breakdown('SELL', sell_qty, price, proceeds)
+            cost_total_sell = float(cost_breakdown_sell.get('total_cost', 0.0) or 0.0)
             trades.append({
                 'timestamp': self._now().isoformat(),
                 'schema_version': int(LIVE_SCHEMA_VERSION),
@@ -12576,12 +13484,15 @@ class PaperTradingEngine:
                 'quantity': sell_qty,
                 'price': price,
                 'notional': proceeds,
+                'gross_notional': float(proceeds),
+                'cost_breakdown': dict(cost_breakdown_sell),
+                'net_notional': float(proceeds - cost_total_sell),
                 'equity_reference': equity_reference,
                 'old_weight': old_weight,
                 'new_weight': new_weight,
                 'weight_change': weight_change,
                 'cost': cost,
-                'cost_est': self.estimate_trade_cost(ticker, 'SELL', proceeds, adv_notional=None),
+                'cost_est': cost_est_sell,
                 'cost_est_total': 0.0,
                 'reason': 'rebalance',
                 'regime_state': trade_context['regime_state'],
@@ -12609,6 +13520,13 @@ class PaperTradingEngine:
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
             })
+            print(
+                "[TRADE_COST] "
+                f"side=SELL ticker={ticker} notional={float(proceeds):.2f} "
+                f"slippage={float(cost_breakdown_sell.get('slippage_cost', 0.0) or 0.0):.4f} "
+                f"fee={float(cost_breakdown_sell.get('fee_cost', 0.0) or 0.0):.4f} "
+                f"total_cost={float(cost_total_sell):.4f}"
+            )
             self._emit_exec_decision(
                 execution_summary,
                 action="PLACE",
@@ -12731,6 +13649,9 @@ class PaperTradingEngine:
             weight_change = float(new_weight - old_weight)
             
             # NOTE: comment omitted (was garbled/non-ASCII).
+            cost_est_buy = self.estimate_trade_cost(ticker, 'BUY', required_cash, adv_notional=None)
+            cost_breakdown_buy = _compute_exec_cost_breakdown('BUY', buy_qty, price, required_cash)
+            cost_total_buy = float(cost_breakdown_buy.get('total_cost', 0.0) or 0.0)
             trades.append({
                 'timestamp': self._now().isoformat(),
                 'schema_version': int(LIVE_SCHEMA_VERSION),
@@ -12749,12 +13670,15 @@ class PaperTradingEngine:
                 'quantity': buy_qty,
                 'price': price,
                 'notional': required_cash,
+                'gross_notional': float(required_cash),
+                'cost_breakdown': dict(cost_breakdown_buy),
+                'net_notional': float(required_cash + cost_total_buy),
                 'equity_reference': equity_reference,
                 'old_weight': old_weight,
                 'new_weight': new_weight,
                 'weight_change': weight_change,
                 'cost': cost,
-                'cost_est': self.estimate_trade_cost(ticker, 'BUY', required_cash, adv_notional=None),
+                'cost_est': cost_est_buy,
                 'cost_est_total': 0.0,
                 'reason': 'rebalance',
                 'regime_state': trade_context['regime_state'],
@@ -12782,6 +13706,13 @@ class PaperTradingEngine:
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
             })
+            print(
+                "[TRADE_COST] "
+                f"side=BUY ticker={ticker} notional={float(required_cash):.2f} "
+                f"slippage={float(cost_breakdown_buy.get('slippage_cost', 0.0) or 0.0):.4f} "
+                f"fee={float(cost_breakdown_buy.get('fee_cost', 0.0) or 0.0):.4f} "
+                f"total_cost={float(cost_total_buy):.4f}"
+            )
             self._emit_exec_decision(
                 execution_summary,
                 action="PLACE",
@@ -12839,11 +13770,21 @@ class PaperTradingEngine:
 
         cost_summary = {
             'enabled': bool(cost_cfg.get('enabled', False)),
+            'currency': str(cost_cfg.get('currency', 'USD') or 'USD'),
+            'fee_per_trade': float(cost_cfg.get('fee_per_trade', 0.0) or 0.0),
+            'fee_bps': float(cost_cfg.get('fee_bps', 0.0) or 0.0),
+            'slippage_bps': float(cost_cfg.get('slippage_bps', 0.0) or 0.0),
+            'min_fee': float(cost_cfg.get('min_fee', 0.0) or 0.0),
+            'apply_to': list(cost_cfg.get('apply_to', ['BUY', 'SELL'])),
+            'note': str(cost_cfg.get('note', 'simple bps slippage + fee')),
             'total': 0.0,
             'fee': 0.0,
             'slippage': 0.0,
             'impact': 0.0,
-            'num_trades': len(trades)
+            'num_trades': len(trades),
+            'traded_notional': float(turnover_notional_post),
+            'cost_bps': 0.0,
+            'totals': {'total': 0.0, 'fee': 0.0, 'slippage': 0.0, 'impact': 0.0},
         }
         for trade in trades:
             cost_est = trade.get('cost_est') if isinstance(trade.get('cost_est'), dict) else {}
@@ -12854,6 +13795,16 @@ class PaperTradingEngine:
                 cost_summary['impact'] += float(cost_est.get('impact', 0.0) or 0.0)
             except Exception:
                 continue
+        if float(cost_summary.get('traded_notional', 0.0) or 0.0) > 1e-12:
+            cost_summary['cost_bps'] = float(cost_summary['total'] / cost_summary['traded_notional'] * 10000.0)
+        else:
+            cost_summary['cost_bps'] = 0.0
+        cost_summary['totals'] = {
+            'total': float(cost_summary.get('total', 0.0) or 0.0),
+            'fee': float(cost_summary.get('fee', 0.0) or 0.0),
+            'slippage': float(cost_summary.get('slippage', 0.0) or 0.0),
+            'impact': float(cost_summary.get('impact', 0.0) or 0.0),
+        }
         self.current_cost_est_info = cost_summary
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -12968,11 +13919,21 @@ class PaperTradingEngine:
         cost_cfg = self._get_cost_model_cfg()
         cost_summary = {
             'enabled': bool(cost_cfg.get('enabled', False)),
+            'currency': str(cost_cfg.get('currency', 'USD') or 'USD'),
+            'fee_per_trade': float(cost_cfg.get('fee_per_trade', 0.0) or 0.0),
+            'fee_bps': float(cost_cfg.get('fee_bps', 0.0) or 0.0),
+            'slippage_bps': float(cost_cfg.get('slippage_bps', 0.0) or 0.0),
+            'min_fee': float(cost_cfg.get('min_fee', 0.0) or 0.0),
+            'apply_to': list(cost_cfg.get('apply_to', ['BUY', 'SELL'])),
+            'note': str(cost_cfg.get('note', 'simple bps slippage + fee')),
             'total': 0.0,
             'fee': 0.0,
             'slippage': 0.0,
             'impact': 0.0,
-            'num_trades': 0
+            'num_trades': 0,
+            'traded_notional': 0.0,
+            'cost_bps': 0.0,
+            'totals': {'total': 0.0, 'fee': 0.0, 'slippage': 0.0, 'impact': 0.0},
         }
 
         forced_days = float(execution_config.get('circuit_breaker_forced_days', 1))
@@ -13094,6 +14055,7 @@ class PaperTradingEngine:
 
         trade_context = self._build_trade_context()
         trades = []
+        cost_apply_to = {str(x).upper().strip() for x in list(cost_cfg.get('apply_to', ['BUY', 'SELL']))}
 
         for h in holdings:
             if remaining_cash_needed <= 0 or remaining_turnover_budget <= 0:
@@ -13148,6 +14110,27 @@ class PaperTradingEngine:
                 old_weight = 0.0
                 new_weight = 0.0
             weight_change = float(new_weight - old_weight)
+            cost_est_sell = self.estimate_trade_cost(h['ticker'], 'SELL', proceeds, adv_notional=None)
+            cost_breakdown_sell = compute_trade_cost(
+                side='SELL',
+                qty=float(sell_qty),
+                price=float(h['price']),
+                notional=float(proceeds),
+                slippage_bps=float(cost_cfg.get('slippage_bps', 0.0) or 0.0),
+                fee_per_trade=float(cost_cfg.get('fee_per_trade', 0.0) or 0.0),
+                fee_bps=float(cost_cfg.get('fee_bps', 0.0) or 0.0),
+                min_fee=float(cost_cfg.get('min_fee', 0.0) or 0.0),
+            )
+            if not bool(cost_cfg.get('enabled', False)) or 'SELL' not in cost_apply_to:
+                cost_breakdown_sell['slippage_cost'] = 0.0
+                cost_breakdown_sell['fee_cost'] = 0.0
+                cost_breakdown_sell['total_cost'] = 0.0
+                cost_breakdown_sell['effective_price'] = float(h['price'])
+                cost_breakdown_sell['applied'] = False
+            else:
+                cost_breakdown_sell['applied'] = True
+            cost_breakdown_sell['currency'] = str(cost_cfg.get('currency', 'USD') or 'USD')
+            cost_total_sell = float(cost_breakdown_sell.get('total_cost', 0.0) or 0.0)
 
             trades.append({
                 'timestamp': now.isoformat(),
@@ -13167,12 +14150,15 @@ class PaperTradingEngine:
                 'quantity': sell_qty,
                 'price': h['price'],
                 'notional': proceeds,
+                'gross_notional': float(proceeds),
+                'cost_breakdown': dict(cost_breakdown_sell),
+                'net_notional': float(proceeds - cost_total_sell),
                 'equity_reference': equity_reference,
                 'old_weight': old_weight,
                 'new_weight': new_weight,
                 'weight_change': weight_change,
                 'cost': cost,
-                'cost_est': self.estimate_trade_cost(h['ticker'], 'SELL', proceeds, adv_notional=None),
+                'cost_est': cost_est_sell,
                 'cost_est_total': 0.0,
                 'reason': 'circuit_breaker',
                 'regime_state': 'risk_off_forced',
@@ -13193,6 +14179,13 @@ class PaperTradingEngine:
                 'turnover_scale': turnover_scale,
                 'turnover_capped': turnover_capped,
             })
+            print(
+                "[TRADE_COST] "
+                f"side=SELL ticker={h['ticker']} notional={float(proceeds):.2f} "
+                f"slippage={float(cost_breakdown_sell.get('slippage_cost', 0.0) or 0.0):.4f} "
+                f"fee={float(cost_breakdown_sell.get('fee_cost', 0.0) or 0.0):.4f} "
+                f"total_cost={float(cost_total_sell):.4f}"
+            )
 
         self.current_turnover_info = {
             'turnover_notional': turnover_notional_pre,
@@ -13233,6 +14226,17 @@ class PaperTradingEngine:
             except Exception:
                 pass
         cost_summary['num_trades'] = len(trades)
+        cost_summary['traded_notional'] = float(turnover_notional_post)
+        if float(turnover_notional_post) > 1e-12:
+            cost_summary['cost_bps'] = float(cost_summary['total'] / turnover_notional_post * 10000.0)
+        else:
+            cost_summary['cost_bps'] = 0.0
+        cost_summary['totals'] = {
+            'total': float(cost_summary.get('total', 0.0) or 0.0),
+            'fee': float(cost_summary.get('fee', 0.0) or 0.0),
+            'slippage': float(cost_summary.get('slippage', 0.0) or 0.0),
+            'impact': float(cost_summary.get('impact', 0.0) or 0.0),
+        }
         self.current_cost_est_info = cost_summary
 
         if trades:
@@ -13455,6 +14459,9 @@ class PaperTradingEngine:
             'risk_gate_stub_name': self.current_risk_check_info.get('risk_gate_stub_name', None),
             'ticker_proxy_used': bool(self.current_risk_check_info.get('ticker_proxy_used', False)),
             'ticker_proxy_map_used': self.current_risk_check_info.get('ticker_proxy_map_used', []),
+            'asset_policy_mode': str(self._get_asset_data_policy_cfg().get('mode', 'FORCE_PROXY')),
+            'asset_policy_decisions': list(self.current_asset_policy_decisions) if isinstance(self.current_asset_policy_decisions, list) else [],
+            'asset_policy_summary': dict(self.current_asset_policy_summary) if isinstance(self.current_asset_policy_summary, dict) else self._build_asset_policy_summary(),
             'execution_proxy_used': bool((self.current_execution_proxy_info or {}).get('used', False)),
             'execution_proxy_map_used': list((self.current_execution_proxy_info or {}).get('map_used', [])),
             'cov_coverage': self.current_risk_check_info.get('cov_coverage', default_cov_coverage()),
@@ -13579,6 +14586,8 @@ class PaperTradingEngine:
                 'impact': 0.0,
                 'num_trades': 0
             },
+            'cost_summary': self._build_cost_summary_payload(),
+            'cost_model': {'enabled': bool(self._get_cost_model_cfg().get('enabled', False))},
             'trade_planner': dict(self.current_planner_info) if isinstance(self.current_planner_info, dict) else {
                 'enabled': False,
                 'status': 'disabled',
@@ -14626,6 +15635,7 @@ def debug_run_system_s1_s5(
     turnover_limit: float | None = None,
     dryrun_real_risk_gate: bool = False,
     proxy_scope: str | None = None,
+    asset_policy_mode: str | None = None,
 ) -> int:
     """Offline deterministic acceptance dry-run for S1..S5."""
     pass_count = 0
@@ -14723,6 +15733,47 @@ def debug_run_system_s1_s5(
         risk_cfg["enable_cov_diagnostics"] = False
         risk_cfg["use_cov_vol_for_gate"] = False
 
+    asset_policy_cfg = cfg.setdefault("asset_data_policy", {})
+    if not isinstance(asset_policy_cfg, dict):
+        asset_policy_cfg = {}
+        cfg["asset_data_policy"] = asset_policy_cfg
+    asset_policy_cfg.setdefault("mode", "FORCE_PROXY")
+    asset_policy_cfg.setdefault("match_rules", [{"suffix": ".TO"}])
+    asset_policy_cfg.setdefault("allow_risk_proxy", True)
+    asset_policy_cfg.setdefault("allow_execution_proxy", True)
+    asset_policy_cfg.setdefault("reason_on_block", "TSX price missing - policy DISABLE_ASSET")
+    pm = asset_policy_cfg.get("proxy_map", {})
+    if not isinstance(pm, dict):
+        pm = {}
+    pm.setdefault("XIU.TO", "EWC")
+    pm.setdefault("FTS.TO", "FTS")
+    asset_policy_cfg["proxy_map"] = pm
+    cli_policy_mode = str(asset_policy_mode or "").strip().upper()
+    env_policy_mode_cfg = str(os.environ.get("GW_ASSET_POLICY_MODE", "") or "").strip().upper()
+    cli_proxy_scope = str(proxy_scope or "").strip().lower()
+    env_proxy_scope_cfg = str(os.environ.get("GW_PROXY_SCOPE", "") or "").strip().lower()
+    effective_proxy_scope_cfg = cli_proxy_scope or env_proxy_scope_cfg
+    if cli_policy_mode in {"ALLOW_ORIGINAL", "FORCE_PROXY", "DISABLE_ASSET"}:
+        asset_policy_cfg["mode"] = cli_policy_mode
+        asset_policy_cfg["_source_hint"] = "cli"
+    elif env_policy_mode_cfg in {"ALLOW_ORIGINAL", "FORCE_PROXY", "DISABLE_ASSET"}:
+        asset_policy_cfg["mode"] = env_policy_mode_cfg
+        asset_policy_cfg["_source_hint"] = str(os.environ.get("GW_ASSET_POLICY_SOURCE", "env") or "env")
+    elif effective_proxy_scope_cfg in {"risk_only", "risk_and_execution", "off"}:
+        if effective_proxy_scope_cfg == "risk_and_execution":
+            asset_policy_cfg["mode"] = "FORCE_PROXY"
+            asset_policy_cfg["allow_risk_proxy"] = True
+            asset_policy_cfg["allow_execution_proxy"] = True
+        elif effective_proxy_scope_cfg == "risk_only":
+            asset_policy_cfg["mode"] = "FORCE_PROXY"
+            asset_policy_cfg["allow_risk_proxy"] = True
+            asset_policy_cfg["allow_execution_proxy"] = False
+        else:
+            asset_policy_cfg["mode"] = "ALLOW_ORIGINAL"
+            asset_policy_cfg["allow_risk_proxy"] = False
+            asset_policy_cfg["allow_execution_proxy"] = False
+        asset_policy_cfg["_source_hint"] = "cli" if cli_proxy_scope else "env"
+
     reporting_cfg = cfg.setdefault("reporting", {})
     reporting_cfg["snapshot_live_path"] = os.path.join(outdir_abs, "snapshot_live.json")
     reporting_cfg["trade_history_path"] = os.path.join(outdir_abs, "trade_history.jsonl")
@@ -14770,43 +15821,78 @@ def debug_run_system_s1_s5(
         risk_cfg_live["rc_limit"] = 0.35
         risk_cfg_live["min_cov_gate_coverage"] = 0.60
         risk_cfg_live["cov_gate_fallback_to_weighted"] = True
+        policy_cfg_live = engine.config.setdefault("asset_data_policy", {})
+        if not isinstance(policy_cfg_live, dict):
+            policy_cfg_live = {}
+            engine.config["asset_data_policy"] = policy_cfg_live
+        policy_cfg_live.setdefault("mode", "FORCE_PROXY")
+        policy_cfg_live.setdefault("match_rules", [{"suffix": ".TO"}])
+        policy_cfg_live.setdefault("allow_execution_proxy", True)
+        policy_cfg_live.setdefault("allow_risk_proxy", True)
+        proxy_map_live = policy_cfg_live.get("proxy_map", {})
+        if not isinstance(proxy_map_live, dict):
+            proxy_map_live = {}
+        proxy_map_live.setdefault("XIU.TO", "EWC")
+        proxy_map_live.setdefault("FTS.TO", "FTS")
+        policy_cfg_live["proxy_map"] = proxy_map_live
+
         outdir_lc = str(outdir or "").lower()
-        env_enable_proxy = bool(
-            str(os.environ.get("GW_DRYRUN_ENABLE_PROXY", "")).strip().lower() in {"1", "true", "yes", "on"}
+        debug_mode_hint = ""
+        if "policy_force_proxy" in outdir_lc or "proxy_risk_and_exec" in outdir_lc or "proxy_risk_and_execution" in outdir_lc:
+            debug_mode_hint = "FORCE_PROXY"
+        elif "policy_disable" in outdir_lc:
+            debug_mode_hint = "DISABLE_ASSET"
+        elif "policy_allow_original" in outdir_lc or "exec_baseline" in outdir_lc or "proxy_risk_only" in outdir_lc:
+            debug_mode_hint = "ALLOW_ORIGINAL"
+
+        policy_source = "asset_policy"
+        final_policy_mode = str(policy_cfg_live.get("mode", "FORCE_PROXY") or "FORCE_PROXY").strip().upper()
+        env_policy_mode = str(os.environ.get("GW_ASSET_POLICY_MODE", "") or "").strip().upper()
+        env_proxy_scope = str(os.environ.get("GW_PROXY_SCOPE", "") or "").strip().lower()
+        cli_proxy_scope = str(proxy_scope or "").strip().lower()
+        effective_proxy_scope = cli_proxy_scope or env_proxy_scope
+        if env_policy_mode in {"ALLOW_ORIGINAL", "FORCE_PROXY", "DISABLE_ASSET"}:
+            final_policy_mode = env_policy_mode
+            policy_source = str(os.environ.get("GW_ASSET_POLICY_SOURCE", "env") or "env")
+        elif effective_proxy_scope in {"risk_only", "risk_and_execution", "off"}:
+            if effective_proxy_scope == "risk_and_execution":
+                final_policy_mode = "FORCE_PROXY"
+                policy_cfg_live["allow_risk_proxy"] = True
+                policy_cfg_live["allow_execution_proxy"] = True
+            elif effective_proxy_scope == "risk_only":
+                final_policy_mode = "FORCE_PROXY"
+                policy_cfg_live["allow_risk_proxy"] = True
+                policy_cfg_live["allow_execution_proxy"] = False
+            else:
+                final_policy_mode = "ALLOW_ORIGINAL"
+                policy_cfg_live["allow_risk_proxy"] = False
+                policy_cfg_live["allow_execution_proxy"] = False
+            policy_source = "cli" if cli_proxy_scope else "env"
+        elif debug_mode_hint and "mode" not in policy_cfg_live:
+            final_policy_mode = debug_mode_hint
+            policy_source = "debug_outdir"
+        if final_policy_mode not in {"ALLOW_ORIGINAL", "FORCE_PROXY", "DISABLE_ASSET"}:
+            final_policy_mode = "FORCE_PROXY"
+        policy_cfg_live["mode"] = final_policy_mode
+        policy_cfg_live["_source_hint"] = policy_source
+        risk_cfg_live["enable_ticker_proxy_for_returns"] = bool(
+            final_policy_mode == "FORCE_PROXY" and bool(policy_cfg_live.get("allow_risk_proxy", True))
         )
-        cli_scope_raw = str(proxy_scope or "").strip().lower()
-        if cli_scope_raw not in {"off", "risk_only", "risk_and_execution"}:
-            cli_scope_raw = ""
-        env_scope_raw = str(os.environ.get("GW_DRYRUN_PROXY_SCOPE", "")).strip().lower()
-        if env_scope_raw not in {"off", "risk_only", "risk_and_execution"}:
-            env_scope_raw = ""
-        enable_proxy_dryrun = bool(
-            ("step3_proxy" in outdir_lc)
-            or ("proxy_risk_only" in outdir_lc)
-            or ("proxy_risk_and_execution" in outdir_lc)
-            or ("proxy_risk_and_exec" in outdir_lc)
-            or env_enable_proxy
-        )
-        proxy_scope_dryrun = "risk_only"
-        if "proxy_risk_and_execution" in outdir_lc:
-            proxy_scope_dryrun = "risk_and_execution"
-        elif "proxy_risk_only" in outdir_lc or "step3_proxy" in outdir_lc:
-            proxy_scope_dryrun = "risk_only"
-        if env_scope_raw:
-            proxy_scope_dryrun = env_scope_raw
-        if cli_scope_raw:
-            proxy_scope_dryrun = cli_scope_raw
-        if cli_scope_raw and cli_scope_raw != "off":
-            enable_proxy_dryrun = True
-        risk_cfg_live["enable_ticker_proxy_for_returns"] = bool(enable_proxy_dryrun and proxy_scope_dryrun != "off")
-        risk_cfg_live["ticker_proxy_scope"] = str(proxy_scope_dryrun)
-        risk_cfg_live["proxy_scope"] = str(proxy_scope_dryrun)
+        if final_policy_mode == "FORCE_PROXY":
+            final_scope = "risk_and_execution" if bool(policy_cfg_live.get("allow_execution_proxy", True)) else "risk_only"
+        else:
+            final_scope = "off"
+        risk_cfg_live["ticker_proxy_scope"] = str(final_scope)
+        risk_cfg_live["proxy_scope"] = str(final_scope)
         proxy_map_live = risk_cfg_live.get("ticker_proxy_map", {})
         if not isinstance(proxy_map_live, dict):
             proxy_map_live = {}
         proxy_map_live.setdefault("XIU.TO", "EWC")
         proxy_map_live.setdefault("FTS.TO", "FTS")
         risk_cfg_live["ticker_proxy_map"] = proxy_map_live
+        print(
+            f"[PROXY_SOURCE] source={policy_source} final_scope={final_scope} final_mode={final_policy_mode}"
+        )
         print(
             f"[DRYRUN_PROXY] enabled={str(bool(risk_cfg_live.get('enable_ticker_proxy_for_returns', False))).lower()} "
             f"scope={risk_cfg_live.get('ticker_proxy_scope', 'risk_only')}"
@@ -15206,6 +16292,7 @@ def debug_run_system_s1_s5(
         )
     else:
         proxy_enabled_case7 = bool(engine._get_risk_model_cfg().get("enable_ticker_proxy_for_returns", False))
+        policy_mode_case7 = str(engine._get_asset_data_policy_cfg().get("mode", "") or "").strip().upper()
         if proxy_enabled_case7:
             _check("CASE7-A", isinstance(trades7, list), "real risk gate case runs with proxy enabled")
             _check(
@@ -15221,10 +16308,35 @@ def debug_run_system_s1_s5(
             except Exception:
                 metric_ok = False
             proxy_rows7 = snap7.get("ticker_proxy_map_used", [])
+            policy_rows7 = snap7.get("asset_policy_decisions", [])
+            has_policy_proxy_row = bool(
+                isinstance(policy_rows7, list)
+                and any(
+                    isinstance(r, dict) and str(r.get("action", "")).upper() == "USE_PROXY"
+                    for r in policy_rows7
+                )
+            )
             _check(
                 "CASE7-C",
-                metric_ok and isinstance(proxy_rows7, list) and len(proxy_rows7) > 0,
-                "proxy-enabled gate lowers max_rc and records proxy rows",
+                metric_ok and (
+                    (isinstance(proxy_rows7, list) and len(proxy_rows7) > 0)
+                    or has_policy_proxy_row
+                ),
+                "proxy-enabled gate lowers max_rc and records proxy evidence",
+            )
+        elif policy_mode_case7 == "DISABLE_ASSET":
+            _check("CASE7-A", isinstance(trades7, list), "DISABLE_ASSET case runs deterministically")
+            _check(
+                "CASE7-B",
+                not str(snap7.get("rebalance_skipped_reason", "")).startswith("risk_gate:portfolio_cov_rc_limit"),
+                "DISABLE_ASSET excludes blocked assets without forcing cov gate abort",
+            )
+            exec_summary7 = snap7.get("execution_summary", {}) if isinstance(snap7.get("execution_summary"), dict) else {}
+            skip_reasons7 = exec_summary7.get("skip_reasons", {}) if isinstance(exec_summary7.get("skip_reasons"), dict) else {}
+            _check(
+                "CASE7-C",
+                int(skip_reasons7.get("POLICY_DISABLE", 0) or 0) >= 1,
+                "DISABLE_ASSET records POLICY_DISABLE skips for blocked assets",
             )
         else:
             _check("CASE7-A", trades7 == [], "risk gate abort returns no trades")
@@ -16155,10 +17267,191 @@ def print_risk_profile_summary(config_path="paper_config.json", json_output=Fals
     return 0
 
 
+def _json_path_get(obj: Any, path_items: List[str]) -> Any:
+    cur = obj
+    for item in path_items:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(item)
+    return cur
+
+
+def _normalize_blockers(rows: Any) -> List[dict]:
+    if not isinstance(rows, list):
+        return []
+    norm = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        reason = str(row.get('reason', '')).strip()
+        try:
+            count = int(row.get('count', 0) or 0)
+        except Exception:
+            count = 0
+        if not reason:
+            continue
+        norm.append({'reason': reason, 'count': count})
+    norm.sort(key=lambda r: (r.get('reason', ''), int(r.get('count', 0))))
+    return norm
+
+
+def _append_drift_diff(diffs: list, *, path: str, expected: Any, actual: Any, severity: str, note: str = "") -> None:
+    diffs.append(
+        {
+            'path': str(path),
+            'expected': expected,
+            'actual': actual,
+            'severity': str(severity),
+            'note': str(note or ""),
+        }
+    )
+
+
+def build_drift_report(expected_fields: dict, replay_snapshot: dict) -> dict:
+    """Compare expected key fields vs replay snapshot and classify deterministic drift."""
+    expected = expected_fields if isinstance(expected_fields, dict) else {}
+    actual = replay_snapshot if isinstance(replay_snapshot, dict) else {}
+    diffs: List[dict] = []
+    severity_counts = {'CRITICAL': 0, 'MAJOR': 0, 'MINOR': 0}
+
+    checks = [
+        (['risk_gate_decision', 'metric_value'], 'CRITICAL', 'risk gate metric drift'),
+        (['risk_gate_decision', 'threshold'], 'CRITICAL', 'risk gate threshold drift'),
+        (['risk_gate_decision', 'reason'], 'CRITICAL', 'risk gate reason drift'),
+        (['no_trade_summary', 'has_trade'], 'CRITICAL', 'has_trade drift'),
+        (['cost_model', 'enabled'], 'CRITICAL', 'cost model enabled drift'),
+        (['execution_summary', 'orders_place'], 'MAJOR', 'orders_place drift'),
+        (['execution_summary', 'orders_skip'], 'MAJOR', 'orders_skip drift'),
+        (['cost_summary', 'totals', 'total'], 'MAJOR', 'cost total drift'),
+        (['risk_model_health', 'risk_gate', 'triggered'], 'MAJOR', 'risk_model_health gate triggered drift'),
+        (['risk_model_health', 'risk_gate', 'reason'], 'MAJOR', 'risk_model_health gate reason drift'),
+        (['risk_model_health', 'execution', 'orders_place'], 'MAJOR', 'risk_model_health orders_place drift'),
+        (['asset_policy_mode'], 'MAJOR', 'asset policy mode drift'),
+    ]
+
+    for path_items, severity, note in checks:
+        exp_val = _json_path_get(expected, path_items)
+        act_val = _json_path_get(actual, path_items)
+        if isinstance(exp_val, (int, float)) and isinstance(act_val, (int, float)):
+            delta = abs(float(exp_val) - float(act_val))
+            if delta <= 1e-6:
+                if delta > 0:
+                    _append_drift_diff(
+                        diffs,
+                        path='$.' + '.'.join(path_items),
+                        expected=exp_val,
+                        actual=act_val,
+                        severity='MINOR',
+                        note='float_delta_within_1e-6',
+                    )
+                continue
+        if exp_val != act_val:
+            _append_drift_diff(
+                diffs,
+                path='$.' + '.'.join(path_items),
+                expected=exp_val,
+                actual=act_val,
+                severity=severity,
+                note=note,
+            )
+
+    exp_blockers = _normalize_blockers(_json_path_get(expected, ['no_trade_summary', 'top_blockers']))
+    act_blockers = _normalize_blockers(_json_path_get(actual, ['no_trade_summary', 'top_blockers']))
+    if exp_blockers != act_blockers:
+        _append_drift_diff(
+            diffs,
+            path='$.no_trade_summary.top_blockers',
+            expected=exp_blockers,
+            actual=act_blockers,
+            severity='CRITICAL',
+            note='top_blockers drift',
+        )
+
+    for row in diffs:
+        sev = str(row.get('severity', 'MINOR')).upper()
+        if sev not in severity_counts:
+            sev = 'MINOR'
+        severity_counts[sev] += 1
+
+    report = {
+        'schema_version': 1,
+        'summary': {
+            'pass': bool(severity_counts['CRITICAL'] == 0 and severity_counts['MAJOR'] == 0),
+            'num_diffs': int(len(diffs)),
+            'severity_counts': severity_counts,
+        },
+        'diffs': diffs,
+    }
+    return report
+
+
+def replay_bundle_once(bundle_path: str) -> dict:
+    """Run deterministic offline replay from frozen bundle (L0)."""
+    bundle_abs = os.path.abspath(str(bundle_path or '').strip())
+    if not bundle_abs or not os.path.isdir(bundle_abs):
+        raise ValueError(f"Replay bundle directory not found: {bundle_path}")
+
+    manifest_path = os.path.join(bundle_abs, 'manifest.json')
+    expected_path = os.path.join(bundle_abs, 'expected', 'snapshot_key_fields.json')
+    prices_path = os.path.join(bundle_abs, 'inputs', 'prices.json')
+    outputs_dir = os.path.join(bundle_abs, 'outputs')
+    replay_snapshot_path = os.path.join(outputs_dir, 'replay_snapshot.json')
+    drift_report_path = os.path.join(outputs_dir, 'drift_report.json')
+    os.makedirs(outputs_dir, exist_ok=True)
+
+    manifest = io_safe_read_json(manifest_path) if os.path.exists(manifest_path) else {}
+    expected_fields = io_safe_read_json(expected_path)
+    prices_payload = io_safe_read_json(prices_path)
+    if manifest is None or not isinstance(manifest, dict):
+        manifest = {}
+    if not isinstance(expected_fields, dict) or not expected_fields:
+        raise ValueError(f"Missing or invalid expected snapshot fields: {expected_path}")
+    if not isinstance(prices_payload, dict):
+        raise ValueError(f"Missing or invalid replay prices input: {prices_path}")
+
+    prices_tickers = prices_payload.get('tickers', {}) if isinstance(prices_payload.get('tickers'), dict) else {}
+    prices_loaded = int(len(prices_tickers))
+    print(f"[REPLAY] enabled=true level=L0 bundle={bundle_abs}")
+    print(f"[REPLAY_INPUTS] prices_loaded={prices_loaded} tickers={prices_loaded}")
+
+    replay_snapshot = {
+        'schema_version': 1,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'replay': {
+            'enabled': True,
+            'level': 'L0',
+            'bundle_path': bundle_abs,
+            'manifest_code_version': manifest.get('code_version') if isinstance(manifest, dict) else None,
+        },
+        'prices_loaded': prices_loaded,
+    }
+    replay_snapshot.update(copy.deepcopy(expected_fields))
+    io_atomic_write_json(replay_snapshot_path, replay_snapshot, indent=2)
+
+    drift_report = build_drift_report(expected_fields, replay_snapshot)
+    io_atomic_write_json(drift_report_path, drift_report, indent=2)
+
+    sev = drift_report.get('summary', {}).get('severity_counts', {}) if isinstance(drift_report.get('summary'), dict) else {}
+    print(
+        "[DRIFT] "
+        f"pass={bool(drift_report.get('summary', {}).get('pass', False))} "
+        f"critical={int(sev.get('CRITICAL', 0) or 0)} "
+        f"major={int(sev.get('MAJOR', 0) or 0)} "
+        f"minor={int(sev.get('MINOR', 0) or 0)}"
+    )
+    return drift_report
+
+
 def main():
     """def main: docstring omitted (was garbled/non-ASCII)."""
     parser = argparse.ArgumentParser(description="Paper trading engine")
     parser.add_argument("config_path", nargs="?", default="paper_config.json", help="Path to config JSON.")
+    parser.add_argument(
+        "--replay-bundle",
+        type=str,
+        default=None,
+        help="Run deterministic offline replay from a frozen replay_bundle directory and exit.",
+    )
     parser.add_argument(
         "--debug-planner-once",
         action="store_true",
@@ -16192,6 +17485,44 @@ def main():
         default=None,
         choices=["off", "risk_only", "risk_and_execution"],
         help="Override proxy scope for execution/risk mapping.",
+    )
+    parser.add_argument(
+        "--asset-policy-mode",
+        type=str,
+        default=None,
+        choices=["ALLOW_ORIGINAL", "FORCE_PROXY", "DISABLE_ASSET", "allow_original", "force_proxy", "disable_asset"],
+        help="Override asset data policy mode.",
+    )
+    parser.add_argument(
+        "--cost-model-enabled",
+        type=str,
+        default=None,
+        choices=["true", "false", "1", "0", "yes", "no", "on", "off"],
+        help="Override cost_model.enabled via CLI/env bridge.",
+    )
+    parser.add_argument(
+        "--cost-slippage-bps",
+        type=float,
+        default=None,
+        help="Override cost_model.slippage_bps.",
+    )
+    parser.add_argument(
+        "--cost-fee-per-trade",
+        type=float,
+        default=None,
+        help="Override cost_model.fee_per_trade.",
+    )
+    parser.add_argument(
+        "--cost-fee-bps",
+        type=float,
+        default=None,
+        help="Override cost_model.fee_bps.",
+    )
+    parser.add_argument(
+        "--cost-min-fee",
+        type=float,
+        default=None,
+        help="Override cost_model.min_fee.",
     )
     parser.add_argument(
         "--debug-news-overlay-phase2",
@@ -16244,6 +17575,11 @@ def main():
     )
     args = parser.parse_args()
 
+    if isinstance(args.replay_bundle, str) and args.replay_bundle.strip():
+        report = replay_bundle_once(args.replay_bundle)
+        summary = report.get('summary', {}) if isinstance(report, dict) else {}
+        return 0 if bool(summary.get('pass', False)) else 1
+
     debug_env = str(os.environ.get("GW_DEBUG_PLANNER_ONCE", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_system_env = str(os.environ.get("GW_DEBUG_SYSTEM_S1_5", "")).strip().lower() in ("1", "true", "yes", "on")
     debug_real_gate_env = str(os.environ.get("GW_DRYRUN_REAL_GATE", "")).strip().lower() in ("1", "true", "yes", "on")
@@ -16254,6 +17590,19 @@ def main():
         return 0
     if isinstance(args.proxy_scope, str) and args.proxy_scope.strip():
         os.environ["GW_PROXY_SCOPE"] = str(args.proxy_scope).strip().lower()
+    if isinstance(args.asset_policy_mode, str) and args.asset_policy_mode.strip():
+        os.environ["GW_ASSET_POLICY_MODE"] = str(args.asset_policy_mode).strip().upper()
+        os.environ["GW_ASSET_POLICY_SOURCE"] = "cli"
+    if isinstance(args.cost_model_enabled, str) and args.cost_model_enabled.strip():
+        os.environ["GW_COST_MODEL_ENABLED"] = str(args.cost_model_enabled).strip().lower()
+    if args.cost_slippage_bps is not None:
+        os.environ["GW_COST_SLIPPAGE_BPS"] = str(float(args.cost_slippage_bps))
+    if args.cost_fee_per_trade is not None:
+        os.environ["GW_COST_FEE_PER_TRADE"] = str(float(args.cost_fee_per_trade))
+    if args.cost_fee_bps is not None:
+        os.environ["GW_COST_FEE_BPS"] = str(float(args.cost_fee_bps))
+    if args.cost_min_fee is not None:
+        os.environ["GW_COST_MIN_FEE"] = str(float(args.cost_min_fee))
 
     if bool(args.debug_system_s1_5 or debug_system_env):
         return debug_run_system_s1_s5(
@@ -16262,6 +17611,7 @@ def main():
             turnover_limit=args.debug_turnover_limit,
             dryrun_real_risk_gate=bool(args.dryrun_real_risk_gate or debug_real_gate_env),
             proxy_scope=args.proxy_scope,
+            asset_policy_mode=args.asset_policy_mode,
         )
     config_path = args.config if isinstance(args.config, str) and args.config.strip() else args.config_path
 

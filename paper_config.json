@@ -1316,6 +1316,21 @@
     "debug_log": false,
     "fallback_to_diag_on_error": true
   },
+  "asset_data_policy": {
+    "mode": "FORCE_PROXY",
+    "match_rules": [
+      {
+        "suffix": ".TO"
+      }
+    ],
+    "proxy_map": {
+      "XIU.TO": "EWC",
+      "FTS.TO": "FTS"
+    },
+    "allow_execution_proxy": true,
+    "allow_risk_proxy": true,
+    "reason_on_block": "TSX price missing - policy DISABLE_ASSET"
+  },
   "execution": {
     "risk_profile": "",
     "weight_threshold": 0.025,
@@ -1495,8 +1510,16 @@
   },
   "cost_model": {
     "enabled": false,
-    "fee_bps": 1.0,
-    "slippage_bps": 2.0,
+    "slippage_bps": 5.0,
+    "fee_per_trade": 0.0,
+    "fee_bps": 0.0,
+    "min_fee": 0.0,
+    "currency": "USD",
+    "apply_to": [
+      "BUY",
+      "SELL"
+    ],
+    "note": "simple bps slippage + fee",
     "impact_enabled": false,
     "impact_k": 0.1,
     "adv_lookback_days": 20,
