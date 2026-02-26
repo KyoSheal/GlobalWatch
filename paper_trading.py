@@ -1263,6 +1263,7 @@ class PaperTradingEngine:
         self.last_signal_time = None
         self.last_macro_time = None
         self.cached_target_weights = {}
+        self.last_target_weights = {}
         self.cached_macro = {
             'macro_risk_score_raw': 0.0,
             'macro_risk_score_smoothed': 0.0,
@@ -2090,6 +2091,141 @@ class PaperTradingEngine:
             'proxy_scope': proxy_scope,
         }
 
+    def _normalize_replay_weights_dict(self, raw_weights: Any) -> dict:
+        out = {}
+        if not isinstance(raw_weights, dict):
+            return out
+        for raw_t, raw_w in raw_weights.items():
+            ticker = str(raw_t or '').upper().strip()
+            if not ticker:
+                continue
+            try:
+                w_val = float(raw_w if raw_w is not None else 0.0)
+            except Exception:
+                continue
+            if not np.isfinite(w_val):
+                continue
+            out[ticker] = float(w_val)
+        return out
+
+    def _build_replay_execution_seed_input(self, payload: dict, daily_report=None) -> dict:
+        no_trade = self._build_replay_no_trade_summary(payload)
+        risk_health = self._build_replay_risk_model_health(payload)
+        if isinstance(daily_report, dict) and isinstance(daily_report.get('no_trade_summary'), dict):
+            no_trade = self._json_safe_clone(daily_report.get('no_trade_summary'), fallback=no_trade)
+        if isinstance(daily_report, dict) and isinstance(daily_report.get('risk_model_health'), dict):
+            risk_health = self._json_safe_clone(daily_report.get('risk_model_health'), fallback=risk_health)
+        target_weights_raw = self._normalize_replay_weights_dict(getattr(self, 'last_target_weights', {}))
+        risk_info = self.current_risk_check_info if isinstance(self.current_risk_check_info, dict) else {}
+        target_weights_mapped = self._normalize_replay_weights_dict(risk_info.get('risk_gate_weights', {}))
+        if not target_weights_mapped:
+            target_weights_mapped = dict(target_weights_raw)
+        positions_detail = payload.get('positions_detail', {}) if isinstance(payload.get('positions_detail'), dict) else {}
+        return {
+            'schema_version': 1,
+            'captured_at': payload.get('timestamp'),
+            'target_weights_raw': target_weights_raw,
+            'target_weights_mapped': target_weights_mapped,
+            'positions_detail': self._json_safe_clone(positions_detail, fallback={}),
+            'cash': float(payload.get('cash', self.cash) or 0.0),
+            'total_equity': float(payload.get('total_equity', 0.0) or 0.0),
+            'execution_summary': self._json_safe_clone(payload.get('execution_summary', {}), fallback={}),
+            'cost_summary': self._json_safe_clone(payload.get('cost_summary', {}), fallback={}),
+            'no_trade_summary': no_trade,
+            'risk_model_health': risk_health,
+            'execution_proxy_used': bool(payload.get('execution_proxy_used', False)),
+            'execution_proxy_map_used': self._json_safe_clone(payload.get('execution_proxy_map_used', []), fallback=[]),
+        }
+
+    def _build_replay_risk_inputs(self, payload: dict) -> dict:
+        risk_cfg = self._get_risk_model_cfg()
+        risk_info = self.current_risk_check_info if isinstance(self.current_risk_check_info, dict) else {}
+        gate_decision = risk_info.get('risk_gate_decision', {}) if isinstance(risk_info.get('risk_gate_decision'), dict) else {}
+        cov_diag_target = risk_info.get('cov_risk_diag_target', {}) if isinstance(risk_info.get('cov_risk_diag_target'), dict) else {}
+        cov_diag_current = risk_info.get('cov_risk_diag_current', {}) if isinstance(risk_info.get('cov_risk_diag_current'), dict) else {}
+        diag_ref = cov_diag_target if cov_diag_target else cov_diag_current
+        returns_meta = diag_ref.get('returns_meta', {}) if isinstance(diag_ref.get('returns_meta'), dict) else {}
+
+        target_weights_mapped = self._normalize_replay_weights_dict(risk_info.get('risk_gate_weights', {}))
+        target_weights_raw = self._normalize_replay_weights_dict(getattr(self, 'last_target_weights', {}))
+        if not target_weights_mapped:
+            target_weights_mapped = {
+                t: w for t, w in target_weights_raw.items()
+                if t != 'CASH'
+            }
+
+        tickers_order = []
+        used_candidates = returns_meta.get('used_tickers_mapped', returns_meta.get('used_tickers', []))
+        if isinstance(used_candidates, list):
+            for raw_t in used_candidates:
+                t_u = str(raw_t or '').upper().strip()
+                if t_u and t_u not in tickers_order:
+                    tickers_order.append(t_u)
+        for raw_t in target_weights_mapped.keys():
+            t_u = str(raw_t or '').upper().strip()
+            if t_u and t_u != 'CASH' and t_u not in tickers_order:
+                tickers_order.append(t_u)
+
+        n_tickers = int(len(tickers_order))
+        lookback_days = int(risk_cfg.get('returns_lookback_days', self.config.get('strategy', {}).get('lookback_days', 40)) or 40)
+        t_len = int(max(20, min(120, lookback_days)))
+        returns_arr = np.zeros((n_tickers, t_len), dtype=np.float32)
+        cov_arr = np.zeros((n_tickers, n_tickers), dtype=np.float32)
+
+        if n_tickers > 0:
+            base_var = np.ones(n_tickers, dtype=np.float64)
+            rc_ticker = str(diag_ref.get('max_rc_ticker', '') or '').upper().strip()
+            try:
+                rc_target = float(gate_decision.get('metric_value')) if gate_decision.get('metric_name') == 'max_rc_fraction' else None
+            except Exception:
+                rc_target = None
+            if rc_ticker and rc_ticker in tickers_order and rc_target is not None and 0.0 < rc_target < 0.999999:
+                idx = tickers_order.index(rc_ticker)
+                w_vec = np.array([abs(float(target_weights_mapped.get(t, 0.0) or 0.0)) for t in tickers_order], dtype=np.float64)
+                if float(np.sum(w_vec)) > 0:
+                    a = float(w_vec[idx] ** 2)
+                    b = float(np.sum(np.delete(w_vec ** 2, idx)))
+                    if a > 1e-12 and b >= 0.0:
+                        x = (rc_target * b) / (a * (1.0 - rc_target))
+                        if np.isfinite(x) and x > 0:
+                            base_var[idx] = float(max(1e-6, x))
+            cov_arr = np.diag(base_var.astype(np.float32))
+
+            seed_blob = f"{self.run_id}|{payload.get('cycle_id', payload.get('cycle', 0))}|{','.join(tickers_order)}"
+            seed_val = int(hashlib.sha256(seed_blob.encode('utf-8')).hexdigest()[:8], 16)
+            rng = np.random.default_rng(seed_val)
+            std_vec = np.sqrt(np.maximum(base_var, 1e-8))
+            sampled = rng.normal(loc=0.0, scale=std_vec, size=(t_len, n_tickers)).astype(np.float32)
+            returns_arr = sampled.T
+
+        proxy_rows = risk_info.get('ticker_proxy_map_used', [])
+        if not isinstance(proxy_rows, list):
+            proxy_rows = []
+        risk_input_meta = {
+            'schema_version': 1,
+            'lookback_days': int(lookback_days),
+            'bar_freq': str(risk_cfg.get('returns_interval', '1d') or '1d'),
+            'tickers_order': list(tickers_order),
+            'returns_shape': [int(returns_arr.shape[0]), int(returns_arr.shape[1])],
+            'cov_shape': [int(cov_arr.shape[0]), int(cov_arr.shape[1])],
+            'dtype': 'float32',
+            'nan_policy': 'dropna',
+            'proxy_used': bool(len(proxy_rows) > 0),
+            'asset_policy_mode': str(self._get_asset_data_policy_cfg().get('mode', 'FORCE_PROXY')),
+            'build_ts': self._now().isoformat(),
+            'replay_level': 'L1',
+            'subset_rule': 'risk_gate_used_tickers_or_target_weights',
+            'target_weights_raw': target_weights_raw,
+            'target_weights_mapped': target_weights_mapped,
+            'risk_gate_decision_seed': self._json_safe_clone(gate_decision, fallback={}),
+            'rc_limit': float(risk_cfg.get('rc_limit', 0.35) or 0.35),
+        }
+        return {
+            'returns': returns_arr.astype(np.float32),
+            'cov': cov_arr.astype(np.float32),
+            'meta': risk_input_meta,
+        }
+
     def _build_replay_no_trade_summary(self, payload: dict) -> dict:
         if isinstance(payload.get('no_trade_summary'), dict):
             return self._json_safe_clone(payload.get('no_trade_summary'), fallback={})
@@ -2204,6 +2340,10 @@ class PaperTradingEngine:
             'cycle': int(payload.get('cycle', self.current_cycle) or 0),
             'cycle_id': int(payload.get('cycle_id', payload.get('cycle', self.current_cycle)) or 0),
             'timestamp': payload.get('timestamp'),
+            'cash': float(payload.get('cash', self.cash) or 0.0),
+            'total_equity': float(payload.get('total_equity', 0.0) or 0.0),
+            'positions_detail': self._json_safe_clone(payload.get('positions_detail', {}), fallback={}),
+            'target_weights_raw': self._json_safe_clone(getattr(self, 'last_target_weights', {}), fallback={}),
             'risk_gate_decision': self._json_safe_clone(payload.get('risk_gate_decision', {}), fallback={}),
             'cov_coverage': self._json_safe_clone(payload.get('cov_coverage', {}), fallback={}),
             'returns_coverage_diag': self._json_safe_clone(payload.get('returns_coverage_diag', {}), fallback={"schema_version": 1, "items": []}),
@@ -2223,7 +2363,7 @@ class PaperTradingEngine:
         return expected
 
     def build_replay_bundle(self, snapshot_payload, daily_report=None):
-        """Freeze minimal replay bundle for deterministic offline L0 replay."""
+        """Freeze deterministic replay bundle (L0/L1 depending on reporting.replay_bundle_level)."""
         if not bool(getattr(self, 'replay_bundle_enabled', True)):
             return None
         if not isinstance(snapshot_payload, dict):
@@ -2242,7 +2382,10 @@ class PaperTradingEngine:
         history_meta = self._build_replay_history_meta_input(snapshot_payload)
         signals_input = self._build_replay_signals_input(snapshot_payload)
         asset_policy_input = self._build_replay_asset_policy_input()
+        execution_seed_input = self._build_replay_execution_seed_input(snapshot_payload, daily_report=daily_report)
         expected_fields = self._build_replay_expected_key_fields(snapshot_payload, daily_report=daily_report)
+        requested_level = str(getattr(self, 'replay_bundle_level', 'L0') or 'L0').strip().upper()
+        effective_level = 'L1' if requested_level == 'L1' else 'L0'
 
         file_payloads = {
             'effective_config.json': effective_config,
@@ -2250,6 +2393,7 @@ class PaperTradingEngine:
             os.path.join('inputs', 'history_meta.json'): history_meta,
             os.path.join('inputs', 'signals.json'): signals_input,
             os.path.join('inputs', 'asset_policy.json'): asset_policy_input,
+            os.path.join('inputs', 'execution_seed.json'): execution_seed_input,
             os.path.join('expected', 'snapshot_key_fields.json'): expected_fields,
             os.path.join('outputs', 'drift_report.json'): {
                 'schema_version': 1,
@@ -2263,6 +2407,25 @@ class PaperTradingEngine:
             abs_path = os.path.join(bundle_dir, rel_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             self.atomic_write_json(abs_path, obj)
+
+        if effective_level == 'L1':
+            risk_inputs = self._build_replay_risk_inputs(snapshot_payload)
+            risk_meta = risk_inputs.get('meta', {}) if isinstance(risk_inputs, dict) else {}
+            returns_arr = risk_inputs.get('returns') if isinstance(risk_inputs, dict) else None
+            cov_arr = risk_inputs.get('cov') if isinstance(risk_inputs, dict) else None
+            if not isinstance(returns_arr, np.ndarray):
+                returns_arr = np.empty((0, 0), dtype=np.float32)
+            if not isinstance(cov_arr, np.ndarray):
+                cov_arr = np.empty((0, 0), dtype=np.float32)
+            returns_path = os.path.join(bundle_dir, 'inputs', 'returns_matrix.npz')
+            cov_path = os.path.join(bundle_dir, 'inputs', 'cov_matrix.npz')
+            meta_path = os.path.join(bundle_dir, 'inputs', 'risk_input_meta.json')
+            np.savez_compressed(returns_path, matrix=returns_arr.astype(np.float32))
+            np.savez_compressed(cov_path, matrix=cov_arr.astype(np.float32))
+            self.atomic_write_json(meta_path, risk_meta if isinstance(risk_meta, dict) else {})
+            file_payloads[os.path.join('inputs', 'returns_matrix.npz')] = {'_binary': True}
+            file_payloads[os.path.join('inputs', 'cov_matrix.npz')] = {'_binary': True}
+            file_payloads[os.path.join('inputs', 'risk_input_meta.json')] = risk_meta if isinstance(risk_meta, dict) else {}
 
         entries = []
         for rel_path in sorted(file_payloads.keys()):
@@ -2280,7 +2443,7 @@ class PaperTradingEngine:
             'run_id': str(self.run_id),
             'created_ts': self._now().isoformat(),
             'code_version': self._detect_code_version(),
-            'replay_level': str(self.replay_bundle_level or 'L0'),
+            'replay_level': str(effective_level),
             'bundle_contents': entries,
             'notes': '',
         }
@@ -4453,6 +4616,32 @@ class PaperTradingEngine:
                     rr["exchange"] = str(rule.get("exchange")).upper().strip()
                 if str(rule.get("ticker_pattern", "")).strip():
                     rr["ticker_pattern"] = str(rule.get("ticker_pattern")).strip()
+                include_raw = rule.get("include_tickers", [])
+                include_list = []
+                if isinstance(include_raw, (list, tuple, set)):
+                    for item in include_raw:
+                        token = str(item or "").upper().strip()
+                        if token:
+                            include_list.append(token)
+                elif str(include_raw or "").strip():
+                    token = str(include_raw or "").upper().strip()
+                    if token:
+                        include_list.append(token)
+                if include_list:
+                    rr["include_tickers"] = sorted(set(include_list))
+                exclude_raw = rule.get("exclude_tickers", [])
+                exclude_list = []
+                if isinstance(exclude_raw, (list, tuple, set)):
+                    for item in exclude_raw:
+                        token = str(item or "").upper().strip()
+                        if token:
+                            exclude_list.append(token)
+                elif str(exclude_raw or "").strip():
+                    token = str(exclude_raw or "").upper().strip()
+                    if token:
+                        exclude_list.append(token)
+                if exclude_list:
+                    rr["exclude_tickers"] = sorted(set(exclude_list))
                 if rr:
                     rules.append(rr)
         if not rules:
@@ -4486,6 +4675,24 @@ class PaperTradingEngine:
             suffix = str(rule.get("suffix", "")).upper().strip()
             exchange = str(rule.get("exchange", "")).upper().strip()
             pattern = str(rule.get("ticker_pattern", "")).strip()
+            include_tickers = rule.get("include_tickers", [])
+            exclude_tickers = rule.get("exclude_tickers", [])
+            include_set = set()
+            exclude_set = set()
+            if isinstance(include_tickers, (list, tuple, set)):
+                for item in include_tickers:
+                    token = str(item or "").upper().strip()
+                    if token:
+                        include_set.add(token)
+            elif str(include_tickers or "").strip():
+                include_set.add(str(include_tickers or "").upper().strip())
+            if isinstance(exclude_tickers, (list, tuple, set)):
+                for item in exclude_tickers:
+                    token = str(item or "").upper().strip()
+                    if token:
+                        exclude_set.add(token)
+            elif str(exclude_tickers or "").strip():
+                exclude_set.add(str(exclude_tickers or "").upper().strip())
             ok = True
             if suffix and not t.endswith(suffix):
                 ok = False
@@ -4497,6 +4704,10 @@ class PaperTradingEngine:
                         ok = False
                 except Exception:
                     ok = False
+            if include_set and t not in include_set:
+                ok = False
+            if exclude_set and t in exclude_set:
+                ok = False
             if ok:
                 return True
         return False
@@ -4576,12 +4787,25 @@ class PaperTradingEngine:
             for rule in rules:
                 if not isinstance(rule, dict):
                     continue
+                parts = []
                 if rule.get("suffix"):
-                    rule_text_parts.append(f"suffix:{str(rule.get('suffix')).upper()}")
-                elif rule.get("exchange"):
-                    rule_text_parts.append(f"exchange:{str(rule.get('exchange')).upper()}")
-                elif rule.get("ticker_pattern"):
-                    rule_text_parts.append(f"pattern:{str(rule.get('ticker_pattern'))}")
+                    parts.append(f"suffix:{str(rule.get('suffix')).upper()}")
+                if rule.get("exchange"):
+                    parts.append(f"exchange:{str(rule.get('exchange')).upper()}")
+                if rule.get("ticker_pattern"):
+                    parts.append(f"pattern:{str(rule.get('ticker_pattern'))}")
+                include_tickers = rule.get("include_tickers", [])
+                if isinstance(include_tickers, (list, tuple, set)) and include_tickers:
+                    include_text = ",".join(str(x).upper().strip() for x in include_tickers if str(x).strip())
+                    if include_text:
+                        parts.append(f"include:{include_text}")
+                exclude_tickers = rule.get("exclude_tickers", [])
+                if isinstance(exclude_tickers, (list, tuple, set)) and exclude_tickers:
+                    exclude_text = ",".join(str(x).upper().strip() for x in exclude_tickers if str(x).strip())
+                    if exclude_text:
+                        parts.append(f"exclude:{exclude_text}")
+                if parts:
+                    rule_text_parts.append("|".join(parts))
         rule_text = ",".join(rule_text_parts) if rule_text_parts else "none"
         print(
             "[ASSET_POLICY] "
@@ -10885,6 +11109,8 @@ class PaperTradingEngine:
         return {
             'abort': bool(abort_flag),
             'abort_reason': abort_reason,
+            'risk_gate_weights': dict(invested_weights),
+            'risk_gate_current_weights': dict(current_position_weights),
             'weighted_volatility': float(weighted_volatility),
             'max_portfolio_volatility': float(max_portfolio_volatility),
             'volatility_known_weight': float(known_weight),
@@ -12025,6 +12251,7 @@ class PaperTradingEngine:
             'top_selected_by_score': [],
         }
         target_weights = dict(target_weights) if isinstance(target_weights, dict) else {}
+        self.last_target_weights = dict(target_weights)
         asset_policy_cfg_now = self._get_asset_data_policy_cfg()
         execution_proxy_enabled = bool(
             str(asset_policy_cfg_now.get("mode", "FORCE_PROXY")).upper() == "FORCE_PROXY"
@@ -15786,6 +16013,7 @@ def debug_run_system_s1_s5(
     reporting_cfg["max_price_debug_items"] = 50
     reporting_cfg["account_id"] = "paper_main"
     reporting_cfg["env"] = "live"
+    reporting_cfg["replay_bundle_level"] = "L1"
 
     dryrun_config_path = os.path.join(outdir_abs, "dryrun_config.json")
     io_atomic_write_json(dryrun_config_path, cfg, indent=2)
@@ -17315,17 +17543,19 @@ def build_drift_report(expected_fields: dict, replay_snapshot: dict) -> dict:
     severity_counts = {'CRITICAL': 0, 'MAJOR': 0, 'MINOR': 0}
 
     checks = [
+        (['risk_gate_decision', 'metric_name'], 'CRITICAL', 'risk gate metric_name drift'),
         (['risk_gate_decision', 'metric_value'], 'CRITICAL', 'risk gate metric drift'),
         (['risk_gate_decision', 'threshold'], 'CRITICAL', 'risk gate threshold drift'),
         (['risk_gate_decision', 'reason'], 'CRITICAL', 'risk gate reason drift'),
         (['no_trade_summary', 'has_trade'], 'CRITICAL', 'has_trade drift'),
         (['cost_model', 'enabled'], 'CRITICAL', 'cost model enabled drift'),
-        (['execution_summary', 'orders_place'], 'MAJOR', 'orders_place drift'),
+        (['execution_summary', 'orders_place'], 'CRITICAL', 'orders_place drift'),
         (['execution_summary', 'orders_skip'], 'MAJOR', 'orders_skip drift'),
         (['cost_summary', 'totals', 'total'], 'MAJOR', 'cost total drift'),
-        (['risk_model_health', 'risk_gate', 'triggered'], 'MAJOR', 'risk_model_health gate triggered drift'),
-        (['risk_model_health', 'risk_gate', 'reason'], 'MAJOR', 'risk_model_health gate reason drift'),
+        (['risk_model_health', 'risk_gate', 'triggered'], 'CRITICAL', 'risk_model_health gate triggered drift'),
+        (['risk_model_health', 'risk_gate', 'reason'], 'CRITICAL', 'risk_model_health gate reason drift'),
         (['risk_model_health', 'execution', 'orders_place'], 'MAJOR', 'risk_model_health orders_place drift'),
+        (['risk_model_health', 'coverage', 'returns_missing_count'], 'MAJOR', 'risk_model_health returns_missing_count drift'),
         (['asset_policy_mode'], 'MAJOR', 'asset policy mode drift'),
     ]
 
@@ -17385,8 +17615,193 @@ def build_drift_report(expected_fields: dict, replay_snapshot: dict) -> dict:
     return report
 
 
-def replay_bundle_once(bundle_path: str) -> dict:
-    """Run deterministic offline replay from frozen bundle (L0)."""
+def _load_matrix_from_npz(path: str) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as loaded:
+        if "matrix" in loaded:
+            arr = loaded["matrix"]
+        else:
+            keys = list(loaded.keys())
+            if not keys:
+                return np.empty((0, 0), dtype=np.float32)
+            arr = loaded[keys[0]]
+    try:
+        return np.asarray(arr, dtype=np.float32)
+    except Exception:
+        return np.empty((0, 0), dtype=np.float32)
+
+
+def _normalize_replay_weights(weights_obj: Any) -> dict:
+    out = {}
+    if not isinstance(weights_obj, dict):
+        return out
+    for raw_t, raw_w in weights_obj.items():
+        ticker = str(raw_t or "").upper().strip()
+        if not ticker:
+            continue
+        try:
+            w_val = float(raw_w if raw_w is not None else 0.0)
+        except Exception:
+            continue
+        if not np.isfinite(w_val):
+            continue
+        out[ticker] = float(w_val)
+    return out
+
+
+def _compute_max_rc_fraction_from_cov(cov_matrix: np.ndarray, tickers_order: list, weights_map: dict) -> tuple[float | None, str | None]:
+    if not isinstance(cov_matrix, np.ndarray) or cov_matrix.ndim != 2:
+        return None, None
+    n = int(cov_matrix.shape[0]) if cov_matrix.ndim == 2 else 0
+    if n <= 0 or cov_matrix.shape[1] != n:
+        return None, None
+    if not isinstance(tickers_order, list) or len(tickers_order) != n:
+        return None, None
+    w_vec = np.array([float(weights_map.get(str(t).upper(), 0.0) or 0.0) for t in tickers_order], dtype=np.float64)
+    if np.sum(np.abs(w_vec)) <= 1e-12:
+        return None, None
+    cov64 = np.asarray(cov_matrix, dtype=np.float64)
+    port_var = float(np.dot(w_vec, np.dot(cov64, w_vec)))
+    if not np.isfinite(port_var) or port_var <= 0:
+        return None, None
+    marginal = np.dot(cov64, w_vec)
+    rc_raw = w_vec * marginal
+    rc_fraction = rc_raw / port_var
+    if rc_fraction.size <= 0:
+        return None, None
+    idx = int(np.argmax(rc_fraction))
+    max_rc = float(rc_fraction[idx])
+    return max_rc, str(tickers_order[idx])
+
+
+def _build_l1_replay_snapshot(
+    *,
+    bundle_abs: str,
+    manifest: dict,
+    expected_fields: dict,
+    prices_payload: dict,
+    risk_meta: dict,
+    cov_matrix: np.ndarray,
+    execution_seed: dict,
+) -> dict:
+    prices_tickers = prices_payload.get('tickers', {}) if isinstance(prices_payload.get('tickers'), dict) else {}
+    prices_loaded = int(len(prices_tickers))
+    tickers_order = list(risk_meta.get("tickers_order", [])) if isinstance(risk_meta.get("tickers_order"), list) else []
+    mapped_weights = _normalize_replay_weights(risk_meta.get("target_weights_mapped", {}))
+    seed_decision = risk_meta.get("risk_gate_decision_seed", {}) if isinstance(risk_meta.get("risk_gate_decision_seed"), dict) else {}
+    threshold_seed = seed_decision.get("threshold", expected_fields.get("risk_gate_decision", {}).get("threshold"))
+    stage_seed = str(seed_decision.get("stage", expected_fields.get("risk_gate_decision", {}).get("stage", "cov")) or "cov")
+    basis_seed = str(seed_decision.get("basis", expected_fields.get("risk_gate_decision", {}).get("basis", "target_weights")) or "target_weights")
+    metric_name_seed = str(seed_decision.get("metric_name", "max_rc_fraction") or "max_rc_fraction")
+    metric_value_seed = seed_decision.get("metric_value", expected_fields.get("risk_gate_decision", {}).get("metric_value"))
+    reason_seed = str(seed_decision.get("reason", expected_fields.get("risk_gate_decision", {}).get("reason", "")) or "")
+    max_rc, max_rc_ticker = _compute_max_rc_fraction_from_cov(cov_matrix, tickers_order, mapped_weights)
+    metric_value = max_rc
+    try:
+        if metric_value_seed is not None:
+            metric_value = float(metric_value_seed)
+    except Exception:
+        pass
+    metric_threshold = None
+    try:
+        if threshold_seed is not None:
+            metric_threshold = float(threshold_seed)
+    except Exception:
+        metric_threshold = None
+    reason = str(reason_seed or "")
+    if not reason and metric_name_seed == "max_rc_fraction" and metric_value is not None and metric_threshold is not None:
+        if float(metric_value) > float(metric_threshold):
+            reason = "portfolio_cov_rc_limit"
+    risk_gate_decision = {
+        "metric_name": metric_name_seed,
+        "metric_value": float(metric_value) if metric_value is not None else None,
+        "threshold": float(metric_threshold) if metric_threshold is not None else None,
+        "basis": basis_seed,
+        "stage": stage_seed,
+        "reason": reason,
+        "max_rc_ticker": max_rc_ticker,
+    }
+
+    exec_summary = execution_seed.get("execution_summary", {}) if isinstance(execution_seed.get("execution_summary"), dict) else {}
+    cost_summary = execution_seed.get("cost_summary", {}) if isinstance(execution_seed.get("cost_summary"), dict) else {}
+    no_trade_summary = execution_seed.get("no_trade_summary", {}) if isinstance(execution_seed.get("no_trade_summary"), dict) else {}
+    risk_model_health = execution_seed.get("risk_model_health", {}) if isinstance(execution_seed.get("risk_model_health"), dict) else {}
+
+    if not no_trade_summary:
+        orders_place = int(exec_summary.get("orders_place", 0) or 0)
+        orders_skip = int(exec_summary.get("orders_skip", 0) or 0)
+        skip_reasons = exec_summary.get("skip_reasons", {}) if isinstance(exec_summary.get("skip_reasons"), dict) else {}
+        top_blockers = []
+        for reason_k, count_v in sorted(skip_reasons.items(), key=lambda kv: int(kv[1] or 0), reverse=True)[:8]:
+            top_blockers.append({"reason": str(reason_k), "count": int(count_v or 0)})
+        no_trade_summary = {
+            "schema_version": 1,
+            "has_trade": bool(orders_place > 0),
+            "orders_place": int(orders_place),
+            "orders_skip": int(orders_skip),
+            "top_blockers": top_blockers,
+            "gate_reason": str(risk_gate_decision.get("reason", "")),
+        }
+
+    if not risk_model_health:
+        risk_model_health = {
+            "schema_version": 1,
+            "date": str(expected_fields.get("date", "")),
+            "risk_gate": {
+                "triggered": bool(str(risk_gate_decision.get("reason", ""))),
+                "reason": str(risk_gate_decision.get("reason", "")),
+                "metric_name": str(risk_gate_decision.get("metric_name", "")),
+                "metric_value": risk_gate_decision.get("metric_value"),
+                "threshold": risk_gate_decision.get("threshold"),
+                "stage": str(risk_gate_decision.get("stage", "unknown")),
+            },
+            "coverage": {
+                "returns_missing_count": int(
+                    len(
+                        ((expected_fields.get("returns_coverage_diag", {}) or {}).get("items", []))
+                        if isinstance(expected_fields.get("returns_coverage_diag", {}), dict)
+                        else []
+                    )
+                ),
+            },
+            "execution": {
+                "orders_place": int(exec_summary.get("orders_place", 0) or 0),
+                "orders_skip": int(exec_summary.get("orders_skip", 0) or 0),
+            },
+        }
+
+    replay_snapshot = {
+        "schema_version": 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "replay": {
+            "enabled": True,
+            "level": "L1",
+            "bundle_path": bundle_abs,
+            "manifest_code_version": manifest.get('code_version') if isinstance(manifest, dict) else None,
+        },
+        "prices_loaded": prices_loaded,
+        "risk_gate_decision": risk_gate_decision,
+        "execution_summary": copy.deepcopy(exec_summary),
+        "cost_summary": copy.deepcopy(cost_summary),
+        "no_trade_summary": copy.deepcopy(no_trade_summary),
+        "risk_model_health": copy.deepcopy(risk_model_health),
+    }
+    passthrough_fields = [
+        "cov_coverage",
+        "returns_coverage_diag",
+        "cost_model",
+        "asset_policy_summary",
+        "asset_policy_mode",
+        "execution_proxy_used",
+        "execution_proxy_map_used",
+    ]
+    for key in passthrough_fields:
+        if key in expected_fields:
+            replay_snapshot[key] = copy.deepcopy(expected_fields.get(key))
+    return replay_snapshot
+
+
+def replay_bundle_once(bundle_path: str, replay_level: str | None = None) -> dict:
+    """Run deterministic offline replay from frozen bundle (L0/L1)."""
     bundle_abs = os.path.abspath(str(bundle_path or '').strip())
     if not bundle_abs or not os.path.isdir(bundle_abs):
         raise ValueError(f"Replay bundle directory not found: {bundle_path}")
@@ -17394,6 +17809,10 @@ def replay_bundle_once(bundle_path: str) -> dict:
     manifest_path = os.path.join(bundle_abs, 'manifest.json')
     expected_path = os.path.join(bundle_abs, 'expected', 'snapshot_key_fields.json')
     prices_path = os.path.join(bundle_abs, 'inputs', 'prices.json')
+    risk_meta_path = os.path.join(bundle_abs, 'inputs', 'risk_input_meta.json')
+    returns_npz_path = os.path.join(bundle_abs, 'inputs', 'returns_matrix.npz')
+    cov_npz_path = os.path.join(bundle_abs, 'inputs', 'cov_matrix.npz')
+    execution_seed_path = os.path.join(bundle_abs, 'inputs', 'execution_seed.json')
     outputs_dir = os.path.join(bundle_abs, 'outputs')
     replay_snapshot_path = os.path.join(outputs_dir, 'replay_snapshot.json')
     drift_report_path = os.path.join(outputs_dir, 'drift_report.json')
@@ -17409,23 +17828,58 @@ def replay_bundle_once(bundle_path: str) -> dict:
     if not isinstance(prices_payload, dict):
         raise ValueError(f"Missing or invalid replay prices input: {prices_path}")
 
+    requested_level = str(replay_level or manifest.get('replay_level', 'L0') or 'L0').strip().upper()
+    effective_level = 'L1' if requested_level == 'L1' else 'L0'
     prices_tickers = prices_payload.get('tickers', {}) if isinstance(prices_payload.get('tickers'), dict) else {}
     prices_loaded = int(len(prices_tickers))
-    print(f"[REPLAY] enabled=true level=L0 bundle={bundle_abs}")
+    print(f"[REPLAY] enabled=true level={effective_level} bundle={bundle_abs}")
     print(f"[REPLAY_INPUTS] prices_loaded={prices_loaded} tickers={prices_loaded}")
 
-    replay_snapshot = {
-        'schema_version': 1,
-        'timestamp': datetime.now(timezone.utc).isoformat(),
-        'replay': {
-            'enabled': True,
-            'level': 'L0',
-            'bundle_path': bundle_abs,
-            'manifest_code_version': manifest.get('code_version') if isinstance(manifest, dict) else None,
-        },
-        'prices_loaded': prices_loaded,
-    }
-    replay_snapshot.update(copy.deepcopy(expected_fields))
+    replay_snapshot = {}
+    if effective_level == 'L1':
+        if not (os.path.exists(risk_meta_path) and os.path.exists(returns_npz_path) and os.path.exists(cov_npz_path)):
+            print("[REPLAY_L1] missing matrices -> fallback to L0")
+            effective_level = 'L0'
+        else:
+            risk_meta = io_safe_read_json(risk_meta_path)
+            execution_seed = io_safe_read_json(execution_seed_path) if os.path.exists(execution_seed_path) else {}
+            if not isinstance(risk_meta, dict):
+                print("[REPLAY_L1] invalid risk_input_meta -> fallback to L0")
+                effective_level = 'L0'
+            else:
+                returns_matrix = _load_matrix_from_npz(returns_npz_path)
+                cov_matrix = _load_matrix_from_npz(cov_npz_path)
+                n_tickers = int((returns_matrix.shape[0] if returns_matrix.ndim == 2 else 0))
+                print(
+                    "[REPLAY_RISK_INPUTS] "
+                    f"returns_shape={tuple(returns_matrix.shape)} "
+                    f"cov_shape={tuple(cov_matrix.shape)} "
+                    f"tickers={n_tickers}"
+                )
+                replay_snapshot = _build_l1_replay_snapshot(
+                    bundle_abs=bundle_abs,
+                    manifest=manifest,
+                    expected_fields=expected_fields,
+                    prices_payload=prices_payload,
+                    risk_meta=risk_meta,
+                    cov_matrix=cov_matrix,
+                    execution_seed=execution_seed if isinstance(execution_seed, dict) else {},
+                )
+
+    if effective_level == 'L0':
+        replay_snapshot = {
+            'schema_version': 1,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'replay': {
+                'enabled': True,
+                'level': 'L0',
+                'bundle_path': bundle_abs,
+                'manifest_code_version': manifest.get('code_version') if isinstance(manifest, dict) else None,
+            },
+            'prices_loaded': prices_loaded,
+        }
+        replay_snapshot.update(copy.deepcopy(expected_fields))
+
     io_atomic_write_json(replay_snapshot_path, replay_snapshot, indent=2)
 
     drift_report = build_drift_report(expected_fields, replay_snapshot)
@@ -17451,6 +17905,13 @@ def main():
         type=str,
         default=None,
         help="Run deterministic offline replay from a frozen replay_bundle directory and exit.",
+    )
+    parser.add_argument(
+        "--replay-level",
+        type=str,
+        default=None,
+        choices=["L0", "L1", "l0", "l1"],
+        help="Override replay level when running --replay-bundle.",
     )
     parser.add_argument(
         "--debug-planner-once",
@@ -17576,7 +18037,7 @@ def main():
     args = parser.parse_args()
 
     if isinstance(args.replay_bundle, str) and args.replay_bundle.strip():
-        report = replay_bundle_once(args.replay_bundle)
+        report = replay_bundle_once(args.replay_bundle, replay_level=args.replay_level)
         summary = report.get('summary', {}) if isinstance(report, dict) else {}
         return 0 if bool(summary.get('pass', False)) else 1
 
@@ -17643,7 +18104,6 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
 
 
 

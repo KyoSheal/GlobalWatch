@@ -3,12 +3,16 @@ from __future__ import annotations
 import paper_trading
 
 
-def _make_engine(mode: str, proxy_map: dict[str, str] | None = None):
+def _make_engine(
+    mode: str,
+    proxy_map: dict[str, str] | None = None,
+    match_rules: list[dict] | None = None,
+):
     engine = paper_trading.PaperTradingEngine.__new__(paper_trading.PaperTradingEngine)
     engine.config = {
         "asset_data_policy": {
             "mode": str(mode).upper(),
-            "match_rules": [{"suffix": ".TO"}],
+            "match_rules": list(match_rules or [{"suffix": ".TO"}]),
             "proxy_map": dict(proxy_map or {"XIU.TO": "EWC", "FTS.TO": "FTS"}),
             "allow_execution_proxy": True,
             "allow_risk_proxy": True,
@@ -69,3 +73,49 @@ def test_asset_policy_force_proxy_without_mapping_disables():
     assert decision["risk_ticker"] is None
     assert decision["exec_ticker"] is None
     assert decision["reason"] == "NO_PROXY_MAPPING"
+
+
+def test_asset_policy_include_tickers_allows_other_to_original():
+    engine = _make_engine(
+        "FORCE_PROXY",
+        match_rules=[{"suffix": ".TO", "include_tickers": ["XIU.TO", "FTS.TO"]}],
+    )
+    decision = paper_trading.PaperTradingEngine.resolve_asset_policy(
+        engine,
+        "AEM.TO",
+        context={"stage": "execution", "price_status": "LIVE"},
+    )
+    assert decision["action"] == "ALLOW_ORIGINAL"
+    assert decision["risk_ticker"] == "AEM.TO"
+    assert decision["exec_ticker"] == "AEM.TO"
+    assert decision["reason"] == "UNMATCHED_RULE"
+
+
+def test_asset_policy_include_tickers_still_maps_xiu():
+    engine = _make_engine(
+        "FORCE_PROXY",
+        match_rules=[{"suffix": ".TO", "include_tickers": ["XIU.TO", "FTS.TO"]}],
+    )
+    decision = paper_trading.PaperTradingEngine.resolve_asset_policy(
+        engine,
+        "XIU.TO",
+        context={"stage": "execution", "price_status": "MISSING"},
+    )
+    assert decision["action"] == "USE_PROXY"
+    assert decision["risk_ticker"] == "EWC"
+    assert decision["exec_ticker"] == "EWC"
+
+
+def test_asset_policy_include_tickers_still_maps_fts():
+    engine = _make_engine(
+        "FORCE_PROXY",
+        match_rules=[{"suffix": ".TO", "include_tickers": ["XIU.TO", "FTS.TO"]}],
+    )
+    decision = paper_trading.PaperTradingEngine.resolve_asset_policy(
+        engine,
+        "FTS.TO",
+        context={"stage": "execution", "price_status": "MISSING"},
+    )
+    assert decision["action"] == "USE_PROXY"
+    assert decision["risk_ticker"] == "FTS"
+    assert decision["exec_ticker"] == "FTS"

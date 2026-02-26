@@ -1320,7 +1320,11 @@
     "mode": "FORCE_PROXY",
     "match_rules": [
       {
-        "suffix": ".TO"
+        "suffix": ".TO",
+        "include_tickers": [
+          "XIU.TO",
+          "FTS.TO"
+        ]
       }
     ],
     "proxy_map": {
