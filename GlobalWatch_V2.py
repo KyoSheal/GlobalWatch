@@ -32,6 +32,7 @@ from ui_reports_window import (
 from run_analytics import summarize_range as summarize_run_periods
 from risk_profile_ui_utils import (
     get_active_risk_profile as _ui_get_active_risk_profile,
+    resolve_effective_reporting_cfg as _ui_resolve_effective_reporting_cfg,
     resolve_widget_profile_default as _ui_resolve_widget_profile_default,
 )
 from risk_profile_state import (
@@ -8061,21 +8062,30 @@ _paper_cfg_obj = _safe_read_json(_paper_cfg_path)
 _paper_reporting_cfg = _paper_cfg_obj.get("reporting", {}) if isinstance(_paper_cfg_obj, dict) else {}
 if not isinstance(_paper_reporting_cfg, dict):
     _paper_reporting_cfg = {}
-_snapshot_live_path = str(_paper_reporting_cfg.get("snapshot_live_path", "outputs/snapshot_live.json")).strip() or "outputs/snapshot_live.json"
+_ui_reporting_cfg = _ui_resolve_effective_reporting_cfg(_paper_cfg_obj if isinstance(_paper_cfg_obj, dict) else {})
+_snapshot_live_path = str(_ui_reporting_cfg.get("snapshot_live_path", "outputs/snapshot_live.json")).strip() or "outputs/snapshot_live.json"
 _snapshot_live_obj = _safe_read_json(_snapshot_live_path)
 if not isinstance(_snapshot_live_obj, dict):
     _snapshot_live_obj = {}
 
-_runtime_control_path_cfg = str(_paper_reporting_cfg.get("runtime_control_path", "")).strip()
+_runtime_control_path_cfg = str(_ui_reporting_cfg.get("runtime_control_path", "")).strip()
 if _runtime_control_path_cfg:
     _runtime_control_path = os.path.abspath(_runtime_control_path_cfg)
 else:
-    _reporting_out_dir = str(_paper_reporting_cfg.get("out_dir", "")).strip()
+    _reporting_out_dir = str(_ui_reporting_cfg.get("out_dir", "")).strip()
     if _reporting_out_dir:
         _runtime_control_path = os.path.abspath(os.path.join(_reporting_out_dir, "runtime_control.json"))
     else:
         _runtime_control_path = os.path.abspath(os.path.join("outputs", "runtime_control.json"))
-_risk_profile_state_path = _resolve_risk_profile_state_path(_paper_reporting_cfg)
+_risk_profile_state_path = _resolve_risk_profile_state_path(_ui_reporting_cfg)
+_rp_ui_debug = str(os.environ.get("GW_RISK_PROFILE_DEBUG", "")).strip().lower() in {"1", "true", "yes", "on"}
+if _rp_ui_debug:
+    print(
+        "[RP_UI_PATH] "
+        f"run_kind={str(_ui_reporting_cfg.get('_resolved_run_kind', 'live'))} "
+        f"state_path={str(_risk_profile_state_path)} "
+        f"runtime_control_path={str(_runtime_control_path)}"
+    )
 
 _source_active_risk_profile = str(
     get_active_risk_profile(
@@ -8189,6 +8199,11 @@ if st.sidebar.button("Apply next cycle", key="runtime_risk_profile_apply_btn"):
                 extra_state={"request_id": _request_id},
             )
             _state_payload = _state_change.get("state", {}) if isinstance(_state_change, dict) else {}
+            _state_mtime = None
+            try:
+                _state_mtime = os.path.getmtime(_risk_profile_state_path)
+            except Exception:
+                _state_mtime = None
             _runtime_payload = {
                 "schema_version": 1,
                 "updated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -8196,6 +8211,15 @@ if st.sidebar.button("Apply next cycle", key="runtime_risk_profile_apply_btn"):
                 "requested_risk_profile": _selected_profile_norm,
             }
             io_atomic_write_json(_runtime_control_path, _runtime_payload, indent=2)
+            if _rp_ui_debug:
+                print(
+                    "[RP_UI_WRITE] "
+                    f"requested={_selected_profile_norm} "
+                    f"path={str(_risk_profile_state_path)} "
+                    f"version={str(_state_payload.get('version', '') or '')} "
+                    f"changed={bool((_state_change or {}).get('changed', False))} "
+                    f"mtime={_state_mtime}"
+                )
             st.session_state["pending_requested_profile"] = _selected_profile_norm
             st.session_state["runtime_risk_profile_notice"] = {
                 "ok": True,

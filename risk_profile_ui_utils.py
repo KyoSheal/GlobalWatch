@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 from atomic_io import safe_read_json as io_safe_read_json
+from outpost import normalize_run_kind, resolve_base_out_dir
 from risk_profile_state import (
     normalize_risk_profile,
     read_risk_profile_state,
@@ -34,6 +35,43 @@ def _resolve_runtime_control_path(reporting_cfg: Dict[str, Any]) -> str:
     return os.path.abspath(os.path.join("outputs", "runtime_control.json"))
 
 
+def _infer_run_kind(cfg: Dict[str, Any], reporting_cfg: Dict[str, Any]) -> str:
+    explicit = normalize_run_kind((reporting_cfg or {}).get("run_kind"), default="")
+    if explicit:
+        return explicit
+
+    mode_hint = str((cfg or {}).get("run_mode", "") or "").strip().lower()
+    if mode_hint in {"dryrun", "debug", "test", "diagnostics"}:
+        if mode_hint == "test":
+            return "test"
+        if mode_hint == "diagnostics":
+            return "diagnostics"
+        return "dryrun"
+
+    env_hint = str((reporting_cfg or {}).get("env", "") or "").strip().lower()
+    if env_hint in {"dryrun", "debug", "test"}:
+        return "dryrun"
+
+    out_hint = str((reporting_cfg or {}).get("out_dir", "") or "").strip().lower()
+    if "dryrun" in out_hint:
+        return "dryrun"
+    return "live"
+
+
+def resolve_effective_reporting_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Mirror engine run-kind routing to keep UI/engine path resolution aligned."""
+    cfg_obj = cfg if isinstance(cfg, dict) else {}
+    reporting_cfg = cfg_obj.get("reporting", {})
+    if not isinstance(reporting_cfg, dict):
+        reporting_cfg = {}
+    out: Dict[str, Any] = dict(reporting_cfg)
+    run_kind = _infer_run_kind(cfg_obj, reporting_cfg)
+    base_raw = str(out.get("base_out_dir", "outputs") or "outputs").strip() or "outputs"
+    out["base_out_dir"] = str(resolve_base_out_dir(run_kind, base_raw))
+    out["_resolved_run_kind"] = str(run_kind)
+    return out
+
+
 def get_active_risk_profile(
     *,
     config_path: str = "paper_config.json",
@@ -51,9 +89,7 @@ def get_active_risk_profile(
     cfg = io_safe_read_json(config_path, retries=2, sleep_ms=15) or {}
     if not isinstance(cfg, dict):
         cfg = {}
-    reporting_cfg = cfg.get("reporting", {})
-    if not isinstance(reporting_cfg, dict):
-        reporting_cfg = {}
+    reporting_cfg = resolve_effective_reporting_cfg(cfg)
 
     state_path = resolve_risk_profile_state_path(reporting_cfg)
     state_obj = read_risk_profile_state(state_path)
@@ -139,4 +175,5 @@ __all__ = [
     "set_filter_to_active",
     "get_active_risk_profile",
     "resolve_widget_profile_default",
+    "resolve_effective_reporting_cfg",
 ]

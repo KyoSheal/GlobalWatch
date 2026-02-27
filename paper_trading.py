@@ -2494,15 +2494,29 @@ class PaperTradingEngine:
         manager = getattr(self, "risk_profile_state_manager", None)
         if manager is None:
             return None
+        state_path = str(getattr(manager, "state_path", "") or self.risk_profile_state_path or "")
+        applied_before = str(getattr(self, "active_risk_profile", "") or RISK_PROFILE_DEFAULT).strip().lower()
         old_requested = str(getattr(self, "requested_risk_profile", "") or "").strip().lower()
+        prev_mtime = getattr(manager, "last_mtime", None)
+        reload_changed = False
+        reload_reason = "init"
+        reload_diag = {}
+        sync_error = ""
         try:
             if force_reload or not isinstance(getattr(manager, "state", None), dict) or not manager.state:
                 state_obj = manager.load(ensure=True)
+                reload_changed = True
+                reload_diag = dict(getattr(manager, "last_reload_diag", {}) or {})
+                reload_reason = str(reload_diag.get("reason", "") or "force_load")
             else:
-                manager.reload_if_changed(force=False)
+                reload_changed = bool(manager.reload_if_changed(force=False))
+                reload_diag = dict(getattr(manager, "last_reload_diag", {}) or {})
+                reload_reason = str(reload_diag.get("reason", "") or ("changed" if reload_changed else "no_change"))
                 state_obj = dict(manager.state or {})
-        except Exception:
+        except Exception as e:
             state_obj = {}
+            sync_error = str(e)
+            reload_reason = "exception"
 
         requested = normalize_risk_profile_state(
             (state_obj or {}).get("requested"),
@@ -2540,6 +2554,20 @@ class PaperTradingEngine:
             except Exception:
                 pass
         new_requested = str(self.requested_risk_profile or "").strip().lower()
+        applied_after = str(getattr(self, "active_risk_profile", "") or RISK_PROFILE_DEFAULT).strip().lower()
+        curr_mtime = getattr(manager, "last_mtime", None)
+        path_exists = bool(os.path.exists(state_path)) if state_path else False
+        print(
+            "[RP_SYNC] "
+            f"path={state_path or '-'} exists={path_exists} "
+            f"prev_mtime={prev_mtime} curr_mtime={curr_mtime} "
+            f"changed={bool(reload_changed)} "
+            f"requested={new_requested or RISK_PROFILE_DEFAULT} "
+            f"applied_before={applied_before} applied_after={applied_after} "
+            f"source=state_file reason={reload_reason} "
+            f"version={self.risk_profile_state_version or '-'}"
+            + (f" error={sync_error}" if sync_error else "")
+        )
         if old_requested and new_requested and old_requested != new_requested:
             change_ts = self.last_risk_profile_change_ts or str((state_obj or {}).get("set_at", "") or self._now().isoformat())
             change_source = self.last_risk_profile_change_source or str((state_obj or {}).get("set_by", "state_file") or "state_file")
@@ -2824,6 +2852,7 @@ class PaperTradingEngine:
                 self.requested_risk_profile or self.active_risk_profile,
                 default=RISK_PROFILE_DEFAULT,
             )
+        state_requested_valid = bool(requested in RISK_PROFILE_CHOICES)
 
         # Backward compatibility fallback: runtime_control request.
         if not requested:
@@ -2851,43 +2880,57 @@ class PaperTradingEngine:
                     },
                 )
                 self._last_runtime_control_result_key = f"reject:{invalid_key}"
-            # Keep requested sourced from state file; do not apply invalid runtime control.
-            self._emit_risk_profile_log()
-            return
+            print(
+                "[RP_OVERRIDE] "
+                f"action=ignored source=runtime_control requested={control_requested} "
+                "reason=invalid_profile state_priority=state_file"
+            )
         if control_requested in RISK_PROFILE_CHOICES and control_requested != requested:
-            requested = str(control_requested)
-            request_id = control_request_id or request_id
-            source = "runtime_control"
-            try:
-                manager = getattr(self, "risk_profile_state_manager", None)
-                if manager is not None:
-                    manager.update_requested(
-                        requested,
-                        set_by="runtime_control_fallback",
-                        actor="engine_runtime_control_fallback",
-                        run_id=str(self.run_id or ""),
-                        cycle_id=int(cycle_id),
-                        extra_state={"request_id": request_id},
-                    )
-                    self.risk_profile_state_mtime = getattr(manager, "last_mtime", None)
-                    self.risk_profile_state_version = str((manager.state or {}).get("version", "") or "").strip()
-                    self.risk_profile_state_set_at = str((manager.state or {}).get("set_at", "") or "").strip()
-                    self.last_risk_profile_change_ts = str((manager.state or {}).get("last_change_ts", self.last_risk_profile_change_ts) or "")
-                    self.last_risk_profile_change_old = str((manager.state or {}).get("last_change_old", self.last_risk_profile_change_old) or "")
-                    self.last_risk_profile_change_new = str((manager.state or {}).get("last_change_new", self.last_risk_profile_change_new) or "")
-                    self.last_risk_profile_change_source = str((manager.state or {}).get("last_change_source", self.last_risk_profile_change_source) or "")
-                else:
-                    request_risk_profile_change(
-                        str(state_path),
-                        requested=requested,
-                        source="runtime_control_fallback",
-                        actor="engine_runtime_control_fallback",
-                        run_id=str(self.run_id or ""),
-                        cycle_id=int(cycle_id),
-                        extra_state={"request_id": request_id},
-                    )
-            except Exception:
-                pass
+            if state_requested_valid:
+                print(
+                    "[RP_OVERRIDE] "
+                    f"action=ignored source=runtime_control requested={control_requested} "
+                    f"state_requested={requested} reason=state_file_priority"
+                )
+            else:
+                requested = str(control_requested)
+                request_id = control_request_id or request_id
+                source = "runtime_control"
+                print(
+                    "[RP_OVERRIDE] "
+                    f"action=applied source=runtime_control requested={requested} "
+                    "reason=state_missing_or_invalid"
+                )
+                try:
+                    manager = getattr(self, "risk_profile_state_manager", None)
+                    if manager is not None:
+                        manager.update_requested(
+                            requested,
+                            set_by="runtime_control_fallback",
+                            actor="engine_runtime_control_fallback",
+                            run_id=str(self.run_id or ""),
+                            cycle_id=int(cycle_id),
+                            extra_state={"request_id": request_id},
+                        )
+                        self.risk_profile_state_mtime = getattr(manager, "last_mtime", None)
+                        self.risk_profile_state_version = str((manager.state or {}).get("version", "") or "").strip()
+                        self.risk_profile_state_set_at = str((manager.state or {}).get("set_at", "") or "").strip()
+                        self.last_risk_profile_change_ts = str((manager.state or {}).get("last_change_ts", self.last_risk_profile_change_ts) or "")
+                        self.last_risk_profile_change_old = str((manager.state or {}).get("last_change_old", self.last_risk_profile_change_old) or "")
+                        self.last_risk_profile_change_new = str((manager.state or {}).get("last_change_new", self.last_risk_profile_change_new) or "")
+                        self.last_risk_profile_change_source = str((manager.state or {}).get("last_change_source", self.last_risk_profile_change_source) or "")
+                    else:
+                        request_risk_profile_change(
+                            str(state_path),
+                            requested=requested,
+                            source="runtime_control_fallback",
+                            actor="engine_runtime_control_fallback",
+                            run_id=str(self.run_id or ""),
+                            cycle_id=int(cycle_id),
+                            extra_state={"request_id": request_id},
+                        )
+                except Exception:
+                    pass
 
         requested = normalize_risk_profile_state(
             requested,
@@ -18126,4 +18169,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-

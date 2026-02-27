@@ -270,6 +270,7 @@ class RiskProfileStateManager:
         self.state: Dict[str, Any] = {}
         self.last_mtime: Optional[float] = None
         self.last_version: str = ""
+        self.last_reload_diag: Dict[str, Any] = {}
 
     def _get_mtime(self) -> Optional[float]:
         try:
@@ -297,25 +298,75 @@ class RiskProfileStateManager:
         self.state = dict(state_obj)
         self.last_mtime = self._get_mtime()
         self.last_version = str(self.state.get("version", "") or "").strip()
+        self.last_reload_diag = {
+            "path": self.state_path,
+            "exists": bool(os.path.exists(self.state_path)),
+            "prev_mtime": None,
+            "curr_mtime": self.last_mtime,
+            "prev_version": "",
+            "curr_version": self.last_version,
+            "mtime_changed": True,
+            "version_changed": bool(self.last_version),
+            "state_changed": bool(self.state),
+            "changed": True,
+            "reason": "load",
+            "force": False,
+            "parse_failed": False,
+        }
         return dict(self.state)
 
     def reload_if_changed(self, *, force: bool = False) -> bool:
+        prev_state = dict(self.state or {})
+        prev_mtime = self.last_mtime
+        prev_version = str(self.last_version or "").strip()
         current_mtime = self._get_mtime()
-        if not force and self.state and current_mtime is not None and self.last_mtime is not None:
-            if abs(current_mtime - self.last_mtime) < 1e-9:
-                return False
+        parse_failed = False
         new_state = read_risk_profile_state(self.state_path)
         if not isinstance(new_state, dict):
+            parse_failed = bool(os.path.exists(self.state_path))
             new_state = ensure_risk_profile_state(
                 self.state_path,
                 default_requested=self.default_requested,
                 set_by="system_default",
             )
         new_version = str(new_state.get("version", "") or "").strip()
-        changed = force or (new_version != self.last_version) or (new_state != self.state)
+        mtime_changed = False
+        if current_mtime is None and prev_mtime is None:
+            mtime_changed = False
+        elif current_mtime is None or prev_mtime is None:
+            mtime_changed = True
+        else:
+            mtime_changed = bool(abs(float(current_mtime) - float(prev_mtime)) >= 1e-9)
+        version_changed = bool(new_version != prev_version)
+        state_changed = bool(new_state != prev_state)
+        changed = bool(force or mtime_changed or version_changed or state_changed)
+        reason = "no_change"
+        if force:
+            reason = "force"
+        elif version_changed:
+            reason = "version_changed"
+        elif state_changed:
+            reason = "state_changed"
+        elif mtime_changed:
+            reason = "mtime_changed"
         self.state = dict(new_state)
         self.last_mtime = current_mtime if current_mtime is not None else self._get_mtime()
         self.last_version = new_version
+        self.last_reload_diag = {
+            "path": self.state_path,
+            "exists": bool(os.path.exists(self.state_path)),
+            "prev_mtime": prev_mtime,
+            "curr_mtime": self.last_mtime,
+            "prev_version": prev_version,
+            "curr_version": self.last_version,
+            "mtime_changed": mtime_changed,
+            "version_changed": version_changed,
+            "state_changed": state_changed,
+            "changed": bool(changed),
+            "reason": reason,
+            "force": bool(force),
+            "parse_failed": bool(parse_failed),
+        }
         return bool(changed)
 
     def update_requested(
