@@ -71,7 +71,13 @@ def test_risk_gate_decision_consistency():
     assert isinstance(decision, dict)
     assert decision.get("reason") == "portfolio_cov_rc_limit"
     assert isinstance(cov_dbg, dict)
-    assert cov_dbg.get("known_weight_gate_value") == decision.get("metric_value")
+    assert float(decision.get("invested_weight_total", 0.0) or 0.0) > 0.0
+    assert math.isclose(
+        float(decision.get("cov_missing_weight_total", 0.0) or 0.0),
+        float(decision.get("missing_weight_total", 0.0) or 0.0),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
 
     metric_name = str(decision.get("metric_name", ""))
     metric_value = decision.get("metric_value")
@@ -83,3 +89,9 @@ def test_risk_gate_decision_consistency():
         assert metric_name == "max_rc_fraction"
         assert str(decision.get("basis", "")) in {"target_weights", "target_weights_abs"}
         assert metric_value is not None and float(metric_value) > 0.35
+    assert math.isclose(
+        float(cov.get("known_weight", 0.0) or 0.0) + float(cov.get("missing_weight_total", 0.0) or 0.0),
+        float(cov.get("target_weights_abs_sum", 0.0) or 0.0),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    )

@@ -50,13 +50,17 @@ def default_cov_coverage(
     missing_count: int = 0,
     missing_tickers: Iterable[str] | None = None,
     top_missing: Iterable[Dict[str, Any]] | None = None,
+    known_weight_ratio: float = 0.0,
+    target_weights_abs_sum: float = 0.0,
 ) -> Dict[str, Any]:
     return {
         "schema_version": 1,
         "basis": str(basis or "target_weights"),
         "stage": str(stage or "cov"),
         "known_weight": float(known_weight),
+        "known_weight_ratio": float(known_weight_ratio),
         "missing_weight_total": float(missing_weight_total),
+        "target_weights_abs_sum": float(target_weights_abs_sum),
         "covered_count": int(covered_count),
         "missing_count": int(missing_count),
         "missing_tickers": list(missing_tickers or []),
@@ -87,7 +91,9 @@ def compute_cov_coverage(
             basis=basis or "target_weights_abs",
             stage=stage or "cov",
             known_weight=0.0,
+            known_weight_ratio=0.0,
             missing_weight_total=0.0,
+            target_weights_abs_sum=0.0,
             covered_count=0,
             missing_count=0,
             missing_tickers=[],
@@ -105,7 +111,8 @@ def compute_cov_coverage(
     missing_rows.sort(key=lambda x: abs(float(x.get("w", 0.0))), reverse=True)
     missing_weight_total_raw = sum(abs(float(item.get("w", 0.0))) for item in missing_rows)
     missing_weight_total = float(missing_weight_total_raw)
-    known_weight = max(0.0, 1.0 - float(missing_weight_total_raw / denom))
+    known_weight = max(0.0, float(denom - missing_weight_total_raw))
+    known_weight_ratio = max(0.0, min(1.0, float(known_weight / denom)))
 
     top_missing = [
         {"ticker": str(item.get("ticker", "")), "w": float(item.get("w", 0.0))}
@@ -117,7 +124,9 @@ def compute_cov_coverage(
         basis=basis or "target_weights_abs",
         stage=stage or "cov",
         known_weight=float(known_weight),
+        known_weight_ratio=float(known_weight_ratio),
         missing_weight_total=float(missing_weight_total),
+        target_weights_abs_sum=float(denom),
         covered_count=int(covered_count),
         missing_count=int(len(missing_rows)),
         missing_tickers=missing_tickers,

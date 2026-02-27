@@ -1308,6 +1308,13 @@ class PaperTradingEngine:
         print(f"   CWD: {os.getcwd()}")
         print(f"   Live Snapshot Path: {self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')}")
         print(f"   Trade History Path: {self.config.get('reporting', {}).get('trade_history_path', 'outputs/trade_history.jsonl')}")
+        cooldown_cfg_echo = self._get_cooldown_policy_config()
+        print(
+            "[COOLDOWN_CFG] "
+            f"success_cooldown_min={float(cooldown_cfg_echo.get('success_cooldown_min', 0.0)):.2f} "
+            f"failure_base_min={float(cooldown_cfg_echo.get('failure_base_min', 0.0)):.2f} "
+            f"policy={str(cooldown_cfg_echo.get('mode', 'exponential_backoff'))}"
+        )
         self._log_asset_policy_once()
         self._telemetry_log_event(
             "ENGINE_INIT",
@@ -10852,10 +10859,12 @@ class PaperTradingEngine:
             gate_cov_min_coverage = float(min_cov_gate_coverage)
 
         coverage_diag_for_dump = cov_diag_target if bool(use_target_cov_basis) else cov_diag_current
+        coverage_weights_for_dump = dict(invested_weights) if bool(use_target_cov_basis) else dict(current_position_weights)
+        coverage_basis_label = "target_weights" if bool(use_target_cov_basis) else "current_weights"
         cov_coverage = self._build_cov_coverage_dump(
-            invested_weights,
+            coverage_weights_for_dump,
             coverage_diag_for_dump if isinstance(coverage_diag_for_dump, dict) else {},
-            basis="target_weights",
+            basis=coverage_basis_label,
         )
         if not isinstance(cov_coverage, dict):
             cov_coverage = default_cov_coverage(basis="target_weights", stage="cov")
@@ -10920,21 +10929,25 @@ class PaperTradingEngine:
                 list(cov_dump_meta.get("ticker_proxy_map_used", []))
                 if isinstance(cov_dump_meta.get("ticker_proxy_map_used"), list) else []
             ),
-            "known_weight_gate_value": None,
             "known_weight_dump_value": known_weight_dump_value,
             "dump_missing_count": int(dump_missing_count),
             "dump_missing_weight_total": float(dump_missing_weight_total),
             "dump_top_missing_top5": dump_top_missing_top5,
+            "dump_covered_count": int(cov_coverage.get("covered_count", 0) or 0),
             "fallback_used": bool(cov_dump_meta.get("fallback_used", False)),
             "fallback_reason": str(cov_dump_meta.get("fallback_reason", "") or ""),
             "exception_repr": str(cov_dump_meta.get("exception_repr", "") or ""),
         }
+        invested_weight_total = float(sum(abs(float(v or 0.0)) for v in (invested_weights or {}).values()))
         gate_decision_inputs = {
             "metric_name": "",
             "metric_value": None,
             "threshold": None,
             "basis": str(cov_coverage_debug_inputs.get("basis", cov_coverage.get("basis", "target_weights"))),
             "stage": str(cov_coverage_debug_inputs.get("stage", cov_coverage.get("stage", "cov"))),
+            "invested_weight_total": float(invested_weight_total),
+            "cov_missing_weight_total": float(cov_coverage_debug_inputs.get("dump_missing_weight_total", 0.0) or 0.0),
+            # backward-compatible alias; keep semantic value from cov coverage (not invested sum)
             "missing_weight_total": float(cov_coverage_debug_inputs.get("dump_missing_weight_total", 0.0) or 0.0),
             "missing_count": int(cov_coverage_debug_inputs.get("dump_missing_count", 0) or 0),
             "top_missing_top5": list(cov_coverage_debug_inputs.get("dump_top_missing_top5", [])) if isinstance(cov_coverage_debug_inputs.get("dump_top_missing_top5"), list) else [],
@@ -11028,8 +11041,6 @@ class PaperTradingEngine:
         gate_decision_inputs["metric_value"] = metric_value
         gate_decision_inputs["threshold"] = metric_threshold
 
-        cov_coverage_debug_inputs["known_weight_gate_value"] = metric_value
-
         if abort_reason:
             cov_coverage["abort_reason"] = str(abort_reason)
         cov_coverage_debug_inputs["risk_gate_reason"] = str(abort_reason or "")
@@ -11051,7 +11062,8 @@ class PaperTradingEngine:
                 f"threshold={gate_decision_inputs.get('threshold')} "
                 f"basis={gate_decision_inputs.get('basis')} "
                 f"stage={gate_decision_inputs.get('stage')} "
-                f"missing_weight_total={gate_decision_inputs.get('missing_weight_total')}"
+                f"invested_weight_total={gate_decision_inputs.get('invested_weight_total')} "
+                f"cov_missing_weight_total={gate_decision_inputs.get('cov_missing_weight_total')}"
             )
             print(
                 "[COV_INPUTS] "
@@ -11071,21 +11083,29 @@ class PaperTradingEngine:
                 and float(cov_coverage_debug_inputs.get("dump_missing_weight_total", 0.0) or 0.0) == 0.0
             ):
                 invariant_hits.append("zero_missing_with_nonempty_target")
-            gate_kw = cov_coverage_debug_inputs.get("known_weight_gate_value")
-            dump_kw = cov_coverage_debug_inputs.get("known_weight_dump_value")
-            if gate_kw is not None and dump_kw is not None:
-                try:
-                    if abs(float(gate_kw) - float(dump_kw)) > 1e-6:
-                        invariant_hits.append("gate_dump_mismatch")
-                except Exception:
-                    pass
+            try:
+                covered_meta = int(cov_coverage_debug_inputs.get("covered_tickers_count", 0) or 0)
+                covered_dump = int(cov_coverage_debug_inputs.get("dump_covered_count", 0) or 0)
+                if covered_meta != covered_dump:
+                    invariant_hits.append("covered_count_mismatch")
+            except Exception:
+                pass
+            try:
+                known_abs = float(cov_coverage_debug_inputs.get("known_weight_dump_value", 0.0) or 0.0)
+                missing_abs = float(cov_coverage_debug_inputs.get("dump_missing_weight_total", 0.0) or 0.0)
+                target_abs = float(cov_coverage_debug_inputs.get("target_weights_abs_sum", 0.0) or 0.0)
+                if target_abs > 1e-12 and abs((known_abs + missing_abs) - target_abs) > 1e-6:
+                    invariant_hits.append("weight_sum_mismatch")
+            except Exception:
+                pass
             if invariant_hits:
                 print(
                     "[COV_INVARIANT] "
                     f"hits={','.join(invariant_hits)} "
                     f"target_weights_count={cov_coverage_debug_inputs.get('target_weights_count')} "
-                    f"known_weight_gate_value={cov_coverage_debug_inputs.get('known_weight_gate_value')} "
                     f"known_weight_dump_value={cov_coverage_debug_inputs.get('known_weight_dump_value')} "
+                    f"covered_tickers_count={cov_coverage_debug_inputs.get('covered_tickers_count')} "
+                    f"dump_covered_count={cov_coverage_debug_inputs.get('dump_covered_count')} "
                     f"dump_missing_count={cov_coverage_debug_inputs.get('dump_missing_count')} "
                     f"dump_missing_weight_total={cov_coverage_debug_inputs.get('dump_missing_weight_total')}"
                 )
@@ -11103,7 +11123,8 @@ class PaperTradingEngine:
                 f"threshold={gate_decision_inputs.get('threshold')} "
                 f"basis={gate_decision_inputs.get('basis')} "
                 f"stage={gate_decision_inputs.get('stage')} "
-                f"missing_weight_total={gate_decision_inputs.get('missing_weight_total')}"
+                f"invested_weight_total={gate_decision_inputs.get('invested_weight_total')} "
+                f"cov_missing_weight_total={gate_decision_inputs.get('cov_missing_weight_total')}"
             )
             self._emit_cov_coverage_logs(cov_coverage)
 
@@ -18105,6 +18126,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
-
 

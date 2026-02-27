@@ -41,7 +41,12 @@ def test_ticker_proxy_mapping_lifts_returns_coverage():
         basis="target_weights",
     )
 
-    assert float(coverage.get("known_weight", 0.0) or 0.0) >= 0.9
+    assert float(coverage.get("known_weight_ratio", 0.0) or 0.0) >= 0.9
+    assert abs(float(coverage.get("missing_weight_total", 0.0) or 0.0)) <= 1e-12
+    assert abs(
+        float(coverage.get("known_weight", 0.0) or 0.0)
+        - float(coverage.get("target_weights_abs_sum", 0.0) or 0.0)
+    ) <= 1e-12
     top_missing = coverage.get("top_missing", [])
     top_missing_tickers = {str(row.get("ticker", "")).upper() for row in top_missing if isinstance(row, dict)}
     assert "XIU.TO" not in top_missing_tickers
