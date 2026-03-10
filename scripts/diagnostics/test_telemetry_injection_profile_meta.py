@@ -57,6 +57,7 @@ def main() -> int:
     rep["telemetry_enabled"] = True
     rep["snapshot_live_path"] = str(out_dir / "snapshot_live.json")
     rep["runtime_control_path"] = str(out_dir / "runtime_control.json")
+    rep["risk_profile_state_path"] = str(out_dir / "state" / "risk_profile_state.json")
     cfg_path = out_dir / "paper_config_t13.json"
     atomic_write_json(str(cfg_path), cfg, indent=2)
 
@@ -114,4 +115,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

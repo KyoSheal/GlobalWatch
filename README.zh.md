@@ -46,6 +46,23 @@ GlobalWatch Paper Trading 是一个本地优先的量化研究与纸面交易系
 - Equity 曲线支持交易时段可视化与轴控
 - Trade History 在 Web UI 侧按“最新在前”展示（不改底层写入顺序）
 
+## 增量更新（V3.2.4 之后）
+1. `asset_data_policy.match_rules` 新增精细匹配能力：
+   - `include_tickers`
+   - `exclude_tickers`
+2. `.TO` 推荐策略（避免全量强制 proxy 导致 `NO_PROXY_MAPPING`）：
+   - 保持 `mode=FORCE_PROXY`
+   - 仅对白名单 ticker 强制 proxy（例如 `XIU.TO`、`FTS.TO`）
+   - 其它加拿大 `.TO` 继续按原 ticker 交易
+3. Replay 能力向 L1 确定性回放推进：
+   - bundle 可冻结更多 risk/cov 输入
+   - drift 对风控/执行一致性校验更严格
+4. 成本模型可观测性增强：
+   - execution/snapshot 中的成本汇总更完整
+   - 日报可更直接比较 gross 与 net 影响
+5. “为什么没交易”诊断增强：
+   - 日报与 UI 的阻断原因/风险健康度汇总更易读、更易回放。
+
 ## 快速启动
 ### 启动纸面交易引擎
 ```bash

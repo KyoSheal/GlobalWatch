@@ -42,6 +42,23 @@ This release updates the engine fingerprint to `v3.2.4` and adds the latest exec
    - `no_trade_day`
 8. CI installs dependencies from root `requirements.txt` before diagnostics.
 
+## Incremental Updates (Post V3.2.4)
+1. `asset_data_policy.match_rules` now supports scoped matching via:
+   - `include_tickers`
+   - `exclude_tickers`
+2. Recommended `.TO` policy pattern:
+   - Keep `mode=FORCE_PROXY`
+   - Limit forced proxy to explicitly listed symbols (for example `XIU.TO`, `FTS.TO`)
+   - Keep other Canadian `.TO` names tradable on original tickers
+3. Replay workflow has moved closer to L1 deterministic replay:
+   - replay bundles can freeze additional risk/cov inputs
+   - drift diagnostics include stricter risk/execution consistency checks
+4. Cost-model observability has been expanded:
+   - execution rows/snapshots now carry clearer cost summaries
+   - daily analysis can compare gross vs net effects
+5. Daily/UI diagnostics improved for "why no trade":
+   - blocker aggregation and risk-health context are easier to inspect in reports.
+
 ## Functional Capabilities
 ### Quant Layer
 - cross-sectional score ranking

@@ -31,6 +31,23 @@ From a systems angle, it provides checkpoint resume, structured snapshots, deter
    - `no_trade_day`
 7. CI now installs Python dependencies from `requirements.txt` before running diagnostics.
 
+## Newly Added (Incremental Update)
+1. Asset data policy matching is now finer-grained for `.TO` symbols:
+   - `asset_data_policy.match_rules` now supports `include_tickers` and `exclude_tickers`.
+   - Recommended setup for current production behavior:
+     - keep `mode=FORCE_PROXY`
+     - restrict proxying to specific symbols (for example `XIU.TO`, `FTS.TO`)
+     - leave other Canadian `.TO` symbols as original tickers instead of `NO_PROXY_MAPPING -> DISABLE`
+2. Replay has been extended toward L1 determinism:
+   - replay bundle includes frozen risk/cov inputs for stronger drift checks.
+   - replay/risk-gate diagnostics are more explicit in dry-run outputs.
+3. Cost-model observability is integrated end-to-end:
+   - `cost_model` config supports fee/slippage controls.
+   - execution records and snapshots include cost summaries.
+4. Daily report and UI observability were expanded:
+   - no-trade/blocker summaries are easier to inspect.
+   - risk/coverage diagnostics are surfaced for faster post-mortem.
+
 ## Documentation
 - Detailed English documentation: `README.en.md`
 - 详细中文文档: `README.zh.md`

@@ -57,6 +57,7 @@ def main() -> int:
     rep["out_dir"] = str(out_dir)
     rep["snapshot_live_path"] = str(out_dir / "snapshot_live.json")
     rep["runtime_control_path"] = str(out_dir / "runtime_control.json")
+    rep["risk_profile_state_path"] = str(out_dir / "state" / "risk_profile_state.json")
     rep["telemetry_enabled"] = True
     rep["write_snapshot_on_profile_apply"] = True
     cfg_path = out_dir / "paper_config_runtime_apply.json"
@@ -162,4 +163,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

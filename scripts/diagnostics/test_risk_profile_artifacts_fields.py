@@ -65,6 +65,7 @@ def main() -> int:
     rep = cfg.setdefault("reporting", {})
     rep["telemetry_enabled"] = True
     rep["out_dir"] = str(out_dir)
+    rep["risk_profile_state_path"] = str(out_dir / "state" / "risk_profile_state.json")
     cfg_path = ROOT / "outputs" / "test_risk_profile_artifacts_fields_config.json"
     atomic_write_json(str(cfg_path), cfg, indent=2)
 
