@@ -59,6 +59,20 @@ This release updates the engine fingerprint to `v3.2.4` and adds the latest exec
 5. Daily/UI diagnostics improved for "why no trade":
    - blocker aggregation and risk-health context are easier to inspect in reports.
 
+## Latest Validation (Recent Corpus)
+1. Comparability is now interpreted in two layers:
+   - baseline drift comparability (`config_metadata_compare`)
+   - scenario-aware comparability (`scenario_metadata_compare`)
+2. Walk-forward ranking and winner eligibility are evaluated using scenario-aware comparable days.
+3. A recent OPEN-focused corpus was rerun to avoid overfitting conclusions to `MARKET_CLOSED` samples:
+   - included OPEN cases with orders
+   - included OPEN cases blocked by risk gate
+4. On the latest OPEN-focused rerun, global winner stayed `baseline_mid`, and per-window winners remained consistent.
+5. Export artifacts for quick review are now standard:
+   - `walkforward_report.md`
+   - `walkforward_report_summary.json`
+6. Remaining caveat: OPEN/high-information replay dates are still limited, so winner stability should be re-validated as more such dates become available.
+
 ## Functional Capabilities
 ### Quant Layer
 - cross-sectional score ranking

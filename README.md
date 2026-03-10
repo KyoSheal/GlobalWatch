@@ -48,6 +48,20 @@ From a systems angle, it provides checkpoint resume, structured snapshots, deter
    - no-trade/blocker summaries are easier to inspect.
    - risk/coverage diagnostics are surfaced for faster post-mortem.
 
+## Latest Validation (Recent Corpus)
+1. The replay comparison pipeline now distinguishes two comparability semantics:
+   - baseline drift comparability (`config_metadata_compare`)
+   - scenario-aware comparability (`scenario_metadata_compare`)
+2. Walk-forward ranking and winner selection now use scenario-aware comparable days as the primary eligibility basis.
+3. A focused OPEN-market corpus check was executed (not only `MARKET_CLOSED` snapshots):
+   - samples included both tradable OPEN cases and risk-gated OPEN cases
+   - scenario reason distribution showed real divergence (`portfolio_cov_rc_limit` vs `RISK_GATE` vs `traded`)
+4. In the latest OPEN-focused rerun, global winner remained `baseline_mid`, and window winners also stayed `baseline_mid`.
+5. A minimal export layer is available for one-page review output:
+   - `walkforward_report.md`
+   - `walkforward_report_summary.json`
+6. Current limitation: available OPEN/high-signal dates are still limited, so stability conclusions should be re-checked as more replayable OPEN samples are collected.
+
 ## Documentation
 - Detailed English documentation: `README.en.md`
 - 详细中文文档: `README.zh.md`

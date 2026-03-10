@@ -1,0 +1,29 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "baseline_mid",
+      "risk_profile": "mid",
+      "risk_model_overrides": {}
+    },
+    {
+      "scenario_id": "mid_rc030_hyst003",
+      "risk_profile": "mid",
+      "risk_model_overrides": {
+        "rc_limit": 0.3,
+        "portfolio_cov_rc_hysteresis_band": 0.03
+      }
+    },
+    {
+      "scenario_id": "mid_rc030_hyst003_buf_on",
+      "risk_profile": "mid",
+      "risk_model_overrides": {
+        "rc_limit": 0.3,
+        "portfolio_cov_rc_hysteresis_band": 0.03,
+        "portfolio_cov_rc_abort_buffer_enabled": true,
+        "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
+        "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
+        "portfolio_cov_rc_abort_buffer_active_cycles": 3
+      }
+    }
+  ]
+}

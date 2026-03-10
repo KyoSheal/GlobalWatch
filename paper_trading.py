@@ -127,6 +127,7 @@ for keyword in REAL_BROKER_KEYWORDS:
 
 LIVE_SCHEMA_VERSION = 2
 RISK_PROFILE_TEMPLATE_VERSION = 1
+EFFECTIVE_RISK_MODEL_CONFIG_SCHEMA_VERSION = 1
 DEFAULT_RISK_PROFILES = {
     "low": {
         "execution": {
@@ -167,7 +168,12 @@ DEFAULT_RISK_PROFILES = {
             "max_weight_per_asset": 0.15,
         },
         "risk_model": {
-            "rc_limit": 0.22,
+            "rc_limit": 0.30,
+            "portfolio_cov_rc_hysteresis_band": 0.03,
+            "portfolio_cov_rc_abort_buffer_enabled": True,
+            "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
+            "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
+            "portfolio_cov_rc_abort_buffer_active_cycles": 3,
             "use_cov_vol_for_gate": True,
         },
         "news_overlay": {
@@ -241,6 +247,11 @@ RISK_PROFILE_ALLOWED_KEYS = {
     },
     "risk_model": {
         "rc_limit",
+        "portfolio_cov_rc_hysteresis_band",
+        "portfolio_cov_rc_abort_buffer_enabled",
+        "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts",
+        "portfolio_cov_rc_abort_buffer_relax_delta",
+        "portfolio_cov_rc_abort_buffer_active_cycles",
         "use_cov_vol_for_gate",
     },
     "news_overlay": {
@@ -251,6 +262,196 @@ RISK_PROFILE_ALLOWED_KEYS = {
 }
 RISK_PROFILE_CHOICES = tuple(sorted(DEFAULT_RISK_PROFILES.keys()))
 RISK_PROFILE_DEFAULT = "mid"
+
+
+def _normalize_cov_rc_gate_decision(decision_value) -> str | None:
+    token = str(decision_value or "").strip().upper()
+    if token in {"ALLOW", "ABORT"}:
+        return token
+    return None
+
+
+def resolve_portfolio_cov_rc_hysteresis_decision(
+    portfolio_rc_fraction,
+    rc_limit,
+    hysteresis_band=0.0,
+    previous_gate_decision=None,
+) -> dict:
+    """Resolve ALLOW/ABORT for portfolio_cov_rc_limit with optional hysteresis."""
+    rc_limit_val = 0.0
+    try:
+        rc_limit_val = float(rc_limit or 0.0)
+    except Exception:
+        rc_limit_val = 0.0
+    if not np.isfinite(rc_limit_val):
+        rc_limit_val = 0.0
+    rc_limit_val = max(0.0, float(rc_limit_val))
+
+    band_val = 0.0
+    try:
+        band_val = float(hysteresis_band or 0.0)
+    except Exception:
+        band_val = 0.0
+    if not np.isfinite(band_val):
+        band_val = 0.0
+    band_val = max(0.0, float(band_val))
+
+    rc_val = None
+    try:
+        if portfolio_rc_fraction is not None:
+            rc_tmp = float(portfolio_rc_fraction)
+            if np.isfinite(rc_tmp):
+                rc_val = float(rc_tmp)
+    except Exception:
+        rc_val = None
+
+    prev_decision = _normalize_cov_rc_gate_decision(previous_gate_decision)
+    pass_threshold = float(rc_limit_val - band_val)
+    fail_threshold = float(rc_limit_val + band_val)
+    sticky_zone = False
+    fallback_used = False
+    fallback_mode = ""
+
+    if rc_limit_val <= 0.0:
+        final_decision = "ALLOW"
+        fallback_mode = "rc_limit_disabled"
+    elif rc_val is None:
+        # Backward-compatible conservative behavior when rc metric is unavailable.
+        final_decision = "ABORT"
+        fallback_used = True
+        fallback_mode = "metric_missing_abort"
+    elif band_val <= 0.0:
+        final_decision = "ABORT" if rc_val > rc_limit_val else "ALLOW"
+    elif rc_val <= pass_threshold:
+        final_decision = "ALLOW"
+    elif rc_val >= fail_threshold:
+        final_decision = "ABORT"
+    else:
+        sticky_zone = True
+        if prev_decision in {"ALLOW", "ABORT"}:
+            final_decision = prev_decision
+        else:
+            # Backward-compatible fallback if no previous decision exists.
+            fallback_used = True
+            fallback_mode = "sticky_no_previous_fallback_old_logic"
+            final_decision = "ABORT" if rc_val > rc_limit_val else "ALLOW"
+
+    return {
+        "portfolio_rc_fraction": float(rc_val) if rc_val is not None else None,
+        "rc_limit": float(rc_limit_val),
+        "hysteresis_band": float(band_val),
+        "pass_threshold": float(pass_threshold),
+        "fail_threshold": float(fail_threshold),
+        "previous_gate_decision": prev_decision,
+        "final_gate_decision": str(final_decision),
+        "sticky_zone": bool(sticky_zone),
+        "fallback_used": bool(fallback_used),
+        "fallback_mode": str(fallback_mode),
+    }
+
+
+def resolve_portfolio_cov_rc_abort_buffer_decision(
+    *,
+    portfolio_rc_fraction,
+    previous_gate_decision=None,
+    base_rc_limit=0.0,
+    hysteresis_band=0.0,
+    buffer_enabled=False,
+    trigger_consecutive_aborts=3,
+    relax_delta=0.02,
+    active_cycles=3,
+    prev_abort_streak=0,
+    prev_buffer_cycles_remaining=0,
+    allow_buffer=True,
+) -> dict:
+    """Resolve Step 1B abort-buffer decision on top of Step 1A hysteresis."""
+    base_decision = resolve_portfolio_cov_rc_hysteresis_decision(
+        portfolio_rc_fraction=portfolio_rc_fraction,
+        rc_limit=base_rc_limit,
+        hysteresis_band=hysteresis_band,
+        previous_gate_decision=previous_gate_decision,
+    )
+    final_decision = dict(base_decision)
+    base_final = _normalize_cov_rc_gate_decision(base_decision.get("final_gate_decision")) or "ALLOW"
+
+    enabled = bool(buffer_enabled)
+    allow = bool(allow_buffer)
+    trigger_n = max(1, int(trigger_consecutive_aborts or 1))
+    relax = max(0.0, float(relax_delta or 0.0))
+    active_n = max(0, int(active_cycles or 0))
+    streak_before = max(0, int(prev_abort_streak or 0))
+    remaining_before = max(0, int(prev_buffer_cycles_remaining or 0))
+
+    triggered_this_cycle = False
+    buffer_active = False
+    degraded_allow = False
+    streak_after = int(streak_before)
+    remaining_after = int(remaining_before)
+    effective_rc_limit = float(base_rc_limit or 0.0)
+
+    if not enabled or not allow:
+        # Disabled (or disallowed by calling path) -> fully backward compatible.
+        if allow and base_final != "ABORT":
+            streak_after = 0
+    else:
+        if remaining_before > 0:
+            buffer_active = True
+            effective_rc_limit = float(base_rc_limit or 0.0) + float(relax)
+            final_decision = resolve_portfolio_cov_rc_hysteresis_decision(
+                portfolio_rc_fraction=portfolio_rc_fraction,
+                rc_limit=effective_rc_limit,
+                hysteresis_band=hysteresis_band,
+                previous_gate_decision=previous_gate_decision,
+            )
+            degraded_allow = (_normalize_cov_rc_gate_decision(final_decision.get("final_gate_decision")) == "ALLOW")
+            remaining_after = max(0, int(remaining_before) - 1)
+            streak_after = 0
+        else:
+            if base_final == "ABORT":
+                streak_after = int(streak_before) + 1
+                if streak_after >= trigger_n:
+                    triggered_this_cycle = True
+                    buffer_active = True
+                    effective_rc_limit = float(base_rc_limit or 0.0) + float(relax)
+                    final_decision = resolve_portfolio_cov_rc_hysteresis_decision(
+                        portfolio_rc_fraction=portfolio_rc_fraction,
+                        rc_limit=effective_rc_limit,
+                        hysteresis_band=hysteresis_band,
+                        previous_gate_decision=previous_gate_decision,
+                    )
+                    degraded_allow = (_normalize_cov_rc_gate_decision(final_decision.get("final_gate_decision")) == "ALLOW")
+                    remaining_after = max(0, active_n - 1)
+                    streak_after = 0
+            else:
+                streak_after = 0
+                remaining_after = 0
+
+    final_gate_decision = _normalize_cov_rc_gate_decision(final_decision.get("final_gate_decision")) or "ALLOW"
+    return {
+        "base_rc_limit": float(base_rc_limit or 0.0),
+        "effective_rc_limit": float(effective_rc_limit),
+        "hysteresis_band": float(hysteresis_band or 0.0),
+        "abort_buffer_enabled": bool(enabled),
+        "abort_buffer_allowed_this_path": bool(allow),
+        "abort_buffer_active": bool(buffer_active),
+        "abort_buffer_triggered_this_cycle": bool(triggered_this_cycle),
+        "abort_buffer_relax_delta": float(relax),
+        "trigger_consecutive_aborts": int(trigger_n),
+        "active_cycles": int(active_n),
+        "active_cycles_remaining": int(remaining_after),
+        "abort_streak_before": int(streak_before),
+        "abort_streak": int(streak_after),
+        "degraded_allow": bool(degraded_allow),
+        "portfolio_rc_fraction": final_decision.get("portfolio_rc_fraction"),
+        "previous_gate_decision": final_decision.get("previous_gate_decision"),
+        "final_gate_decision": str(final_gate_decision),
+        "sticky_zone": bool(final_decision.get("sticky_zone", False)),
+        "pass_threshold": final_decision.get("pass_threshold"),
+        "fail_threshold": final_decision.get("fail_threshold"),
+        "fallback_used": bool(final_decision.get("fallback_used", False)),
+        "fallback_mode": str(final_decision.get("fallback_mode", "")),
+        "hysteresis_decision_final": final_decision,
+    }
 
 
 class MacroSignalAdapter:
@@ -1050,6 +1251,9 @@ class PaperTradingEngine:
         self._last_rebalance_plan_filter_status = None
         self._last_rebalance_plan_filter_n_raw = None
         self._last_risk_gate_decision_cycle_id = None
+        self._last_portfolio_cov_rc_gate_decision = None
+        self._portfolio_cov_rc_abort_streak = 0
+        self._portfolio_cov_rc_abort_buffer_cycles_remaining = 0
         self._rebind_telemetry_logger()
         self.last_rebalance_time = None  # backward-compatible alias of last successful rebalance time
         self.last_rebalance_attempt_time = None
@@ -1508,6 +1712,11 @@ class PaperTradingEngine:
         risk_model_config.setdefault('fallback_to_diag_on_error', True)
         risk_model_config.setdefault('use_cov_vol_for_gate', False)
         risk_model_config.setdefault('rc_limit', 0.35)
+        risk_model_config.setdefault('portfolio_cov_rc_hysteresis_band', 0.0)
+        risk_model_config.setdefault('portfolio_cov_rc_abort_buffer_enabled', False)
+        risk_model_config.setdefault('portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts', 3)
+        risk_model_config.setdefault('portfolio_cov_rc_abort_buffer_relax_delta', 0.02)
+        risk_model_config.setdefault('portfolio_cov_rc_abort_buffer_active_cycles', 3)
         risk_model_config.setdefault('min_cov_gate_coverage', 0.6)
         risk_model_config.setdefault('cov_gate_fallback_to_weighted', True)
         asset_policy_cfg = config.setdefault('asset_data_policy', {})
@@ -1528,7 +1737,7 @@ class PaperTradingEngine:
         policy_proxy_map.setdefault('FTS.TO', 'FTS')
         asset_policy_cfg.setdefault('allow_execution_proxy', True)
         asset_policy_cfg.setdefault('allow_risk_proxy', True)
-        asset_policy_cfg.setdefault('reason_on_block', 'TSX price missing - policy DISABLE_ASSET')
+        asset_policy_cfg.setdefault('reason_on_block', 'Blocked by asset_data_policy (see ASSET_POLICY_DECISION for details)')
         reporting_config = config.setdefault('reporting', {})
         out_dir_raw = str(reporting_config.get('out_dir', '') or '').strip()
         reporting_config['_out_dir_explicit'] = bool(out_dir_raw)
@@ -2342,6 +2551,41 @@ class PaperTradingEngine:
         if isinstance(daily_report, dict) and isinstance(daily_report.get('risk_model_health'), dict):
             risk_health = self._json_safe_clone(daily_report.get('risk_model_health'), fallback=risk_health)
 
+        def _norm(v):
+            if isinstance(v, dict):
+                out = {}
+                for kk in sorted(v.keys(), key=lambda x: str(x)):
+                    out[str(kk)] = _norm(v.get(kk))
+                return out
+            if isinstance(v, list):
+                return [_norm(x) for x in v]
+            if isinstance(v, tuple):
+                return [_norm(x) for x in v]
+            if isinstance(v, float):
+                if not np.isfinite(v):
+                    return None
+                return float(v)
+            if isinstance(v, np.floating):
+                fv = float(v)
+                if not np.isfinite(fv):
+                    return None
+                return fv
+            if isinstance(v, np.integer):
+                return int(v)
+            if isinstance(v, np.bool_):
+                return bool(v)
+            return v
+
+        def _stable_fp(cfg_dict: dict) -> str:
+            payload_obj = _norm(cfg_dict if isinstance(cfg_dict, dict) else {})
+            stable = json.dumps(payload_obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+        effective_risk_model_cfg = self._json_safe_clone(self._get_risk_model_cfg(), fallback={})
+        requested_profile = str(payload.get('requested_risk_profile', self.requested_risk_profile or '') or '').strip().lower()
+        active_profile = str(payload.get('active_risk_profile', self.active_risk_profile or '') or '').strip().lower()
+        effective_risk_profile = active_profile or requested_profile or RISK_PROFILE_DEFAULT
+
         expected = {
             'schema_version': 1,
             'run_id': str(payload.get('run_id', self.run_id)),
@@ -2367,6 +2611,10 @@ class PaperTradingEngine:
             'asset_policy_mode': str(payload.get('asset_policy_mode', self._get_asset_data_policy_cfg().get('mode', 'FORCE_PROXY'))),
             'execution_proxy_used': bool(payload.get('execution_proxy_used', False)),
             'execution_proxy_map_used': self._json_safe_clone(payload.get('execution_proxy_map_used', []), fallback=[]),
+            'effective_risk_profile': effective_risk_profile,
+            'effective_risk_model_config': effective_risk_model_cfg,
+            'effective_risk_model_config_schema_version': EFFECTIVE_RISK_MODEL_CONFIG_SCHEMA_VERSION,
+            'effective_risk_model_config_fingerprint': _stable_fp(effective_risk_model_cfg),
         }
         return expected
 
@@ -2759,6 +3007,11 @@ class PaperTradingEngine:
             'portfolio_exposure_cap': execution_cfg.get('portfolio_exposure_cap'),
             'max_single_weight': objectives_cfg.get('max_weight_per_asset'),
             'rc_limit': risk_cfg.get('rc_limit'),
+            'portfolio_cov_rc_hysteresis_band': risk_cfg.get('portfolio_cov_rc_hysteresis_band'),
+            'portfolio_cov_rc_abort_buffer_enabled': risk_cfg.get('portfolio_cov_rc_abort_buffer_enabled'),
+            'portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts': risk_cfg.get('portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts'),
+            'portfolio_cov_rc_abort_buffer_relax_delta': risk_cfg.get('portfolio_cov_rc_abort_buffer_relax_delta'),
+            'portfolio_cov_rc_abort_buffer_active_cycles': risk_cfg.get('portfolio_cov_rc_abort_buffer_active_cycles'),
             'overlay_alpha': news_cfg.get('alpha'),
             'overlay_max_abs_delta': news_cfg.get('max_abs_delta'),
             'overlay_min_confidence': news_cfg.get('min_confidence'),
@@ -4260,6 +4513,14 @@ class PaperTradingEngine:
                 'cov_coverage_debug_inputs',
                 self.current_risk_check_info.get('cov_coverage_debug_inputs') if isinstance(self.current_risk_check_info, dict) else {}
             ),
+            'portfolio_cov_rc_hysteresis': snapshot.get(
+                'portfolio_cov_rc_hysteresis',
+                self.current_risk_check_info.get('portfolio_cov_rc_hysteresis') if isinstance(self.current_risk_check_info, dict) else {}
+            ),
+            'portfolio_cov_rc_abort_buffer': snapshot.get(
+                'portfolio_cov_rc_abort_buffer',
+                self.current_risk_check_info.get('portfolio_cov_rc_abort_buffer') if isinstance(self.current_risk_check_info, dict) else {}
+            ),
             'returns_coverage_diag': snapshot.get(
                 'returns_coverage_diag',
                 self.current_risk_check_info.get('returns_coverage_diag') if isinstance(self.current_risk_check_info, dict) else {"schema_version": 1, "items": []}
@@ -4634,7 +4895,7 @@ class PaperTradingEngine:
             "proxy_map": {"XIU.TO": "EWC", "FTS.TO": "FTS"},
             "allow_execution_proxy": True,
             "allow_risk_proxy": True,
-            "reason_on_block": "TSX price missing - policy DISABLE_ASSET",
+            "reason_on_block": "Blocked by asset_data_policy (see ASSET_POLICY_DECISION for details)",
             "source": "config",
         }
         raw_cfg = self.config.get("asset_data_policy", {}) if isinstance(self.config, dict) else {}
@@ -8493,6 +8754,11 @@ class PaperTradingEngine:
             "fallback_to_diag_on_error": True,
             "use_cov_vol_for_gate": False,
             "rc_limit": 0.35,
+            "portfolio_cov_rc_hysteresis_band": 0.0,
+            "portfolio_cov_rc_abort_buffer_enabled": False,
+            "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
+            "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
+            "portfolio_cov_rc_abort_buffer_active_cycles": 3,
             "min_cov_gate_coverage": 0.6,
             "cov_gate_fallback_to_weighted": True,
             "enable_vol_targeting": False,
@@ -8526,6 +8792,11 @@ class PaperTradingEngine:
             cfg["fallback_to_diag_on_error"] = bool(cfg.get("fallback_to_diag_on_error", True))
             cfg["use_cov_vol_for_gate"] = bool(cfg.get("use_cov_vol_for_gate", False))
             cfg["rc_limit"] = float(cfg.get("rc_limit", 0.35))
+            cfg["portfolio_cov_rc_hysteresis_band"] = float(cfg.get("portfolio_cov_rc_hysteresis_band", 0.0))
+            cfg["portfolio_cov_rc_abort_buffer_enabled"] = bool(cfg.get("portfolio_cov_rc_abort_buffer_enabled", False))
+            cfg["portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts"] = int(cfg.get("portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts", 3))
+            cfg["portfolio_cov_rc_abort_buffer_relax_delta"] = float(cfg.get("portfolio_cov_rc_abort_buffer_relax_delta", 0.02))
+            cfg["portfolio_cov_rc_abort_buffer_active_cycles"] = int(cfg.get("portfolio_cov_rc_abort_buffer_active_cycles", 3))
             cfg["min_cov_gate_coverage"] = float(cfg.get("min_cov_gate_coverage", 0.6))
             cfg["cov_gate_fallback_to_weighted"] = bool(cfg.get("cov_gate_fallback_to_weighted", True))
             cfg["enable_vol_targeting"] = bool(cfg.get("enable_vol_targeting", False))
@@ -8576,6 +8847,14 @@ class PaperTradingEngine:
                 cfg["max_pair_corr_pairs"] = 0
             if cfg["rc_limit"] < 0:
                 cfg["rc_limit"] = 0.0
+            if cfg["portfolio_cov_rc_hysteresis_band"] < 0:
+                cfg["portfolio_cov_rc_hysteresis_band"] = 0.0
+            if cfg["portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts"] < 1:
+                cfg["portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts"] = 1
+            if cfg["portfolio_cov_rc_abort_buffer_relax_delta"] < 0:
+                cfg["portfolio_cov_rc_abort_buffer_relax_delta"] = 0.0
+            if cfg["portfolio_cov_rc_abort_buffer_active_cycles"] < 0:
+                cfg["portfolio_cov_rc_abort_buffer_active_cycles"] = 0
             cfg["min_cov_gate_coverage"] = float(np.clip(cfg["min_cov_gate_coverage"], 0.0, 1.0))
             if cfg["vol_target"] <= 0:
                 cfg["vol_target"] = 0.18
@@ -10680,6 +10959,25 @@ class PaperTradingEngine:
         except Exception:
             return None
 
+    def _get_previous_portfolio_cov_rc_gate_decision(self) -> str | None:
+        prev = _normalize_cov_rc_gate_decision(getattr(self, "_last_portfolio_cov_rc_gate_decision", None))
+        if prev in {"ALLOW", "ABORT"}:
+            return prev
+
+        risk_info = self.current_risk_check_info if isinstance(getattr(self, "current_risk_check_info", None), dict) else {}
+        gate_decision = risk_info.get("risk_gate_decision", {}) if isinstance(risk_info.get("risk_gate_decision"), dict) else {}
+        prev = _normalize_cov_rc_gate_decision(gate_decision.get("final_gate_decision"))
+        if prev in {"ALLOW", "ABORT"}:
+            return prev
+
+        gate_reason = str(gate_decision.get("reason", "") or "").strip().lower()
+        if gate_reason == "portfolio_cov_rc_limit":
+            return "ABORT"
+        gate_metric = str(gate_decision.get("metric_name", "") or "").strip().lower()
+        if gate_metric == "max_rc_fraction" and not gate_reason:
+            return "ALLOW"
+        return None
+
     def _evaluate_portfolio_risk_gate(self, target_weights):
         """Check portfolio-level volatility/diversification before execution."""
         execution_cfg = self.config.get('execution', {})
@@ -10694,11 +10992,33 @@ class PaperTradingEngine:
 
         use_cov_vol_for_gate = bool(risk_model_cfg.get('use_cov_vol_for_gate', False))
         rc_limit = float(risk_model_cfg.get('rc_limit', 0.35))
+        portfolio_cov_rc_hysteresis_band = float(risk_model_cfg.get('portfolio_cov_rc_hysteresis_band', 0.0) or 0.0)
+        if not np.isfinite(portfolio_cov_rc_hysteresis_band) or portfolio_cov_rc_hysteresis_band < 0.0:
+            portfolio_cov_rc_hysteresis_band = 0.0
         min_cov_gate_coverage = float(risk_model_cfg.get('min_cov_gate_coverage', 0.6))
         cov_gate_fallback_to_weighted = bool(risk_model_cfg.get('cov_gate_fallback_to_weighted', True))
         enable_target_cov_gate = bool(execution_cfg.get('enable_target_cov_gate', False))
         target_cov_gate_min_coverage = float(execution_cfg.get('target_cov_gate_min_coverage', 0.60))
         target_cov_gate_require_ok = bool(execution_cfg.get('target_cov_gate_require_ok', True))
+        previous_rc_gate_decision = self._get_previous_portfolio_cov_rc_gate_decision()
+        portfolio_cov_rc_abort_buffer_enabled = bool(risk_model_cfg.get("portfolio_cov_rc_abort_buffer_enabled", False))
+        portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts = int(
+            risk_model_cfg.get("portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts", 3) or 3
+        )
+        portfolio_cov_rc_abort_buffer_relax_delta = float(
+            risk_model_cfg.get("portfolio_cov_rc_abort_buffer_relax_delta", 0.02) or 0.02
+        )
+        portfolio_cov_rc_abort_buffer_active_cycles = int(
+            risk_model_cfg.get("portfolio_cov_rc_abort_buffer_active_cycles", 3) or 3
+        )
+        if portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts < 1:
+            portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts = 1
+        if not np.isfinite(portfolio_cov_rc_abort_buffer_relax_delta) or portfolio_cov_rc_abort_buffer_relax_delta < 0.0:
+            portfolio_cov_rc_abort_buffer_relax_delta = 0.0
+        if portfolio_cov_rc_abort_buffer_active_cycles < 0:
+            portfolio_cov_rc_abort_buffer_active_cycles = 0
+        prev_rc_abort_streak = int(getattr(self, "_portfolio_cov_rc_abort_streak", 0) or 0)
+        prev_rc_abort_buffer_cycles_remaining = int(getattr(self, "_portfolio_cov_rc_abort_buffer_cycles_remaining", 0) or 0)
 
         invested_weights = {}
         for t, w in (target_weights or {}).items():
@@ -10995,6 +11315,24 @@ class PaperTradingEngine:
             "missing_count": int(cov_coverage_debug_inputs.get("dump_missing_count", 0) or 0),
             "top_missing_top5": list(cov_coverage_debug_inputs.get("dump_top_missing_top5", [])) if isinstance(cov_coverage_debug_inputs.get("dump_top_missing_top5"), list) else [],
             "reason": "",
+            "portfolio_rc_fraction": float(cov_gate_max_rc) if cov_gate_max_rc is not None else None,
+            "rc_limit": float(rc_limit) if rc_limit > 0 else None,
+            "hysteresis_band": float(portfolio_cov_rc_hysteresis_band),
+            "pass_threshold": None,
+            "fail_threshold": None,
+            "previous_gate_decision": _normalize_cov_rc_gate_decision(previous_rc_gate_decision),
+            "final_gate_decision": None,
+            "sticky_zone": False,
+            "base_rc_limit": float(rc_limit) if rc_limit > 0 else None,
+            "effective_rc_limit": float(rc_limit) if rc_limit > 0 else None,
+            "abort_buffer_enabled": bool(portfolio_cov_rc_abort_buffer_enabled),
+            "abort_buffer_active": False,
+            "abort_buffer_triggered_this_cycle": False,
+            "abort_buffer_relax_delta": float(portfolio_cov_rc_abort_buffer_relax_delta),
+            "abort_streak": int(prev_rc_abort_streak),
+            "trigger_consecutive_aborts": int(portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts),
+            "active_cycles_remaining": int(prev_rc_abort_buffer_cycles_remaining),
+            "degraded_allow": False,
         }
         returns_coverage_diag = {"schema_version": 1, "items": []}
 
@@ -11005,8 +11343,36 @@ class PaperTradingEngine:
             and cov_gate_coverage >= gate_cov_min_coverage
         )
         vol_ok = bool(cov_gate_vol is not None and cov_gate_vol <= max_portfolio_volatility)
+        rc_hysteresis_decision = None
+        rc_hysteresis_decision_base = None
+        rc_abort_buffer_meta = None
         if rc_limit > 0:
-            rc_ok = bool(cov_gate_max_rc is not None and cov_gate_max_rc <= rc_limit)
+            rc_hysteresis_decision_base = resolve_portfolio_cov_rc_hysteresis_decision(
+                portfolio_rc_fraction=cov_gate_max_rc,
+                rc_limit=rc_limit,
+                hysteresis_band=portfolio_cov_rc_hysteresis_band,
+                previous_gate_decision=previous_rc_gate_decision,
+            )
+            rc_abort_buffer_meta = resolve_portfolio_cov_rc_abort_buffer_decision(
+                portfolio_rc_fraction=cov_gate_max_rc,
+                previous_gate_decision=previous_rc_gate_decision,
+                base_rc_limit=rc_limit,
+                hysteresis_band=portfolio_cov_rc_hysteresis_band,
+                buffer_enabled=portfolio_cov_rc_abort_buffer_enabled,
+                trigger_consecutive_aborts=portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts,
+                relax_delta=portfolio_cov_rc_abort_buffer_relax_delta,
+                active_cycles=portfolio_cov_rc_abort_buffer_active_cycles,
+                prev_abort_streak=prev_rc_abort_streak,
+                prev_buffer_cycles_remaining=prev_rc_abort_buffer_cycles_remaining,
+                allow_buffer=bool(vol_ok),
+            )
+            rc_hysteresis_decision = (
+                rc_abort_buffer_meta.get("hysteresis_decision_final")
+                if isinstance(rc_abort_buffer_meta, dict)
+                and isinstance(rc_abort_buffer_meta.get("hysteresis_decision_final"), dict)
+                else rc_hysteresis_decision_base
+            )
+            rc_ok = str(rc_hysteresis_decision.get("final_gate_decision", "ALLOW")).upper() == "ALLOW"
         else:
             rc_ok = True
 
@@ -11083,6 +11449,57 @@ class PaperTradingEngine:
         gate_decision_inputs["metric_name"] = metric_name
         gate_decision_inputs["metric_value"] = metric_value
         gate_decision_inputs["threshold"] = metric_threshold
+        if isinstance(rc_hysteresis_decision, dict):
+            gate_decision_inputs["portfolio_rc_fraction"] = rc_hysteresis_decision.get("portfolio_rc_fraction")
+            gate_decision_inputs["rc_limit"] = rc_hysteresis_decision.get("rc_limit")
+            gate_decision_inputs["hysteresis_band"] = rc_hysteresis_decision.get("hysteresis_band")
+            gate_decision_inputs["pass_threshold"] = rc_hysteresis_decision.get("pass_threshold")
+            gate_decision_inputs["fail_threshold"] = rc_hysteresis_decision.get("fail_threshold")
+            gate_decision_inputs["previous_gate_decision"] = rc_hysteresis_decision.get("previous_gate_decision")
+            gate_decision_inputs["final_gate_decision"] = rc_hysteresis_decision.get("final_gate_decision")
+            gate_decision_inputs["sticky_zone"] = bool(rc_hysteresis_decision.get("sticky_zone", False))
+        if isinstance(rc_abort_buffer_meta, dict):
+            gate_decision_inputs["base_rc_limit"] = rc_abort_buffer_meta.get("base_rc_limit")
+            gate_decision_inputs["effective_rc_limit"] = rc_abort_buffer_meta.get("effective_rc_limit")
+            gate_decision_inputs["abort_buffer_enabled"] = bool(rc_abort_buffer_meta.get("abort_buffer_enabled", False))
+            gate_decision_inputs["abort_buffer_active"] = bool(rc_abort_buffer_meta.get("abort_buffer_active", False))
+            gate_decision_inputs["abort_buffer_triggered_this_cycle"] = bool(rc_abort_buffer_meta.get("abort_buffer_triggered_this_cycle", False))
+            gate_decision_inputs["abort_buffer_relax_delta"] = float(rc_abort_buffer_meta.get("abort_buffer_relax_delta", 0.0) or 0.0)
+            gate_decision_inputs["abort_streak"] = int(rc_abort_buffer_meta.get("abort_streak", 0) or 0)
+            gate_decision_inputs["trigger_consecutive_aborts"] = int(rc_abort_buffer_meta.get("trigger_consecutive_aborts", 0) or 0)
+            gate_decision_inputs["active_cycles_remaining"] = int(rc_abort_buffer_meta.get("active_cycles_remaining", 0) or 0)
+            gate_decision_inputs["degraded_allow"] = bool(rc_abort_buffer_meta.get("degraded_allow", False))
+            gate_decision_inputs["rc_buffer_allow_path"] = bool(rc_abort_buffer_meta.get("abort_buffer_allowed_this_path", False))
+            print(
+                "[RC_ABORT_BUFFER] "
+                f"base_rc_limit={rc_abort_buffer_meta.get('base_rc_limit')} "
+                f"effective_rc_limit={rc_abort_buffer_meta.get('effective_rc_limit')} "
+                f"abort_buffer_enabled={bool(rc_abort_buffer_meta.get('abort_buffer_enabled', False))} "
+                f"abort_buffer_active={bool(rc_abort_buffer_meta.get('abort_buffer_active', False))} "
+                f"abort_buffer_triggered_this_cycle={bool(rc_abort_buffer_meta.get('abort_buffer_triggered_this_cycle', False))} "
+                f"abort_buffer_relax_delta={rc_abort_buffer_meta.get('abort_buffer_relax_delta')} "
+                f"abort_streak={rc_abort_buffer_meta.get('abort_streak')} "
+                f"trigger_consecutive_aborts={rc_abort_buffer_meta.get('trigger_consecutive_aborts')} "
+                f"active_cycles_remaining={rc_abort_buffer_meta.get('active_cycles_remaining')} "
+                f"degraded_allow={bool(rc_abort_buffer_meta.get('degraded_allow', False))} "
+                f"portfolio_rc_fraction={rc_abort_buffer_meta.get('portfolio_rc_fraction')} "
+                f"final_gate_decision={rc_abort_buffer_meta.get('final_gate_decision')}"
+            )
+        if isinstance(rc_hysteresis_decision, dict):
+            self._last_portfolio_cov_rc_gate_decision = _normalize_cov_rc_gate_decision(
+                rc_hysteresis_decision.get("final_gate_decision")
+            )
+            print(
+                "[RC_HYST] "
+                f"portfolio_rc_fraction={rc_hysteresis_decision.get('portfolio_rc_fraction')} "
+                f"rc_limit={rc_hysteresis_decision.get('rc_limit')} "
+                f"hysteresis_band={rc_hysteresis_decision.get('hysteresis_band')} "
+                f"pass_threshold={rc_hysteresis_decision.get('pass_threshold')} "
+                f"fail_threshold={rc_hysteresis_decision.get('fail_threshold')} "
+                f"previous_gate_decision={rc_hysteresis_decision.get('previous_gate_decision')} "
+                f"final_gate_decision={rc_hysteresis_decision.get('final_gate_decision')} "
+                f"sticky_zone={bool(rc_hysteresis_decision.get('sticky_zone', False))}"
+            )
 
         if abort_reason:
             cov_coverage["abort_reason"] = str(abort_reason)
@@ -11171,6 +11588,20 @@ class PaperTradingEngine:
             )
             self._emit_cov_coverage_logs(cov_coverage)
 
+        if isinstance(rc_abort_buffer_meta, dict) and bool(rc_abort_buffer_meta.get("abort_buffer_allowed_this_path", False)):
+            if abort_reason == "portfolio_cov_rc_limit":
+                self._portfolio_cov_rc_abort_streak = int(rc_abort_buffer_meta.get("abort_streak", 0) or 0)
+                self._portfolio_cov_rc_abort_buffer_cycles_remaining = int(rc_abort_buffer_meta.get("active_cycles_remaining", 0) or 0)
+            else:
+                self._portfolio_cov_rc_abort_streak = 0
+                if bool(rc_abort_buffer_meta.get("abort_buffer_active", False)):
+                    self._portfolio_cov_rc_abort_buffer_cycles_remaining = int(rc_abort_buffer_meta.get("active_cycles_remaining", 0) or 0)
+                else:
+                    self._portfolio_cov_rc_abort_buffer_cycles_remaining = 0
+        elif not bool(portfolio_cov_rc_abort_buffer_enabled):
+            self._portfolio_cov_rc_abort_streak = 0
+            self._portfolio_cov_rc_abort_buffer_cycles_remaining = 0
+
         return {
             'abort': bool(abort_flag),
             'abort_reason': abort_reason,
@@ -11200,6 +11631,8 @@ class PaperTradingEngine:
             'cov_gate_reason': cov_gate_reason,
             'cov_coverage': cov_coverage,
             'cov_coverage_debug_inputs': cov_coverage_debug_inputs,
+            'portfolio_cov_rc_hysteresis': dict(rc_hysteresis_decision) if isinstance(rc_hysteresis_decision, dict) else {},
+            'portfolio_cov_rc_abort_buffer': dict(rc_abort_buffer_meta) if isinstance(rc_abort_buffer_meta, dict) else {},
             'ticker_proxy_used': ticker_proxy_used,
             'ticker_proxy_map_used': proxy_rows[:20],
             'returns_coverage_diag': returns_coverage_diag,
@@ -14758,6 +15191,8 @@ class PaperTradingEngine:
             'execution_proxy_map_used': list((self.current_execution_proxy_info or {}).get('map_used', [])),
             'cov_coverage': self.current_risk_check_info.get('cov_coverage', default_cov_coverage()),
             'cov_coverage_debug_inputs': self.current_risk_check_info.get('cov_coverage_debug_inputs', {}),
+            'portfolio_cov_rc_hysteresis': self.current_risk_check_info.get('portfolio_cov_rc_hysteresis', {}),
+            'portfolio_cov_rc_abort_buffer': self.current_risk_check_info.get('portfolio_cov_rc_abort_buffer', {}),
             'returns_coverage_diag': self.current_risk_check_info.get('returns_coverage_diag', {"schema_version": 1, "items": []}),
             'cov_refresh': self.current_risk_check_info.get('cov_refresh', self.current_cov_refresh_info),
             'risk_gate_basis': self.current_risk_check_info.get('risk_gate_basis', 'current'),
@@ -15906,6 +16341,30 @@ def _build_debug_risk_gate_stub_payload(
         "cov_gate_reason": "risk_gate_stub",
         "cov_coverage": default_cov_coverage(basis="target_weights", stage="cov"),
         "cov_coverage_debug_inputs": cov_debug,
+        "portfolio_cov_rc_hysteresis": {},
+        "portfolio_cov_rc_abort_buffer": {
+            "base_rc_limit": 1.0,
+            "effective_rc_limit": 1.0,
+            "abort_buffer_enabled": False,
+            "abort_buffer_allowed_this_path": False,
+            "abort_buffer_active": False,
+            "abort_buffer_triggered_this_cycle": False,
+            "abort_buffer_relax_delta": 0.0,
+            "trigger_consecutive_aborts": 0,
+            "active_cycles": 0,
+            "active_cycles_remaining": 0,
+            "abort_streak_before": 0,
+            "abort_streak": 0,
+            "degraded_allow": False,
+            "portfolio_rc_fraction": None,
+            "previous_gate_decision": None,
+            "final_gate_decision": "ALLOW",
+            "sticky_zone": False,
+            "pass_threshold": None,
+            "fail_threshold": None,
+            "fallback_used": False,
+            "fallback_mode": "",
+        },
         "cov_refresh": {"attempted": False, "status": "skipped", "reason": "risk_gate_stub"},
         "rc_limit": 1.0,
         "min_cov_gate_coverage": 1.0,
@@ -16033,7 +16492,7 @@ def debug_run_system_s1_s5(
     asset_policy_cfg.setdefault("match_rules", [{"suffix": ".TO"}])
     asset_policy_cfg.setdefault("allow_risk_proxy", True)
     asset_policy_cfg.setdefault("allow_execution_proxy", True)
-    asset_policy_cfg.setdefault("reason_on_block", "TSX price missing - policy DISABLE_ASSET")
+    asset_policy_cfg.setdefault("reason_on_block", "Blocked by asset_data_policy (see ASSET_POLICY_DECISION for details)")
     pm = asset_policy_cfg.get("proxy_map", {})
     if not isinstance(pm, dict):
         pm = {}
@@ -17662,6 +18121,67 @@ def build_drift_report(expected_fields: dict, replay_snapshot: dict) -> dict:
             note='top_blockers drift',
         )
 
+    # Effective risk_model metadata guardrail (Step 3B.7)
+    exp_schema = expected.get('effective_risk_model_config_schema_version')
+    act_schema = actual.get('effective_risk_model_config_schema_version')
+    exp_fp = expected.get('effective_risk_model_config_fingerprint')
+    act_fp = actual.get('effective_risk_model_config_fingerprint')
+
+    metadata_status = 'ok'
+    schema_match = None
+    fingerprint_match = None
+
+    if exp_schema is None or act_schema is None:
+        metadata_status = 'legacy_snapshot_missing_metadata'
+        _append_drift_diff(
+            diffs,
+            path='$.effective_risk_model_config_schema_version',
+            expected=exp_schema,
+            actual=act_schema,
+            severity='MINOR',
+            note='legacy_snapshot_missing_metadata',
+        )
+    else:
+        schema_match = bool(exp_schema == act_schema)
+        if not schema_match:
+            metadata_status = 'effective_risk_model_config_schema_version_mismatch'
+            _append_drift_diff(
+                diffs,
+                path='$.effective_risk_model_config_schema_version',
+                expected=exp_schema,
+                actual=act_schema,
+                severity='MAJOR',
+                note='effective_risk_model_config_schema_version_mismatch',
+            )
+
+    if exp_fp is None or act_fp is None:
+        if metadata_status == 'ok':
+            metadata_status = 'legacy_snapshot_missing_metadata'
+        _append_drift_diff(
+            diffs,
+            path='$.effective_risk_model_config_fingerprint',
+            expected=exp_fp,
+            actual=act_fp,
+            severity='MINOR',
+            note='legacy_snapshot_missing_metadata',
+        )
+    else:
+        exp_fp_s = str(exp_fp).strip()
+        act_fp_s = str(act_fp).strip()
+        fingerprint_match = bool(exp_fp_s == act_fp_s)
+        if not fingerprint_match:
+            # Same schema + fingerprint changed => configuration changed under same metadata model.
+            if metadata_status == 'ok':
+                metadata_status = 'effective_risk_model_config_fingerprint_changed'
+            _append_drift_diff(
+                diffs,
+                path='$.effective_risk_model_config_fingerprint',
+                expected=exp_fp_s,
+                actual=act_fp_s,
+                severity='MAJOR',
+                note='effective_risk_model_config_fingerprint_changed',
+            )
+
     for row in diffs:
         sev = str(row.get('severity', 'MINOR')).upper()
         if sev not in severity_counts:
@@ -17674,6 +18194,15 @@ def build_drift_report(expected_fields: dict, replay_snapshot: dict) -> dict:
             'pass': bool(severity_counts['CRITICAL'] == 0 and severity_counts['MAJOR'] == 0),
             'num_diffs': int(len(diffs)),
             'severity_counts': severity_counts,
+        },
+        'config_metadata_compare': {
+            'effective_risk_model_config_schema_version_expected': exp_schema,
+            'effective_risk_model_config_schema_version_actual': act_schema,
+            'effective_risk_model_config_fingerprint_expected': exp_fp,
+            'effective_risk_model_config_fingerprint_actual': act_fp,
+            'schema_version_match': schema_match,
+            'fingerprint_match': fingerprint_match,
+            'status': metadata_status,
         },
         'diffs': diffs,
     }
@@ -17865,7 +18394,234 @@ def _build_l1_replay_snapshot(
     return replay_snapshot
 
 
-def replay_bundle_once(bundle_path: str, replay_level: str | None = None) -> dict:
+def _apply_replay_risk_overrides(
+    replay_snapshot: dict,
+    *,
+    scenario_id: str | None = None,
+    risk_profile_override: str | None = None,
+    risk_model_overrides: dict | None = None,
+) -> dict:
+    snap = replay_snapshot if isinstance(replay_snapshot, dict) else {}
+    overrides = risk_model_overrides if isinstance(risk_model_overrides, dict) else {}
+    allowed_keys = {
+        "rc_limit",
+        "portfolio_cov_rc_hysteresis_band",
+        "portfolio_cov_rc_abort_buffer_enabled",
+        "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts",
+        "portfolio_cov_rc_abort_buffer_relax_delta",
+        "portfolio_cov_rc_abort_buffer_active_cycles",
+    }
+    cleaned = {}
+    for k, v in overrides.items():
+        key = str(k or "").strip()
+        if key in allowed_keys:
+            cleaned[key] = v
+
+    if str(scenario_id or "").strip():
+        snap["scenario_id"] = str(scenario_id or "").strip()
+    if str(risk_profile_override or "").strip():
+        snap["risk_profile_requested"] = str(risk_profile_override or "").strip().lower()
+    if cleaned:
+        snap["risk_model_overrides"] = copy.deepcopy(cleaned)
+
+    risk_gate = snap.get("risk_gate_decision", {}) if isinstance(snap.get("risk_gate_decision"), dict) else {}
+    metric_name = str(risk_gate.get("metric_name", "")).strip().lower()
+    metric_value = risk_gate.get("metric_value")
+    threshold_seed = risk_gate.get("threshold")
+
+    effective_rc_limit = cleaned.get("rc_limit", threshold_seed)
+    effective_hysteresis_band = cleaned.get("portfolio_cov_rc_hysteresis_band", risk_gate.get("hysteresis_band", 0.0))
+    effective_abort_buffer_enabled = cleaned.get("portfolio_cov_rc_abort_buffer_enabled", risk_gate.get("abort_buffer_enabled", False))
+    effective_abort_buffer_trigger = cleaned.get("portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts", risk_gate.get("trigger_consecutive_aborts"))
+    effective_abort_buffer_delta = cleaned.get("portfolio_cov_rc_abort_buffer_relax_delta", risk_gate.get("abort_buffer_relax_delta"))
+    effective_abort_buffer_cycles = cleaned.get("portfolio_cov_rc_abort_buffer_active_cycles", risk_gate.get("active_cycles_remaining"))
+
+    try:
+        effective_rc_limit_f = float(effective_rc_limit) if effective_rc_limit is not None else None
+    except Exception:
+        effective_rc_limit_f = None
+    try:
+        effective_hyst_f = float(effective_hysteresis_band) if effective_hysteresis_band is not None else None
+    except Exception:
+        effective_hyst_f = None
+
+    existing_risk_cfg = snap.get("effective_risk_model_config")
+    risk_cfg = copy.deepcopy(existing_risk_cfg) if isinstance(existing_risk_cfg, dict) else {}
+    if "rc_limit" not in risk_cfg:
+        risk_cfg["rc_limit"] = effective_rc_limit_f
+    if "portfolio_cov_rc_hysteresis_band" not in risk_cfg:
+        risk_cfg["portfolio_cov_rc_hysteresis_band"] = effective_hyst_f
+    if "portfolio_cov_rc_abort_buffer_enabled" not in risk_cfg:
+        risk_cfg["portfolio_cov_rc_abort_buffer_enabled"] = bool(effective_abort_buffer_enabled)
+    if "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts" not in risk_cfg:
+        risk_cfg["portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts"] = (
+            int(effective_abort_buffer_trigger) if effective_abort_buffer_trigger is not None else None
+        )
+    if "portfolio_cov_rc_abort_buffer_relax_delta" not in risk_cfg:
+        risk_cfg["portfolio_cov_rc_abort_buffer_relax_delta"] = (
+            float(effective_abort_buffer_delta) if effective_abort_buffer_delta is not None else None
+        )
+    if "portfolio_cov_rc_abort_buffer_active_cycles" not in risk_cfg:
+        risk_cfg["portfolio_cov_rc_abort_buffer_active_cycles"] = (
+            int(effective_abort_buffer_cycles) if effective_abort_buffer_cycles is not None else None
+        )
+
+    if "rc_limit" in cleaned:
+        try:
+            risk_cfg["rc_limit"] = float(cleaned.get("rc_limit"))
+        except Exception:
+            risk_cfg["rc_limit"] = cleaned.get("rc_limit")
+    if "portfolio_cov_rc_hysteresis_band" in cleaned:
+        try:
+            risk_cfg["portfolio_cov_rc_hysteresis_band"] = float(cleaned.get("portfolio_cov_rc_hysteresis_band"))
+        except Exception:
+            risk_cfg["portfolio_cov_rc_hysteresis_band"] = cleaned.get("portfolio_cov_rc_hysteresis_band")
+    if "portfolio_cov_rc_abort_buffer_enabled" in cleaned:
+        risk_cfg["portfolio_cov_rc_abort_buffer_enabled"] = bool(cleaned.get("portfolio_cov_rc_abort_buffer_enabled"))
+    if "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts" in cleaned:
+        try:
+            risk_cfg["portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts"] = int(
+                cleaned.get("portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts")
+            )
+        except Exception:
+            risk_cfg["portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts"] = cleaned.get(
+                "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts"
+            )
+    if "portfolio_cov_rc_abort_buffer_relax_delta" in cleaned:
+        try:
+            risk_cfg["portfolio_cov_rc_abort_buffer_relax_delta"] = float(cleaned.get("portfolio_cov_rc_abort_buffer_relax_delta"))
+        except Exception:
+            risk_cfg["portfolio_cov_rc_abort_buffer_relax_delta"] = cleaned.get("portfolio_cov_rc_abort_buffer_relax_delta")
+    if "portfolio_cov_rc_abort_buffer_active_cycles" in cleaned:
+        try:
+            risk_cfg["portfolio_cov_rc_abort_buffer_active_cycles"] = int(cleaned.get("portfolio_cov_rc_abort_buffer_active_cycles"))
+        except Exception:
+            risk_cfg["portfolio_cov_rc_abort_buffer_active_cycles"] = cleaned.get("portfolio_cov_rc_abort_buffer_active_cycles")
+
+    effective_profile = (
+        str(risk_profile_override or "").strip().lower()
+        or str(snap.get("effective_risk_profile", "")).strip().lower()
+        or str(snap.get("active_risk_profile", "")).strip().lower()
+        or str(snap.get("risk_profile_requested", "")).strip().lower()
+        or None
+    )
+    source_parts = []
+    if isinstance(existing_risk_cfg, dict) and existing_risk_cfg:
+        source_parts.append("snapshot_base")
+    else:
+        source_parts.append("snapshot_inferred")
+    if cleaned:
+        source_parts.append("replay_override")
+    if str(risk_profile_override or "").strip():
+        source_parts.append("profile_override")
+    effective_source = "+".join(source_parts)
+
+    def _normalize_fingerprint_value(v):
+        if isinstance(v, dict):
+            out = {}
+            for kk in sorted(v.keys(), key=lambda x: str(x)):
+                out[str(kk)] = _normalize_fingerprint_value(v.get(kk))
+            return out
+        if isinstance(v, list):
+            return [_normalize_fingerprint_value(x) for x in v]
+        if isinstance(v, tuple):
+            return [_normalize_fingerprint_value(x) for x in v]
+        if isinstance(v, float):
+            if not np.isfinite(v):
+                return None
+            return float(v)
+        if isinstance(v, np.floating):
+            fv = float(v)
+            if not np.isfinite(fv):
+                return None
+            return fv
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, np.bool_):
+            return bool(v)
+        return v
+
+    def _stable_risk_model_fingerprint(cfg_dict: dict) -> str:
+        payload_obj = _normalize_fingerprint_value(cfg_dict if isinstance(cfg_dict, dict) else {})
+        payload = json.dumps(payload_obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    final_gate_decision = str(risk_gate.get("final_gate_decision", "")).strip().upper()
+    reason = str(risk_gate.get("reason", "")).strip()
+    gate_override_requested = bool(
+        ("rc_limit" in cleaned) or ("portfolio_cov_rc_hysteresis_band" in cleaned)
+    )
+    if gate_override_requested and metric_name == "max_rc_fraction" and effective_rc_limit_f is not None:
+        try:
+            metric_val_f = float(metric_value) if metric_value is not None else None
+        except Exception:
+            metric_val_f = None
+        if metric_val_f is not None:
+            # Step 3B minimal behavior: apply scenario threshold directly in replay path.
+            final_gate_decision = "ABORT" if metric_val_f > float(effective_rc_limit_f) else "ALLOW"
+            if final_gate_decision == "ABORT":
+                reason = "portfolio_cov_rc_limit"
+            elif reason == "portfolio_cov_rc_limit":
+                reason = ""
+            risk_gate["threshold"] = float(effective_rc_limit_f)
+            risk_gate["final_gate_decision"] = final_gate_decision
+            risk_gate["reason"] = reason
+            if effective_hyst_f is not None:
+                risk_gate["hysteresis_band"] = float(effective_hyst_f)
+
+            no_trade = snap.get("no_trade_summary", {}) if isinstance(snap.get("no_trade_summary"), dict) else {}
+            if isinstance(no_trade, dict):
+                gate_metric = no_trade.get("gate_metric", {}) if isinstance(no_trade.get("gate_metric"), dict) else {}
+                gate_metric["metric_name"] = risk_gate.get("metric_name")
+                gate_metric["metric_value"] = risk_gate.get("metric_value")
+                gate_metric["threshold"] = risk_gate.get("threshold")
+                gate_metric["stage"] = risk_gate.get("stage")
+                no_trade["gate_metric"] = gate_metric
+                no_trade["gate_reason"] = reason
+                snap["no_trade_summary"] = no_trade
+
+            health = snap.get("risk_model_health", {}) if isinstance(snap.get("risk_model_health"), dict) else {}
+            health_gate = health.get("risk_gate", {}) if isinstance(health.get("risk_gate"), dict) else {}
+            health_gate["triggered"] = bool(reason)
+            health_gate["reason"] = reason
+            health_gate["metric_name"] = risk_gate.get("metric_name")
+            health_gate["metric_value"] = risk_gate.get("metric_value")
+            health_gate["threshold"] = risk_gate.get("threshold")
+            health_gate["stage"] = risk_gate.get("stage")
+            health["risk_gate"] = health_gate
+            snap["risk_model_health"] = health
+
+    snap["risk_gate_decision"] = risk_gate
+    snap["effective_rc_limit"] = effective_rc_limit_f
+    snap["effective_hysteresis_band"] = effective_hyst_f
+    snap["effective_abort_buffer_enabled"] = bool(effective_abort_buffer_enabled)
+    snap["effective_abort_buffer_trigger_consecutive_aborts"] = (
+        int(effective_abort_buffer_trigger) if effective_abort_buffer_trigger is not None else None
+    )
+    snap["effective_abort_buffer_relax_delta"] = (
+        float(effective_abort_buffer_delta) if effective_abort_buffer_delta is not None else None
+    )
+    snap["effective_abort_buffer_active_cycles"] = (
+        int(effective_abort_buffer_cycles) if effective_abort_buffer_cycles is not None else None
+    )
+    snap["effective_risk_profile"] = effective_profile
+    snap["effective_risk_model_config"] = risk_cfg
+    snap["effective_risk_model_config_schema_version"] = EFFECTIVE_RISK_MODEL_CONFIG_SCHEMA_VERSION
+    snap["effective_risk_model_config_fingerprint"] = _stable_risk_model_fingerprint(risk_cfg)
+    snap["effective_risk_model_source"] = effective_source
+    snap["effective_config_source"] = effective_source
+    snap["override_applied"] = bool(cleaned or str(risk_profile_override or "").strip())
+    return snap
+
+
+def replay_bundle_once(
+    bundle_path: str,
+    replay_level: str | None = None,
+    *,
+    scenario_id: str | None = None,
+    risk_profile_override: str | None = None,
+    risk_model_overrides: dict | None = None,
+) -> dict:
     """Run deterministic offline replay from frozen bundle (L0/L1)."""
     bundle_abs = os.path.abspath(str(bundle_path or '').strip())
     if not bundle_abs or not os.path.isdir(bundle_abs):
@@ -17944,6 +18700,13 @@ def replay_bundle_once(bundle_path: str, replay_level: str | None = None) -> dic
             'prices_loaded': prices_loaded,
         }
         replay_snapshot.update(copy.deepcopy(expected_fields))
+
+    replay_snapshot = _apply_replay_risk_overrides(
+        replay_snapshot,
+        scenario_id=scenario_id,
+        risk_profile_override=risk_profile_override,
+        risk_model_overrides=risk_model_overrides,
+    )
 
     io_atomic_write_json(replay_snapshot_path, replay_snapshot, indent=2)
 

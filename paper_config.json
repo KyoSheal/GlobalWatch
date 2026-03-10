@@ -1314,7 +1314,12 @@
     "annualization_factor": 252,
     "max_pair_corr_pairs": 3,
     "debug_log": false,
-    "fallback_to_diag_on_error": true
+    "fallback_to_diag_on_error": true,
+    "portfolio_cov_rc_hysteresis_band": 0.0,
+    "portfolio_cov_rc_abort_buffer_enabled": false,
+    "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
+    "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
+    "portfolio_cov_rc_abort_buffer_active_cycles": 3
   },
   "asset_data_policy": {
     "mode": "FORCE_PROXY",
@@ -1333,7 +1338,7 @@
     },
     "allow_execution_proxy": true,
     "allow_risk_proxy": true,
-    "reason_on_block": "TSX price missing - policy DISABLE_ASSET"
+    "reason_on_block": "Blocked by asset_data_policy (see ASSET_POLICY_DECISION for details)"
   },
   "execution": {
     "risk_profile": "",
@@ -1443,6 +1448,11 @@
       },
       "risk_model": {
         "rc_limit": 0.3,
+        "portfolio_cov_rc_hysteresis_band": 0.03,
+        "portfolio_cov_rc_abort_buffer_enabled": true,
+        "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
+        "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
+        "portfolio_cov_rc_abort_buffer_active_cycles": 3,
         "use_cov_vol_for_gate": true
       },
       "news_overlay": {

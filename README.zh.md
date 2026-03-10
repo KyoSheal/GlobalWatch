@@ -63,6 +63,20 @@ GlobalWatch Paper Trading 是一个本地优先的量化研究与纸面交易系
 5. “为什么没交易”诊断增强：
    - 日报与 UI 的阻断原因/风险健康度汇总更易读、更易回放。
 
+## 最新验证（近期样本）
+1. 回放可比性已拆分为两层语义：
+   - baseline 漂移可比性（`config_metadata_compare`）
+   - scenario 感知可比性（`scenario_metadata_compare`）
+2. Walk-forward 的 ranking 与 winner eligibility 已以 scenario-aware comparable days 作为主依据。
+3. 已执行一轮 OPEN 市场聚焦样本验证（不再只看 `MARKET_CLOSED`）：
+   - 包含可交易的 OPEN 样本
+   - 也包含被风险门禁拦截的 OPEN 样本
+4. 最新 OPEN 样本 rerun 结果中，global winner 仍为 `baseline_mid`，window winners 也保持一致。
+5. 已提供一页式导出产物，便于快速复盘：
+   - `walkforward_report.md`
+   - `walkforward_report_summary.json`
+6. 当前限制：OPEN/高信息量可回放日期仍偏少，结论需随样本扩展持续复验。
+
 ## 快速启动
 ### 启动纸面交易引擎
 ```bash

@@ -26,8 +26,10 @@ from ui_equity_window import filter_df_by_trading_day_window
 from ui_reports_window import (
     select_window_effective_count,
     summarize_risk_model_health,
+    summarize_live_cycle_health,
     build_risk_health_trend_rows,
-    format_ui_health_preview,
+    format_ui_health_preview_live,
+    format_ui_health_preview_daily,
 )
 from run_analytics import summarize_range as summarize_run_periods
 from risk_profile_ui_utils import (
@@ -7581,6 +7583,46 @@ def render_portfolio_monitor():
 
                         st.markdown("**Risk Model & Data Health**")
                         latest_report = selected_reports[-1] if selected_reports else {}
+
+                        live_health = summarize_live_cycle_health(
+                            snapshot=snapshot if isinstance(snapshot, dict) else {},
+                            trades=trades if isinstance(trades, list) else [],
+                            latest_daily_report=latest_report if isinstance(latest_report, dict) else {},
+                        )
+                        print(format_ui_health_preview_live(live_health))
+
+                        st.markdown("**Live Status (Current Cycle)**")
+                        live_col1, live_col2, live_col3, live_col4 = st.columns(4)
+                        live_col1.metric("Session", str(live_health.get("market_session", "N/A") or "N/A"))
+                        live_col2.metric("Gate", str(live_health.get("final_gate_decision", "N/A") or "N/A"))
+                        live_col3.metric("Orders Place", f"{int(_to_float(live_health.get('orders_place'), 0.0))}")
+                        live_col4.metric("Fills Today", f"{int(_to_float(live_health.get('fills_count_today'), 0.0))}")
+                        st.caption(
+                            f"last_cycle_ts={live_health.get('last_cycle_ts') or 'N/A'} | "
+                            f"active={live_health.get('active_risk_profile') or 'N/A'} "
+                            f"(requested={live_health.get('requested_risk_profile') or 'N/A'}, "
+                            f"source={live_health.get('risk_profile_source') or 'N/A'})"
+                        )
+                        st.caption(
+                            f"gate_reason={live_health.get('gate_reason') or 'none'} | "
+                            f"freshness returns={live_health.get('returns_age_min', 'N/A')}min "
+                            f"cov={live_health.get('cov_age_min', 'N/A')}min "
+                            f"price={live_health.get('price_age_min', 'N/A')}min"
+                        )
+                        st.caption(
+                            f"price_status live/recent/stale/missing="
+                            f"{int(_to_float(live_health.get('price_live_count'), 0.0))}/"
+                            f"{int(_to_float(live_health.get('price_recent_count'), 0.0))}/"
+                            f"{int(_to_float(live_health.get('price_stale_count'), 0.0))}/"
+                            f"{int(_to_float(live_health.get('price_missing_count'), 0.0))} | "
+                            f"last_trade_ts={live_health.get('last_trade_ts') or 'N/A'}"
+                        )
+                        st.caption(
+                            f"Live source: {live_health.get('source')} | "
+                            f"fallback_to_daily={bool(live_health.get('fallback_to_daily', False))}"
+                        )
+
+                        st.markdown("**Daily Report Snapshot (Reference)**")
                         latest_health = (
                             latest_report.get("risk_model_health", {})
                             if isinstance(latest_report, dict) and isinstance(latest_report.get("risk_model_health"), dict)
@@ -7611,16 +7653,25 @@ def render_portfolio_monitor():
                                 "risk_model_health": latest_health,
                             }
                         )
-                        print(format_ui_health_preview(latest_summary))
+                        daily_generated_at = (
+                            str(latest_report.get("generated_at_local", "")).strip()
+                            if isinstance(latest_report, dict)
+                            else ""
+                        )
+                        print(format_ui_health_preview_daily(latest_summary, generated_at=daily_generated_at))
 
                         h1, h2, h3, h4 = st.columns(4)
-                        h1.metric("Gate Triggered", "Yes" if bool(latest_summary.get("triggered", False)) else "No")
-                        h2.metric("Orders Place", f"{int(_to_float(latest_summary.get('orders_place'), 0.0))}")
-                        h3.metric("Returns Missing", f"{int(_to_float(latest_summary.get('returns_missing_count'), 0.0))}")
-                        h4.metric("Cost bps", "N/A" if latest_summary.get("cost_bps", None) is None else f"{_to_float(latest_summary.get('cost_bps'), 0.0):.2f}")
+                        h1.metric("Gate Triggered (Daily)", "Yes" if bool(latest_summary.get("triggered", False)) else "No")
+                        h2.metric("Orders Place (Daily)", f"{int(_to_float(latest_summary.get('orders_place'), 0.0))}")
+                        h3.metric("Returns Missing (Daily)", f"{int(_to_float(latest_summary.get('returns_missing_count'), 0.0))}")
+                        h4.metric("Cost bps (Daily)", "N/A" if latest_summary.get("cost_bps", None) is None else f"{_to_float(latest_summary.get('cost_bps'), 0.0):.2f}")
                         st.caption(
-                            f"reason={latest_summary.get('reason', 'N/A')} | "
-                            f"metric={latest_summary.get('metric_name', 'N/A')}:{latest_summary.get('metric_value')} "
+                            f"last_daily_report_generated_at={daily_generated_at or 'N/A'} | "
+                            f"daily_date={latest_summary.get('date', 'N/A')}"
+                        )
+                        st.caption(
+                            f"daily_reason={latest_summary.get('reason', 'N/A')} | "
+                            f"daily_metric={latest_summary.get('metric_name', 'N/A')}:{latest_summary.get('metric_value')} "
                             f"threshold={latest_summary.get('metric_threshold')} "
                             f"stage={latest_summary.get('stage', 'unknown')}"
                         )
