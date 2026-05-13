@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict
+
+logger = logging.getLogger(__name__)
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError):
+        logger.debug("_to_float: cannot convert %r, using default %s", value, default)
         out = float(default)
     if out != out:  # NaN
         return float(default)

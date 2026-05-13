@@ -1,6 +1,6 @@
 {
   "paper_mode": true,
-  "initial_cash_usd": 30000,
+  "initial_cash_usd": 80000,
   "duration_hours": 48,
   "rebalance_minutes": 20,
   "universe": [
@@ -325,6 +325,71 @@
       "asset_type": "STOCK"
     },
     {
+      "ticker": "AMD",
+      "name": "Advanced Micro Devices Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "QCOM",
+      "name": "Qualcomm Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "AVGO",
+      "name": "Broadcom Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "TXN",
+      "name": "Texas Instruments Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MRVL",
+      "name": "Marvell Technology Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "ARM",
+      "name": "Arm Holdings plc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "TSM",
+      "name": "Taiwan Semiconductor Mfg Co",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "ASML",
+      "name": "ASML Holding NV",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "LRCX",
+      "name": "Lam Research Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "KLAC",
+      "name": "KLA Corp",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "AMAT",
+      "name": "Applied Materials Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "MU",
+      "name": "Micron Technology Inc",
+      "asset_type": "STOCK"
+    },
+    {
+      "ticker": "ON",
+      "name": "ON Semiconductor Corp",
+      "asset_type": "STOCK"
+    },
+    {
       "ticker": "CASH",
       "name": "Cash Equivalent",
       "asset_type": "CASH"
@@ -418,6 +483,23 @@
     ],
     "cash_equivalent": [
       "CASH"
+    ],
+    "chip": [
+      "AMD",
+      "QCOM",
+      "AVGO",
+      "TXN",
+      "MRVL",
+      "ARM"
+    ],
+    "semiconductor": [
+      "TSM",
+      "ASML",
+      "LRCX",
+      "KLAC",
+      "AMAT",
+      "MU",
+      "ON"
     ]
   },
   "industry_taxonomy": {
@@ -431,7 +513,9 @@
       "utilities",
       "broad_market_etf",
       "rates_and_gold",
-      "cash_equivalent"
+      "cash_equivalent",
+      "chip",
+      "semiconductor"
     ],
     "L3": {
       "technology": [
@@ -482,6 +566,16 @@
       ],
       "cash_equivalent": [
         "cash"
+      ],
+      "chip": [
+        "fabless_cpu_gpu",
+        "mobile_wireless",
+        "networking_chip"
+      ],
+      "semiconductor": [
+        "foundry",
+        "semi_equipment",
+        "memory"
       ]
     }
   },
@@ -1285,6 +1379,191 @@
         "cash",
         "liquidity"
       ]
+    },
+    "AMD": {
+      "L2": [
+        "chip"
+      ],
+      "L3": [
+        "fabless_cpu_gpu"
+      ],
+      "keywords": [
+        "amd",
+        "ryzen",
+        "radeon",
+        "epyc",
+        "cpu",
+        "gpu"
+      ]
+    },
+    "QCOM": {
+      "L2": [
+        "chip"
+      ],
+      "L3": [
+        "mobile_wireless"
+      ],
+      "keywords": [
+        "qualcomm",
+        "snapdragon",
+        "5g modem",
+        "mobile chip"
+      ]
+    },
+    "AVGO": {
+      "L2": [
+        "chip"
+      ],
+      "L3": [
+        "networking_chip"
+      ],
+      "keywords": [
+        "broadcom",
+        "networking asic",
+        "custom ai chip",
+        "vmware"
+      ]
+    },
+    "TXN": {
+      "L2": [
+        "chip"
+      ],
+      "L3": [
+        "fabless_cpu_gpu"
+      ],
+      "keywords": [
+        "texas instruments",
+        "analog chip",
+        "embedded processor",
+        "industrial semiconductor"
+      ]
+    },
+    "MRVL": {
+      "L2": [
+        "chip"
+      ],
+      "L3": [
+        "networking_chip"
+      ],
+      "keywords": [
+        "marvell",
+        "data center chip",
+        "custom silicon",
+        "cloud chip"
+      ]
+    },
+    "ARM": {
+      "L2": [
+        "chip"
+      ],
+      "L3": [
+        "mobile_wireless"
+      ],
+      "keywords": [
+        "arm holdings",
+        "chip architecture",
+        "ip licensing",
+        "mobile cpu"
+      ]
+    },
+    "TSM": {
+      "L2": [
+        "semiconductor"
+      ],
+      "L3": [
+        "foundry"
+      ],
+      "keywords": [
+        "tsmc",
+        "taiwan semiconductor",
+        "chip foundry",
+        "wafer fabrication"
+      ]
+    },
+    "ASML": {
+      "L2": [
+        "semiconductor"
+      ],
+      "L3": [
+        "semi_equipment"
+      ],
+      "keywords": [
+        "asml",
+        "euv lithography",
+        "chip equipment",
+        "semiconductor lithography"
+      ]
+    },
+    "LRCX": {
+      "L2": [
+        "semiconductor"
+      ],
+      "L3": [
+        "semi_equipment"
+      ],
+      "keywords": [
+        "lam research",
+        "etch equipment",
+        "deposition",
+        "wafer processing"
+      ]
+    },
+    "KLAC": {
+      "L2": [
+        "semiconductor"
+      ],
+      "L3": [
+        "semi_equipment"
+      ],
+      "keywords": [
+        "kla",
+        "process control",
+        "semiconductor inspection",
+        "yield management"
+      ]
+    },
+    "AMAT": {
+      "L2": [
+        "semiconductor"
+      ],
+      "L3": [
+        "semi_equipment"
+      ],
+      "keywords": [
+        "applied materials",
+        "semiconductor equipment",
+        "cvd",
+        "pvd"
+      ]
+    },
+    "MU": {
+      "L2": [
+        "semiconductor"
+      ],
+      "L3": [
+        "memory"
+      ],
+      "keywords": [
+        "micron",
+        "dram",
+        "nand",
+        "memory chip",
+        "hbm"
+      ]
+    },
+    "ON": {
+      "L2": [
+        "semiconductor"
+      ],
+      "L3": [
+        "foundry"
+      ],
+      "keywords": [
+        "on semiconductor",
+        "power chip",
+        "ev semiconductor",
+        "silicon carbide"
+      ]
     }
   },
   "objectives": {
@@ -1315,11 +1594,32 @@
     "max_pair_corr_pairs": 3,
     "debug_log": false,
     "fallback_to_diag_on_error": true,
-    "portfolio_cov_rc_hysteresis_band": 0.0,
-    "portfolio_cov_rc_abort_buffer_enabled": false,
+    "portfolio_cov_rc_hysteresis_band": 0.02,
+    "portfolio_cov_rc_abort_buffer_enabled": true,
     "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
     "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
-    "portfolio_cov_rc_abort_buffer_active_cycles": 3
+    "portfolio_cov_rc_abort_buffer_active_cycles": 3,
+    "enable_vol_targeting": true,
+    "vol_target": 0.2,
+    "cov_method": "ledoit_wolf",
+    "enable_crisis_detection": true,
+    "crisis_corr_ratio": 1.5,
+    "crisis_short_window": 20,
+    "crisis_long_window": 60,
+    "crisis_rc_tighten_pct": 0.3,
+    "enable_cvar_gate": true,
+    "cvar_confidence": 0.95,
+    "cvar_daily_threshold": -0.05
+  },
+  "auto_risk_profile": {
+    "enabled": true,
+    "vix_low": 15.0,
+    "vix_high": 25.0,
+    "vix_extreme": 40.0,
+    "cooldown_hours": 24,
+    "risk_on_profile": "high",
+    "neutral_profile": "mid",
+    "risk_off_profile": "low"
   },
   "asset_data_policy": {
     "mode": "FORCE_PROXY",
@@ -1395,6 +1695,25 @@
       "short": 0.4,
       "medium": 0.6
     },
+    "momentum_skip_recent_days": 5,
+    "sharpe_momentum_weight": 0.2,
+    "crisis_momentum_weight_scale": 0.5,
+    "min_rank_score_threshold": -0.5,
+    "min_volume_z_score": -1.5,
+    "max_sector_weight": 0.45,
+    "stop_loss_enabled": true,
+    "stop_loss_pct": -0.08,
+    "stop_loss_override_min_holding": true,
+    "ramp_in_enabled": true,
+    "ramp_in_cycles": 2,
+    "adaptive_turnover_enabled": true,
+    "adaptive_turnover_vol_window": 5,
+    "adaptive_turnover_vol_high": 0.025,
+    "adaptive_turnover_scale_min": 0.4,
+    "circuit_breaker_rolling_enabled": true,
+    "circuit_breaker_rolling_window": 10,
+    "circuit_breaker_rolling_drawdown_pct": 0.12,
+    "circuit_breaker_rolling_recovery_pct": 0.03,
     "price_stale_policy": {
       "allow_buy": [
         "LIVE",
@@ -1436,7 +1755,7 @@
       "execution": {
         "target_vol_annual": 0.12,
         "portfolio_exposure_cap": 0.95,
-        "max_turnover_pct_per_rebalance": 0.40,
+        "max_turnover_pct_per_rebalance": 0.4,
         "weight_threshold": 0.015,
         "enable_target_cov_gate": false,
         "target_cov_gate_min_coverage": 0.6,
@@ -1447,8 +1766,8 @@
         "max_weight_per_asset": 0.15
       },
       "risk_model": {
-        "rc_limit": 0.3,
-        "portfolio_cov_rc_hysteresis_band": 0.03,
+        "rc_limit": 0.65,
+        "portfolio_cov_rc_hysteresis_band": 0.02,
         "portfolio_cov_rc_abort_buffer_enabled": true,
         "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
         "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
@@ -1520,17 +1839,17 @@
     "adv_limit_frac": 0.02,
     "adv_lookback_days": 20,
     "adv_apply_to_forced": true,
-    "enable_cost_sensitive_ranking": false,
-    "lambda_cost": 1.0,
+    "enable_cost_sensitive_ranking": true,
+    "lambda_cost": 2.0,
     "benefit_mode": "delta_weight",
     "max_audit_items": 20
   },
   "cost_model": {
-    "enabled": false,
+    "enabled": true,
     "slippage_bps": 5.0,
-    "fee_per_trade": 0.0,
-    "fee_bps": 0.0,
-    "min_fee": 0.0,
+    "fee_per_trade": 1.0,
+    "fee_bps": 0.5,
+    "min_fee": 0.5,
     "currency": "USD",
     "apply_to": [
       "BUY",
@@ -1565,12 +1884,15 @@
     "enabled": true,
     "chroma_path": "./memory_db",
     "collection": "trading_signals",
+    "llm_topic_model": "qwen2.5:32b",
     "confirm_k_of_n": [
       2,
       3
     ],
-    "signal_max_age_hours": 48,
-    "decay_lambda_per_hour": 0.15,
+    "signal_max_age_hours": 72,
+    "decay_lambda_per_hour": 0.04,
+    "news_score_weight": 0.15,
+    "min_calibration_count": 5,
     "macro_cash_slope": 0.02,
     "tilt_max_delta": 0.02,
     "enable_llm_topic_signals": true,
@@ -1581,7 +1903,23 @@
     "topic_sector_ticker_map": {
       "semiconductors": [
         "NVDA",
-        "XLK"
+        "XLK",
+        "TSM",
+        "ASML",
+        "MU"
+      ],
+      "chip_design": [
+        "AMD",
+        "QCOM",
+        "AVGO",
+        "TXN",
+        "MRVL",
+        "ARM"
+      ],
+      "semi_equipment": [
+        "LRCX",
+        "KLAC",
+        "AMAT"
       ],
       "technology": [
         "XLK",
@@ -1614,7 +1952,18 @@
     },
     "macro_allow_new_positions": [
       "TLT",
-      "GLD"
+      "GLD",
+      "SPY",
+      "QQQ",
+      "IWM",
+      "XLK",
+      "XLF",
+      "XLE",
+      "XLV",
+      "XLP",
+      "XLI",
+      "VOO",
+      "XIU.TO"
     ],
     "smoothing_window": 3,
     "smoothing_method": "median",
@@ -1626,9 +1975,10 @@
     "industry_collection": "industry_signals",
     "max_age_hours": 48,
     "alpha": 0.6,
-    "mode": "risk_only",
+    "mode": "symmetric",
     "min_confidence": 0.45,
-    "max_abs_delta": 0.03,
+    "max_abs_delta": 0.05,
+    "decay_lambda_per_hour": 0.04,
     "macro_risk_off_prior": {
       "enabled": true,
       "strength": 1,
@@ -1713,6 +2063,18 @@
       "cash_equivalent": [
         "cash allocation",
         "money market yields"
+      ],
+      "chip": [
+        "chip design",
+        "gpu ai accelerator",
+        "cpu processor market",
+        "fabless semiconductor"
+      ],
+      "semiconductor": [
+        "semiconductor manufacturing",
+        "chip foundry capacity",
+        "semiconductor equipment",
+        "memory chip market"
       ]
     },
     "industry_keyword_map": {
@@ -1772,6 +2134,23 @@
         "etf",
         "market breadth",
         "equity market"
+      ],
+      "chip": [
+        "chip",
+        "gpu",
+        "cpu",
+        "ai chip",
+        "processor",
+        "fabless"
+      ],
+      "semiconductor": [
+        "semiconductor",
+        "foundry",
+        "wafer",
+        "lithography",
+        "chip equipment",
+        "dram",
+        "nand"
       ]
     }
   },
@@ -1793,11 +2172,21 @@
       "cash_add": 0.05
     }
   },
+  "fx_rates": {
+    "CAD_USD": 0.73,
+    "auto_fetch": true,
+    "auto_fetch_symbol": "CADUSD=X",
+    "cache_minutes": 60
+  },
   "reporting": {
+    "market_tz": "America/New_York",
+    "market_open_time_et": "09:30",
+    "market_close_time_et": "16:00",
     "equity_curve_path": "outputs/equity_curve.png",
     "trades_log_path": "outputs/paper_trades.csv",
     "portfolio_snapshots_path": "outputs/portfolio_snapshots.jsonl",
     "summary_report_path": "outputs/paper_summary.txt",
+    "attribution_path": "outputs/factor_attribution.jsonl",
     "scoreboard_path": "outputs/scoreboard.jsonl",
     "industry_taxonomy_preview_path": "outputs/industry_taxonomy_preview.json"
   },

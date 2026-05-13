@@ -39,6 +39,8 @@ def test_replay_bundle_manifest_includes_l1_matrices(tmp_path: Path):
     engine._last_replay_bundle_cycle_id = None
     engine._last_replay_bundle_source = None
     engine._last_replay_bundle_path = ""
+    engine.requested_risk_profile = ""
+    engine.active_risk_profile = "mid"
     engine.config = {
         "strategy": {"lookback_days": 40},
         "risk_model": {"returns_interval": "1d", "returns_lookback_days": 40, "rc_limit": 0.35},

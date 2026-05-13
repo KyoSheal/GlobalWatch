@@ -1,3 +1,4 @@
+import logging
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -20,6 +21,11 @@ import urllib.parse
 import urllib.request
 import os
 from atomic_io import atomic_write_json as io_atomic_write_json, safe_read_json as io_safe_read_json
+from logger_config import setup_logging
+from config_validator import validate_config, ConfigValidationError
+
+setup_logging()
+logger = logging.getLogger(__name__)
 from market_time_filter import parse_iso_to_utc, sanitize_equity_rows
 from ui_window_presets import WINDOW_PRESETS, get_window_preset, format_till_now
 from ui_equity_window import filter_df_by_trading_day_window
@@ -64,24 +70,13 @@ except ImportError:
 
 # === 0.1. Logging Helpers ===
 def log_error(message):
+    """Compatibility shim: route to standard logging.error().
+
+    Kept for backward compatibility with existing call sites.
+    The root logger (configured via logger_config.setup_logging) writes to
+    both outputs/app.log and the console, so no manual file I/O is needed here.
     """
-    Write error messages to file and console safely.
-    Args:
-        message: Error message string.
-    """
-    try:
-        # Ensure outputs directory exists
-        os.makedirs("outputs", exist_ok=True)
-        
-        # Append to error log file
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = f"[{timestamp}] {message}\n"
-        
-        with open("outputs/error.log", "a", encoding="utf-8") as f:
-            f.write(log_entry)
-    except Exception as e:
-        # Logging itself should never crash the app
-        print(f"Logging failed: {e}")
+    logger.error(message)
 
 def safe_format_number(value, decimals=2, default="N/A"):
     """
@@ -167,10 +162,9 @@ if CHROMADB_IMPORTED:
     except Exception as e:
         CHROMA_INIT_ERROR = str(e)
         log_error(f"Chroma initialization failed, using no-op memory: {CHROMA_INIT_ERROR}")
-        print(f"[WARN] Chroma disabled (no-op memory): {CHROMA_INIT_ERROR}")
 else:
     CHROMA_INIT_ERROR = "chromadb import failed"
-    print("[WARN] Chroma disabled: chromadb package not available")
+    logger.warning("Chroma disabled: chromadb package not available")
 
 # Macro reasoning knowledge injected into prompts
 MACRO_LOGIC_KNOWLEDGE = """
@@ -1232,7 +1226,7 @@ def _run_debug_industry_one_bucket_cli_if_requested():
 
     target_l2 = str(args.run_industry_one_bucket_debug or args.debug_industry_one_bucket or "").strip()
     if not target_l2:
-        print("[DEBUG_BUCKET] ERROR: empty bucket")
+        logger.warning("one_bucket_step: empty bucket target_l2")
         return 1
 
     try:
@@ -1491,16 +1485,22 @@ def _run_debug_industry_one_bucket_cli_if_requested():
             f"final=({ff.get('risk_delta', 0.0)},{ff.get('confidence', 0.0)},{ff.get('direction', 'neutral')},{ff.get('status', 'error')}) "
             f"llm_time={ss.get('llm_time_seconds', 0.0):.2f}s timeout={ss.get('llm_timeout_hit', False)}"
         )
-        print(f"[DEBUG_BUCKET] wrote: {args.output}")
+        logger.debug("one_bucket_step wrote: %s", args.output)
         return 0
     except Exception as e:
-        print(f"[DEBUG_BUCKET] ERROR: {e}")
+        logger.error("one_bucket_step failed: %s", e)
         return 1
 
 
 def _load_json_config(config_path):
     with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    try:
+        validate_config(cfg)
+    except ConfigValidationError as exc:
+        for err in exc.errors:
+            logger.warning("CONFIG VALIDATION: %s", err)
+    return cfg
 
 
 def _default_news_overlay_cfg():
@@ -2731,7 +2731,14 @@ def _validate_industry_label_payload(parsed_obj, evidence_items):
     return True, None, out
 
 
+# AI.1: Cache of last successful LLM labels per bucket, for timeout fallback.
+# Entries: {bucket: {"labels": [...], "ts": float, "confidence_scale": float}}
+_llm_industry_label_cache: dict = {}
+_LLM_LABEL_CACHE_TTL_SECONDS = 7200  # 2 hours before cache entry expires
+
+
 def _llm_label_industry_evidence(bucket, evidence_items, macro_context, model, llm_timeout_seconds=None):
+    import time as _time
     asof_utc = datetime.now(timezone.utc).isoformat()
     prompt = _build_industry_llm_prompt(bucket, evidence_items, asof_utc)
     try:
@@ -2745,6 +2752,33 @@ def _llm_label_industry_evidence(bucket, evidence_items, macro_context, model, l
         timeout_hit = False
     except Exception as e:
         if "ollama_timeout" in str(e):
+            # AI.1: Try cache before falling back to neutral
+            cached = _llm_industry_label_cache.get(bucket)
+            now_ts = _time.time()
+            if cached and (now_ts - cached["ts"]) < _LLM_LABEL_CACHE_TTL_SECONDS:
+                # Decay confidence by 0.70 per timeout event (capped at 0.30 min)
+                decayed_scale = max(0.30, cached["confidence_scale"] * 0.70)
+                decayed_labels = []
+                for lbl in cached["labels"]:
+                    d = dict(lbl)
+                    # Reduce strength by 1 (min 1) to reflect staleness
+                    d["strength"] = max(1, int(d.get("strength", 1)) - 1)
+                    d["rationale"] = f"[cached-decay] {d.get('rationale', '')}"
+                    decayed_labels.append(d)
+                _llm_industry_label_cache[bucket]["confidence_scale"] = decayed_scale
+                print(f"[AI.1 CACHE] {bucket}: timeout — using cached labels (decay={decayed_scale:.2f}, age={int(now_ts - cached['ts'])}s)")
+                return {
+                    "ok": True,
+                    "error": None,
+                    "raw_text": "",
+                    "parsed_obj": {"labels": decayed_labels, "notes": "ollama_timeout_cached_fallback"},
+                    "labels": decayed_labels,
+                    "notes": "ollama_timeout_cached_fallback",
+                    "timeout_hit": True,
+                    "cache_used": True,
+                    "confidence_scale": decayed_scale,
+                }
+            # No usable cache — fall back to neutral
             fallback_labels = []
             for item in (evidence_items or []):
                 if not isinstance(item, dict):
@@ -2768,6 +2802,7 @@ def _llm_label_industry_evidence(bucket, evidence_items, macro_context, model, l
                 "labels": fallback_labels,
                 "notes": "ollama_timeout_fallback",
                 "timeout_hit": True,
+                "cache_used": False,
             }
         raise
     parsed = robust_json_parse(raw_text, model, max_retries=1)
@@ -2793,6 +2828,13 @@ def _llm_label_industry_evidence(bucket, evidence_items, macro_context, model, l
             "notes": str(parsed.get("notes", ""))[:200] if isinstance(parsed, dict) else "",
             "timeout_hit": False,
         }
+    # AI.1: Cache the successful result for this bucket
+    import time as _time
+    _llm_industry_label_cache[bucket] = {
+        "labels": [dict(lbl) for lbl in labels],
+        "ts": _time.time(),
+        "confidence_scale": 1.0,
+    }
     return {
         "ok": True,
         "error": None,
@@ -2801,6 +2843,7 @@ def _llm_label_industry_evidence(bucket, evidence_items, macro_context, model, l
         "labels": labels,
         "notes": str(parsed.get("notes", ""))[:200],
         "timeout_hit": bool(timeout_hit),
+        "cache_used": False,
     }
 
 

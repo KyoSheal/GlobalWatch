@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, Optional
 
+logger = logging.getLogger(__name__)
 
 CacheRow = Dict[str, Any]
 
@@ -81,7 +83,7 @@ class PriceService:
             if price != price:  # NaN
                 return None
             return price
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
     def _is_usable_cached_row(self, row: Any) -> bool:
@@ -97,12 +99,14 @@ class PriceService:
                 if mod is not None:
                     return mod
             except Exception:
+                logger.warning("_get_yfinance_module() raised unexpectedly; falling back to import")
                 return None
         try:
             import yfinance as yf_mod  # lazy import
 
             return yf_mod
-        except Exception:
+        except ImportError:
+            logger.warning("yfinance not installed; price fetching unavailable")
             return None
 
     def _to_symbol(self, ticker: str) -> str:
@@ -110,6 +114,7 @@ class PriceService:
             mapped = self._symbol_mapper(ticker)
             return str(mapped or ticker).strip()
         except Exception:
+            logger.warning("symbol_mapper raised for ticker %r; using raw ticker", ticker)
             return str(ticker).strip()
 
     # ---------- dataframe parsing ----------
@@ -207,7 +212,7 @@ class PriceService:
     ) -> tuple[Dict[str, CacheRow], list[str], Optional[str], str]:
         try:
             import pandas as pd_mod  # lazy import
-        except Exception:
+        except ImportError:
             pd_mod = None
         if pd_mod is None:
             missing = [str(s) for s in symbols]

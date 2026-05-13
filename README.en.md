@@ -1,4 +1,4 @@
-﻿# GlobalWatch Paper Trading (V3.2.4)
+# GlobalWatch Paper Trading (V3.3.0)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -10,88 +10,146 @@ It does not connect to a real broker. The focus is transparent behavior, stable 
 The stack combines:
 - cross-sectional ranking and portfolio construction
 - market-regime and macro/topic overlays
-- execution safeguards (stale policy, turnover budget, planner)
+- AI-driven industry news signals (bidirectional buy + sell via local Ollama LLM)
+- execution safeguards (stale policy, turnover budget, planner, FX-correct accounting)
 - structured runtime outputs consumed by Streamlit monitoring pages
 
-## What's New in V3.2.4
-This release updates the engine fingerprint to `v3.2.4` and adds the latest execution/risk-control improvements.
+## What's New in V3.3.0
 
-1. Target-cov risk gate routing is now configurable and fallback-safe:
-   - `execution.enable_target_cov_gate`
-   - `execution.target_cov_gate_min_coverage`
-   - `execution.target_cov_gate_require_ok`
-2. Risk gate observability now includes:
-   - snapshot fields: `risk_gate_basis`, `risk_gate_cov_coverage_used`
-   - telemetry event: `RISK_GATE_DECISION`
-   - cycle-metrics fields for basis and coverage used
-3. Portfolio exposure cap is configurable instead of fixed:
-   - `execution.portfolio_exposure_cap` (default `0.90`)
-   - invalid inputs auto-fallback and clamp to `[0.0, 1.0]`
-4. Default behavior remains backward-compatible:
-   - target-cov gate stays off unless enabled
-   - exposure cap remains 90% unless changed
-5. Daily Quant Pack now writes execution/no-trade diagnostics:
-   - `quant_packs/<date>/execution_blockers/exec_blockers.json`
-   - `quant_packs/<date>/no_trade/no_trade.json`
-   - embedded into flat daily JSON as `quant_pack.execution_blockers` and `quant_pack.no_trade`
-6. Daily index synchronization now includes execution blocker summaries:
-   - `exec_blocker_top1_reason`, `exec_blocker_top1_ratio`, `exec_blocked_ratio`
-   - `no_trade_flag`, `no_trade_primary_reason`, merged warnings count
-7. Alert rules were expanded with:
-   - `exec_blocker_dominant_cyclelevel`
-   - `no_trade_day`
-8. CI installs dependencies from root `requirements.txt` before diagnostics.
+### 1. Full CAD/USD FX Overhaul
+All portfolio accounting is now consistently in USD throughout the engine.
 
-## Incremental Updates (Post V3.2.4)
-1. `asset_data_policy.match_rules` now supports scoped matching via:
-   - `include_tickers`
-   - `exclude_tickers`
-2. Recommended `.TO` policy pattern:
-   - Keep `mode=FORCE_PROXY`
-   - Limit forced proxy to explicitly listed symbols (for example `XIU.TO`, `FTS.TO`)
-   - Keep other Canadian `.TO` names tradable on original tickers
-3. Replay workflow has moved closer to L1 deterministic replay:
-   - replay bundles can freeze additional risk/cov inputs
-   - drift diagnostics include stricter risk/execution consistency checks
-4. Cost-model observability has been expanded:
-   - execution rows/snapshots now carry clearer cost summaries
-   - daily analysis can compare gross vs net effects
-5. Daily/UI diagnostics improved for "why no trade":
-   - blocker aggregation and risk-health context are easier to inspect in reports.
+**Root cause fixed:** Canadian `.TO` stocks (e.g. `MFC.TO`, `SU.TO`) are priced in CAD. Previously several code paths used the native CAD price directly in USD cash arithmetic, causing phantom P&L losses on every buy cycle.
 
-## Latest Validation (Recent Corpus)
-1. Comparability is now interpreted in two layers:
-   - baseline drift comparability (`config_metadata_compare`)
-   - scenario-aware comparability (`scenario_metadata_compare`)
-2. Walk-forward ranking and winner eligibility are evaluated using scenario-aware comparable days.
-3. A recent OPEN-focused corpus was rerun to avoid overfitting conclusions to `MARKET_CLOSED` samples:
-   - included OPEN cases with orders
-   - included OPEN cases blocked by risk gate
-4. On the latest OPEN-focused rerun, global winner stayed `baseline_mid`, and per-window winners remained consistent.
-5. Export artifacts for quick review are now standard:
-   - `walkforward_report.md`
-   - `walkforward_report_summary.json`
-6. Remaining caveat: OPEN/high-information replay dates are still limited, so winner stability should be re-validated as more such dates become available.
+**Fixed locations:**
+| Function | Fix |
+|---|---|
+| `_build_post_rebalance_snapshot` | `value = qty × price × fx` |
+| `_evaluate_portfolio_risk_gate` | fallback value uses `fx` |
+| SELL execution path | `price_usd = price × fx_sell`, `proceeds = sell_qty × price_usd` |
+| BUY execution path | `price_usd = price × fx_buy`, `required_cash = buy_qty × price_usd` |
+| `_run_circuit_breaker_derisk` | holdings dict stores `fx`, sell qty and proceeds use `price × fx` |
+| SELL/BUY weight fallbacks | use `price × fx` in `old_position_value` |
+| Display | `.TO` stocks print `C$` prefix; trade logs show USD price |
+
+**FX rate mechanism:**
+- Source: yfinance `CADUSD=X` (real-time)
+- Cache: 60 minutes in-memory
+- Fallback: `0.73` from `paper_config.json → fx_rates.CAD_USD` if fetch fails
+- Non-`.TO` tickers always use `fx = 1.0`
+
+### 2. New Industry Baskets: Chip + Semiconductor
+Universe expanded from **65 → 78 tickers**.
+
+**Chip basket** (`industry_map.chip`):
+| Ticker | Company |
+|---|---|
+| AMD | Advanced Micro Devices |
+| QCOM | Qualcomm |
+| AVGO | Broadcom |
+| TXN | Texas Instruments |
+| MRVL | Marvell Technology |
+| ARM | Arm Holdings |
+
+**Semiconductor basket** (`industry_map.semiconductor`):
+| Ticker | Company |
+|---|---|
+| TSM | Taiwan Semiconductor |
+| ASML | ASML Holding |
+| LRCX | Lam Research |
+| KLAC | KLA Corp |
+| AMAT | Applied Materials |
+| MU | Micron Technology |
+| ON | ON Semiconductor |
+
+All 13 tickers have full entries in:
+- `universe` (tradable)
+- `industry_map` (sector concentration caps)
+- `ticker_tags` (L2/L3 labels + keywords for news routing)
+- `industry_taxonomy` (L2: chip, semiconductor; L3: fabless_cpu_gpu, foundry, semi_equipment, memory, etc.)
+- `topic_sector_ticker_map`, `industry_topic_queries`, `industry_keyword_map`
+
+### 3. AI News Overlay — Alpha Mode (Bidirectional)
+Previously the Ollama/LLM news signal could **only reduce positions** (`risk_only` mode).
+This meant the AI could never act on positive news to increase or initiate positions — a fundamental limitation.
+
+**Changes:**
+| Parameter | Before | After |
+|---|---|---|
+| `news_overlay.mode`: `risk_only` → `symmetric`` |
+| `news_overlay.max_abs_delta` | `0.03` (3%) | `0.05` (5%) |
+
+In `alpha` mode, the LLM signal (qwen2.5:32b / gemma3:12b via Ollama) can:
+- **Increase** position weights on positive sector news
+- **Decrease** position weights on negative sector news
+- Open new positions when signal confidence ≥ `min_confidence` (0.45)
+
+### 4. Risk Gate Tuning (mid profile)
+| Parameter | Before | After |
+|---|---|---|
+| `rc_limit` | `0.45` | `0.65` |
+| `pass_threshold` | `0.43` | `0.63` |
+| `fail_threshold` | `0.47` | `0.67` |
+| `hysteresis_band` | `0.02` | `0.02` (unchanged) |
+
+The previous limit of 0.45 caused the gate to permanently lock at ~60% rc_fraction (energy/Canada concentration), blocking all trades for days.
+
+### 5. Execution Parameter Updates (mid profile)
+| Parameter | Before | After | Effect |
+|---|---|---|---|
+| `ramp_in_cycles` | `3` (60 min) | `2` (40 min) | New positions reach full weight faster |
+| `macro_allow_new_positions` | `[TLT, GLD]` | 13 tickers | Macro signals can open positions in major ETFs |
+
+`macro_allow_new_positions` now includes:
+`TLT, GLD, SPY, QQQ, IWM, XLK, XLF, XLE, XLV, XLP, XLI, VOO, XIU.TO`
+
+### 6. Permanent Daily Summary Log
+A new `_write_daily_summary()` method appends a compact one-line record per cycle to:
+```
+outputs/daily/YYYY-MM-DD.log
+```
+
+**Format:**
+```
+[2026-05-12 09:42:02] Cycle=223 Cash=$52,047 Pos=$28,618 Equity=$80,665 Return=+0.83% RC=60.6% Gate=ABORT Regime=RISK_ON Trades=0 Holdings=[BP x42 | MFC.TO x304 ...]
+```
+
+- **Permanent** — never deleted by log cleanup routines
+- **Full `app.log`** remains a rotating temp file (deleted on restart)
+- Enables fast multi-day performance review without loading large logs
 
 ## Functional Capabilities
+
 ### Quant Layer
 - cross-sectional score ranking
 - volatility-aware allocation and clipping
 - correlation filtering
 - regime-aware cash target and max-weight controls
-- optional macro/topic/industry overlays
+- macro/topic/industry overlays (bidirectional alpha mode)
 
 ### Execution and Risk Layer
+- FX-correct accounting for CAD/USD mixed portfolios
 - stale quote policy for BUY/SELL paths
 - stale-ratio abort guard during tradable sessions
 - turnover budgeting with planner diagnostics
 - exit-signal hooks and forced de-risk path
+- rolling drawdown circuit breaker
+- stop-loss override (-8% from cost basis)
+- ramp-in gradual position entry
 - optional cost estimation, ADV checks, and planner scoring controls
+
+### AI Signal Layer (Ollama / Local LLM)
+- Models: `qwen2.5:32b`, `gemma3:12b` (always in RAM, ~22 GB)
+- News pipeline: `run_news_pipeline.py --interval 30` (separate persistent process)
+- Signal refresh: every 15 min minimum (`runtime_min_interval_seconds: 900`)
+- Coverage: 78-ticker universe across 10+ industry baskets including Chip + Semiconductor
+- Mode: `alpha` — drives both buy and sell decisions
 
 ### System Layer
 - checkpoint resume and fresh-start handling
 - deterministic config-driven runtime
 - cycle snapshots and trade history persistence
+- permanent daily summary logs (`outputs/daily/`)
 - dry-run diagnostics and calibration utilities
 - Streamlit monitoring integration
 
@@ -99,6 +157,11 @@ This release updates the engine fingerprint to `v3.2.4` and adds the latest exec
 ### Paper engine
 ```bash
 python -u paper_trading.py paper_config.json
+```
+
+### News pipeline
+```bash
+python run_news_pipeline.py --interval 30
 ```
 
 ### GlobalWatch UI
@@ -113,13 +176,17 @@ streamlit run GlobalWatch_V2.py
 
 ## Outputs
 Main runtime artifacts are written under `outputs/`:
-- `snapshot_live.json`: live state payload for UI cards/charts
-- `trade_history.jsonl`: normalized trade rows for UI table
-- `portfolio_snapshots.jsonl`: per-cycle snapshots for audit
-- `paper_trades.csv`: execution-oriented trade log
-- `paper_summary_live.txt`: rolling text summary
-- `paper_summary.txt`: final report
-- `scoreboard.jsonl`: performance diagnostics
+
+| File | Description |
+|---|---|
+| `snapshot_live.json` | live state payload for UI cards/charts |
+| `trade_history.jsonl` | normalized trade rows for UI table |
+| `portfolio_snapshots.jsonl` | per-cycle snapshots for audit |
+| `paper_trades.csv` | execution-oriented trade log |
+| `paper_summary_live.txt` | rolling text summary |
+| `paper_summary.txt` | final report |
+| `scoreboard.jsonl` | performance diagnostics |
+| `daily/YYYY-MM-DD.log` | **permanent** one-line-per-cycle daily summary |
 
 ## Web Monitor
 The Streamlit app includes:
@@ -128,7 +195,7 @@ The Streamlit app includes:
 
 Data mapping:
 - cards/charts: `outputs/snapshot_live.json`
-- trade table: `outputs/trade_history.jsonl` (fallback can read `outputs/paper_trades.csv`)
+- trade table: `outputs/trade_history.jsonl`
 - summary block: `outputs/paper_summary_live.txt`
 
 ## Key CLI Diagnostics
@@ -138,7 +205,7 @@ python GlobalWatch_V2.py --dump-industry-taxonomy --config paper_config.json
 python GlobalWatch_V2.py --industry-sanity-check --config paper_config.json
 python GlobalWatch_V2.py --run-industry-runtime-once --config paper_config.json
 python GlobalWatch_V2.py --run-industry-runtime-once-debug --config paper_config.json --output outputs/industry_runtime_debug_latest.json
-python GlobalWatch_V2.py --run-industry-one-bucket-debug rates_and_gold --config paper_config.json --max_evidence 4 --llm_timeout_seconds 120 --output outputs/debug_industry_one_bucket.json
+python GlobalWatch_V2.py --run-industry-one-bucket-debug chip --config paper_config.json --max_evidence 4 --llm_timeout_seconds 120 --output outputs/debug_industry_one_bucket.json
 python GlobalWatch_V2.py --debug-industry-news --config paper_config.json --debug-outdir outputs/gw_industry_dryrun
 ```
 
@@ -151,47 +218,57 @@ python paper_trading.py --debug-system-s1-5 --debug-outdir outputs/gw_dryrun pap
 ```
 
 ## Key Config Quick Reference (`paper_config.json`)
-Only high-level meaning is listed below.
+
+### `fx_rates`
+- `CAD_USD`: fallback rate when live fetch fails (default `0.73`)
+- `auto_fetch`: enable real-time yfinance fetch (default `true`)
+- `auto_fetch_symbol`: Yahoo Finance symbol (default `CADUSD=X`)
+- `cache_minutes`: rate cache TTL (default `60`)
 
 ### `execution`
 - `signal_refresh_minutes`: signal refresh cadence
 - `macro_refresh_minutes`: macro refresh cadence
-- `weight_threshold`: rebalance trigger threshold
-- `min_trade_notional_usd`: minimum trade size
-- `max_turnover_pct_per_rebalance`: turnover cap per cycle
-- `max_stale_ratio`: stale-ratio abort guard
-- `price_stale_policy.allow_buy`: BUY quote statuses allowed
-- `price_stale_policy.allow_sell`: SELL quote statuses allowed
+- `weight_threshold`: rebalance trigger threshold (mid: `0.015`)
+- `min_trade_notional_usd`: minimum trade size (default `$400`)
+- `max_turnover_pct_per_rebalance`: turnover cap per cycle (mid: `0.40`)
+- `ramp_in_cycles`: gradual entry cycles for new positions (mid: `2`)
+- `min_holding_cycles`: minimum hold before selling (mid: `4`)
 - `rebalance_cooldown_minutes`: cooldown after successful rebalance
-- `rebalance_attempt_cooldown_minutes`: cooldown after blocked attempts
+- `stop_loss_pct`: stop-loss threshold (default `-0.08`)
+- `portfolio_exposure_cap`: max invested fraction (default `0.90`)
+- `enable_target_cov_gate`: use target-cov as risk gate basis (default `false`)
+
+### `risk_model` (mid profile)
+- `rc_limit`: max portfolio risk concentration fraction (`0.65`)
+- `portfolio_cov_rc_hysteresis_band`: hysteresis band (`0.02`)
+- `portfolio_cov_rc_abort_buffer_enabled`: consecutive-abort relaxation (`true`)
 
 ### `trade_planner`
 - `enable_trade_planner`: planner switch
 - `allow_partial_fill`: partial fill on budget pressure
-- `min_trade_notional`: planner min notional filter
-- `enable_adv_limit`: ADV hard limit switch
-- `adv_limit_frac`: max participation per trade
-- `enable_cost_sensitive_ranking`: score-based ranking switch
+- `enable_adv_limit`: ADV hard limit switch (default `false`)
 - `lambda_cost`: cost penalty strength
 
 ### `news_overlay`
 - `enabled`: industry overlay switch
-- `mode`: default `risk_only`
-- `alpha`: overlay sensitivity
-- `min_confidence`: confidence floor
-- `max_abs_delta`: per-bucket clip
-- `enable_confidence_scaling`: confidence scaling switch
-- `max_age_hours`: freshness filter
-- `macro_risk_off_prior.enabled`: risk-off prior switch
-- `macro_risk_off_prior.strength`: prior strength
-- `macro_risk_off_prior.min_score`: prior gating score
-- `macro_risk_off_prior.cooldown_minutes`: prior cooldown
+- `mode`: `symmetric` (bidirectional) — buy and sell) or `risk_only` (sell only)
+- `alpha`: overlay sensitivity (`0.6`)
+- `min_confidence`: confidence floor (`0.45`)
+- `max_abs_delta`: per-bucket weight clip (`0.05`)
+- `max_age_hours`: news freshness window
 
-### `risk_model`
-- covariance diagnostics and vol-targeting options (all optional)
+### `macro_integration`
+- `macro_allow_new_positions`: tickers where macro can open new positions
+- `cooldown_cycles`: macro signal cooldown in cycles
 
-### `cost_model`
-- estimated fee/slippage/impact controls for audit/planner scoring
+### `risk_profiles`
+Each profile (`low`, `mid`, `high`, `ultra`) can override:
+- `rc_limit`, `max_weight_per_asset`, `min_cash_pct`, `max_turnover_pct_per_rebalance`, `weight_threshold`
+
+### `universe`
+- 78 tradable assets: US stocks, Canadian `.TO` stocks, ETFs, sector ETFs, CASH
+- Chip basket: `AMD QCOM AVGO TXN MRVL ARM`
+- Semiconductor basket: `TSM ASML LRCX KLAC AMAT MU ON`
 
 ## Validation
 ```bash
@@ -199,17 +276,7 @@ python -m py_compile paper_trading.py
 python -m py_compile GlobalWatch_V2.py
 ```
 
-## New Quant CLIs (Execution/No-Trade Attribution)
-```bash
-python scripts/quant/a19_compute_exec_blockers.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD
-python scripts/quant/a20_attach_exec_blockers_to_daily.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD
-```
-
-These commands generate and embed:
-- cycle-level blocker distribution (`market_closed`, `attempt_cooldown`, `risk/cov gate`, etc.)
-- day-level no-trade reason inference
-
 ## Notes
-- Paper trading only.
-- No real broker connection.
+- Paper trading only — no real broker connection.
 - Not investment advice.
+- Canadian `.TO` stocks are priced in CAD; all portfolio values are converted to USD for accounting.

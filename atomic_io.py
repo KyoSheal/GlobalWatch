@@ -57,8 +57,8 @@ def atomic_write_text(path: str, content: str) -> None:
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except Exception:
-                pass
+            except OSError:
+                pass  # temp file cleanup failure is non-fatal
 
 
 def atomic_write_json(path: str, obj: Any, *, indent: int = 2) -> None:

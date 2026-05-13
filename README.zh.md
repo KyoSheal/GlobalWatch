@@ -1,4 +1,4 @@
-﻿# GlobalWatch Paper Trading (V3.2.4)
+# GlobalWatch Paper Trading (V3.3.0)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -7,80 +7,141 @@
 GlobalWatch Paper Trading 是一个本地优先的量化研究与纸面交易系统。
 它不连接真实券商，目标是让策略行为可观察、可审计、可复现、可迭代。
 
-系统由三层组成：
-- 量化层：横截面打分、组合构建、相关性与波动约束
-- 执行层：stale 报价策略、换手预算、交易规划器、风控退出
-- 系统层：checkpoint 恢复、快照落盘、Streamlit 可视化监控
+系统由四层组成：
+- **量化层**：横截面打分、组合构建、相关性与波动约束
+- **AI 信号层**：本地 Ollama LLM（qwen2.5:32b / gemma3:12b）分析行业新闻，双向驱动买卖
+- **执行层**：FX 正确的 CAD/USD 记账、stale 报价策略、换手预算、风控退出
+- **系统层**：checkpoint 恢复、快照落盘、永久日度摘要日志、Streamlit 可视化监控
 
-## V3.2.4 更新摘要
-本版本整合了你最近这批核心升级，并将引擎版本指纹提升到 `v3.2.4`。
+## V3.3.0 更新摘要
 
-### 信号与行业管线
-- 新增 L2/L3 多层多标签体系：`industry_taxonomy` + `ticker_tags`
-- 行业新闻管线修复“分桶前全局截断”问题，避免桶被饿死
-- 加入 seed-aware 分桶，降低行业桶污染
-- 行业信号改为“证据标签 -> 确定性打分”路径，输出更可解释
-- 增加宏观 risk-off prior（可开关、可门槛、可 cooldown）
-- LLM 输出解析增加 schema 校验、空输出保护、fallback 兜底
+### 1. CAD/USD 汇率全面修复
+所有组合估值与现金记账现在**全程以 USD 为单位**，彻底修复加拿大股票（`.TO`）的虚假亏损问题。
 
-### 交易侧与 Overlay
-- PaperTrading 已消费 `industry_signals` 并可作用到 cash target overlay
-- `min_confidence`、`risk_only`、`max_abs_delta`、confidence scaling 全部可控
-- 新增一次性 overlay 诊断与校准回放工具，便于参数落地
-- 协方差风险诊断链路保留并写入快照审计字段
+**根本原因：** `MFC.TO`、`SU.TO` 等加拿大股票以 CAD 报价，此前多个代码路径直接用 CAD 价格做 USD 现金运算，导致每次买入周期产生虚假 P&L 损失（约 -2% ~ -3%）。
 
-### 执行与风控
-- stale 策略、会话时段 gate、换手预算路径保持有效
-- post-rebalance 快照刷新更及时，UI 持仓同步更快
-- planner/cost/overlay 调试字段更完整，便于逐轮回溯
-- 新增“执行阻塞分布 + 无交易原因”量化链路：
-  - `quant_packs/<date>/execution_blockers/exec_blockers.json`
-  - `quant_packs/<date>/no_trade/no_trade.json`
-  - 平铺日报写回：`quant_pack.execution_blockers`、`quant_pack.no_trade`
-  - 索引同步字段：`exec_blocker_top1_reason`、`exec_blocked_ratio`、`no_trade_flag` 等
+**修复位置：**
+| 函数 | 修复内容 |
+|---|---|
+| `_build_post_rebalance_snapshot` | `value = qty × price × fx` |
+| `_evaluate_portfolio_risk_gate` | 回退估值加入 `fx` |
+| SELL 执行路径 | `price_usd = price × fx_sell`，`proceeds = sell_qty × price_usd` |
+| BUY 执行路径 | `price_usd = price × fx_buy`，`required_cash = buy_qty × price_usd` |
+| `_run_circuit_breaker_derisk` | holdings 存 `fx`，卖出数量与收益均用 `price × fx` |
+| SELL/BUY 权重回退 | `old_position_value` 改用 `price × fx` |
+| 打印显示 | `.TO` 股票显示 `C$` 前缀，交易日志显示 USD 价格 |
 
-### UI 与交互
-- Macro/FX 支持“仅分析当前选中目标”的轻量交互模式
-- 新增可选开关 `Request <think>`，默认仍走快速 JSON
-- 若模型无 `<think>`，UI 改为显示 `Reasoning Summary`，不再误导
-- Equity 曲线支持交易时段可视化与轴控
-- Trade History 在 Web UI 侧按“最新在前”展示（不改底层写入顺序）
+**实时汇率机制：**
+- 数据源：yfinance `CADUSD=X`（实时）
+- 缓存：内存 60 分钟
+- 兜底：`paper_config.json → fx_rates.CAD_USD = 0.73`（拉取失败时使用）
+- 非 `.TO` 股票始终使用 `fx = 1.0`
 
-## 增量更新（V3.2.4 之后）
-1. `asset_data_policy.match_rules` 新增精细匹配能力：
-   - `include_tickers`
-   - `exclude_tickers`
-2. `.TO` 推荐策略（避免全量强制 proxy 导致 `NO_PROXY_MAPPING`）：
-   - 保持 `mode=FORCE_PROXY`
-   - 仅对白名单 ticker 强制 proxy（例如 `XIU.TO`、`FTS.TO`）
-   - 其它加拿大 `.TO` 继续按原 ticker 交易
-3. Replay 能力向 L1 确定性回放推进：
-   - bundle 可冻结更多 risk/cov 输入
-   - drift 对风控/执行一致性校验更严格
-4. 成本模型可观测性增强：
-   - execution/snapshot 中的成本汇总更完整
-   - 日报可更直接比较 gross 与 net 影响
-5. “为什么没交易”诊断增强：
-   - 日报与 UI 的阻断原因/风险健康度汇总更易读、更易回放。
+### 2. 新增行业篮子：芯片 + 半导体
+交易 universe 从 **65 → 78 个标的**。
 
-## 最新验证（近期样本）
-1. 回放可比性已拆分为两层语义：
-   - baseline 漂移可比性（`config_metadata_compare`）
-   - scenario 感知可比性（`scenario_metadata_compare`）
-2. Walk-forward 的 ranking 与 winner eligibility 已以 scenario-aware comparable days 作为主依据。
-3. 已执行一轮 OPEN 市场聚焦样本验证（不再只看 `MARKET_CLOSED`）：
-   - 包含可交易的 OPEN 样本
-   - 也包含被风险门禁拦截的 OPEN 样本
-4. 最新 OPEN 样本 rerun 结果中，global winner 仍为 `baseline_mid`，window winners 也保持一致。
-5. 已提供一页式导出产物，便于快速复盘：
-   - `walkforward_report.md`
-   - `walkforward_report_summary.json`
-6. 当前限制：OPEN/高信息量可回放日期仍偏少，结论需随样本扩展持续复验。
+**芯片篮子**（`industry_map.chip`）：
+| Ticker | 公司 |
+|---|---|
+| AMD | 超微半导体 |
+| QCOM | 高通 |
+| AVGO | 博通 |
+| TXN | 德州仪器 |
+| MRVL | 美满电子 |
+| ARM | Arm Holdings |
+
+**半导体篮子**（`industry_map.semiconductor`）：
+| Ticker | 公司 |
+|---|---|
+| TSM | 台积电 |
+| ASML | ASML 光刻机 |
+| LRCX | 泛林半导体 |
+| KLAC | KLA 检测设备 |
+| AMAT | 应用材料 |
+| MU | 美光科技 |
+| ON | 安森美 |
+
+13 个新标的已完整配置至：
+- `universe`（可交易）
+- `industry_map`（行业集中度控制）
+- `ticker_tags`（L2/L3 标签 + 关键词，用于新闻路由）
+- `industry_taxonomy`（L2: chip、semiconductor；L3: fabless_cpu_gpu、foundry、semi_equipment、memory 等）
+- `topic_sector_ticker_map`、`industry_topic_queries`、`industry_keyword_map`
+
+### 3. AI 新闻 Overlay 升级为双向 Alpha 模式
+此前 Ollama/LLM 新闻信号**只能减仓**（`risk_only` 模式），AI 看好的正面新闻无法驱动买入——这是系统最大的功能缺陷。
+
+**变更：**
+| 参数 | 之前 | 现在 |
+|---|---|---|
+| ``news_overlay.mode`: `risk_only` → `symmetric`
+| `news_overlay.max_abs_delta` | `0.03`（3%）| `0.05`（5%）|
+
+`symmetric` 模式下，本地 LLM 信号可以：
+- 看好行业新闻 → **增加**对应持仓权重（买入）
+- 看空行业新闻 → **减少**对应持仓权重（卖出）
+- 置信度 ≥ `min_confidence`（0.45）时可开新仓
+
+### 4. 风险门控调整（mid profile）
+| 参数 | 之前 | 现在 |
+|---|---|---|
+| `rc_limit` | `0.45` | `0.65` |
+| `pass_threshold` | `0.43` | `0.63` |
+| `fail_threshold` | `0.47` | `0.67` |
+| `hysteresis_band` | `0.02` | `0.02`（不变）|
+
+旧阈值 0.45 导致 rc_fraction 持续卡在 ~60%（能源/加拿大板块集中），风险门控连续锁死数天，所有交易被阻断。
+
+### 5. 执行参数优化（mid profile）
+| 参数 | 之前 | 现在 | 效果 |
+|---|---|---|---|
+| `ramp_in_cycles` | `3`（60 分钟）| `2`（40 分钟）| 新仓位更快建满 |
+| `macro_allow_new_positions` | `[TLT, GLD]` | 13 个标的 | 宏观信号可在主要 ETF 开新仓 |
+
+`macro_allow_new_positions` 现包含：
+`TLT, GLD, SPY, QQQ, IWM, XLK, XLF, XLE, XLV, XLP, XLI, VOO, XIU.TO`
+
+### 6. 永久日度摘要日志
+新增 `_write_daily_summary()` 方法，每个周期结束后追加一行摘要至：
+```
+outputs/daily/YYYY-MM-DD.log
+```
+
+**格式示例：**
+```
+[2026-05-12 09:42:02] Cycle=223 Cash=$52,047 Pos=$28,618 Equity=$80,665 Return=+0.83% RC=60.6% Gate=ABORT Regime=RISK_ON Trades=0 Holdings=[BP x42 | MFC.TO x304 | SU.TO x156 ...]
+```
+
+- **永久保存** — 不会被日志清理例程删除
+- `app.log` 保持轮转临时文件（重启时删除）
+- 可快速回顾多天表现，无需加载大型日志
+
+## 交易限制体系（mid profile 关键参数）
+
+| 类型 | 参数 | 当前值 |
+|---|---|---|
+| 市场时间 | 09:30–16:00 ET | 非交易时段完全阻断 |
+| RC 集中度门控 | `rc_limit` | 0.65（pass=0.63, fail=0.67）|
+| 单仓上限 | `max_weight_per_asset` | 15% |
+| 最小现金 | `min_cash_pct` | 12% |
+| 单次换手上限 | `max_turnover_pct_per_rebalance` | 40% |
+| 最小交易额 | `min_trade_notional_usd` | $400 |
+| 止损 | `stop_loss_pct` | -8% |
+| 熔断器 | `circuit_breaker_rolling_drawdown_pct` | 12%（10 周期内）|
+| 行业集中度 | `max_sector_weight` | 45% |
+| 建仓周期 | `ramp_in_cycles` | 2 周期（40 分钟）|
+| 最短持仓 | `min_holding_cycles` | 4 周期（80 分钟）|
 
 ## 快速启动
+
 ### 启动纸面交易引擎
 ```bash
 python -u paper_trading.py paper_config.json
+```
+
+### 启动新闻信号管线
+```bash
+python run_news_pipeline.py --interval 30
 ```
 
 ### 启动 GlobalWatch 前端
@@ -94,120 +155,98 @@ streamlit run GlobalWatch_V2.py
 - `Start_GlobalWatch_And_Paper.bat`
 
 ## 输出文件说明
-主要运行产物在 `outputs/`：
-- `snapshot_live.json`：前端卡片/图表主数据
-- `trade_history.jsonl`：前端交易历史表
-- `portfolio_snapshots.jsonl`：逐轮快照审计
-- `paper_trades.csv`：成交导向交易流水
-- `paper_summary_live.txt`：滚动文本摘要
-- `paper_summary.txt`：最终汇总
-- `scoreboard.jsonl`：绩效与诊断
+
+| 文件 | 说明 |
+|---|---|
+| `snapshot_live.json` | 前端卡片/图表主数据 |
+| `trade_history.jsonl` | 前端交易历史表 |
+| `portfolio_snapshots.jsonl` | 逐轮快照审计 |
+| `paper_trades.csv` | 成交导向交易流水 |
+| `paper_summary_live.txt` | 滚动文本摘要 |
+| `paper_summary.txt` | 最终汇总 |
+| `scoreboard.jsonl` | 绩效与诊断 |
+| `daily/YYYY-MM-DD.log` | **永久**日度摘要（每周期一行）|
 
 ## Web 页面如何查看
 Streamlit 主要包含：
 - `Global Macro Signals`：宏观/主题/行业信号诊断
 - `Portfolio Monitor`：净值、现金、持仓构成、交易历史、摘要
 
-数据映射关系：
+数据映射：
 - 顶部指标与图表：`outputs/snapshot_live.json`
-- 交易表：`outputs/trade_history.jsonl`（必要时回退 `outputs/paper_trades.csv`）
+- 交易表：`outputs/trade_history.jsonl`
 - 文本摘要：`outputs/paper_summary_live.txt`
 
 ## 关键调试命令
-每条命令都附带“对应作用”，便于快速定位问题。
 
-### 1) GlobalWatch 侧
-1. `python GlobalWatch_V2.py --dump-industry-taxonomy --config paper_config.json`  
-   对应：导出行业分类预览，检查 L2/L3 与 ticker 多标签映射是否正确。
-2. `python GlobalWatch_V2.py --industry-sanity-check --config paper_config.json`  
-   对应：读取最新行业信号做一致性核查（方向分布、偏置、关键 mismatch）。
-3. `python GlobalWatch_V2.py --run-industry-runtime-once --config paper_config.json`  
-   对应：真实跑一轮行业新闻管线（抓取→分桶→LLM→写入 `industry_signals`）。
-4. `python GlobalWatch_V2.py --run-industry-runtime-once-debug --config paper_config.json --output outputs/industry_runtime_debug_latest.json`  
-   对应：输出全链路调试信息（bucket items、raw/parsed/normalized、写入与读回对账）。
-5. `python GlobalWatch_V2.py --run-industry-one-bucket-debug rates_and_gold --config paper_config.json --max_evidence 4 --llm_timeout_seconds 120 --output outputs/debug_industry_one_bucket.json`  
-   对应：只调试单个行业桶，定位慢/卡/解析问题更快。
-6. `python GlobalWatch_V2.py --debug-industry-news --config paper_config.json --debug-outdir outputs/gw_industry_dryrun`  
-   对应：离线 dry-run 行业新闻链路验收，不依赖真实交易执行。
+### GlobalWatch 侧
+```bash
+python GlobalWatch_V2.py --dump-industry-taxonomy --config paper_config.json
+python GlobalWatch_V2.py --industry-sanity-check --config paper_config.json
+python GlobalWatch_V2.py --run-industry-runtime-once --config paper_config.json
+python GlobalWatch_V2.py --run-industry-one-bucket-debug chip --config paper_config.json --max_evidence 4 --llm_timeout_seconds 120 --output outputs/debug_chip_bucket.json
+python GlobalWatch_V2.py --debug-industry-news --config paper_config.json --debug-outdir outputs/gw_industry_dryrun
+```
 
-### 2) PaperTrading 侧
-1. `python paper_trading.py --debug-news-overlay-once --debug-outdir outputs/gw_dryrun paper_config.json`  
-   对应：单次验证新闻 overlay 消费（confidence 过滤、clip、risk_only、cash_target 变化）。
-2. `python paper_trading.py --calibrate-news-overlay --lookback-hours 72 --target-cash-delta 0.02 --config paper_config.json --out outputs/news_overlay_calibration.json`  
-   对应：基于历史信号分布给出 overlay 参数建议，并做回放模拟。
-3. `python paper_trading.py --debug-news-overlay-phase2 --debug-outdir outputs/gw_dryrun paper_config.json`  
-   对应：Phase2 消费侧确定性验收（内置用例，输出 PASS/FAIL）。
-4. `python paper_trading.py --debug-system-s1-5 --debug-outdir outputs/gw_dryrun paper_config.json`  
-   对应：系统级总体验收，快速确认主链路是否可运行。
+### PaperTrading 侧
+```bash
+python paper_trading.py --debug-news-overlay-once --debug-outdir outputs/gw_dryrun paper_config.json
+python paper_trading.py --calibrate-news-overlay --lookback-hours 72 --target-cash-delta 0.02 --config paper_config.json --out outputs/news_overlay_calibration.json
+python paper_trading.py --debug-news-overlay-phase2 --debug-outdir outputs/gw_dryrun paper_config.json
+python paper_trading.py --debug-system-s1-5 --debug-outdir outputs/gw_dryrun paper_config.json
+```
 
-### 3) Quant Pack 执行阻塞/无交易归因
-1. `python scripts/quant/a19_compute_exec_blockers.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD`  
-   对应：生成 cycle 级执行阻塞分布与 day-level 无交易原因产物。
-2. `python scripts/quant/a20_attach_exec_blockers_to_daily.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD`  
-   对应：把 execution_blockers / no_trade 写回平铺日报 JSON（幂等覆盖）。
+### Quant Pack 执行阻塞归因
+```bash
+python scripts/quant/a19_compute_exec_blockers.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD
+python scripts/quant/a20_attach_exec_blockers_to_daily.py --daily-base "outputs/Daily Report" --date YYYY-MM-DD
+```
 
 ## 关键配置速查（paper_config.json）
-这里只写用途，不展开具体阈值调参细节。
+
+### `fx_rates`
+- `CAD_USD`：CAD/USD 兜底汇率（默认 `0.73`）
+- `auto_fetch`：是否实时拉取 yfinance 汇率（默认 `true`）
+- `auto_fetch_symbol`：Yahoo Finance 代码（默认 `CADUSD=X`）
+- `cache_minutes`：汇率缓存时间（默认 `60` 分钟）
 
 ### `execution`
-- `signal_refresh_minutes`：信号刷新周期。
-- `macro_refresh_minutes`：宏观刷新周期。
-- `weight_threshold`：触发调仓阈值。
-- `min_trade_notional_usd`：最小交易金额。
-- `max_turnover_pct_per_rebalance`：单轮换手上限。
-- `max_stale_ratio`：stale 比例中止阈值。
-- `price_stale_policy.allow_buy` / `price_stale_policy.allow_sell`：买卖允许的报价状态。
-- `rebalance_cooldown_minutes` / `rebalance_attempt_cooldown_minutes`：调仓冷却与尝试冷却。
-- `portfolio_exposure_cap`：组合最大可投入上限（默认 `0.90`）。
-- `enable_target_cov_gate`：是否启用 target cov 作为风险闸门依据（默认 `false`）。
-- `target_cov_gate_min_coverage`：启用 target gate 的最小覆盖率（默认 `0.60`）。
-- `target_cov_gate_require_ok`：target cov 状态是否必须为 `ok`（默认 `true`）。
-- `price_ttl_seconds`：价格缓存 TTL（默认 `45` 秒）。
-- `price_batch_chunk_size`：批量拉价分块大小（默认 `50`）。
-- `price_batch_allow_1m_fallback`：5m 缺失时是否允许 1m fallback（默认 `true`）。
-- `enable_greedy_trade_filter`：是否启用贪心过滤执行计划（默认 `false`）。
-- `min_trade_delta_w`：最小权重变化过滤阈值（默认 `0.002`）。
-- `max_trades_per_cycle`：每轮最多执行交易数（默认 `25`）。
-- `min_keep_trades`：soft trades 兜底保留数量（默认 `0`）。
-- `cost_bps`：A4 过滤阶段成本估算 bps（默认 `0.0008`）。
+- `signal_refresh_minutes`：信号刷新周期
+- `macro_refresh_minutes`：宏观刷新周期
+- `weight_threshold`：触发调仓阈值（mid: `0.015`）
+- `min_trade_notional_usd`：最小交易金额（默认 `$400`）
+- `max_turnover_pct_per_rebalance`：单轮换手上限（mid: `0.40`）
+- `ramp_in_cycles`：新仓建仓周期数（mid: `2`）
+- `min_holding_cycles`：最短持仓周期（mid: `4`）
+- `rebalance_cooldown_minutes`：成功调仓后冷却时间
+- `stop_loss_pct`：止损阈值（默认 `-0.08`）
+- `portfolio_exposure_cap`：最大可投入比例（默认 `0.90`）
 
-### `trade_planner`
-- `enable_trade_planner`：是否启用规划器。
-- `allow_partial_fill`：预算不足时是否部分成交。
-- `min_trade_notional`：规划器最小交易门槛。
-- `enable_adv_limit`：是否启用 ADV 限制。
-- `adv_limit_frac`：单笔最大参与率。
-- `enable_cost_sensitive_ranking`：是否启用成本敏感排序。
-- `lambda_cost`：成本惩罚强度。
+### `risk_model`（mid profile）
+- `rc_limit`：组合风险集中度上限（`0.65`）
+- `portfolio_cov_rc_hysteresis_band`：迟滞带宽（`0.02`）
+- `portfolio_cov_rc_abort_buffer_enabled`：连续 abort 自动放宽（`true`）
 
 ### `news_overlay`
-- `enabled`：行业新闻 overlay 开关。
-- `mode`：默认 `risk_only`。
-- `alpha`：overlay 敏感度。
-- `min_confidence`：置信度下限。
-- `max_abs_delta`：单桶影响截断。
-- `enable_confidence_scaling`：置信度缩放开关。
-- `max_age_hours`：新闻新鲜度窗口。
-- `macro_risk_off_prior.enabled`：宏观 risk-off 先验开关。
-- `macro_risk_off_prior.strength`：先验强度。
-- `macro_risk_off_prior.min_score`：触发门槛。
-- `macro_risk_off_prior.cooldown_minutes`：冷却分钟数。
+- `enabled`：行业新闻 overlay 开关
+- `mode`: `symmetric`（双向））或 `risk_only`（仅减仓）
+- `alpha`：overlay 敏感度（`0.6`）
+- `min_confidence`：置信度下限（`0.45`）
+- `max_abs_delta`：单桶权重最大变化（`0.05`）
+- `max_age_hours`：新闻新鲜度窗口
 
-### `risk_model`
-- 协方差诊断参数（收益窗口、最小样本、收缩、覆盖阈值等）。
-- 配合 target gate 使用时，建议重点观察 coverage 与 status 稳定性。
+### `macro_integration`
+- `macro_allow_new_positions`：允许宏观信号开新仓的标的列表
+- `cooldown_cycles`：宏观信号冷却周期数
 
-### `reporting`
-- `snapshot_live_path`：Web UI 主快照路径。
-- `trade_history_path`：交易历史路径。
-- `scoreboard_path`：记分板路径。
-- `max_price_debug_items`：价格调试字段上限（防止快照膨胀）。
-- `telemetry_enabled` / `telemetry_fsync`：结构化 telemetry 开关与刷盘策略（若在配置中启用）。
+### `risk_profiles`
+每个 profile（`low`、`mid`、`high`、`ultra`）可覆盖：
+- `rc_limit`、`max_weight_per_asset`、`min_cash_pct`、`max_turnover_pct_per_rebalance`、`weight_threshold`
 
-### `cost_model`
-- 手续费/滑点/冲击成本估算参数。
-
-> 说明：部分新参数即使未显式写在 `paper_config.json`，引擎也会注入默认值；建议只覆盖你要调整的键。
+### `universe`
+- 78 个可交易标的：美股、加拿大 `.TO` 股票、ETF、板块 ETF、CASH
+- 芯片篮子：`AMD QCOM AVGO TXN MRVL ARM`
+- 半导体篮子：`TSM ASML LRCX KLAC AMAT MU ON`
 
 ## 验证命令
 ```bash
@@ -215,14 +254,7 @@ python -m py_compile paper_trading.py
 python -m py_compile GlobalWatch_V2.py
 ```
 
-## CI 依赖说明
-CI 现已通过根目录 `requirements.txt` 安装基础依赖后再跑诊断：
-- `pandas`
-- `numpy`
-- `matplotlib`
-- `yfinance`
-
 ## 说明
-- 仅用于模拟交易。
-- 不连接真实券商。
+- 仅用于模拟交易，不连接真实券商。
 - 不构成投资建议。
+- 加拿大 `.TO` 股票以 CAD 报价，所有组合价值均转换为 USD 进行记账。

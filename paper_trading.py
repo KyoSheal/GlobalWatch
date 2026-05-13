@@ -1,5 +1,7 @@
 ﻿"""Paper trading engine (simulation only)."""
 
+from __future__ import annotations
+
 import json
 import io
 import os
@@ -9,6 +11,7 @@ import time
 import uuid
 import copy
 import hashlib
+import logging
 import argparse
 import shutil
 import subprocess
@@ -28,6 +31,10 @@ from atomic_io import (
 )
 from market_time_filter import sanitize_equity_rows
 from vol_target_stabilizer import stabilize_vol_target_scale
+from config_validator import validate_config, ConfigValidationError
+from logger_config import setup_logging
+
+logger = logging.getLogger(__name__)
 from outpost import (
     append_registry,
     make_run_id,
@@ -587,21 +594,40 @@ class MacroSignalAdapter:
         return summary
 
     def _get_accuracy_factor(self, theme, source):
-        """def _get_accuracy_factor: docstring omitted (was garbled/non-ASCII)."""
+        """Return an accuracy-calibration multiplier for a signal.
+
+        AI.3: When fewer than min_calibration_count samples exist, use a
+        conservative prior (0.65) instead of the neutral 0.70, to penalise
+        unverified signals more strongly. The factor range is widened to
+        [0.50, 1.40] so well-calibrated signals get a larger boost.
+        """
         theme_key = str(theme or 'unknown').strip().lower()
         source_key = str(source or 'unknown').strip().lower()
 
-        if source_key in self.source_accuracy_history and self.source_accuracy_history[source_key]:
-            acc = float(np.mean(self.source_accuracy_history[source_key]))
-            scope = f"source:{source_key}"
-        elif theme_key in self.theme_accuracy_history and self.theme_accuracy_history[theme_key]:
-            acc = float(np.mean(self.theme_accuracy_history[theme_key]))
-            scope = f"theme:{theme_key}"
-        else:
-            acc = 0.5
-            scope = "default"
+        macro_cfg = self.config.get('macro_integration', {}) if isinstance(self.config, dict) else {}
+        min_cal = max(1, int(macro_cfg.get('min_calibration_count', 5)))
 
-        accuracy_factor = float(np.clip(0.7 + 0.6 * (acc - 0.5), 0.7, 1.3))
+        source_hist = self.source_accuracy_history.get(source_key, [])
+        theme_hist = self.theme_accuracy_history.get(theme_key, [])
+
+        if len(source_hist) >= min_cal:
+            acc = float(np.mean(source_hist))
+            scope = f"source:{source_key}"
+        elif len(theme_hist) >= min_cal:
+            acc = float(np.mean(theme_hist))
+            scope = f"theme:{theme_key}"
+        elif source_hist or theme_hist:
+            # Has some data but below min — use it with a slight penalty
+            combined = source_hist + theme_hist
+            acc = float(np.mean(combined)) * 0.90
+            scope = f"partial({len(combined)})"
+        else:
+            # No history at all — conservative prior
+            acc = 0.45
+            scope = "prior_conservative"
+
+        # AI.3: wider range [0.50, 1.40] vs old [0.70, 1.30]
+        accuracy_factor = float(np.clip(0.65 + 0.75 * (acc - 0.5), 0.50, 1.40))
         return accuracy_factor, acc, scope
 
     def _parse_topic_outcome(self, metadata):
@@ -906,15 +932,17 @@ class MacroSignalAdapter:
                 })
                 
                 # NOTE: comment omitted (was garbled/non-ASCII).
-                print(f"  [DEBUG] {theme}: direction={confirmed_direction}, "
-                      f"count={bullish_count if confirmed_direction=='bullish' else bearish_count}/"
-                      f"{bearish_count if confirmed_direction=='bullish' else bullish_count}, "
-                      f"strength={strength:.3f}, conf_raw={confidence_raw_avg:.3f}, "
-                      f"conf_eff={confidence_effective:.3f}, acc_factor={accuracy_factor_avg:.3f}, "
-                      f"newest={newest_timestamp[:19]}")
-        
-        print("-" * 70)
-        
+                logger.debug(
+                    "%s: direction=%s count=%s/%s strength=%.3f conf_raw=%.3f "
+                    "conf_eff=%.3f acc_factor=%.3f newest=%s",
+                    theme, confirmed_direction,
+                    bullish_count if confirmed_direction == 'bullish' else bearish_count,
+                    bearish_count if confirmed_direction == 'bullish' else bullish_count,
+                    strength, confidence_raw_avg, confidence_effective,
+                    accuracy_factor_avg, newest_timestamp[:19],
+                )
+
+
         # NOTE: comment omitted (was garbled/non-ASCII).
         risk_off_themes = ['risk_off', 'recession', 'rates_up', 'credit_stress', 'inflation_risk', 
                            'geopolitical_risk', 'market_crash', 'volatility_spike']
@@ -1406,6 +1434,12 @@ class PaperTradingEngine:
         self.current_holding_blocks = []
         self.forced_until_time = None  # NOTE: comment omitted (was garbled/non-ASCII).
         self.forced_regime_reason = ""
+        # Phase 5.2: rolling drawdown circuit breaker state
+        self.circuit_breaker_rolling_active = False
+        self.circuit_breaker_rolling_triggered_cycle = None
+        self.circuit_breaker_rolling_recovery_equity = None
+        # Phase 5.3: factor attribution — most recent asset metrics snapshot
+        self._last_asset_metrics_for_attribution = {}
         self.scoreboard_history = []  # 2w scoreboard records
         self.last_diagnostic_hint = ""
         self.current_weights_reused = False
@@ -1694,7 +1728,7 @@ class PaperTradingEngine:
         news_overlay_cfg.setdefault('industry_collection', 'industry_signals')
         news_overlay_cfg.setdefault('max_age_hours', 48)
         news_overlay_cfg.setdefault('alpha', 0.08)
-        news_overlay_cfg.setdefault('mode', 'risk_only')
+        news_overlay_cfg.setdefault('mode', 'symmetric')
         news_overlay_cfg.setdefault('min_confidence', 0.55)
         news_overlay_cfg.setdefault('max_abs_delta', 0.10)
         news_overlay_cfg.setdefault('enable_confidence_scaling', True)
@@ -1789,7 +1823,16 @@ class PaperTradingEngine:
         execution_config['portfolio_exposure_cap'] = float(exposure_cap_clamped)
         # Force startup risk profile to one of low/mid/high/ultra.
         self._normalize_execution_risk_profile(source="load_config", config_obj=config)
-        
+
+        # Validate config structure and value ranges.
+        try:
+            validate_config(config)
+        except ConfigValidationError as exc:
+            # Log all errors as warnings — do not crash on existing configs that
+            # may have unknown fields, but make problems visible.
+            for err in exc.errors:
+                logger.warning("CONFIG VALIDATION: %s", err)
+
         return config
 
     def _compute_config_hash(self, config_obj):
@@ -2709,7 +2752,7 @@ class PaperTradingEngine:
         cycle_id = int(snapshot_payload.get('cycle_id', snapshot_payload.get('cycle', self.current_cycle)) or 0)
         source = str(snapshot_payload.get('source', 'unknown') or 'unknown')
         if self._last_replay_bundle_cycle_id != cycle_id or self._last_replay_bundle_source != source:
-            print(f"[REPLAY_BUNDLE] built path={bundle_dir} files={len(entries) + 1}")
+            logger.debug("[REPLAY_BUNDLE] built path=%s files=%d", bundle_dir, len(entries) + 1)
             self._last_replay_bundle_cycle_id = cycle_id
             self._last_replay_bundle_source = source
             self._last_replay_bundle_path = bundle_dir
@@ -2805,7 +2848,7 @@ class PaperTradingEngine:
         applied_after = str(getattr(self, "active_risk_profile", "") or RISK_PROFILE_DEFAULT).strip().lower()
         curr_mtime = getattr(manager, "last_mtime", None)
         path_exists = bool(os.path.exists(state_path)) if state_path else False
-        print(
+        logger.debug(
             "[RP_SYNC] "
             f"path={state_path or '-'} exists={path_exists} "
             f"prev_mtime={prev_mtime} curr_mtime={curr_mtime} "
@@ -2859,7 +2902,7 @@ class PaperTradingEngine:
                 mtime_text = f"{float(self.risk_profile_state_mtime):.3f}"
         except Exception:
             mtime_text = str(self.risk_profile_state_mtime)
-        print(
+        logger.debug(
             "[RISK_PROFILE] "
             f"requested={str(self.requested_risk_profile or RISK_PROFILE_DEFAULT)} "
             f"applied={str(self.active_risk_profile or RISK_PROFILE_DEFAULT)} "
@@ -2983,14 +3026,14 @@ class PaperTradingEngine:
             'remaining_min': float(remaining_min),
             'ts': now_ref.isoformat(),
         }
-        print(
-            "[COOLDOWN] "
-            f"outcome={self.current_cooldown_info.get('outcome')} "
-            f"reason={self.current_cooldown_info.get('reason')} "
-            f"backoff_min={self.current_cooldown_info.get('backoff_min'):.2f} "
-            f"next_allowed_ts={self.current_cooldown_info.get('next_allowed_ts')} "
-            f"fail_count={self.current_cooldown_info.get('fail_count')} "
-            f"policy={self.current_cooldown_info.get('policy')}"
+        logger.debug(
+            "[COOLDOWN] outcome=%s reason=%s backoff_min=%.2f next_allowed_ts=%s fail_count=%s policy=%s",
+            self.current_cooldown_info.get('outcome'),
+            self.current_cooldown_info.get('reason'),
+            self.current_cooldown_info.get('backoff_min', 0.0),
+            self.current_cooldown_info.get('next_allowed_ts'),
+            self.current_cooldown_info.get('fail_count'),
+            self.current_cooldown_info.get('policy'),
         )
         return dict(self.current_cooldown_info)
 
@@ -4827,6 +4870,19 @@ class PaperTradingEngine:
             "overall_row_coverage": float(returns_meta.get("overall_row_coverage", 0.0) or 0.0),
         }
 
+        # Per-ticker coverage: {ticker: fraction_of_lookback_days_with_data}
+        raw_cov_by_ticker = returns_meta.get("coverage_by_ticker", {})
+        cov_coverage_per_ticker = {}
+        if isinstance(raw_cov_by_ticker, dict):
+            for t, v in raw_cov_by_ticker.items():
+                try:
+                    cov_coverage_per_ticker[str(t)] = round(float(v), 4)
+                except Exception:
+                    pass
+
+        missing_tickers = list(returns_meta.get("missing_tickers", []) or [])
+        dropped_tickers = list(returns_meta.get("dropped_tickers", []) or [])
+
         top_corr = []
         raw_corr_pairs = diag.get("top_corr_pairs", [])
         if isinstance(raw_corr_pairs, list):
@@ -4864,6 +4920,9 @@ class PaperTradingEngine:
             "avg_pairwise_corr": diag.get("avg_pairwise_corr"),
             "top_corr_pairs": top_corr,
             "rc_fraction_top5": rc_top,
+            "cov_coverage_per_ticker": cov_coverage_per_ticker,
+            "missing_tickers": missing_tickers,
+            "dropped_tickers": dropped_tickers,
         }
         return out
 
@@ -5084,7 +5143,7 @@ class PaperTradingEngine:
             if ex_key == key:
                 return
         self.current_asset_policy_decisions.append(row)
-        print(
+        logger.debug(
             "[ASSET_POLICY_DECISION] "
             f"original={row['original']} risk={row['risk_ticker']} exec={row['exec_ticker']} "
             f"action={row['action']} reason={row['reason']}"
@@ -5318,13 +5377,12 @@ class PaperTradingEngine:
         cash_after_val = float(cash_after) if cash_after is not None else float(self.cash)
         cooldown_blocked_b = bool(cooldown_blocked)
 
-        print(
-            "[EXEC_DECISION] "
-            f"action={action_s} reason={reason_s} ticker={ticker_s} "
-            f"from={from_s} to={to_s} "
-            f"target_w={target_w_val:.6f} current_w={current_w_val:.6f} delta={delta_val:.6f} "
-            f"price_status={price_status_s} cash_after={cash_after_val:.2f} "
-            f"cooldown_blocked={str(cooldown_blocked_b).lower()}"
+        logger.debug(
+            "[EXEC_DECISION] action=%s reason=%s ticker=%s from=%s to=%s "
+            "target_w=%.6f current_w=%.6f delta=%.6f price_status=%s cash_after=%.2f cooldown_blocked=%s",
+            action_s, reason_s, ticker_s, from_s, to_s,
+            target_w_val, current_w_val, delta_val, price_status_s, cash_after_val,
+            str(cooldown_blocked_b).lower(),
         )
 
         if not isinstance(summary, dict):
@@ -5498,7 +5556,7 @@ class PaperTradingEngine:
             fallback_used = True
             fallback_reason = "exception"
             exception_repr = repr(e)
-            print(f"[COV_COVERAGE_ERROR] exception={exception_repr}")
+            logger.debug(f"[COV_COVERAGE_ERROR] exception={exception_repr}")
             coverage = default_cov_coverage(basis=str(basis or "target_weights"), stage=str(stage or "cov"))
         if not isinstance(coverage, dict):
             fallback_used = True
@@ -5578,9 +5636,9 @@ class PaperTradingEngine:
             w = float(row.get("w", 0.0) or 0.0)
             parts.append(f"{idx}) {t} {w:.4f}")
         if parts:
-            print("[COV_MISSING_TOP] " + " ".join(parts))
+            logger.debug("[COV_MISSING_TOP] " + " ".join(parts))
         else:
-            print("[COV_MISSING_TOP] none")
+            logger.debug("[COV_MISSING_TOP] none")
 
     def _cov_refresh_public_info(self, info):
         if not isinstance(info, dict):
@@ -5627,7 +5685,7 @@ class PaperTradingEngine:
         self._cov_refresh_attempted_cycle = cycle_id
         out["attempted"] = True
         start_ts = time.time()
-        print(f"[COV_REFRESH] started reason={reason} cycle={cycle_id}")
+        logger.debug(f"[COV_REFRESH] started reason={reason} cycle={cycle_id}")
 
         removed = 0
         try:
@@ -6924,7 +6982,7 @@ class PaperTradingEngine:
             price_debug_items = 0
             if isinstance(payload, dict) and isinstance(payload.get('price_debug'), dict):
                 price_debug_items = len(payload.get('price_debug', {}))
-            print(f"[PRICE_DEBUG_SAVE] items={price_debug_items} source={source}")
+            logger.debug("price_debug_save items=%d source=%s", price_debug_items, source)
             if price_debug_items == 0 and isinstance(payload, dict):
                 holdings_count = 0
                 positions_obj = payload.get('positions_detail')
@@ -6933,7 +6991,7 @@ class PaperTradingEngine:
                 if holdings_count <= 0 and isinstance(self.positions, dict):
                     holdings_count = len([k for k, v in self.positions.items() if str(k).upper() != 'CASH' and float(v or 0) > 0])
                 if holdings_count > 0:
-                    print(f"[WARN] [PRICE_DEBUG_SAVE] holdings={holdings_count} but price_debug is empty")
+                    logger.warning("price_debug_save: holdings=%d but price_debug is empty", holdings_count)
             price_diag_summary = self._build_price_diagnostics_summary(payload)
             if isinstance(price_diag_summary, dict):
                 payload["price_diagnostics_summary"] = dict(price_diag_summary)
@@ -7141,6 +7199,49 @@ class PaperTradingEngine:
             return False
         return True
 
+    def _write_daily_summary(self, trades=None):
+        """Append a one-line-per-cycle summary to a permanent daily log file."""
+        import os
+        try:
+            now = self._now().astimezone()
+            date_str = now.strftime("%Y-%m-%d")
+            daily_dir = os.path.join(os.path.dirname(self.output_dir), "daily") if hasattr(self, 'output_dir') else "outputs/daily"
+            os.makedirs(daily_dir, exist_ok=True)
+            log_path = os.path.join(daily_dir, f"{date_str}.log")
+
+            positions_value = sum(
+                float(qty) * float(price) * (self._get_fx_rate("CAD", "USD") if str(t).upper().endswith(".TO") else 1.0)
+                for t, qty in self.positions.items()
+                for price, _, _ in [self.get_current_price(t)]
+                if price
+            )
+            total_equity = float(self.cash) + positions_value
+            ret = (total_equity - self.initial_cash) / self.initial_cash if self.initial_cash > 0 else 0.0
+
+            risk_info = dict(self.current_risk_check_info) if isinstance(self.current_risk_check_info, dict) else {}
+            rc_frac = risk_info.get('cov_risk_current_summary', {}).get('max_rc_fraction', float('nan'))
+            gate = risk_info.get('cov_risk_current_summary', {}).get('gate_decision', 'N/A')
+            regime = str(getattr(self, 'current_regime_state', 'N/A')).upper()
+
+            holdings_str = " | ".join(
+                f"{t}x{qty}" for t, qty in sorted(self.positions.items())
+            ) or "none"
+            trade_count = len(trades) if trades else 0
+
+            fx_flag = " FX=FALLBACK" if getattr(self, '_fx_fallback_active', False) else ""
+            line = (
+                f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"Cycle={self.current_cycle} "
+                f"Cash=${self.cash:,.0f} Pos=${positions_value:,.0f} Equity=${total_equity:,.0f} "
+                f"Return={ret:+.2%} "
+                f"RC={rc_frac:.1%} Gate={gate} Regime={regime} "
+                f"Trades={trade_count}{fx_flag} Holdings=[{holdings_str}]\n"
+            )
+            with open(log_path, "a") as f:
+                f.write(line)
+        except Exception as e:
+            logger.debug("_write_daily_summary failed: %s", e)
+
     def _build_post_rebalance_snapshot(self):
         """Build a lightweight snapshot from current in-memory state without appending history."""
         positions_value = 0.0
@@ -7149,7 +7250,8 @@ class PaperTradingEngine:
             price, age_min, status = self.get_current_price(ticker)
             if not price:
                 continue
-            value = float(qty) * float(price)
+            _fx = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+            value = float(qty) * float(price) * _fx
             positions_value += value
             positions_detail[ticker] = {
                 'quantity': qty,
@@ -7387,7 +7489,7 @@ class PaperTradingEngine:
             # Keep text summary aligned with the same post-rebalance snapshot payload.
             self.generate_live_summary(snapshot_override=snapshot)
             live_snapshot_path = self.config.get('reporting', {}).get('snapshot_live_path', 'outputs/snapshot_live.json')
-            print(f"[SNAPSHOT] Post-rebalance live snapshot written (cycle={self.current_cycle}, trades={int(trades_count)}, path={live_snapshot_path}, source={source})")
+            logger.debug("[SNAPSHOT] Post-rebalance live snapshot written (cycle=%d, trades=%d, path=%s, source=%s)", self.current_cycle, int(trades_count), live_snapshot_path, source)
         except Exception as e:
             print(f"[WARN] Post-rebalance live snapshot refresh failed: {e}")
 
@@ -7496,7 +7598,7 @@ class PaperTradingEngine:
             ),
         }
 
-        print(
+        logger.debug(
             "[GATE_DEBUG] "
             f"reason={reason} detail={reason_detail} session={state} "
             f"now={gate.get('now_local')} now_tz={gate.get('now_tz')} now_utc={gate.get('now_utc')} now_et={gate.get('now_et')} "
@@ -7599,7 +7701,7 @@ class PaperTradingEngine:
             payload['latest_daily_report_date'] = str(report_date)
             payload['latest_daily_report_path'] = str(report_path)
             pd_items = len(payload.get('price_debug', {})) if isinstance(payload.get('price_debug'), dict) else 0
-            print(f"[PRICE_DEBUG_SAVE] items={pd_items} source=update_daily_report_ref")
+            logger.debug("price_debug_save items=%d source=update_daily_report_ref", pd_items)
             self.atomic_write_json(snapshot_path, payload)
         except Exception as e:
             print(f"[WARN] Failed to update snapshot daily report pointer: {e}")
@@ -7635,7 +7737,8 @@ class PaperTradingEngine:
                 'stale_info': dict(self.current_stale_info) if isinstance(self.current_stale_info, dict) else {}
             }
 
-            session = daily_reporter.get_market_session_state(now_local, tz_market='America/New_York')
+            market_tz_name = str(reporting_cfg.get('market_tz', 'America/New_York') or 'America/New_York')
+            session = daily_reporter.get_market_session_state(now_local, tz_market=market_tz_name)
             closed, reason = daily_reporter.is_market_closed(
                 now=now_local,
                 tz=tz_name,
@@ -7843,6 +7946,150 @@ class PaperTradingEngine:
         self.status = "READY"
         self.position_entry_cycle = {}
         self.current_holding_blocks = []
+
+    # ------------------------------------------------------------------
+    # Phase 4 helpers
+    # ------------------------------------------------------------------
+
+    def _compute_position_stop_loss_overrides(self, target_weights: dict) -> dict:
+        """Phase 4.1: Force target weight to 0 for positions that have fallen
+        below the stop-loss threshold from their cost basis.
+
+        Config keys (under execution):
+          stop_loss_enabled  (bool, default True)
+          stop_loss_pct      (float, default -0.08)  — e.g. -0.08 means -8%
+          stop_loss_override_min_holding  (bool, default False) — bypass min_holding when triggered
+        """
+        execution_cfg = self.config.get("execution", {})
+        if not bool(execution_cfg.get("stop_loss_enabled", True)):
+            return dict(target_weights)
+
+        threshold = float(execution_cfg.get("stop_loss_pct", -0.08))
+        override_holding = bool(execution_cfg.get("stop_loss_override_min_holding", True))
+
+        overrides = dict(target_weights)
+        triggered = []
+        for ticker, qty in list(self.positions.items()):
+            if qty <= 0:
+                continue
+            cost = self.cost_basis.get(ticker, 0.0)
+            if cost <= 0:
+                continue
+            price, _, _ = self.get_current_price(ticker)
+            if price is None or price <= 0:
+                continue
+            pnl_pct = (price - cost) / cost
+            if pnl_pct <= threshold:
+                overrides[ticker] = 0.0
+                triggered.append((ticker, pnl_pct, cost, price))
+                if override_holding:
+                    self.position_entry_cycle.pop(str(ticker).upper(), None)
+                print(
+                    f"[PHASE4 STOP-LOSS] {ticker}: cost={cost:.2f} price={price:.2f} "
+                    f"pnl={pnl_pct:.2%} <= threshold={threshold:.2%} -> weight=0"
+                )
+
+        if triggered:
+            self.current_stop_loss_triggers = [
+                {"ticker": t, "pnl_pct": p, "cost": c, "price": pr}
+                for t, p, c, pr in triggered
+            ]
+        else:
+            self.current_stop_loss_triggers = []
+        return overrides
+
+    def _apply_ramp_in_to_targets(self, target_weights: dict) -> dict:
+        """Phase 4.2: Gradually scale up new positions over ramp_in_cycles cycles.
+
+        Config keys (under execution):
+          ramp_in_enabled  (bool, default True)
+          ramp_in_cycles   (int, default 3)
+        """
+        execution_cfg = self.config.get("execution", {})
+        if not bool(execution_cfg.get("ramp_in_enabled", True)):
+            return dict(target_weights)
+
+        ramp_cycles = max(1, int(execution_cfg.get("ramp_in_cycles", 3)))
+        current_cycle = int(self.current_cycle)
+
+        adjusted = dict(target_weights)
+        ramp_applied = []
+        for ticker, tw in target_weights.items():
+            if tw <= 0:
+                continue
+            ticker_u = str(ticker).upper()
+            # Only ramp on brand-new entries (not currently held)
+            if self.positions.get(ticker, 0) > 0:
+                continue
+            entry_cycle = self.position_entry_cycle.get(ticker_u)
+            if entry_cycle is None:
+                # new entry this cycle — assign entry NOW so we can track ramp
+                entry_cycle = current_cycle
+                self.position_entry_cycle[ticker_u] = entry_cycle
+
+            cycles_held = max(0, current_cycle - entry_cycle)
+            if cycles_held >= ramp_cycles:
+                continue  # fully ramped in
+
+            ramp_fraction = (cycles_held + 1) / ramp_cycles
+            original_tw = float(tw)
+            adjusted[ticker] = original_tw * ramp_fraction
+            ramp_applied.append((ticker, original_tw, adjusted[ticker], ramp_fraction))
+            logger.debug(
+                f"[PHASE4 RAMP-IN] {ticker}: cycle {cycles_held+1}/{ramp_cycles} "
+                f"({ramp_fraction:.0%}) -> weight {original_tw:.2%} => {adjusted[ticker]:.2%}"
+            )
+
+        self.current_ramp_in_info = {
+            "enabled": True,
+            "ramp_cycles": ramp_cycles,
+            "applied": [{"ticker": t, "target": o, "ramped": r, "fraction": f}
+                        for t, o, r, f in ramp_applied]
+        }
+        return adjusted
+
+    def _compute_adaptive_turnover_limit(self, base_turnover: float) -> float:
+        """Phase 4.3: Scale down turnover limit when recent intraday vol is high.
+
+        Config keys (under execution):
+          adaptive_turnover_enabled      (bool, default True)
+          adaptive_turnover_vol_window   (int, default 5)   — number of cycles
+          adaptive_turnover_vol_high     (float, default 0.025) — daily return stdev threshold
+          adaptive_turnover_scale_min    (float, default 0.40)  — minimum scale factor
+        """
+        execution_cfg = self.config.get("execution", {})
+        if not bool(execution_cfg.get("adaptive_turnover_enabled", True)):
+            return float(base_turnover)
+
+        vol_window = max(2, int(execution_cfg.get("adaptive_turnover_vol_window", 5)))
+        vol_high = float(execution_cfg.get("adaptive_turnover_vol_high", 0.025))
+        scale_min = float(np.clip(execution_cfg.get("adaptive_turnover_scale_min", 0.40), 0.1, 1.0))
+
+        # Use recent equity curve as proxy for portfolio return vol
+        recent_eq = [p.get("total_equity", 0) for p in self.portfolio_snapshots[-(vol_window + 1):]]
+        if len(recent_eq) < 3:
+            return float(base_turnover)
+
+        returns = [
+            (recent_eq[i] - recent_eq[i - 1]) / recent_eq[i - 1]
+            for i in range(1, len(recent_eq))
+            if recent_eq[i - 1] > 0
+        ]
+        if not returns:
+            return float(base_turnover)
+
+        recent_vol = float(np.std(returns))
+        if recent_vol <= vol_high:
+            return float(base_turnover)
+
+        # Linear scale-down: higher vol → lower turnover
+        scale = max(scale_min, 1.0 - (recent_vol - vol_high) / vol_high)
+        adjusted = float(base_turnover) * scale
+        print(
+            f"[PHASE4 ADAPTIVE TURNOVER] recent_vol={recent_vol:.4f} > threshold={vol_high:.4f} "
+            f"-> scale={scale:.2f} turnover {base_turnover:.2%} => {adjusted:.2%}"
+        )
+        return adjusted
         self.current_price_debug = {}
 
     def set_market_data_fetcher(self, fetcher):
@@ -7867,6 +8114,43 @@ class PaperTradingEngine:
             except Exception:
                 return None
         return yf
+
+    def _get_fx_rate(self, from_currency: str, to_currency: str = "USD") -> float:
+        """Return FX conversion rate (from_currency → to_currency), with cache and fallback.
+
+        Used to convert CAD-priced Canadian (.TO) stocks to USD for consistent
+        portfolio valuation. Falls back to paper_config.json fx_rates section
+        if live fetch fails or auto_fetch is disabled.
+        """
+        key = f"{from_currency}_{to_currency}"
+        cache_attr = "_fx_rate_cache"
+        if not hasattr(self, cache_attr):
+            setattr(self, cache_attr, {})
+        cache = getattr(self, cache_attr)
+        now_ts = time.time()
+        fx_cfg = self.config.get("fx_rates", {})
+        cache_minutes = float(fx_cfg.get("cache_minutes", 60))
+        cached = cache.get(key)
+        if cached and (now_ts - cached["ts"]) < cache_minutes * 60:
+            return float(cached["rate"])
+        fallback = float(fx_cfg.get(key, fx_cfg.get(f"{from_currency}_USD", 0.73)))
+        rate = fallback
+        if bool(fx_cfg.get("auto_fetch", True)):
+            try:
+                symbol = fx_cfg.get("auto_fetch_symbol", f"{from_currency}{to_currency}=X")
+                import yfinance as _yf
+                tk = _yf.Ticker(symbol)
+                info = tk.fast_info
+                last = getattr(info, "last_price", None)
+                if last and float(last) > 0:
+                    rate = float(last)
+                    self._fx_fallback_active = False
+            except Exception as e:
+                logger.warning("FX rate fetch failed for %s: %s — using fallback %.4f", key, e, fallback)
+                print(f"[FX_FALLBACK] {key} live fetch failed, using fallback {fallback:.4f}")
+                self._fx_fallback_active = True
+        cache[key] = {"rate": rate, "ts": now_ts}
+        return rate
 
     def _now(self):
         """Current wall-clock time with optional deterministic debug override."""
@@ -8261,7 +8545,7 @@ class PaperTradingEngine:
                         age_min = 99999.0
                     market_status = _classify_status(age_min, thresholds)
                     ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M ET') if isinstance(ts_obj, datetime) else "N/A"
-                    print(f"[PRICE] {ticker}: ${price:.2f} (5m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
+                    logger.debug(f"[PRICE] {ticker}: ${price:.2f} (5m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
                     notes_joined = ';'.join(note_items) if note_items else None
                     _cache_quote(
                         price,
@@ -8289,7 +8573,7 @@ class PaperTradingEngine:
                 fallback_notes.append("empty_history_5m")
             except Exception as e:
                 fallback_notes.append(f"history_5m_error={e}")
-                print(f"[PRICE] {ticker}: 5m history failed - {e}")
+                logger.debug(f"[PRICE] {ticker}: 5m history failed - {e}")
 
             try:
                 hist = t.history(period='1d', interval='1m')
@@ -8304,7 +8588,7 @@ class PaperTradingEngine:
                         age_min = 99999.0
                     market_status = _classify_status(age_min, thresholds)
                     ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%H:%M ET') if isinstance(ts_obj, datetime) else "N/A"
-                    print(f"[PRICE] {ticker}: ${price:.2f} (1m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
+                    logger.debug(f"[PRICE] {ticker}: ${price:.2f} (1m @ {ts_label}, {age_min:.0f}min ago) {market_status}")
                     notes_joined = ';'.join(note_items) if note_items else None
                     _cache_quote(
                         price,
@@ -8332,7 +8616,7 @@ class PaperTradingEngine:
                 fallback_notes.append("empty_history_1m")
             except Exception as e:
                 fallback_notes.append(f"history_1m_error={e}")
-                print(f"[PRICE] {ticker}: 1m history failed - {e}")
+                logger.debug(f"[PRICE] {ticker}: 1m history failed - {e}")
 
             try:
                 info = t.info
@@ -8340,7 +8624,7 @@ class PaperTradingEngine:
                     if price_field in info and info[price_field]:
                         price = float(info[price_field])
                         if price > 0:
-                            print(f"[PRICE] {ticker}: ${price:.2f} (from info.{price_field}) STALE (no timestamp)")
+                            logger.debug(f"[PRICE] {ticker}: ${price:.2f} (from info.{price_field}) STALE (no timestamp)")
                             _cache_quote(
                                 price,
                                 source="yfinance_info",
@@ -8367,7 +8651,7 @@ class PaperTradingEngine:
                 fallback_notes.append("missing_info_price_fields")
             except Exception as e:
                 fallback_notes.append(f"info_error={e}")
-                print(f"[PRICE] {ticker}: info failed - {e}")
+                logger.debug(f"[PRICE] {ticker}: info failed - {e}")
 
             try:
                 hist = t.history(period='5d', interval='1d')
@@ -8380,7 +8664,7 @@ class PaperTradingEngine:
                     else:
                         age_min = 99999.0
                     ts_label = ts_obj.astimezone(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d') if isinstance(ts_obj, datetime) else "N/A"
-                    print(f"[PRICE] {ticker}: ${price:.2f} (from daily close {ts_label}, {age_min:.0f}min ago) STALE")
+                    logger.debug(f"[PRICE] {ticker}: ${price:.2f} (from daily close {ts_label}, {age_min:.0f}min ago) STALE")
                     notes_joined = ';'.join(note_items) if note_items else None
                     _cache_quote(
                         price,
@@ -8408,7 +8692,7 @@ class PaperTradingEngine:
                 fallback_notes.append("empty_history_daily")
             except Exception as e:
                 fallback_notes.append(f"history_daily_error={e}")
-                print(f"[PRICE] {ticker}: daily history failed - {e}")
+                logger.debug(f"[PRICE] {ticker}: daily history failed - {e}")
 
         except Exception as e:
             fallback_notes.append(f"all_methods_error={e}")
@@ -8588,7 +8872,7 @@ class PaperTradingEngine:
                 stale_count += 1
 
         self.current_price_debug = price_debug
-        print(f"[PRICE_DEBUG] n={len(price_debug)} cap={cap} missing={missing_count} stale={stale_count}")
+        logger.debug("price_debug n=%d cap=%d missing=%d stale=%d", len(price_debug), cap, missing_count, stale_count)
         return price_debug
 
     def build_returns_matrix(
@@ -9754,6 +10038,231 @@ class PaperTradingEngine:
             meta["error"] = str(e)
             return pd.DataFrame(), meta
 
+    def _estimate_covariance_ledoit_wolf(self, returns_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+        """Ledoit-Wolf analytical shrinkage covariance estimator (Phase 3.1).
+
+        Automatically selects the optimal shrinkage coefficient based on the
+        sample size and number of assets. Falls back to diagonal shrink if
+        sklearn is unavailable or the fit fails.
+        """
+        meta = {"method": "ledoit_wolf", "rows": 0, "cols": 0, "shrinkage": 0.0}
+        try:
+            if not isinstance(returns_df, pd.DataFrame) or returns_df.empty:
+                return pd.DataFrame(), meta
+            if returns_df.shape[0] < 2 or returns_df.shape[1] < 1:
+                meta["rows"] = int(returns_df.shape[0])
+                meta["cols"] = int(returns_df.shape[1])
+                return pd.DataFrame(), meta
+
+            from sklearn.covariance import LedoitWolf
+            lw = LedoitWolf(assume_centered=False)
+            lw.fit(returns_df.values)
+            cov_array = lw.covariance_
+            meta["shrinkage"] = float(lw.shrinkage_)
+            meta["rows"] = int(returns_df.shape[0])
+            meta["cols"] = int(returns_df.shape[1])
+            cov_df = pd.DataFrame(cov_array, index=returns_df.columns, columns=returns_df.columns)
+            return cov_df, meta
+        except ImportError:
+            logger.debug("sklearn not available; falling back to diagonal shrink for Ledoit-Wolf")
+            return self._estimate_covariance_diag_shrink(returns_df, 0.15)
+        except Exception as e:
+            meta["error"] = str(e)
+            logger.debug("Ledoit-Wolf fit failed (%s); falling back to diagonal shrink", e)
+            return self._estimate_covariance_diag_shrink(returns_df, 0.15)
+
+    def _compute_crisis_mode(self, returns_df: pd.DataFrame, short_window: int = 20, long_window: int = 60,
+                              crisis_ratio: float = 1.5) -> dict:
+        """Detect correlation regime shift indicating a potential crisis (Phase 3.2).
+
+        Compares short-window average pairwise correlation to long-window average.
+        If short_avg_corr / long_avg_corr >= crisis_ratio, crisis mode is active.
+        In crisis, correlations spike as assets sell off together.
+        """
+        result = {
+            "crisis_mode": False,
+            "short_avg_corr": 0.0,
+            "long_avg_corr": 0.0,
+            "corr_ratio": 1.0,
+            "short_window": int(short_window),
+            "long_window": int(long_window),
+            "crisis_ratio_threshold": float(crisis_ratio),
+            "n_assets": 0,
+            "status": "ok",
+        }
+        try:
+            if not isinstance(returns_df, pd.DataFrame) or returns_df.empty:
+                result["status"] = "no_data"
+                return result
+            if returns_df.shape[1] < 2:
+                result["status"] = "insufficient_assets"
+                return result
+
+            n = len(returns_df)
+            result["n_assets"] = int(returns_df.shape[1])
+
+            def _avg_pairwise_corr(df: pd.DataFrame) -> float:
+                if df.shape[0] < 2 or df.shape[1] < 2:
+                    return 0.0
+                corr = df.corr()
+                vals = []
+                cols = list(corr.columns)
+                for i in range(len(cols)):
+                    for j in range(i + 1, len(cols)):
+                        v = corr.iloc[i, j]
+                        if not pd.isna(v):
+                            vals.append(float(v))
+                return float(np.mean(vals)) if vals else 0.0
+
+            short_w = min(int(short_window), n)
+            long_w = min(int(long_window), n)
+            short_avg = _avg_pairwise_corr(returns_df.iloc[-short_w:])
+            long_avg = _avg_pairwise_corr(returns_df.iloc[-long_w:])
+
+            result["short_avg_corr"] = float(short_avg)
+            result["long_avg_corr"] = float(long_avg)
+
+            if abs(long_avg) > 1e-6:
+                ratio = float(short_avg / long_avg)
+                result["corr_ratio"] = ratio
+                if ratio >= float(crisis_ratio) and short_avg > 0.4:
+                    result["crisis_mode"] = True
+            else:
+                result["status"] = "long_corr_near_zero"
+        except Exception as e:
+            result["status"] = f"error:{e}"
+        return result
+
+    def _compute_portfolio_cvar(self, returns_df: pd.DataFrame, weights: dict,
+                                 confidence: float = 0.95) -> dict:
+        """Historical simulation Conditional Value-at-Risk (Phase 3.3).
+
+        Computes the expected portfolio return on the worst (1-confidence)% of days.
+        Uses the actual returns matrix, so it reflects true tail co-movement.
+        """
+        result = {
+            "cvar": None,
+            "var": None,
+            "confidence": float(confidence),
+            "n_obs": 0,
+            "status": "ok",
+        }
+        try:
+            if not isinstance(returns_df, pd.DataFrame) or returns_df.empty:
+                result["status"] = "no_data"
+                return result
+            if not isinstance(weights, dict) or not weights:
+                result["status"] = "no_weights"
+                return result
+
+            common = [t for t in returns_df.columns if float(weights.get(t, 0.0) or 0.0) > 1e-12]
+            if not common:
+                result["status"] = "no_overlap"
+                return result
+
+            w_vec = np.array([float(weights.get(t, 0.0)) for t in common], dtype=float)
+            total_w = w_vec.sum()
+            if total_w <= 1e-12:
+                result["status"] = "zero_weight"
+                return result
+            w_vec /= total_w  # normalise to sum=1 for the invested portion
+
+            port_returns = returns_df[common].dropna().values @ w_vec
+            if len(port_returns) < 10:
+                result["status"] = "insufficient_obs"
+                return result
+
+            result["n_obs"] = int(len(port_returns))
+            threshold = float(np.percentile(port_returns, (1.0 - confidence) * 100))
+            tail = port_returns[port_returns <= threshold]
+            cvar = float(np.mean(tail)) if len(tail) > 0 else float(threshold)
+            result["var"] = float(threshold)
+            result["cvar"] = float(cvar)
+        except Exception as e:
+            result["status"] = f"error:{e}"
+        return result
+
+    def _get_vix_level(self) -> float | None:
+        """Fetch current VIX level with 30-minute cache (Phase 3.4).
+
+        Returns None if fetch fails so callers can gracefully degrade.
+        """
+        cache_attr = "_vix_cache"
+        if not hasattr(self, cache_attr):
+            setattr(self, cache_attr, {})
+        cache = getattr(self, cache_attr)
+        now_ts = time.time()
+        if cache and (now_ts - cache.get("ts", 0)) < 1800:
+            return cache.get("vix")
+        try:
+            import yfinance as _yf
+            info = _yf.Ticker("^VIX").fast_info
+            vix = float(getattr(info, "last_price", None) or 0)
+            if vix > 0:
+                cache["vix"] = vix
+                cache["ts"] = now_ts
+                return vix
+        except Exception as e:
+            logger.debug("VIX fetch failed: %s", e)
+        return cache.get("vix")  # return stale if available
+
+    def _compute_auto_risk_profile_signal(self, regime_state: str) -> str | None:
+        """Derive suggested risk profile from VIX + regime (Phase 3.4).
+
+        Returns a profile name ('low','mid','high') or None if auto-switching
+        is disabled or not enough data. Does NOT apply the change — caller decides.
+        """
+        auto_cfg = self.config.get("auto_risk_profile", {})
+        if not bool(auto_cfg.get("enabled", False)):
+            return None
+
+        vix = self._get_vix_level()
+        vix_low = float(auto_cfg.get("vix_low", 15.0))
+        vix_high = float(auto_cfg.get("vix_high", 25.0))
+        vix_extreme = float(auto_cfg.get("vix_extreme", 40.0))
+        profile_risk_on = str(auto_cfg.get("risk_on_profile", "high"))
+        profile_neutral = str(auto_cfg.get("neutral_profile", "mid"))
+        profile_risk_off = str(auto_cfg.get("risk_off_profile", "low"))
+
+        # Cooldown: don't switch more often than cooldown_hours
+        cooldown_h = float(auto_cfg.get("cooldown_hours", 24.0))
+        last_switch_attr = "_auto_profile_last_switch_ts"
+        now_ts = time.time()
+        if hasattr(self, last_switch_attr):
+            elapsed_h = (now_ts - getattr(self, last_switch_attr)) / 3600.0
+            if elapsed_h < cooldown_h:
+                return None  # still in cooldown
+
+        # Determine target profile
+        if vix is None:
+            # No VIX data — use regime only
+            if regime_state in ("risk_off", "risk_off_forced"):
+                target = profile_risk_off
+            elif regime_state == "risk_on":
+                target = profile_risk_on
+            else:
+                target = profile_neutral
+        elif vix >= vix_extreme:
+            target = profile_risk_off
+        elif vix >= vix_high or regime_state in ("risk_off", "risk_off_forced"):
+            target = profile_risk_off
+        elif vix < vix_low and regime_state == "risk_on":
+            target = profile_risk_on
+        else:
+            target = profile_neutral
+
+        if target not in RISK_PROFILE_CHOICES:
+            return None
+        if target == (self.active_risk_profile or RISK_PROFILE_DEFAULT):
+            return None  # already at target, no switch needed
+
+        setattr(self, last_switch_attr, now_ts)
+        logger.info(
+            "[AUTO_RISK_PROFILE] vix=%.1f regime=%s current=%s suggested=%s",
+            vix or -1, regime_state, self.active_risk_profile, target,
+        )
+        return target
+
     def _compute_portfolio_vol_and_rc(self, cov: pd.DataFrame, weights: dict, annualization_factor: int) -> dict:
         """Compute annualized portfolio volatility and risk contributions."""
         result = {
@@ -9861,10 +10370,14 @@ class PaperTradingEngine:
                     "returns_meta": returns_meta,
                 }
 
-            cov, cov_meta = self._estimate_covariance_diag_shrink(
-                returns_df,
-                float(cfg.get("shrinkage_alpha", 0.15)),
-            )
+            cov_method = str(cfg.get("cov_method", "diag_shrink")).lower()
+            if cov_method == "ledoit_wolf":
+                cov, cov_meta = self._estimate_covariance_ledoit_wolf(returns_df)
+            else:
+                cov, cov_meta = self._estimate_covariance_diag_shrink(
+                    returns_df,
+                    float(cfg.get("shrinkage_alpha", 0.15)),
+                )
 
             if cov.empty:
                 if bool(cfg.get("fallback_to_diag_on_error", True)):
@@ -9948,11 +10461,41 @@ class PaperTradingEngine:
                 "top_corr_pairs": top_corr_pairs,
             }
 
+            # Phase 3.2 — crisis mode detection
+            if bool(cfg.get("enable_crisis_detection", True)):
+                crisis_info = self._compute_crisis_mode(
+                    returns_df,
+                    short_window=int(cfg.get("crisis_short_window", 20)),
+                    long_window=int(cfg.get("crisis_long_window", 60)),
+                    crisis_ratio=float(cfg.get("crisis_corr_ratio", 1.5)),
+                )
+                result["crisis_mode"] = crisis_info.get("crisis_mode", False)
+                result["crisis_info"] = crisis_info
+            else:
+                result["crisis_mode"] = False
+                result["crisis_info"] = {}
+
+            # Phase 3.3 — CVaR computation (stored in result for gate usage)
+            if bool(cfg.get("enable_cvar_gate", True)):
+                cvar_info = self._compute_portfolio_cvar(
+                    returns_df,
+                    weights,
+                    confidence=float(cfg.get("cvar_confidence", 0.95)),
+                )
+                result["cvar_info"] = cvar_info
+            else:
+                result["cvar_info"] = {}
+
+            # Phase 2.3: expose crisis mode to cross-sectional scoring
+            self._last_crisis_mode = bool(result.get("crisis_mode", False))
+
             if bool(cfg.get("debug_log", False)):
                 print(
                     f"[CovRisk] vol={result.get('portfolio_vol_annualized', 0.0):.4f}, "
                     f"max_rc={result.get('max_rc_fraction', 0.0):.4f} "
                     f"ticker={result.get('max_rc_ticker')}, "
+                    f"crisis={result.get('crisis_mode', False)}, "
+                    f"cvar={result.get('cvar_info', {}).get('cvar')}, "
                     f"cols={int(returns_df.shape[1])}, rows={int(returns_df.shape[0])}"
                 )
 
@@ -10136,14 +10679,20 @@ class PaperTradingEngine:
             vt_meta["error"] = str(e)
             return dict(original), vt_meta
     
-    def calculate_momentum(self, ticker, lookback_days=20):
-        """def calculate_momentum: docstring omitted (was garbled/non-ASCII)."""
+    def calculate_momentum(self, ticker, lookback_days=20, skip_recent_days=0):
+        """Return price momentum over lookback_days, optionally skipping the
+        most recent skip_recent_days bars to avoid short-term reversal bias."""
         try:
             hist = self.get_market_data(ticker, period='3mo', interval='1d')
-            if hist is None or len(hist) < lookback_days:
+            skip = max(0, int(skip_recent_days))
+            required = lookback_days + skip + 1
+            if hist is None or len(hist) < required:
                 return 0.0
-            
-            recent_return = (hist['Close'].iloc[-1] - hist['Close'].iloc[-lookback_days]) / hist['Close'].iloc[-lookback_days]
+            end_idx = -(1 + skip) if skip > 0 else -1
+            start_idx = -(lookback_days + skip)
+            end_price = hist['Close'].iloc[end_idx]
+            start_price = hist['Close'].iloc[start_idx]
+            recent_return = (end_price - start_price) / start_price
             return float(recent_return)
         except:
             return 0.0
@@ -10290,25 +10839,38 @@ class PaperTradingEngine:
         if collection is None:
             return []
 
-        include = ['metadatas', 'documents']
+        include = ['ids', 'metadatas', 'documents']
         try:
             results = collection.get(include=include)
         except Exception as e:
             print(f"[NEWS_OVERLAY] WARN collection read failed: {e}")
             return []
 
+        id_rows = results.get('ids', []) if isinstance(results, dict) else []
         metadata_rows = results.get('metadatas', []) if isinstance(results, dict) else []
         document_rows = results.get('documents', []) if isinstance(results, dict) else []
         now_utc = datetime.now(timezone.utc)
         latest_by_l2 = {}
+        _decay_lambda = float(cfg.get('decay_lambda_per_hour', 0.04))
+        max_age_hours = float(cfg.get('max_age_hours', 48.0))
+        _expired_ids = []
+        _most_recent_ts = None
 
         for idx, meta in enumerate(metadata_rows):
+            row_id = id_rows[idx] if idx < len(id_rows) else None
             if not isinstance(meta, dict):
-                continue
-            if str(meta.get('scope', '')).lower() != 'industry':
                 continue
             ts = self._parse_iso_datetime(meta.get('timestamp'))
             if ts is None:
+                continue
+            if _most_recent_ts is None or ts > _most_recent_ts:
+                _most_recent_ts = ts
+            age_hours = max(0.0, (now_utc - ts).total_seconds() / 3600.0)
+            if age_hours > max_age_hours:
+                if row_id is not None:
+                    _expired_ids.append(row_id)
+                continue
+            if str(meta.get('scope', '')).lower() != 'industry':
                 continue
 
             l2 = str(meta.get('L2', '')).strip()
@@ -10317,7 +10879,9 @@ class PaperTradingEngine:
 
             confidence = float(meta.get('confidence', 0.0) or 0.0)
             risk_delta = float(meta.get('risk_delta', 0.0) or 0.0)
-            age_hours = max(0.0, (now_utc - ts).total_seconds() / 3600.0)
+            _decay_weight = float(np.exp(-_decay_lambda * age_hours))
+            confidence = confidence * _decay_weight
+            risk_delta = risk_delta * _decay_weight
             doc = document_rows[idx] if idx < len(document_rows) else None
             doc_text = str(doc) if isinstance(doc, str) else ''
             payload = None
@@ -10335,6 +10899,8 @@ class PaperTradingEngine:
                 'doc_risk_delta': float((payload or {}).get('risk_delta', 0.0) or 0.0) if isinstance(payload, dict) else 0.0,
                 'doc_confidence': float((payload or {}).get('confidence', 0.0) or 0.0) if isinstance(payload, dict) else 0.0,
                 'doc_horizon': str((payload or {}).get('horizon', '') if isinstance(payload, dict) else ''),
+                'decay_weight': _decay_weight,
+                'decay_lambda': _decay_lambda,
             }
 
             row = {
@@ -10342,6 +10908,7 @@ class PaperTradingEngine:
                 'timestamp': ts.isoformat(),
                 'confidence': confidence,
                 'risk_delta': risk_delta,
+                'decay_weight': _decay_weight,
                 'horizon': str(meta.get('horizon', '1d')),
                 'age_hours': age_hours,
                 'payload': payload if isinstance(payload, dict) else {},
@@ -10356,6 +10923,30 @@ class PaperTradingEngine:
                 prev_ts = self._parse_iso_datetime(prev.get('timestamp'))
                 if prev_ts is None or ts > prev_ts:
                     latest_by_l2[l2] = row
+
+        if _expired_ids:
+            try:
+                collection.delete(ids=_expired_ids)
+                print(f"[NEWS_OVERLAY_TTL] deleted {len(_expired_ids)} expired records (age > {max_age_hours:.0f}h) from {collection_name}")
+            except Exception as e:
+                logger.debug("NEWS_OVERLAY_TTL delete failed: %s", e)
+
+        if not latest_by_l2:
+            stale_warn_hours = float(cfg.get('industry_stale_warn_hours', 2.0))
+            if _most_recent_ts is not None:
+                last_age = max(0.0, (now_utc - _most_recent_ts).total_seconds() / 3600.0)
+                if last_age > stale_warn_hours:
+                    logger.warning(
+                        "[INDUSTRY_SIGNAL_STALE] No fresh industry signals found — "
+                        "last record age=%.1fh (warn_threshold=%.1fh). "
+                        "Run: python3 GlobalWatch_V2.py --run-industry-runtime-once",
+                        last_age, stale_warn_hours,
+                    )
+            else:
+                logger.warning(
+                    "[INDUSTRY_SIGNAL_STALE] industry_signals collection is empty. "
+                    "Run: python3 GlobalWatch_V2.py --run-industry-runtime-once"
+                )
 
         return list(latest_by_l2.values())
 
@@ -10720,11 +11311,78 @@ class PaperTradingEngine:
             'confirmed_topics': confirmed_topics,
             'macro_tilts': macro_tilts_filtered,
             'macro_tilts_ignored': macro_tilts_ignored,
-            'signal_summary': signal_summary
+            'signal_summary': signal_summary,
+            'per_ticker_news_score': self._compute_per_ticker_news_score(confirmed_topics),
         }
         self._sync_current_macro_from_cache()
         self.last_macro_time = now
 
+
+    def _compute_per_ticker_news_score(self, confirmed_topics: list) -> dict:
+        """AI.2: Map confirmed macro topics → per-ticker news sentiment scores.
+
+        Uses topic_sector_ticker_map to find which tickers are affected by each
+        confirmed theme. Returns {ticker: score} where score ∈ [-1.0, 1.0].
+
+        A bullish theme on a sector boosts the tickers in that sector;
+        bearish themes penalize them. Score is weighted by topic strength,
+        confidence_effective, and accuracy_factor.
+        """
+        macro_cfg = self.config.get('macro_integration', {})
+        topic_map = macro_cfg.get('topic_sector_ticker_map', {})
+        if not isinstance(topic_map, dict) or not confirmed_topics:
+            return {}
+
+        # Normalize the map: {sector_key_lower: [TICKER, ...]}
+        norm_map: dict[str, list[str]] = {}
+        for sector_key, tickers in topic_map.items():
+            sk = str(sector_key).strip().lower()
+            if not sk:
+                continue
+            if isinstance(tickers, list):
+                norm_map[sk] = [str(t).strip().upper() for t in tickers if str(t).strip()]
+
+        raw_scores: dict[str, float] = {}
+        raw_weights: dict[str, float] = {}
+
+        for topic in confirmed_topics:
+            theme = str(topic.get('theme', '')).strip().lower()
+            direction = str(topic.get('direction', '')).strip().lower()
+            strength = float(topic.get('strength', 0.0))
+            conf_eff = float(topic.get('confidence_effective', topic.get('confidence_raw', 0.5)))
+            acc_factor = float(topic.get('accuracy_factor', 1.0))
+
+            direction_sign = 1.0 if direction == 'bullish' else (-1.0 if direction == 'bearish' else 0.0)
+            if direction_sign == 0.0:
+                continue
+
+            contribution = direction_sign * strength * conf_eff * acc_factor
+
+            # Match this theme against all sector keys in the map
+            for sector_key, tickers in norm_map.items():
+                if sector_key in theme or theme in sector_key:
+                    for ticker in tickers:
+                        raw_scores[ticker] = raw_scores.get(ticker, 0.0) + contribution
+                        raw_weights[ticker] = raw_weights.get(ticker, 0.0) + abs(contribution)
+
+        if not raw_scores:
+            return {}
+
+        # Normalize to [-1, 1] using max absolute score
+        max_abs = max(abs(v) for v in raw_scores.values())
+        if max_abs < 1e-12:
+            return {}
+
+        result = {}
+        for ticker, score in raw_scores.items():
+            result[ticker] = float(np.clip(score / max_abs, -1.0, 1.0))
+
+        if result:
+            top3 = sorted(result.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+            print(f"[AI.2 NEWS SCORE] Per-ticker scores (top5): "
+                  f"{', '.join(f'{t}:{s:+.2f}' for t, s in top3)}")
+
+        return result
 
     def _compute_cross_sectional_metrics(
         self,
@@ -10737,24 +11395,52 @@ class PaperTradingEngine:
         enable_short_term_momentum=False,
         short_lookback_days=10,
         momentum_short_weight=0.4,
-        momentum_medium_weight=0.6
+        momentum_medium_weight=0.6,
+        skip_recent_days=0,
+        sharpe_momentum_weight=0.0,
+        min_volume_z_threshold=-1.5,
+        min_rank_score_threshold=-99.0,
+        crisis_momentum_weight_scale=1.0,
+        news_score_weight=0.0,
     ):
         """Compute momentum/vol metrics and cross-sectional rank score."""
         blend_weight_sum = max(1e-12, float(momentum_short_weight) + float(momentum_medium_weight))
         short_w = float(momentum_short_weight) / blend_weight_sum
         medium_w = float(momentum_medium_weight) / blend_weight_sum
         industry_lookup = self._build_industry_lookup()
+
+        # Crisis mode dampens momentum signal to avoid momentum crashes
+        crisis_active = bool(getattr(self, "_last_crisis_mode", False))
+        eff_crisis_scale = float(np.clip(crisis_momentum_weight_scale, 0.0, 1.0)) if crisis_active else 1.0
+        if crisis_active:
+            print(f"[PHASE2] Crisis mode active — momentum weight scaled by {eff_crisis_scale:.2f}")
+
+        # AI.2: per-ticker news scores from macro cache
+        per_ticker_news = {}
+        if float(news_score_weight) > 0:
+            per_ticker_news = dict(self.cached_macro.get('per_ticker_news_score', {}) or {})
+
         metrics = {}
+        skip = max(0, int(skip_recent_days))
         for asset in trade_universe_assets:
             ticker = str(asset.get('ticker', ''))
             if not ticker or ticker.upper() == 'CASH':
                 continue
 
-            medium_momentum = self.calculate_momentum(ticker, lookback_days)
-            short_momentum = self.calculate_momentum(ticker, short_lookback_days) if enable_short_term_momentum else medium_momentum
+            medium_momentum = self.calculate_momentum(ticker, lookback_days, skip_recent_days=skip)
+            short_momentum = self.calculate_momentum(ticker, short_lookback_days, skip_recent_days=skip) if enable_short_term_momentum else medium_momentum
             blended_momentum = (medium_w * medium_momentum) + (short_w * short_momentum)
             volatility = self.calculate_volatility(ticker, lookback_days)
             volume_z = self.calculate_volume_zscore(ticker, lookback_days=60)
+
+            # Phase 2.6: exclude illiquid assets early
+            if float(volume_z) < float(min_volume_z_threshold):
+                logger.debug(f"[PHASE2 LIQ FILTER] {ticker} excluded: volume_z={volume_z:.2f} < {min_volume_z_threshold:.2f}")
+                continue
+
+            # Phase 2.1: Sharpe-adjusted momentum
+            sharpe_momentum = blended_momentum / max(float(volatility), 0.05)
+
             base_score = momentum_weight * blended_momentum - vol_weight * (volatility - vol_target)
             industry_name = industry_lookup.get(str(ticker).upper(), "UNCLASSIFIED")
             metrics[ticker] = {
@@ -10763,6 +11449,7 @@ class PaperTradingEngine:
                 'short_momentum': float(short_momentum),
                 'volatility': float(max(volatility, 1e-6)),
                 'volume_z': float(volume_z),
+                'sharpe_momentum': float(sharpe_momentum),
                 'industry': industry_name,
                 'industry_strength': 0.0,
                 'volatility_score': 0.0,
@@ -10771,7 +11458,8 @@ class PaperTradingEngine:
                 'momentum_rank_pct': 0.0,
                 'medium_term_z': 0.0,
                 'short_term_z': 0.0,
-                'blended_momentum_z': 0.0
+                'blended_momentum_z': 0.0,
+                'sharpe_z': 0.0,
             }
 
         if not metrics:
@@ -10787,6 +11475,11 @@ class PaperTradingEngine:
         vol_mu = float(np.mean(vol_values))
         vol_sigma = float(np.std(vol_values))
 
+        # Phase 2.1: cross-sectional z-score for Sharpe momentum
+        sharpe_values = np.array([v['sharpe_momentum'] for v in metrics.values()], dtype=float)
+        sharpe_mu = float(np.mean(sharpe_values))
+        sharpe_sigma = float(np.std(sharpe_values))
+
         for ticker, data in metrics.items():
             medium_z = (data['medium_momentum'] - med_mu) / med_sigma if med_sigma > 1e-12 else 0.0
             short_z = (data['short_momentum'] - short_mu) / short_sigma if short_sigma > 1e-12 else 0.0
@@ -10794,12 +11487,14 @@ class PaperTradingEngine:
             if not enable_short_term_momentum:
                 short_z = medium_z
                 blended_z = medium_z
+            sharpe_z = (data['sharpe_momentum'] - sharpe_mu) / sharpe_sigma if sharpe_sigma > 1e-12 else 0.0
             data['medium_term_z'] = float(medium_z)
             data['short_term_z'] = float(short_z)
             data['blended_momentum_z'] = float(blended_z)
+            data['sharpe_z'] = float(sharpe_z)
             data['volatility_score'] = float((vol_mu - data['volatility']) / vol_sigma) if vol_sigma > 1e-12 else 0.0
             if enable_short_term_momentum:
-                print(f"[MOMENTUM] {ticker}: short={short_z:+.2f}, med={medium_z:+.2f}, blended={blended_z:+.2f}")
+                print(f"[MOMENTUM] {ticker}: short={short_z:+.2f}, med={medium_z:+.2f}, blended={blended_z:+.2f}, sharpe_z={sharpe_z:+.2f}")
 
         industry_grouped = {}
         for ticker, data in metrics.items():
@@ -10811,20 +11506,46 @@ class PaperTradingEngine:
             peers = industry_grouped.get(industry_name, [])
             industry_strength = float(np.mean(peers)) if peers else 0.0
             momentum_z = float(data.get('blended_momentum_z', 0.0))
+            sharpe_z = float(data.get('sharpe_z', 0.0))
             volatility_score = float(data.get('volatility_score', 0.0))
             volume_z = float(data.get('volume_z', 0.0))
+
+            # Phase 2.3: in crisis mode, shift weight from momentum toward vol-safety
+            eff_momentum_contrib = eff_crisis_scale * 0.5 * momentum_z
+            eff_vol_contrib = (2.0 - eff_crisis_scale) * 0.3 * volatility_score
+
+            # AI.2: news sentiment score for this ticker
+            news_raw = float(per_ticker_news.get(ticker, per_ticker_news.get(ticker.upper(), 0.0)))
+            news_contrib = float(news_score_weight) * news_raw
+
             final_score = (
-                0.5 * momentum_z +
-                0.3 * volatility_score +
+                eff_momentum_contrib +
+                eff_vol_contrib +
                 0.2 * industry_strength +
-                0.2 * volume_z
+                0.2 * volume_z +
+                sharpe_momentum_weight * sharpe_z +  # Phase 2.1
+                news_contrib                          # AI.2
             )
             data['industry_strength'] = industry_strength
+            data['news_score'] = float(news_raw)
+            data['news_contrib'] = float(news_contrib)
             data['final_score_raw'] = float(final_score)
             data['rank_score'] = float(final_score)
             data['base_score'] = float(final_score)
 
         metrics = self._apply_score_stability_controls(metrics)
+
+        # Phase 2.4: score threshold gate — exclude weak signals
+        if float(min_rank_score_threshold) > -90.0:
+            before_count = len(metrics)
+            metrics = {t: d for t, d in metrics.items() if d['rank_score'] >= float(min_rank_score_threshold)}
+            removed = before_count - len(metrics)
+            if removed > 0:
+                logger.debug(f"[PHASE2 SCORE GATE] Removed {removed} asset(s) with rank_score < {min_rank_score_threshold:.2f}")
+
+        if not metrics:
+            return {}, []
+
         ranked_for_pct = sorted(metrics.items(), key=lambda x: x[1]['rank_score'], reverse=True)
         n = len(ranked_for_pct)
         for rank_idx, (ticker, data) in enumerate(ranked_for_pct, start=1):
@@ -10897,7 +11618,7 @@ class PaperTradingEngine:
 
             return kept, decisions, degraded_reasons
         except Exception as e:
-            print(f"[CORR] Degraded: correlation filter failed ({e}), fallback to ranked list")
+            logger.debug(f"[CORR] Degraded: correlation filter failed ({e}), fallback to ranked list")
             return list(ranked_tickers), [], [f"error:{e}"]
 
     def _apply_score_stability_controls(self, metrics):
@@ -10943,8 +11664,48 @@ class PaperTradingEngine:
             data['normalized_rank_score'] = float(normalized_score)
             data['rank_score'] = capped_score
 
-        print(f"[SCORE STABILITY] smoothing={enable_smoothing} window={window} mu={mu:+.3f} sigma={sigma:.3f} clipped={clipped_count}")
+        logger.debug(f"[SCORE STABILITY] smoothing={enable_smoothing} window={window} mu={mu:+.3f} sigma={sigma:.3f} clipped={clipped_count}")
         return metrics
+
+    def _apply_sector_concentration_cap(
+        self,
+        weights: dict,
+        asset_metrics: dict,
+        max_sector_weight: float = 0.45,
+    ) -> dict:
+        """Phase 2.5: Iteratively scale down the heaviest sector so no sector
+        exceeds max_sector_weight of total portfolio weight.
+
+        Returns adjusted weights dict (does not modify input in-place).
+        """
+        if not weights or max_sector_weight >= 1.0:
+            return dict(weights)
+
+        w = dict(weights)
+        max_iters = 10
+        for _ in range(max_iters):
+            # Compute sector totals
+            sector_totals: dict[str, float] = {}
+            sector_members: dict[str, list[str]] = {}
+            for ticker, wt in w.items():
+                sector = str(asset_metrics.get(ticker, {}).get('industry', 'UNCLASSIFIED'))
+                sector_totals[sector] = sector_totals.get(sector, 0.0) + wt
+                sector_members.setdefault(sector, []).append(ticker)
+
+            over = {s: t for s, t in sector_totals.items() if t > max_sector_weight + 1e-9}
+            if not over:
+                break
+
+            for sector, total in over.items():
+                scale = max_sector_weight / total
+                for ticker in sector_members.get(sector, []):
+                    w[ticker] = w[ticker] * scale
+                print(
+                    f"[PHASE2 SECTOR CAP] {sector}: {total:.2%} -> {max_sector_weight:.2%} "
+                    f"(scaled {len(sector_members.get(sector, []))} assets by {scale:.4f})"
+                )
+
+        return w
 
     def _get_asset_volatility_optional(self, ticker, lookback_days):
         """Return annualized volatility or None if data is insufficient."""
@@ -11096,7 +11857,8 @@ class PaperTradingEngine:
                     price, _, _ = self.get_current_price(ticker)
                     if price is None:
                         continue
-                    value = float(qty_val * float(price))
+                    _fx_rg = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+                    value = float(qty_val * float(price) * _fx_rg)
                     if value <= 0:
                         continue
                     ticker_upper = str(ticker).strip().upper()
@@ -11343,20 +12105,38 @@ class PaperTradingEngine:
             and cov_gate_coverage >= gate_cov_min_coverage
         )
         vol_ok = bool(cov_gate_vol is not None and cov_gate_vol <= max_portfolio_volatility)
+
+        # Phase 3.2 — crisis mode: tighten RC limit if correlation spike detected
+        crisis_mode = False
+        crisis_info = {}
+        effective_rc_limit = float(rc_limit)
+        try:
+            cov_diag_ref = cov_diag_target if isinstance(cov_diag_target, dict) and cov_diag_target.get("status") == "ok" else cov_diag_current
+            if isinstance(cov_diag_ref, dict):
+                crisis_mode = bool(cov_diag_ref.get("crisis_mode", False))
+                crisis_info = cov_diag_ref.get("crisis_info", {}) if isinstance(cov_diag_ref.get("crisis_info"), dict) else {}
+                if crisis_mode:
+                    tighten_pct = float(risk_model_cfg.get("crisis_rc_tighten_pct", 0.30))
+                    effective_rc_limit = float(rc_limit) * (1.0 - tighten_pct)
+                    logger.info("[CRISIS_MODE] Correlation spike detected — RC limit tightened %.2f→%.2f (tighten_pct=%.0f%%)",
+                                rc_limit, effective_rc_limit, tighten_pct * 100)
+        except Exception:
+            pass
+
         rc_hysteresis_decision = None
         rc_hysteresis_decision_base = None
         rc_abort_buffer_meta = None
         if rc_limit > 0:
             rc_hysteresis_decision_base = resolve_portfolio_cov_rc_hysteresis_decision(
                 portfolio_rc_fraction=cov_gate_max_rc,
-                rc_limit=rc_limit,
+                rc_limit=effective_rc_limit,
                 hysteresis_band=portfolio_cov_rc_hysteresis_band,
                 previous_gate_decision=previous_rc_gate_decision,
             )
             rc_abort_buffer_meta = resolve_portfolio_cov_rc_abort_buffer_decision(
                 portfolio_rc_fraction=cov_gate_max_rc,
                 previous_gate_decision=previous_rc_gate_decision,
-                base_rc_limit=rc_limit,
+                base_rc_limit=effective_rc_limit,
                 hysteresis_band=portfolio_cov_rc_hysteresis_band,
                 buffer_enabled=portfolio_cov_rc_abort_buffer_enabled,
                 trigger_consecutive_aborts=portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts,
@@ -11428,6 +12208,22 @@ class PaperTradingEngine:
             abort_flag = True
             abort_reason = "diversity_hhi"
 
+        # Phase 3.3 — CVaR gate
+        cvar_gate_info = {}
+        if not abort_flag and bool(risk_model_cfg.get("enable_cvar_gate", True)):
+            try:
+                cov_diag_ref = cov_diag_target if isinstance(cov_diag_target, dict) and cov_diag_target.get("status") == "ok" else cov_diag_current
+                cvar_info = cov_diag_ref.get("cvar_info", {}) if isinstance(cov_diag_ref, dict) else {}
+                cvar_gate_info = cvar_info if isinstance(cvar_info, dict) else {}
+                cvar_val = cvar_info.get("cvar") if isinstance(cvar_info, dict) else None
+                cvar_threshold = float(risk_model_cfg.get("cvar_daily_threshold", -0.03))
+                if cvar_val is not None and float(cvar_val) < cvar_threshold:
+                    abort_flag = True
+                    abort_reason = "cvar_exceeded"
+                    logger.warning("[CVAR_GATE] CVaR=%.4f < threshold=%.4f — ABORT", float(cvar_val), cvar_threshold)
+            except Exception as e:
+                logger.debug("CVaR gate evaluation failed: %s", e)
+
         metric_name = "max_rc_fraction"
         metric_value = float(cov_gate_max_rc) if cov_gate_max_rc is not None else None
         metric_threshold = float(rc_limit) if rc_limit > 0 else None
@@ -11470,7 +12266,7 @@ class PaperTradingEngine:
             gate_decision_inputs["active_cycles_remaining"] = int(rc_abort_buffer_meta.get("active_cycles_remaining", 0) or 0)
             gate_decision_inputs["degraded_allow"] = bool(rc_abort_buffer_meta.get("degraded_allow", False))
             gate_decision_inputs["rc_buffer_allow_path"] = bool(rc_abort_buffer_meta.get("abort_buffer_allowed_this_path", False))
-            print(
+            logger.debug(
                 "[RC_ABORT_BUFFER] "
                 f"base_rc_limit={rc_abort_buffer_meta.get('base_rc_limit')} "
                 f"effective_rc_limit={rc_abort_buffer_meta.get('effective_rc_limit')} "
@@ -11489,7 +12285,7 @@ class PaperTradingEngine:
             self._last_portfolio_cov_rc_gate_decision = _normalize_cov_rc_gate_decision(
                 rc_hysteresis_decision.get("final_gate_decision")
             )
-            print(
+            logger.debug(
                 "[RC_HYST] "
                 f"portfolio_rc_fraction={rc_hysteresis_decision.get('portfolio_rc_fraction')} "
                 f"rc_limit={rc_hysteresis_decision.get('rc_limit')} "
@@ -11515,7 +12311,7 @@ class PaperTradingEngine:
                 returns_coverage_diag = {"schema_version": 1, "items": []}
                 print(f"[RETURNS_COVERAGE] error={e}")
         if abort_reason == "portfolio_cov_rc_limit":
-            print(
+            logger.debug(
                 "[RISK_GATE_DECISION] "
                 f"metric={gate_decision_inputs.get('metric_name')} "
                 f"value={gate_decision_inputs.get('metric_value')} "
@@ -11576,7 +12372,7 @@ class PaperTradingEngine:
                     fallback_reason = ",".join(invariant_hits)
                 cov_coverage_debug_inputs["fallback_reason"] = fallback_reason
         elif ticker_proxy_used and gate_decision_inputs.get("metric_name") == "max_rc_fraction":
-            print(
+            logger.debug(
                 "[RISK_GATE_DECISION] "
                 f"metric={gate_decision_inputs.get('metric_name')} "
                 f"value={gate_decision_inputs.get('metric_value')} "
@@ -11671,7 +12467,8 @@ class PaperTradingEngine:
             price, _, _ = self.get_current_price(ticker)
             if price is None or price <= 0:
                 continue
-            positions_value += qty * price
+            fx = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+            positions_value += qty * price * fx
 
         total_equity = self.cash + positions_value
         if total_equity <= 1e-9:
@@ -12241,6 +13038,16 @@ class PaperTradingEngine:
         momentum_weights_cfg = execution_cfg.get('momentum_weights', {}) if isinstance(execution_cfg.get('momentum_weights', {}), dict) else {}
         momentum_short_weight = float(momentum_weights_cfg.get('short', 0.4))
         momentum_medium_weight = float(momentum_weights_cfg.get('medium', 0.6))
+        # Phase 2 new params
+        skip_recent_days = int(execution_cfg.get('momentum_skip_recent_days', 0))
+        sharpe_momentum_weight = float(execution_cfg.get('sharpe_momentum_weight', 0.0))
+        crisis_momentum_weight_scale = float(execution_cfg.get('crisis_momentum_weight_scale', 0.5))
+        min_rank_score_threshold = float(execution_cfg.get('min_rank_score_threshold', -99.0))
+        min_volume_z_score = float(execution_cfg.get('min_volume_z_score', -1.5))
+        max_sector_weight = float(execution_cfg.get('max_sector_weight', 1.0))
+        # AI.2 new param
+        macro_cfg_exec = self.config.get('macro_integration', {})
+        news_score_weight = float(macro_cfg_exec.get('news_score_weight', 0.0))
 
         asset_metrics, top_ranked = self._compute_cross_sectional_metrics(
             trade_universe_assets,
@@ -12252,7 +13059,13 @@ class PaperTradingEngine:
             enable_short_term_momentum=enable_short_term_momentum,
             short_lookback_days=short_momentum_lookback_days,
             momentum_short_weight=momentum_short_weight,
-            momentum_medium_weight=momentum_medium_weight
+            momentum_medium_weight=momentum_medium_weight,
+            skip_recent_days=skip_recent_days,
+            sharpe_momentum_weight=sharpe_momentum_weight,
+            min_volume_z_threshold=min_volume_z_score,
+            min_rank_score_threshold=min_rank_score_threshold,
+            crisis_momentum_weight_scale=crisis_momentum_weight_scale,
+            news_score_weight=news_score_weight,
         )
 
         print(f"\n[RANKING] Top {len(top_ranked)} assets (cross-sectional):")
@@ -12273,10 +13086,10 @@ class PaperTradingEngine:
             corr_threshold
         )
         selected_assets = corr_selected
-        print(f"[CORR] Selected {len(selected_assets)}/{len(top_ranked)} after correlation filter (threshold={corr_threshold:.2f})")
+        logger.debug(f"[CORR] Selected {len(selected_assets)}/{len(top_ranked)} after correlation filter (threshold={corr_threshold:.2f})")
         if corr_decisions:
             for d in corr_decisions:
-                print(f"[CORR DROP] {d['dropped']} -> keep {d['kept']} (corr={d['corr']:.2f}, {d['reason']})")
+                logger.debug(f"[CORR DROP] {d['dropped']} -> keep {d['kept']} (corr={d['corr']:.2f}, {d['reason']})")
         if corr_degraded:
             print(f"[CORR DEGRADED] insufficient data for: {', '.join(corr_degraded[:8])}{' ...' if len(corr_degraded) > 8 else ''}")
 
@@ -12332,14 +13145,14 @@ class PaperTradingEngine:
         else:
             raw_weights = {}
 
-        print(f"[VOL SCALE] rank->vol adjusted weights:")
-        print(f"{'Ticker':<8} {'RankW':>10} {'Vol':>10} {'ScaledW':>10}")
-        print('-' * 44)
+        logger.debug(f"[VOL SCALE] rank->vol adjusted weights:")
+        logger.debug(f"{'Ticker':<8} {'RankW':>10} {'Vol':>10} {'ScaledW':>10}")
+        logger.debug('-' * 44)
         for ticker in sorted(raw_weights.keys(), key=lambda x: raw_weights[x], reverse=True):
             rank_w = rank_only_weights.get(ticker, 0.0)
             vol = float(asset_metrics.get(ticker, {}).get('volatility', vol_floor))
-            print(f"{ticker:<8} {rank_w:>9.2%} {vol:>9.2%} {raw_weights[ticker]:>9.2%}")
-        print('-' * 44)
+            logger.debug(f"{ticker:<8} {rank_w:>9.2%} {vol:>9.2%} {raw_weights[ticker]:>9.2%}")
+        logger.debug('-' * 44)
 
         # NOTE: comment omitted (was garbled/non-ASCII).
         invested_budget_raw = max(0.0, 1.0 - cash_target)
@@ -12417,6 +13230,16 @@ class PaperTradingEngine:
             fill_gap_max_iters,
             score_map
         )
+
+        # Phase 2.5: apply sector concentration cap after per-asset caps
+        if max_sector_weight < 1.0 and adjusted_weights and asset_metrics:
+            adjusted_weights = self._apply_sector_concentration_cap(
+                adjusted_weights, asset_metrics, max_sector_weight
+            )
+            alloc_diag['sector_cap_applied'] = True
+            alloc_diag['max_sector_weight'] = float(max_sector_weight)
+        else:
+            alloc_diag['sector_cap_applied'] = False
         alloc_diag['cross_section_top_n'] = int(top_n)
         alloc_diag['ranked_candidates'] = list(top_ranked)
         alloc_diag['corr_selected'] = list(selected_assets)
@@ -12582,7 +13405,7 @@ class PaperTradingEngine:
             vt_scale = float(self.current_vol_targeting_info.get('scale', 1.0) or 1.0)
             vt_vol_before = self.current_vol_targeting_info.get('vol_before')
             vt_vol_target = self.current_vol_targeting_info.get('vol_target')
-            print(f"[VOL TARGET] status={vt_status} scale={vt_scale:.4f} vol_before={vt_vol_before} target={vt_vol_target}")
+            logger.debug(f"[VOL TARGET] status={vt_status} scale={vt_scale:.4f} vol_before={vt_vol_before} target={vt_vol_target}")
 
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_macro['applied_tilts'] = dict(applied_tilts)
@@ -12600,16 +13423,19 @@ class PaperTradingEngine:
         self.current_regime['capped_assets'] = list(capped_assets)
         self.current_regime['allocation_diagnostics'] = dict(alloc_diag)
 
-        print(f"[ALLOC] budget={alloc_diag['invested_budget']:.2%}, before_caps={alloc_diag['total_before_caps']:.2%}, "
+        logger.debug(f"[ALLOC] budget={alloc_diag['invested_budget']:.2%}, before_caps={alloc_diag['total_before_caps']:.2%}, "
               f"after_caps={alloc_diag['total_after_caps']:.2%}, downscaled={alloc_diag['downscaled']}, "
               f"scale={alloc_diag['downscale_factor']:.6f}, gap={alloc_diag['remaining_gap']:.2%}, "
               f"fill_applied={alloc_diag['fill_applied']}, fill_amount={alloc_diag['fill_amount']:.2%}, "
               f"fill_reason={alloc_diag['fill_reason']}")
 
+        # Phase 5.3: store asset_metrics for factor attribution (used in _record_factor_attribution)
+        self._last_asset_metrics_for_attribution = dict(asset_metrics) if isinstance(asset_metrics, dict) else {}
+
         return adjusted_weights
 
     def execute_rebalance(self, target_weights):
-        """def execute_rebalance: docstring omitted (was garbled/non-ASCII)."""
+        """Execute rebalance trades to reach target portfolio weights."""
         self._sync_requested_risk_profile_from_state(force_reload=False)
         self._emit_risk_profile_log()
         
@@ -12617,7 +13443,7 @@ class PaperTradingEngine:
         if self.positions:
             test_ticker = list(self.positions.keys())[0]
             test_price, test_age, test_status = self.get_current_price(test_ticker)
-            print(f"[SELF-CHECK] get_current_price('{test_ticker}') = (price={test_price}, age={test_age}min, status={test_status})")
+            logger.debug("[SELF-CHECK] get_current_price('%s') = (price=%s, age=%smin, status=%s)", test_ticker, test_price, test_age, test_status)
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         trade_context = self._build_trade_context()
@@ -12750,6 +13576,12 @@ class PaperTradingEngine:
         }
         target_weights = dict(target_weights) if isinstance(target_weights, dict) else {}
         self.last_target_weights = dict(target_weights)
+
+        # Phase 4.1: stop-loss overrides — zero out weights for positions below stop threshold
+        target_weights = self._compute_position_stop_loss_overrides(target_weights)
+
+        # Phase 4.2: ramp-in for new entries — scale weight by fraction of ramp_in_cycles elapsed
+        target_weights = self._apply_ramp_in_to_targets(target_weights)
         asset_policy_cfg_now = self._get_asset_data_policy_cfg()
         execution_proxy_enabled = bool(
             str(asset_policy_cfg_now.get("mode", "FORCE_PROXY")).upper() == "FORCE_PROXY"
@@ -12916,12 +13748,10 @@ class PaperTradingEngine:
                 cooldown_blocked=True,
             )
             self.current_execution_summary = execution_summary
-            print(
-                "[COOLDOWN] "
-                f"gate=blocked reason={last_reason} outcome={last_outcome} "
-                f"now_utc={now_rebalance.isoformat()} "
-                f"next_allowed_ts={cooldown_until_ref.isoformat()} "
-                f"remaining_min={remaining:.2f}"
+            logger.debug(
+                "[COOLDOWN] gate=blocked reason=%s outcome=%s now_utc=%s next_allowed_ts=%s remaining_min=%.2f",
+                last_reason, last_outcome, now_rebalance.isoformat(),
+                cooldown_until_ref.isoformat(), remaining,
             )
             self._write_post_rebalance_live_snapshot(0, source="execute_rebalance_attempt_cooldown")
             return []
@@ -12957,7 +13787,7 @@ class PaperTradingEngine:
                 )
                 self.current_price_fetch_stats = dict(stats) if isinstance(stats, dict) else {}
                 if isinstance(stats, dict):
-                    print(
+                    logger.debug(
                         "[PRICE_FETCH] "
                         f"n={int(stats.get('tickers_in', len(prefetch_tickers)))} "
                         f"batch_calls={int(stats.get('batch_calls', 0))} "
@@ -13028,7 +13858,7 @@ class PaperTradingEngine:
         
         stale_ratio = stale_count / total_count if total_count > 0 else 0
         
-        print(f"\n[PRICE CHECK] Total tickers: {total_count}, STALE: {stale_count}, Ratio: {stale_ratio:.1%} | "
+        logger.debug(f"\n[PRICE CHECK] Total tickers: {total_count}, STALE: {stale_count}, Ratio: {stale_ratio:.1%} | "
               f"Policy BUY={sorted(allow_buy_status)} SELL={sorted(allow_sell_status)}")
         if total_count > 0 and stale_count == total_count and 'STALE' not in allow_buy_status:
             print("[INFO] All candidate prices are STALE and BUY policy blocks STALE quotes. "
@@ -13051,12 +13881,16 @@ class PaperTradingEngine:
         # NOTE: comment omitted (was garbled/non-ASCII).
         current_values = {}
         positions_value = 0.0
-        
+        # CAD→USD conversion: .TO tickers are priced in CAD by yfinance; convert to USD
+        # so portfolio valuation is consistently in USD.
+        _cad_usd = self._get_fx_rate("CAD", "USD")
+
         for ticker, qty in self.positions.items():
             if ticker not in price_info:
                 continue
             price, age, status = price_info[ticker]
-            value = qty * price
+            fx = _cad_usd if str(ticker).upper().endswith(".TO") else 1.0
+            value = qty * price * fx
             current_values[ticker] = value
             positions_value += value
         
@@ -13140,7 +13974,7 @@ class PaperTradingEngine:
             weight_diff = abs(target_weight - current_weight)
             
             if weight_diff < weight_threshold:
-                print(f"[SKIP] {ticker} weight diff {weight_diff:.4f} < threshold {weight_threshold:.4f}")
+                logger.debug(f"[SKIP] {ticker} weight diff {weight_diff:.4f} < threshold {weight_threshold:.4f}")
                 self._emit_exec_decision(
                     execution_summary,
                     action="SKIP",
@@ -13211,7 +14045,7 @@ class PaperTradingEngine:
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             if desired_trade_value < min_notional:
-                print(f"[SKIP] {ticker} trade notional ${desired_trade_value:.2f} < min ${min_notional}")
+                logger.debug(f"[SKIP] {ticker} trade notional ${desired_trade_value:.2f} < min ${min_notional}")
                 self._emit_exec_decision(
                     execution_summary,
                     action="SKIP",
@@ -13279,7 +14113,7 @@ class PaperTradingEngine:
                 if isinstance(d2, dict):
                     price_debug_cache[execution_ticker] = d2
                 if execution_ticker not in price_info:
-                    print(f"[SKIP] {original_ticker} no price info")
+                    logger.debug(f"[SKIP] {original_ticker} no price info")
                     self._emit_exec_decision(
                         execution_summary,
                         action="SKIP",
@@ -13303,7 +14137,7 @@ class PaperTradingEngine:
             # NOTE: comment omitted (was garbled/non-ASCII).
             if side == 'BUY' and status not in allow_buy_status:
                 policy_skip_count += 1
-                print(f"[SKIP] {original_ticker} BUY status={status} not in allow_buy={sorted(allow_buy_status)}")
+                logger.debug(f"[SKIP] {original_ticker} BUY status={status} not in allow_buy={sorted(allow_buy_status)}")
                 self._emit_exec_decision(
                     execution_summary,
                     action="SKIP",
@@ -13321,7 +14155,7 @@ class PaperTradingEngine:
                 continue
             if side == 'SELL' and status not in allow_sell_status:
                 policy_skip_count += 1
-                print(f"[SKIP] {original_ticker} SELL status={status} not in allow_sell={sorted(allow_sell_status)}")
+                logger.debug(f"[SKIP] {original_ticker} SELL status={status} not in allow_sell={sorted(allow_sell_status)}")
                 self._emit_exec_decision(
                     execution_summary,
                     action="SKIP",
@@ -13508,9 +14342,9 @@ class PaperTradingEngine:
                 print(f"[WARN] cooldown apply failed (stale_abort): {e}")
             return []
         elif candidate_count_policy_pass == 0:
-            print("[STALE CHECK] Skip stale-abort: no policy-pass tradable candidates.")
+            logger.debug("[STALE CHECK] Skip stale-abort: no policy-pass tradable candidates.")
         elif not stale_abort_allowed:
-            print(f"[STALE CHECK] Skip stale-abort outside tradable session (state={session_state}, open_grace={open_grace_passed}).")
+            logger.debug(f"[STALE CHECK] Skip stale-abort outside tradable session (state={session_state}, open_grace={open_grace_passed}).")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_stale_info['price_stale_skip'] = policy_skip_count > 0
@@ -13557,17 +14391,17 @@ class PaperTradingEngine:
                     if str(risk_gate.get('abort_reason', '') or '') == 'portfolio_cov_rc_limit':
                         self._emit_cov_coverage_logs(risk_gate.get('cov_coverage', {}))
                 else:
-                    print("[COV_REFRESH] recovered_from_portfolio_cov_rc_limit=true")
+                    logger.debug("[COV_REFRESH] recovered_from_portfolio_cov_rc_limit=true")
         self.current_risk_check_info = dict(risk_gate)
 
         if risk_gate.get('volatility_confident', False):
-            print(f"[RISK CHECK] Portfolio volatility = {risk_gate['weighted_volatility']:.2f} "
+            logger.debug(f"[RISK CHECK] Portfolio volatility = {risk_gate['weighted_volatility']:.2f} "
                   f"(limit {risk_gate['max_portfolio_volatility']:.2f}, known_weight={risk_gate['volatility_known_weight']:.1%})")
         else:
-            print(f"[RISK CHECK] Portfolio volatility unknown coverage {risk_gate['volatility_known_weight']:.1%} "
+            logger.debug(f"[RISK CHECK] Portfolio volatility unknown coverage {risk_gate['volatility_known_weight']:.1%} "
                   f"< required {risk_gate['min_coverage']:.1%}; skip volatility gate")
         if risk_gate.get('enable_diversity_check', False):
-            print(f"[RISK CHECK] Herfindahl Index = {risk_gate['herfindahl_index']:.3f} "
+            logger.debug(f"[RISK CHECK] Herfindahl Index = {risk_gate['herfindahl_index']:.3f} "
                   f"(limit {risk_gate['max_herfindahl_index']:.3f})")
 
         if risk_gate.get('abort', False):
@@ -13738,6 +14572,8 @@ class PaperTradingEngine:
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         max_turnover_pct = execution_config.get('max_turnover_pct_per_rebalance', 0.20)
+        # Phase 4.3: adaptive turnover — reduce limit when portfolio vol is elevated
+        max_turnover_pct = self._compute_adaptive_turnover_limit(max_turnover_pct)
         turnover_limit = total_equity * max_turnover_pct
         
         planner_enabled = bool(planner_cfg.get('enable_trade_planner', False))
@@ -13803,7 +14639,7 @@ class PaperTradingEngine:
                     
                     # NOTE: comment omitted (was garbled/non-ASCII).
                     if scaled_trade_value < min_notional:
-                        print(f"[SKIP] {trade['ticker']} scaled notional ${scaled_trade_value:.2f} < min ${min_notional}")
+                        logger.debug(f"[SKIP] {trade['ticker']} scaled notional ${scaled_trade_value:.2f} < min ${min_notional}")
                         continue
                     
                     trade['desired_trade_value'] = scaled_trade_value
@@ -13847,7 +14683,7 @@ class PaperTradingEngine:
                         'trade': trade,
                         'desired_abs': float(desired_abs),
                     })
-                    print(f"[SKIP] {trade.get('ticker', '')} post-planner notional ${desired_abs:.2f} < min ${min_notional}")
+                    logger.debug(f"[SKIP] {trade.get('ticker', '')} post-planner notional ${desired_abs:.2f} < min ${min_notional}")
                     continue
                 filtered_trades.append(trade)
             planned_trades = filtered_trades
@@ -14120,12 +14956,16 @@ class PaperTradingEngine:
             ticker = trade['ticker']
             price = trade['price']
             desired_notional = abs(trade['desired_trade_value'])
-            
+
+            # Convert native price to USD so qty and cash are always in USD.
+            _fx_sell = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+            price_usd = price * _fx_sell
+
             # NOTE: comment omitted (was garbled/non-ASCII).
             current_qty = self.positions.get(ticker, 0)
-            sell_qty = int(desired_notional / price)
+            sell_qty = int(desired_notional / price_usd)
             sell_qty = min(sell_qty, current_qty)
-            
+
             if sell_qty <= 0:
                 self._emit_exec_decision(
                     execution_summary,
@@ -14144,7 +14984,7 @@ class PaperTradingEngine:
                 continue
             
             # NOTE: comment omitted (was garbled/non-ASCII).
-            proceeds = sell_qty * price
+            proceeds = sell_qty * price_usd
             cost = proceeds * self.config['objectives']['transaction_cost_pct']
             net_proceeds = proceeds - cost
             turnover_notional_post += proceeds
@@ -14177,7 +15017,7 @@ class PaperTradingEngine:
             decision_trace.extend(alloc_trace)
 
             equity_reference = float(total_equity) if total_equity > 0 else 0.0
-            old_position_value = float(trade.get('current_value', current_qty * price) or 0.0)
+            old_position_value = float(trade.get('current_value', current_qty * price * _fx_sell) or 0.0)
             new_position_value = max(0.0, old_position_value - proceeds)
             if equity_reference > 0:
                 old_weight = float(old_position_value / equity_reference)
@@ -14245,12 +15085,12 @@ class PaperTradingEngine:
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
             })
-            print(
-                "[TRADE_COST] "
-                f"side=SELL ticker={ticker} notional={float(proceeds):.2f} "
-                f"slippage={float(cost_breakdown_sell.get('slippage_cost', 0.0) or 0.0):.4f} "
-                f"fee={float(cost_breakdown_sell.get('fee_cost', 0.0) or 0.0):.4f} "
-                f"total_cost={float(cost_total_sell):.4f}"
+            logger.debug(
+                "[TRADE_COST] side=SELL ticker=%s notional=%.2f slippage=%.4f fee=%.4f total_cost=%.4f",
+                ticker, float(proceeds),
+                float(cost_breakdown_sell.get('slippage_cost', 0.0) or 0.0),
+                float(cost_breakdown_sell.get('fee_cost', 0.0) or 0.0),
+                float(cost_total_sell),
             )
             self._emit_exec_decision(
                 execution_summary,
@@ -14267,16 +15107,20 @@ class PaperTradingEngine:
                 cooldown_blocked=False,
             )
             
-            print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price:.2f} (notional: ${proceeds:.2f}, {trade['status']})")
+            print(f"[TRADE] SELL {sell_qty} {ticker} @ ${price_usd:.2f} (notional: ${proceeds:.2f}, {trade['status']})")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         for trade in [t for t in planned_trades if t['side'] == 'BUY']:
             ticker = trade['ticker']
             price = trade['price']
             desired_notional = abs(trade['desired_trade_value'])
-            
+
+            # Convert native price to USD so qty and cash are always in USD.
+            _fx_buy = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+            price_usd = price * _fx_buy
+
             # NOTE: comment omitted (was garbled/non-ASCII).
-            buy_qty = int(desired_notional / price)
+            buy_qty = int(desired_notional / price_usd)
             
             if buy_qty <= 0:
                 self._emit_exec_decision(
@@ -14297,16 +15141,16 @@ class PaperTradingEngine:
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             cash_before_trade = self.cash
-            required_cash = buy_qty * price
+            required_cash = buy_qty * price_usd
             cost = required_cash * self.config['objectives']['transaction_cost_pct']
             total_required = required_cash + cost
-            
+
             if total_required > self.cash:
                 # NOTE: comment omitted (was garbled/non-ASCII).
-                buy_qty = int((self.cash * 0.99) / (price * (1 + self.config['objectives']['transaction_cost_pct'])))
+                buy_qty = int((self.cash * 0.99) / (price_usd * (1 + self.config['objectives']['transaction_cost_pct'])))
                 
                 if buy_qty <= 0:
-                    print(f"[SKIP] {ticker} insufficient cash")
+                    logger.debug(f"[SKIP] {ticker} insufficient cash")
                     self._emit_exec_decision(
                         execution_summary,
                         action="SKIP",
@@ -14323,7 +15167,7 @@ class PaperTradingEngine:
                     )
                     continue
                 
-                required_cash = buy_qty * price
+                required_cash = buy_qty * price_usd
                 cost = required_cash * self.config['objectives']['transaction_cost_pct']
                 total_required = required_cash + cost
             
@@ -14363,7 +15207,7 @@ class PaperTradingEngine:
             decision_trace.extend(alloc_trace)
 
             equity_reference = float(total_equity) if total_equity > 0 else 0.0
-            old_position_value = float(trade.get('current_value', old_qty * price) or 0.0)
+            old_position_value = float(trade.get('current_value', old_qty * price_usd) or 0.0)
             new_position_value = max(0.0, old_position_value + required_cash)
             if equity_reference > 0:
                 old_weight = float(old_position_value / equity_reference)
@@ -14431,12 +15275,12 @@ class PaperTradingEngine:
                 'price_age_minutes': trade['age'],
                 'price_status': trade['status']
             })
-            print(
-                "[TRADE_COST] "
-                f"side=BUY ticker={ticker} notional={float(required_cash):.2f} "
-                f"slippage={float(cost_breakdown_buy.get('slippage_cost', 0.0) or 0.0):.4f} "
-                f"fee={float(cost_breakdown_buy.get('fee_cost', 0.0) or 0.0):.4f} "
-                f"total_cost={float(cost_total_buy):.4f}"
+            logger.debug(
+                "[TRADE_COST] side=BUY ticker=%s notional=%.2f slippage=%.4f fee=%.4f total_cost=%.4f",
+                ticker, float(required_cash),
+                float(cost_breakdown_buy.get('slippage_cost', 0.0) or 0.0),
+                float(cost_breakdown_buy.get('fee_cost', 0.0) or 0.0),
+                float(cost_total_buy),
             )
             self._emit_exec_decision(
                 execution_summary,
@@ -14453,7 +15297,7 @@ class PaperTradingEngine:
                 cooldown_blocked=False,
             )
             
-            print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price:.2f} (notional: ${required_cash:.2f}, {trade['status']})")
+            print(f"[TRADE] BUY {buy_qty} {ticker} @ ${price_usd:.2f} (notional: ${required_cash:.2f}, {trade['status']})")
 
         # NOTE: comment omitted (was garbled/non-ASCII).
         self.current_turnover_info['turnover_notional_post'] = turnover_notional_post
@@ -14690,7 +15534,8 @@ class PaperTradingEngine:
             if not price or price <= 0:
                 continue
 
-            value = qty * price
+            _fx_cb = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+            value = qty * price * _fx_cb
             score, momentum, volatility, ticker_drawdown, score_source = self._compute_position_score_for_derisk(ticker)
 
             holdings.append({
@@ -14699,6 +15544,7 @@ class PaperTradingEngine:
                 'price': price,
                 'age': age_min,
                 'status': status,
+                'fx': _fx_cb,
                 'value': value,
                 'score': score,
                 'momentum': momentum,
@@ -14787,13 +15633,14 @@ class PaperTradingEngine:
                 break
 
             desired_notional = min(h['value'], remaining_cash_needed, remaining_turnover_budget)
-            sell_qty = int(desired_notional / h['price'])
+            _price_usd_cb = h['price'] * h.get('fx', 1.0)
+            sell_qty = int(desired_notional / _price_usd_cb)
             sell_qty = min(sell_qty, h['qty'])
 
             if sell_qty <= 0:
                 continue
 
-            proceeds = sell_qty * h['price']
+            proceeds = sell_qty * _price_usd_cb
             if proceeds < min_notional:
                 continue
 
@@ -14904,12 +15751,12 @@ class PaperTradingEngine:
                 'turnover_scale': turnover_scale,
                 'turnover_capped': turnover_capped,
             })
-            print(
-                "[TRADE_COST] "
-                f"side=SELL ticker={h['ticker']} notional={float(proceeds):.2f} "
-                f"slippage={float(cost_breakdown_sell.get('slippage_cost', 0.0) or 0.0):.4f} "
-                f"fee={float(cost_breakdown_sell.get('fee_cost', 0.0) or 0.0):.4f} "
-                f"total_cost={float(cost_total_sell):.4f}"
+            logger.debug(
+                "[TRADE_COST] side=SELL ticker=%s notional=%.2f slippage=%.4f fee=%.4f total_cost=%.4f",
+                h['ticker'], float(proceeds),
+                float(cost_breakdown_sell.get('slippage_cost', 0.0) or 0.0),
+                float(cost_breakdown_sell.get('fee_cost', 0.0) or 0.0),
+                float(cost_total_sell),
             )
 
         self.current_turnover_info = {
@@ -14982,7 +15829,8 @@ class PaperTradingEngine:
         for ticker, qty in self.positions.items():
             price, age_min, status = self.get_current_price(ticker)  # NOTE: comment omitted (was garbled/non-ASCII).
             if price:
-                positions_value += qty * price
+                fx = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+                positions_value += qty * price * fx
 
         total_equity = self.cash + positions_value
 
@@ -14993,27 +15841,27 @@ class PaperTradingEngine:
         max_dd = self.config['objectives']['max_drawdown_pct']
 
         if drawdown > max_dd:
-            print(f"[WARN] CIRCUIT BREAKER: Drawdown {drawdown:.2%} exceeds limit {max_dd:.2%}")
+            logger.warning("CIRCUIT BREAKER: Drawdown %.2f%% exceeds limit %.2f%%", drawdown * 100, max_dd * 100)
             trades = self._run_circuit_breaker_derisk(drawdown, max_dd)
             if trades:
-                print(f"[CIRCUIT] Executed {len(trades)} structured de-risk trades")
+                logger.info("CIRCUIT: Executed %d structured de-risk trades", len(trades))
             else:
-                print("[CIRCUIT] No de-risk trades executed (already at target cash or constrained)")
+                logger.info("CIRCUIT: No de-risk trades executed (already at target cash or constrained)")
             return True
 
         return False
     def record_snapshot(self):
         """def record_snapshot: docstring omitted (was garbled/non-ASCII)."""
-        print(f"[DEBUG] Recording snapshot at {datetime.now().strftime('%H:%M:%S')}")
-        import sys; sys.stdout.flush()
-        
+        logger.debug("Recording snapshot at %s", datetime.now().strftime('%H:%M:%S'))
+
         positions_value = 0.0
         positions_detail = {}
-        
+
         for ticker, qty in self.positions.items():
             price, age_min, status = self.get_current_price(ticker)  # NOTE: comment omitted (was garbled/non-ASCII).
             if price:
-                value = qty * price
+                fx = self._get_fx_rate("CAD", "USD") if str(ticker).upper().endswith(".TO") else 1.0
+                value = qty * price * fx
                 positions_value += value
                 positions_detail[ticker] = {
                     'quantity': qty,
@@ -15021,9 +15869,8 @@ class PaperTradingEngine:
                     'value': value
                 }
         
-        print(f"[DEBUG] Snapshot complete at {datetime.now().strftime('%H:%M:%S')}")
-        import sys; sys.stdout.flush()
-        
+        logger.debug("Snapshot complete at %s", datetime.now().strftime('%H:%M:%S'))
+
         total_equity = self.cash + positions_value
         
         total_return = (total_equity - self.initial_cash) / self.initial_cash
@@ -15345,7 +16192,12 @@ class PaperTradingEngine:
             'trade_planner_num_adv_dropped': int((self.current_planner_info or {}).get('num_adv_dropped', 0)) if isinstance(self.current_planner_info, dict) else 0,
             'trade_planner_normal_score_count': int((((self.current_planner_info or {}).get('normal_score_stats', {}) or {}).get('count', 0))) if isinstance(self.current_planner_info, dict) else 0,
             'news_overlay_debug': dict(self.current_news_overlay_info) if isinstance(self.current_news_overlay_info, dict) else {'enabled': False, 'status': 'unavailable'},
-            'diagnostic_hint': self.last_diagnostic_hint
+            'diagnostic_hint': self.last_diagnostic_hint,
+            # Phase 5.2: rolling drawdown circuit breaker state
+            'circuit_breaker_rolling_active': bool(self.circuit_breaker_rolling_active),
+            'circuit_breaker_rolling_triggered_cycle': self.circuit_breaker_rolling_triggered_cycle,
+            # Phase 5.3: factor attribution snapshot
+            'factor_contributions': dict(self.current_factor_contributions) if hasattr(self, 'current_factor_contributions') and isinstance(self.current_factor_contributions, dict) else {},
         }
         
         self.portfolio_snapshots.append(snapshot)
@@ -15488,7 +16340,7 @@ class PaperTradingEngine:
                 hist = self.get_market_data(ticker, period='1mo', interval='1d')
                 
                 if hist is None or len(hist) < evaluation_days + 1:
-                    print(f"[BENCHMARK] {ticker}: insufficient data (need {evaluation_days+1} days)")
+                    logger.debug(f"[BENCHMARK] {ticker}: insufficient data (need {evaluation_days+1} days)")
                     continue
                 
                 # NOTE: comment omitted (was garbled/non-ASCII).
@@ -15498,14 +16350,14 @@ class PaperTradingEngine:
                 ret = (latest_close - past_close) / past_close
                 bench_returns[ticker] = float(ret)
                 
-                print(f"[BENCHMARK] {ticker}: {ret:.2%} over {evaluation_days} days")
+                logger.debug(f"[BENCHMARK] {ticker}: {ret:.2%} over {evaluation_days} days")
                 
             except Exception as e:
-                print(f"[BENCHMARK] {ticker}: error - {e}")
+                logger.debug(f"[BENCHMARK] {ticker}: error - {e}")
                 continue
         
         if not bench_returns:
-            print("[BENCHMARK] No valid benchmark data")
+            logger.debug("[BENCHMARK] No valid benchmark data")
             return {}, 0.0, 0.0
         
         # NOTE: comment omitted (was garbled/non-ASCII).
@@ -15618,7 +16470,26 @@ class PaperTradingEngine:
         print(f"[REGIME] Market State: {regime_state.upper()}")
         print(f"[REGIME] Dynamic Min Cash: {dynamic_min_cash:.1%} (was {self.config['objectives']['min_cash_pct']:.1%})")
         print(f"[REGIME] Dynamic Max Weight: {dynamic_max_weight:.1%} (was {self.config['objectives']['max_weight_per_asset']:.1%})")
-        
+
+        # Phase 3.4 — auto risk profile switching based on VIX + regime
+        try:
+            suggested_profile = self._compute_auto_risk_profile_signal(regime_state)
+            if suggested_profile and suggested_profile != (self.active_risk_profile or RISK_PROFILE_DEFAULT):
+                manager = getattr(self, "risk_profile_state_manager", None)
+                if manager is not None:
+                    manager.update_requested(
+                        suggested_profile,
+                        set_by="auto_risk_profile",
+                        actor="engine_auto_vix_regime",
+                    )
+                else:
+                    self.requested_risk_profile = suggested_profile
+                logger.info("[AUTO_RISK_PROFILE] Requested switch: %s → %s (regime=%s)",
+                            self.active_risk_profile, suggested_profile, regime_state)
+                print(f"[AUTO_RISK_PROFILE] Requesting switch to '{suggested_profile}' (regime={regime_state})")
+        except Exception as e:
+            logger.debug("Auto risk profile signal failed: %s", e)
+
         return regime_state, trend_score, regime_details, dynamic_min_cash, dynamic_max_weight
 
     def run_cycle(self):
@@ -15672,7 +16543,7 @@ class PaperTradingEngine:
             else:
                 target_weights = dict(self.cached_target_weights)
                 self.current_weights_reused = True
-                print(f"[SIGNAL REFRESH] Reusing target weights ({signal_elapsed:.1f}m < {self.signal_refresh_minutes}m)")
+                logger.debug(f"[SIGNAL REFRESH] Reusing target weights ({signal_elapsed:.1f}m < {self.signal_refresh_minutes}m)")
 
         snapshot = self.record_snapshot()
 
@@ -15698,6 +16569,7 @@ class PaperTradingEngine:
                 current_price = pos['price']
                 value = pos['value']
                 weight = value / snapshot['total_equity'] * 100
+                price_sym = "C$" if str(ticker).upper().endswith(".TO") else "$"
 
                 cost_basis = self.get_cost_basis(ticker)
                 if cost_basis:
@@ -15708,7 +16580,7 @@ class PaperTradingEngine:
                     pnl_str = "N/A"
                     pnl_color = "NA"
 
-                print(f"{ticker:<8} {qty:>6} ${current_price:>9.2f} ${value:>11,.2f} {weight:>7.1f}% {pnl_color} {pnl_str:>8}")
+                print(f"{ticker:<8} {qty:>6} {price_sym}{current_price:>9.2f} ${value:>11,.2f} {weight:>7.1f}% {pnl_color} {pnl_str:>8}")
 
             print("-" * 60)
 
@@ -15716,6 +16588,9 @@ class PaperTradingEngine:
             print("[WARN] Risk control triggered (risk_off_forced active), skipping normal rebalance")
             self.current_cycle += 1
             return
+
+        # Phase 5.2: rolling drawdown circuit breaker
+        self._check_rolling_drawdown_circuit_breaker()
 
         print("\nTarget Weights:")
         for ticker, weight in sorted(target_weights.items(), key=lambda x: x[1], reverse=True):
@@ -15745,6 +16620,13 @@ class PaperTradingEngine:
                 print("No trades executed (already_balanced_or_filtered)")
             else:
                 print(f"No trades executed ({self.current_rebalance_skipped_reason or 'already_balanced_or_filtered'})")
+
+        # Phase 5.3: record factor attribution for this cycle
+        prev_equity = self.portfolio_snapshots[-2]['total_equity'] if len(self.portfolio_snapshots) >= 2 else self.initial_cash
+        curr_equity = self.portfolio_snapshots[-1]['total_equity'] if self.portfolio_snapshots else self.initial_cash
+        cycle_return = (curr_equity - prev_equity) / prev_equity if prev_equity > 0 else 0.0
+        self._record_factor_attribution(cycle_return=cycle_return)
+        self._write_daily_summary(trades=trades)
 
         self.current_cycle += 1
 
@@ -15799,22 +16681,19 @@ class PaperTradingEngine:
                 sleep_seconds = self.config['rebalance_minutes'] * 60
                 
                 if datetime.now() + timedelta(seconds=sleep_seconds) >= self.end_time:
-                    print(f"\n[INFO] Approaching end time, running final cycle...")
+                    logger.info("Approaching end time, running final cycle...")
                     break
                 
-                print(f"\nSleeping for {self.config['rebalance_minutes']} minutes...")
-                print(f"   Next cycle at: {(datetime.now() + timedelta(seconds=sleep_seconds)).strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                print(f"[DEBUG] About to sleep at {datetime.now().strftime('%H:%M:%S')}")
-                print(f"[DEBUG] Sleep duration: {sleep_seconds} seconds")
-                import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
+                logger.info(
+                    "Sleeping for %s minutes... next cycle at %s",
+                    self.config['rebalance_minutes'],
+                    (datetime.now() + timedelta(seconds=sleep_seconds)).strftime('%Y-%m-%d %H:%M:%S'),
+                )
+                logger.debug("Sleeping %d seconds", sleep_seconds)
                 time.sleep(sleep_seconds)
-                print(f"[DEBUG] Woke up at {datetime.now().strftime('%H:%M:%S')}")
-                import sys; sys.stdout.flush()  # NOTE: comment omitted (was garbled/non-ASCII).
-            
-            print(f"\n{'='*60}")
-            print("Final Snapshot")
-            print(f"{'='*60}")
+                logger.debug("Woke up at %s", datetime.now().strftime('%H:%M:%S'))
+
+            logger.info("Final Snapshot")
             self.run_cycle()
             self._maybe_generate_daily_report()
             
@@ -16012,7 +16891,149 @@ class PaperTradingEngine:
         print(f"[OK] Equity curve saved: {curve_path}")
         
         plt.close()
-    
+
+    # ------------------------------------------------------------------
+    # Phase 5.1 – Enhanced performance metrics
+    # ------------------------------------------------------------------
+    def _compute_enhanced_performance_metrics(self, returns, trades_log, max_drawdown, annualized_return):
+        """Compute Sortino, Calmar, win rate, avg win/loss, max consecutive losses."""
+        metrics = {
+            'sortino': 0.0,
+            'calmar': 0.0,
+            'win_rate': 0.0,
+            'avg_win': 0.0,
+            'avg_loss': 0.0,
+            'win_loss_ratio': 0.0,
+            'max_consecutive_losses': 0,
+        }
+        if returns:
+            avg_return = float(np.mean(returns))
+            neg_returns = [r for r in returns if r < 0]
+            downside_std = float(np.std(neg_returns)) if neg_returns else 0.0
+            metrics['sortino'] = float(avg_return / downside_std * np.sqrt(252)) if downside_std > 0 else 0.0
+        if max_drawdown > 0:
+            metrics['calmar'] = float(annualized_return / max_drawdown)
+
+        if trades_log:
+            trade_pnls = []
+            ticker_basis = {}
+            for t in trades_log:
+                side = str(t.get('side', '')).upper()
+                ticker = str(t.get('ticker', ''))
+                price = float(t.get('price', 0.0) or 0.0)
+                qty = float(t.get('quantity', 0.0) or 0.0)
+                if side == 'BUY' and qty > 0:
+                    ticker_basis[ticker] = price
+                elif side == 'SELL' and ticker in ticker_basis and qty > 0:
+                    pnl_pct = (price - ticker_basis[ticker]) / ticker_basis[ticker]
+                    trade_pnls.append(pnl_pct)
+                    del ticker_basis[ticker]
+            if trade_pnls:
+                wins = [p for p in trade_pnls if p > 0]
+                losses = [p for p in trade_pnls if p <= 0]
+                metrics['win_rate'] = float(len(wins) / len(trade_pnls))
+                metrics['avg_win'] = float(np.mean(wins)) if wins else 0.0
+                metrics['avg_loss'] = float(np.mean(losses)) if losses else 0.0
+                metrics['win_loss_ratio'] = float(abs(metrics['avg_win'] / metrics['avg_loss'])) if metrics['avg_loss'] != 0 else 0.0
+                max_consec = 0
+                cur_consec = 0
+                for p in trade_pnls:
+                    if p <= 0:
+                        cur_consec += 1
+                        max_consec = max(max_consec, cur_consec)
+                    else:
+                        cur_consec = 0
+                metrics['max_consecutive_losses'] = max_consec
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Phase 5.2 – Rolling drawdown circuit breaker
+    # ------------------------------------------------------------------
+    def _check_rolling_drawdown_circuit_breaker(self):
+        """Check last N cycles for rolling drawdown; switch to low risk profile if exceeded."""
+        exec_cfg = self.config.get('execution', {})
+        if not bool(exec_cfg.get('circuit_breaker_rolling_enabled', True)):
+            return
+        window = int(exec_cfg.get('circuit_breaker_rolling_window', 10))
+        threshold = float(exec_cfg.get('circuit_breaker_rolling_drawdown_pct', 0.12))
+        recovery_pct = float(exec_cfg.get('circuit_breaker_rolling_recovery_pct', 0.03))
+
+        if len(self.portfolio_snapshots) < 2:
+            return
+
+        recent = self.portfolio_snapshots[-window:]
+        start_equity = float(recent[0].get('total_equity', 0.0))
+        end_equity = float(recent[-1].get('total_equity', 0.0))
+        if start_equity <= 0:
+            return
+
+        rolling_dd = (start_equity - end_equity) / start_equity
+
+        if not self.circuit_breaker_rolling_active:
+            if rolling_dd >= threshold:
+                self.circuit_breaker_rolling_active = True
+                self.circuit_breaker_rolling_triggered_cycle = self.current_cycle
+                self.circuit_breaker_rolling_recovery_equity = end_equity * (1.0 + recovery_pct)
+                # Switch to low risk profile (write runtime control request so it persists)
+                try:
+                    self.write_runtime_control_request('low', request_id='circuit_breaker_rolling')
+                except Exception:
+                    pass
+                self.active_risk_profile = 'low'
+                self.requested_risk_profile = 'low'
+                self.risk_profile_source = 'circuit_breaker_rolling'
+                print(f"[CIRCUIT BREAKER] Rolling {window}-cycle drawdown {rolling_dd:.2%} >= {threshold:.2%} — switching to LOW risk profile")
+        else:
+            # Check for recovery
+            current_equity = end_equity
+            if self.circuit_breaker_rolling_recovery_equity is not None and current_equity >= self.circuit_breaker_rolling_recovery_equity:
+                self.circuit_breaker_rolling_active = False
+                self.circuit_breaker_rolling_triggered_cycle = None
+                self.circuit_breaker_rolling_recovery_equity = None
+                print(f"[CIRCUIT BREAKER] Recovery detected (equity {current_equity:,.2f}), releasing LOW risk override")
+
+    # ------------------------------------------------------------------
+    # Phase 5.3 – Factor attribution reporting
+    # ------------------------------------------------------------------
+    def _record_factor_attribution(self, cycle_return: float = 0.0):
+        """Compute average factor contributions from last asset_metrics and write to attribution JSONL."""
+        asset_metrics = self._last_asset_metrics_for_attribution
+        if not asset_metrics:
+            self.current_factor_contributions = {}
+            return
+
+        momentum_z_vals = [float(m.get('blended_momentum_z', 0.0)) for m in asset_metrics.values()]
+        sharpe_z_vals = [float(m.get('sharpe_z', 0.0)) for m in asset_metrics.values()]
+        news_contrib_vals = [float(m.get('news_contrib', 0.0)) for m in asset_metrics.values()]
+        vol_score_vals = [float(m.get('vol_score', m.get('volatility_score', 0.0))) for m in asset_metrics.values()]
+
+        contrib = {
+            'cycle': int(self.current_cycle),
+            'timestamp': self._now().isoformat(),
+            'cycle_return': float(cycle_return),
+            'momentum_z_avg': float(np.mean(momentum_z_vals)) if momentum_z_vals else 0.0,
+            'sharpe_z_avg': float(np.mean(sharpe_z_vals)) if sharpe_z_vals else 0.0,
+            'news_contrib_avg': float(np.mean(news_contrib_vals)) if news_contrib_vals else 0.0,
+            'vol_score_avg': float(np.mean(vol_score_vals)) if vol_score_vals else 0.0,
+            'n_assets': len(asset_metrics),
+        }
+        self.current_factor_contributions = contrib
+        self._append_attribution_jsonl(contrib)
+
+    def _append_attribution_jsonl(self, record: dict):
+        """Append a factor attribution record to the attribution JSONL file."""
+        attribution_path = self.config.get('reporting', {}).get('attribution_path', '')
+        if not attribution_path:
+            return
+        try:
+            import os as _os
+            _os.makedirs(_os.path.dirname(_os.path.abspath(attribution_path)), exist_ok=True)
+            with open(attribution_path, 'a', encoding='utf-8') as f:
+                import json as _json
+                f.write(_json.dumps(record, default=str) + '\n')
+        except Exception as e:
+            print(f"[WARN] Could not write attribution JSONL: {e}")
+
     def generate_summary_report(self):
         """def generate_summary_report: docstring omitted (was garbled/non-ASCII)."""
         if not self.portfolio_snapshots:
@@ -16036,7 +17057,13 @@ class PaperTradingEngine:
             std_return = np.std(returns)
             sharpe = (avg_return / std_return * np.sqrt(252)) if std_return > 0 else 0
         else:
+            avg_return = 0.0
             sharpe = 0
+
+        # Phase 5.1: compute cycle count for annualization (assume daily cycles unless duration known)
+        n_cycles = max(len(returns), 1)
+        annualized_return = float((1.0 + total_return) ** (252.0 / n_cycles) - 1.0) if n_cycles > 0 else total_return
+        enh = self._compute_enhanced_performance_metrics(returns, self.trades_log, max_drawdown, annualized_return)
         
         report_path = self.config['reporting']['summary_report_path']
         
@@ -16056,8 +17083,15 @@ class PaperTradingEngine:
             f.write(f"  Initial Cash: ${self.initial_cash:,.2f}\n")
             f.write(f"  Final Equity: ${final_snapshot['total_equity']:,.2f}\n")
             f.write(f"  Total Return: {total_return:.2%}\n")
+            f.write(f"  Annualized Return: {annualized_return:.2%}\n")
             f.write(f"  Max Drawdown: {max_drawdown:.2%}\n")
-            f.write(f"  Sharpe Ratio: {sharpe:.2f}\n\n")
+            f.write(f"  Sharpe Ratio: {sharpe:.2f}\n")
+            f.write(f"  Sortino Ratio: {enh['sortino']:.2f}\n")
+            f.write(f"  Calmar Ratio: {enh['calmar']:.2f}\n")
+            f.write(f"  Win Rate: {enh['win_rate']:.2%}\n")
+            f.write(f"  Avg Win / Avg Loss: {enh['avg_win']:.2%} / {enh['avg_loss']:.2%}\n")
+            f.write(f"  Win/Loss Ratio: {enh['win_loss_ratio']:.2f}\n")
+            f.write(f"  Max Consecutive Losses: {enh['max_consecutive_losses']}\n\n")
             
             # NOTE: comment omitted (was garbled/non-ASCII).
             if final_snapshot.get('regime_state'):
@@ -16136,8 +17170,12 @@ class PaperTradingEngine:
         print(f"Initial Cash: ${self.initial_cash:,.2f}")
         print(f"Final Equity: ${final_snapshot['total_equity']:,.2f}")
         print(f"Total Return: {total_return:.2%}")
+        print(f"Annualized Return: {annualized_return:.2%}")
         print(f"Max Drawdown: {max_drawdown:.2%}")
         print(f"Sharpe Ratio: {sharpe:.2f}")
+        print(f"Sortino Ratio: {enh['sortino']:.2f}")
+        print(f"Calmar Ratio: {enh['calmar']:.2f}")
+        print(f"Win Rate: {enh['win_rate']:.2%}  (Win/Loss: {enh['win_loss_ratio']:.2f}x)  Max Consec Losses: {enh['max_consecutive_losses']}")
         
         # NOTE: comment omitted (was garbled/non-ASCII).
         if final_snapshot.get('bench_returns'):
@@ -16162,7 +17200,7 @@ def debug_run_planner_once(config_path: str = "paper_config.json", turnover_limi
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f) if f else {}
     except Exception as e:
-        print(f"[DEBUG PLANNER] Failed to load config {config_path}: {e}")
+        logger.warning("debug_run_planner_once: failed to load config %s: %s", config_path, e)
         cfg = {}
 
     trade_planner_cfg = cfg.get("trade_planner", {}) if isinstance(cfg, dict) else {}
@@ -16250,36 +17288,21 @@ def debug_run_planner_once(config_path: str = "paper_config.json", turnover_limi
             remaining = 0.0
 
     used_total = float(sum(abs(float(t.get("desired_trade_value", 0.0) or 0.0)) for t in chosen))
-    print("[DEBUG PLANNER] deterministic dry-run (no market data)")
-    print(
-        f"[DEBUG PLANNER] pre_notional=${pre_notional:,.2f} limit=${budget:,.2f} "
-        f"used=${used_total:,.2f} keep={len(chosen)} dropped={len(dropped)} scaled={len(scaled)}"
+    logger.debug(
+        "planner dry-run (no market data): pre_notional=$%.2f limit=$%.2f used=$%.2f "
+        "keep=%d dropped=%d scaled=%d rank_mode=%s allow_partial_fill=%s min_trade_notional=%.2f",
+        pre_notional, budget, used_total, len(chosen), len(dropped), len(scaled),
+        'planner_score' if enable_cost_sensitive_ranking else 'notional',
+        str(bool(allow_partial_fill)).lower(), min_trade_notional,
     )
-    print(
-        f"[DEBUG PLANNER] rank_mode={'planner_score' if enable_cost_sensitive_ranking else 'notional'} "
-        f"allow_partial_fill={str(bool(allow_partial_fill)).lower()} min_trade_notional={min_trade_notional:.2f}"
-    )
-    print("[DEBUG PLANNER] chosen:")
-    for t in chosen:
-        print(
-            "  - "
-            + json.dumps(
-                {
-                    "ticker": t.get("ticker"),
-                    "side": t.get("side"),
-                    "notional": round(float(t.get("desired_trade_value", 0.0) or 0.0), 4),
-                    "forced": bool(t.get("is_forced", False)),
-                    "planner_score": t.get("planner_score"),
-                },
-                ensure_ascii=False,
-            )
-        )
-    print("[DEBUG PLANNER] dropped:")
-    for d in dropped:
-        print("  - " + json.dumps(d, ensure_ascii=False))
-    print("[DEBUG PLANNER] scaled:")
-    for s in scaled:
-        print("  - " + json.dumps(s, ensure_ascii=False))
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("planner chosen: %s", json.dumps(
+            [{"ticker": t.get("ticker"), "side": t.get("side"),
+              "notional": round(float(t.get("desired_trade_value", 0.0) or 0.0), 4),
+              "forced": bool(t.get("is_forced", False)), "planner_score": t.get("planner_score")}
+             for t in chosen], ensure_ascii=False))
+        logger.debug("planner dropped: %s", json.dumps(dropped, ensure_ascii=False))
+        logger.debug("planner scaled: %s", json.dumps(scaled, ensure_ascii=False))
 
     return {
         "pre_notional": pre_notional,
@@ -16444,6 +17467,7 @@ def debug_run_system_s1_s5(
     execution_cfg["max_portfolio_volatility"] = 999.0
     execution_cfg["portfolio_vol_min_coverage"] = 1.0
     execution_cfg["enable_diversity_check"] = False
+    execution_cfg["min_holding_cycles"] = 0
     if bool(dryrun_real_risk_gate):
         execution_cfg["enable_target_cov_gate"] = True
         execution_cfg["target_cov_gate_min_coverage"] = 0.60
@@ -18726,6 +19750,7 @@ def replay_bundle_once(
 
 def main():
     """def main: docstring omitted (was garbled/non-ASCII)."""
+    setup_logging(log_dir="outputs", log_file="app.log")
     parser = argparse.ArgumentParser(description="Paper trading engine")
     parser.add_argument("config_path", nargs="?", default="paper_config.json", help="Path to config JSON.")
     parser.add_argument(
