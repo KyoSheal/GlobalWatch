@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V3.3.0)
+# GlobalWatch Paper Trading (V3.4.1)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -12,6 +12,37 @@ GlobalWatch Paper Trading 是一个本地优先的量化研究与纸面交易系
 - **AI 信号层**：本地 Ollama LLM（qwen2.5:32b / gemma3:12b）分析行业新闻，双向驱动买卖
 - **执行层**：FX 正确的 CAD/USD 记账、stale 报价策略、换手预算、风控退出
 - **系统层**：checkpoint 恢复、快照落盘、永久日度摘要日志、Streamlit 可视化监控
+
+## V3.4.1 更新摘要
+
+### 1. 语义向量检索（Semantic Vector Retrieval）
+行业信号查询从全量 `collection.get()` 升级为 `collection.query()`：
+- `_read_recent_industry_signals(tickers)` 接收当前持仓，查询 ChromaDB 返回最相关的 top-N 行业信号
+- 相似度加权：`effective_weight = decay_weight × (0.5 + 0.5 × similarity)` — 无关 sector 自动降权
+- 无持仓时回退 `get()`；`distance` 字段写入每行 row 供诊断
+
+### 2. 闭环 IC 反馈（Closed-Loop IC Feedback）
+AI overlay 现在会学习哪些行业信号准确：
+- 每次 overlay 应用后，`_append_prediction_log()` 将 `{cycle_ts, worst_l2, predicted_delta, cash_adj, snapshot_equity}` 写入 `prediction_log.jsonl`
+- 每个 cycle 开始时 `_settle_previous_predictions()` 对比上次 snapshot equity 与当前 equity，计算方向一致性，通过 EMA 更新 `signal_ic_state.json`
+- IC EMA 公式：`ic_new = 0.1 × contribution + 0.9 × ic_old` — 新市场环境自动压制历史偏差
+
+### 3. 三层状态分离（Three-Layer State Separation）
+预测日志与 IC 状态完全解耦：
+- `prediction_log.jsonl` — 可删，调试时随意清理
+- `signal_ic_state.json` — 持久化，跨重启保留，存 `{L2: {ic, n_settled}}`
+- 删日志不重置 IC，系统从上次学到的程度继续
+
+### 4. 渐进自适应 Alpha（Adaptive Alpha Ramp-Up）
+per-L2 alpha 动态随 IC 置信度爬升：
+- `effective_alpha = base_alpha × ((1−conf) × 1.0 + conf × clamp(1 + ic × 3, 0.5, 2.0))`
+- `conf = min(1.0, n_settled / min_cycles_before_adaptive)` — 从第 1 次 cycle 就有轻微效果，到 `min_cycles_before_adaptive`（默认 20，dev 可设 5）时完全激活
+- IC 诊断（`ic`、`ic_conf`、`n_settled`、`effective_alpha`）写入每个 cycle snapshot 的 `l2_delta_map_sample`
+
+### 5. 行业信号陈旧检测（Industry Signal Staleness Detection）
+防止 overlay 静默返回 `no_data`：
+- `_read_recent_industry_signals()` 在无新鲜信号时发出 `[INDUSTRY_SIGNAL_STALE]` 警告，含最后记录 age 和操作指引
+- `run_news_pipeline.py --include-industry` 新增步骤 4，检查 `industry_signals` 集合新鲜度并打印 `[INDUSTRY_HEALTH] OK/STALE/WARN`
 
 ## V3.3.0 更新摘要
 

@@ -587,8 +587,8 @@ def build_industry_membership(config):
         raise ValueError("ticker_tags must be a dict")
 
     l2_clean = [str(x).strip() for x in l2_list if str(x).strip()]
-    if not (8 <= len(l2_clean) <= 10):
-        raise ValueError(f"L2 count must be within 8-10, got {len(l2_clean)}")
+    if not (8 <= len(l2_clean) <= 15):
+        raise ValueError(f"L2 count must be within 8-15, got {len(l2_clean)}")
     l2_set = set(l2_clean)
 
     l3_to_parent = {}

@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V3.3.0)
+# GlobalWatch Paper Trading (V3.4.1)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -13,6 +13,37 @@ The stack combines:
 - AI-driven industry news signals (bidirectional buy + sell via local Ollama LLM)
 - execution safeguards (stale policy, turnover budget, planner, FX-correct accounting)
 - structured runtime outputs consumed by Streamlit monitoring pages
+
+## What's New in V3.4.1
+
+### 1. Semantic Vector Retrieval
+Industry signal lookup upgraded from full `collection.get()` to `collection.query()`:
+- `_read_recent_industry_signals(tickers)` receives current holdings and queries ChromaDB for the top-N most relevant sector signals
+- Similarity weighting: `effective_weight = decay_weight × (0.5 + 0.5 × similarity)` — distant sectors auto-downweighted
+- Falls back to `get()` when no tickers provided; `distance` field exposed per row for diagnostics
+
+### 2. Closed-Loop IC Feedback
+The AI overlay now learns which sector signals are accurate over time:
+- `_append_prediction_log()` writes `{cycle_ts, worst_l2, predicted_delta, cash_adj, snapshot_equity}` to ephemeral `prediction_log.jsonl` after each applied overlay
+- `_settle_previous_predictions()` runs at cycle start: compares prior snapshot equity to current equity, computes direction correctness, and updates `signal_ic_state.json` via EMA
+- IC EMA: `ic_new = 0.1 × contribution + 0.9 × ic_old` — recent regime automatically outweighs stale history
+
+### 3. Three-Layer State Separation
+Prediction log and IC state are fully decoupled:
+- `prediction_log.jsonl` — ephemeral, safe to delete for debugging
+- `signal_ic_state.json` — durable, persists across restarts; stores `{L2: {ic, n_settled}}`
+- Deleting logs never resets learned IC state
+
+### 4. Adaptive Alpha (Gradual Ramp-Up)
+Per-L2 alpha dynamically scales with IC confidence:
+- `effective_alpha = base_alpha × ((1−conf) × 1.0 + conf × clamp(1 + ic × 3, 0.5, 2.0))`
+- `conf = min(1.0, n_settled / min_cycles_before_adaptive)` — useful from cycle 1, fully adaptive at `min_cycles_before_adaptive` (default 20, dev: 5)
+- IC diagnostics (`ic`, `ic_conf`, `n_settled`, `effective_alpha`) visible in `l2_delta_map_sample` of every cycle snapshot
+
+### 5. Industry Signal Staleness Detection
+Prevents silent `no_data` failures in the news overlay:
+- `_read_recent_industry_signals()` emits `[INDUSTRY_SIGNAL_STALE]` warning with last-record age and remediation command when no fresh signals are found
+- `run_news_pipeline.py --include-industry` adds a step 4 that checks `industry_signals` collection freshness and prints `[INDUSTRY_HEALTH] OK/STALE/WARN`
 
 ## What's New in V3.3.0
 

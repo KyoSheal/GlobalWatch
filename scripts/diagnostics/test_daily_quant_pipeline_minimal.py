@@ -24,7 +24,8 @@ def _fail(msg: str) -> int:
 
 def _write_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
 def _write_csv(path: Path, cols, rows) -> None:
@@ -130,8 +131,9 @@ def main() -> int:
     tmp_root = Path(tempfile.mkdtemp(prefix="daily_quant_pipeline_min_"))
     try:
         daily_base = tmp_root / "outputs" / "Daily Report"
-        prev_date = "2026-02-18"
-        date_str = "2026-02-19"
+        today = datetime.now(timezone.utc).date()
+        date_str = today.isoformat()
+        prev_date = (today - timedelta(days=1)).isoformat()
 
         _write_json(daily_base / f"{prev_date}.json", {"date": prev_date, "title": "Prev Day"})
         _write_json(daily_base / f"{date_str}.json", {"date": date_str, "title": "Today"})

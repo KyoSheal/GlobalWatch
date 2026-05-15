@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V3.3.0)
+# GlobalWatch Paper Trading (V3.4.1)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -8,6 +8,33 @@ It combines cross-sectional alpha selection, macro/topic overlays, and execution
 
 From a quant angle, the stack supports momentum + volatility + correlation-aware allocation, regime-aware cash control, and AI-driven industry news overlays (bidirectional: buy and sell signals).
 From a systems angle, it provides checkpoint resume, structured snapshots, deterministic dry-runs, permanent daily summary logs, and a Streamlit dashboard for live monitoring and audit.
+
+## Release Highlights (V3.4.1)
+
+1. **Semantic vector retrieval** — industry signal lookup upgraded from full `collection.get()` to `collection.query()`:
+   - `_read_recent_industry_signals(tickers)` now receives current holdings and queries ChromaDB for the top-N most relevant sector signals
+   - Similarity weighting: `effective_weight = decay_weight × (0.5 + 0.5 × similarity)` — distant sectors auto-downweighted
+   - Fallback to `get()` when tickers list is empty; `distance` field exposed in every row for diagnostics
+
+2. **Closed-loop IC feedback** — AI overlay now learns which sector signals are accurate:
+   - `_append_prediction_log()` writes `{cycle_ts, worst_l2, predicted_delta, cash_adj, snapshot_equity}` to ephemeral `prediction_log.jsonl` after each applied overlay
+   - `_settle_previous_predictions()` runs at the start of each cycle: compares prior snapshot equity to current equity, computes direction correctness, and updates `signal_ic_state.json` via EMA
+   - IC EMA formula: `ic_new = 0.1 × contribution + 0.9 × ic_old` — recent market regimes automatically outweigh stale history
+
+3. **Three-layer state separation** — prediction log and IC state are fully decoupled:
+   - `prediction_log.jsonl` — ephemeral, safe to delete for debugging without losing learned IC
+   - `signal_ic_state.json` — durable, persists across restarts and log deletions; stores `{L2: {ic, n_settled}}`
+   - Deleting logs never resets the IC state the system has learned
+
+4. **Adaptive alpha (gradual ramp-up)** — per-L2 alpha dynamically scales with IC confidence:
+   - `effective_alpha = base_alpha × ((1−conf) × 1.0 + conf × clamp(1 + ic × 3, 0.5, 2.0))`
+   - `conf = min(1.0, n_settled / min_cycles_before_adaptive)` — confidence grows linearly from 0 to 1
+   - No hard cutoff: system is immediately useful from cycle 1, reaches full adaptation at `min_cycles_before_adaptive` (default 20, configurable to 5 for dev)
+   - IC diagnostics (`ic`, `ic_conf`, `n_settled`, `effective_alpha`) visible in `l2_delta_map_sample` of every cycle snapshot
+
+5. **Industry signal staleness detection** — prevents silent `no_data` failures:
+   - `_read_recent_industry_signals()` emits `[INDUSTRY_SIGNAL_STALE]` warning with last-record age and remediation command when no fresh signals found
+   - `run_news_pipeline.py --include-industry` adds step 4 that checks `industry_signals` collection freshness and prints `[INDUSTRY_HEALTH] OK/STALE/WARN`
 
 ## Release Highlights (V3.3.0)
 
@@ -23,7 +50,7 @@ From a systems angle, it provides checkpoint resume, structured snapshots, deter
    - Full `industry_map`, `ticker_tags`, `industry_taxonomy` (L2/L3), `topic_sector_ticker_map`, `industry_topic_queries`, `industry_keyword_map` entries added
 
 3. **AI news overlay upgraded to alpha mode**:
-   - `news_overlay.mode`: `risk_only` → `symmetric`` — AI signals can now drive both BUY and SELL
+   - `news_overlay.mode`: `risk_only` → `symmetric` — AI signals can now drive both BUY and SELL
    - `news_overlay.max_abs_delta`: `0.03` → `0.05` — wider weight shift range per signal
    - Previously, Ollama/LLM could only reduce positions; now it drives the full allocation
 
@@ -61,3 +88,13 @@ streamlit run GlobalWatch_V2.py
 ```
 pandas  numpy  matplotlib  yfinance
 ```
+
+
+# 启动
+./start_trading_day.sh
+
+# 监控（看是否在跑）
+ps aux | grep -E "paper_trading|news_pipeline" | grep -v grep
+
+# 停止
+pkill -f paper_trading.py; pkill -f run_news_pipeline.py

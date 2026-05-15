@@ -7219,8 +7219,11 @@ class PaperTradingEngine:
             ret = (total_equity - self.initial_cash) / self.initial_cash if self.initial_cash > 0 else 0.0
 
             risk_info = dict(self.current_risk_check_info) if isinstance(self.current_risk_check_info, dict) else {}
-            rc_frac = risk_info.get('cov_risk_current_summary', {}).get('max_rc_fraction', float('nan'))
-            gate = risk_info.get('cov_risk_current_summary', {}).get('gate_decision', 'N/A')
+            cov_summary = risk_info.get('cov_risk_current_summary') or {}
+            rc_frac_raw = cov_summary.get('max_rc_fraction')
+            rc_frac = rc_frac_raw if (rc_frac_raw is not None and isinstance(rc_frac_raw, (int, float)) and np.isfinite(float(rc_frac_raw))) else None
+            gate_decision_dict = risk_info.get('risk_gate_decision') or {}
+            gate = str(gate_decision_dict.get('final_gate_decision') or 'N/A')
             regime = str(getattr(self, 'current_regime_state', 'N/A')).upper()
 
             holdings_str = " | ".join(
@@ -7234,7 +7237,7 @@ class PaperTradingEngine:
                 f"Cycle={self.current_cycle} "
                 f"Cash=${self.cash:,.0f} Pos=${positions_value:,.0f} Equity=${total_equity:,.0f} "
                 f"Return={ret:+.2%} "
-                f"RC={rc_frac:.1%} Gate={gate} Regime={regime} "
+                f"RC={'N/A' if rc_frac is None else f'{rc_frac:.1%}'} Gate={gate} Regime={regime} "
                 f"Trades={trade_count}{fx_flag} Holdings=[{holdings_str}]\n"
             )
             with open(log_path, "a") as f:
@@ -10055,9 +10058,15 @@ class PaperTradingEngine:
                 return pd.DataFrame(), meta
 
             from sklearn.covariance import LedoitWolf
+            import warnings
             lw = LedoitWolf(assume_centered=False)
-            lw.fit(returns_df.values)
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=RuntimeWarning, module='scipy')
+                lw.fit(returns_df.values)
             cov_array = lw.covariance_
+            if not np.all(np.isfinite(cov_array)):
+                logger.debug("LedoitWolf returned non-finite covariance; falling back to diagonal shrink")
+                return self._estimate_covariance_diag_shrink(returns_df, 0.15)
             meta["shrinkage"] = float(lw.shrinkage_)
             meta["rows"] = int(returns_df.shape[0])
             meta["cols"] = int(returns_df.shape[1])
@@ -10312,8 +10321,10 @@ class PaperTradingEngine:
             marginal_dict = {}
             rc_fraction_dict = {}
             for idx, ticker in enumerate(tickers):
-                marginal_dict[ticker] = float(marginal[idx])
-                rc_fraction_dict[ticker] = float(rc_fraction[idx])
+                m_val = float(marginal[idx])
+                rc_val = float(rc_fraction[idx])
+                marginal_dict[ticker] = m_val if np.isfinite(m_val) else 0.0
+                rc_fraction_dict[ticker] = rc_val if np.isfinite(rc_val) else 0.0
 
             result["marginal_contrib"] = marginal_dict
             result["rc_fraction"] = rc_fraction_dict
@@ -10808,6 +10819,129 @@ class PaperTradingEngine:
         except Exception:
             return None
 
+    def _get_prediction_log_path(self) -> str:
+        """Path to ephemeral prediction log — safe to delete without losing IC state."""
+        base = str(self.config.get('macro_integration', {}).get('chroma_path', './memory_db'))
+        return os.path.join(base, 'prediction_log.jsonl')
+
+    def _get_signal_ic_state_path(self) -> str:
+        """Path to durable IC state — persists across restarts and log deletions."""
+        base = str(self.config.get('macro_integration', {}).get('chroma_path', './memory_db'))
+        return os.path.join(base, 'signal_ic_state.json')
+
+    def _load_signal_ic_state(self) -> dict:
+        path = self._get_signal_ic_state_path()
+        try:
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    obj = json.load(f)
+                return obj if isinstance(obj, dict) else {}
+        except Exception as e:
+            logger.debug('signal_ic_state load failed: %s', e)
+        return {}
+
+    def _save_signal_ic_state(self, state: dict) -> None:
+        path = self._get_signal_ic_state_path()
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.debug('signal_ic_state save failed: %s', e)
+
+    def _append_prediction_log(self, *, worst_l2, predicted_delta, cash_adj, l2_deltas) -> None:
+        _pos_val = sum(
+            float(p.get('value', 0.0) or 0.0)
+            for p in (self.positions.values() if isinstance(getattr(self, 'positions', None), dict) else [])
+        )
+        snapshot_equity = float(getattr(self, 'cash', 0.0)) + _pos_val
+        record = {
+            'cycle_ts': datetime.now(timezone.utc).isoformat(),
+            'cycle_id': int(getattr(self, 'current_cycle', 0)),
+            'worst_l2': worst_l2,
+            'predicted_delta': float(predicted_delta),
+            'cash_adj': float(cash_adj),
+            'snapshot_equity': float(snapshot_equity),
+            'l2_deltas': {k: float(v) for k, v in (l2_deltas or {}).items()},
+        }
+        path = self._get_prediction_log_path()
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logger.debug('prediction_log append failed: %s', e)
+
+    def _settle_previous_predictions(self) -> None:
+        """Read last prediction, compare current equity, update signal_ic_state.json via EMA."""
+        log_path = self._get_prediction_log_path()
+        if not os.path.exists(log_path):
+            return
+        try:
+            last_record = None
+            with open(log_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            last_record = json.loads(line)
+                        except Exception:
+                            pass
+            if last_record is None:
+                return
+
+            prev_equity = float(last_record.get('snapshot_equity', 0.0) or 0.0)
+            if prev_equity <= 0.0:
+                return
+
+            _pos_val = sum(
+                float(p.get('value', 0.0) or 0.0)
+                for p in (self.positions.values() if isinstance(getattr(self, 'positions', None), dict) else [])
+            )
+            current_equity = float(getattr(self, 'cash', 0.0)) + _pos_val
+            actual_return = (current_equity - prev_equity) / prev_equity if prev_equity > 0 else 0.0
+
+            # predicted_delta < 0 means bearish (we increased cash = expected drop)
+            predicted_delta = float(last_record.get('predicted_delta', 0.0) or 0.0)
+            if predicted_delta < 0 and actual_return < 0:
+                ic_contribution = 1.0   # predicted down, actually down ✓
+            elif predicted_delta < 0 and actual_return >= 0:
+                ic_contribution = -1.0  # predicted down, actually up ✗
+            else:
+                ic_contribution = 0.0   # no strong prediction (neutral/no-signal case)
+
+            worst_l2 = str(last_record.get('worst_l2') or '')
+            if not worst_l2:
+                return
+
+            cfg = self._get_news_overlay_cfg()
+            alpha_ema = float(cfg.get('ic_ema_alpha', 0.1))
+
+            state = self._load_signal_ic_state()
+            entry = state.get(worst_l2, {}) if isinstance(state.get(worst_l2), dict) else {}
+            old_ic = float(entry.get('ic', 0.0) or 0.0)
+            n_settled = int(entry.get('n_settled', 0) or 0)
+
+            new_ic = alpha_ema * ic_contribution + (1.0 - alpha_ema) * old_ic
+            n_settled += 1
+
+            state[worst_l2] = {
+                'ic': round(new_ic, 6),
+                'n_settled': n_settled,
+                'last_contribution': ic_contribution,
+                'last_actual_return': round(actual_return, 6),
+                'last_settled_ts': datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_signal_ic_state(state)
+            logger.debug(
+                '[IC_SETTLE] L2=%s ic_old=%.4f contribution=%.1f ic_new=%.4f n=%d',
+                worst_l2, old_ic, ic_contribution, new_ic, n_settled,
+            )
+        except Exception as e:
+            logger.debug('_settle_previous_predictions failed: %s', e)
+
     def _get_industry_signals_collection(self, collection_name, chroma_path):
         if not CHROMADB_AVAILABLE:
             return None
@@ -10826,7 +10960,7 @@ class PaperTradingEngine:
             print(f"[NEWS_OVERLAY] WARN collection init failed: {e}")
             return None
 
-    def _read_recent_industry_signals(self):
+    def _read_recent_industry_signals(self, tickers=None):
         cfg = self._get_news_overlay_cfg()
         if not bool(cfg.get('enabled', False)):
             return []
@@ -10839,16 +10973,32 @@ class PaperTradingEngine:
         if collection is None:
             return []
 
-        include = ['ids', 'metadatas', 'documents']
+        get_include = ['ids', 'metadatas', 'documents']
+        query_include = ['metadatas', 'documents']
+        n_results = int(cfg.get('semantic_query_n_results', 20))
+        distance_rows: list = []
         try:
-            results = collection.get(include=include)
+            if tickers:
+                holdings_str = ' '.join(str(t) for t in tickers if t)
+                q_results = collection.query(
+                    query_texts=[holdings_str],
+                    n_results=n_results,
+                    include=query_include + ['distances'],
+                )
+                # query() wraps each field in an extra list (one per query); unwrap [0]
+                id_rows = list((q_results.get('ids') or [[]])[0])
+                metadata_rows = list((q_results.get('metadatas') or [[]])[0])
+                document_rows = list((q_results.get('documents') or [[]])[0])
+                distance_rows = list((q_results.get('distances') or [[]])[0])
+                print(f"[NEWS_OVERLAY_QUERY] semantic query n={len(id_rows)} holdings='{holdings_str[:60]}'")
+            else:
+                results = collection.get(include=get_include)
+                id_rows = results.get('ids', []) if isinstance(results, dict) else []
+                metadata_rows = results.get('metadatas', []) if isinstance(results, dict) else []
+                document_rows = results.get('documents', []) if isinstance(results, dict) else []
         except Exception as e:
             print(f"[NEWS_OVERLAY] WARN collection read failed: {e}")
             return []
-
-        id_rows = results.get('ids', []) if isinstance(results, dict) else []
-        metadata_rows = results.get('metadatas', []) if isinstance(results, dict) else []
-        document_rows = results.get('documents', []) if isinstance(results, dict) else []
         now_utc = datetime.now(timezone.utc)
         latest_by_l2 = {}
         _decay_lambda = float(cfg.get('decay_lambda_per_hour', 0.04))
@@ -10880,8 +11030,12 @@ class PaperTradingEngine:
             confidence = float(meta.get('confidence', 0.0) or 0.0)
             risk_delta = float(meta.get('risk_delta', 0.0) or 0.0)
             _decay_weight = float(np.exp(-_decay_lambda * age_hours))
-            confidence = confidence * _decay_weight
-            risk_delta = risk_delta * _decay_weight
+            # similarity weighting: distance=0 → similarity=1.0 (exact match); distance=2 → 0.0
+            _raw_distance = float(distance_rows[idx]) if idx < len(distance_rows) else 0.0
+            _similarity = max(0.0, 1.0 - _raw_distance / 2.0) if distance_rows else 1.0
+            _effective_weight = _decay_weight * (0.5 + 0.5 * _similarity)
+            confidence = confidence * _effective_weight
+            risk_delta = risk_delta * _effective_weight
             doc = document_rows[idx] if idx < len(document_rows) else None
             doc_text = str(doc) if isinstance(doc, str) else ''
             payload = None
@@ -10901,6 +11055,8 @@ class PaperTradingEngine:
                 'doc_horizon': str((payload or {}).get('horizon', '') if isinstance(payload, dict) else ''),
                 'decay_weight': _decay_weight,
                 'decay_lambda': _decay_lambda,
+                'similarity': _similarity,
+                'effective_weight': _effective_weight,
             }
 
             row = {
@@ -10911,6 +11067,7 @@ class PaperTradingEngine:
                 'decay_weight': _decay_weight,
                 'horizon': str(meta.get('horizon', '1d')),
                 'age_hours': age_hours,
+                'distance': float(distance_rows[idx]) if idx < len(distance_rows) else 0.0,
                 'payload': payload if isinstance(payload, dict) else {},
                 'raw_metadata': dict(meta),
                 'raw_doc_head_600': doc_text[:600],
@@ -10982,7 +11139,7 @@ class PaperTradingEngine:
             return base_cash, info
 
         try:
-            signal_rows = self._read_recent_industry_signals()
+            signal_rows = self._read_recent_industry_signals(tickers=tickers)
             if not signal_rows:
                 info['status'] = 'no_data'
                 return base_cash, info
@@ -10993,6 +11150,8 @@ class PaperTradingEngine:
             max_age_hours = float(cfg.get('max_age_hours', 48.0))
             mode = str(cfg.get('mode', 'risk_only')).lower()
             enable_confidence_scaling = bool(cfg.get('enable_confidence_scaling', True))
+            min_cycles_before_adaptive = int(cfg.get('min_cycles_before_adaptive', 20))
+            ic_state = self._load_signal_ic_state()
             l2_delta_map = {}
             l2_diag_map = {}
             excluded_conf_sample = []
@@ -11064,7 +11223,12 @@ class PaperTradingEngine:
                             }
                         )
                     continue
-                raw_delta = float(risk_delta * alpha)
+                ic_entry = ic_state.get(l2, {}) if isinstance(ic_state.get(l2), dict) else {}
+                l2_ic = float(ic_entry.get('ic', 0.0) or 0.0)
+                n_settled = int(ic_entry.get('n_settled', 0) or 0)
+                ic_conf = min(1.0, n_settled / max(1, min_cycles_before_adaptive))
+                effective_alpha = alpha * ((1.0 - ic_conf) * 1.0 + ic_conf * max(0.5, min(2.0, 1.0 + l2_ic * 3.0)))
+                raw_delta = float(risk_delta * effective_alpha)
                 if enable_confidence_scaling:
                     raw_delta = float(raw_delta * confidence)
                 delta = float(np.clip(raw_delta, -max_abs_delta, max_abs_delta))
@@ -11076,6 +11240,10 @@ class PaperTradingEngine:
                     'risk_delta': float(risk_delta),
                     'confidence': float(confidence),
                     'delta': float(delta),
+                    'effective_alpha': round(float(effective_alpha), 6),
+                    'ic': round(float(l2_ic), 6),
+                    'ic_conf': round(float(ic_conf), 4),
+                    'n_settled': int(n_settled),
                 }
                 if len(info['included_rows_audit']) < 3:
                     info['included_rows_audit'].append(
@@ -11200,6 +11368,12 @@ class PaperTradingEngine:
                     "alpha": float(alpha),
                     "min_confidence": float(min_confidence),
                 },
+            )
+            self._append_prediction_log(
+                worst_l2=worst_l2,
+                predicted_delta=worst_l2_delta,
+                cash_adj=float(applied_cash_delta),
+                l2_deltas={k: float(v) for k, v in l2_delta_map.items()},
             )
             return new_cash, info
         except Exception as e:
@@ -13000,6 +13174,7 @@ class PaperTradingEngine:
             print(f"[MACRO PATH2] CASH tilt {cash_tilt:+.2%} -> cash_target {cash_target_before_cash_tilt:.2%} -> {cash_target:.2%}")
 
         overlay_tickers = sorted(list(trade_universe_tickers))
+        self._settle_previous_predictions()
         cash_target, news_overlay_info = self.apply_news_overlay_to_cash_target(
             overlay_tickers,
             cash_target=cash_target,
@@ -16964,21 +17139,31 @@ class PaperTradingEngine:
         recent = self.portfolio_snapshots[-window:]
         start_equity = float(recent[0].get('total_equity', 0.0))
         end_equity = float(recent[-1].get('total_equity', 0.0))
-        if start_equity <= 0:
+        if start_equity <= 0 or not (np.isfinite(start_equity) and np.isfinite(end_equity)):
             return
 
         rolling_dd = (start_equity - end_equity) / start_equity
 
+        logger.debug(
+            f"[CIRCUIT_BREAKER_CHECK] cycle={self.current_cycle} "
+            f"window={window} n_snapshots={len(self.portfolio_snapshots)} "
+            f"start_eq={start_equity:.2f} end_eq={end_equity:.2f} "
+            f"rolling_dd={rolling_dd:.4f} threshold={threshold:.4f} active={self.circuit_breaker_rolling_active}"
+        )
+
         if not self.circuit_breaker_rolling_active:
+            # Require a full window of real samples before the circuit breaker can fire.
+            # This prevents spurious triggers when portfolio_snapshots is rebuilt from
+            # equity_history on session resume and the window straddles different sessions.
+            if len(self.portfolio_snapshots) < window:
+                return
             if rolling_dd >= threshold:
                 self.circuit_breaker_rolling_active = True
                 self.circuit_breaker_rolling_triggered_cycle = self.current_cycle
                 self.circuit_breaker_rolling_recovery_equity = end_equity * (1.0 + recovery_pct)
-                # Switch to low risk profile (write runtime control request so it persists)
-                try:
-                    self.write_runtime_control_request('low', request_id='circuit_breaker_rolling')
-                except Exception:
-                    pass
+                # Only update in-memory state; don't write to the persistent state file so
+                # that a spurious trigger cannot permanently lock the risk profile to 'low'
+                # across session restarts.
                 self.active_risk_profile = 'low'
                 self.requested_risk_profile = 'low'
                 self.risk_profile_source = 'circuit_breaker_rolling'
@@ -16990,7 +17175,10 @@ class PaperTradingEngine:
                 self.circuit_breaker_rolling_active = False
                 self.circuit_breaker_rolling_triggered_cycle = None
                 self.circuit_breaker_rolling_recovery_equity = None
-                print(f"[CIRCUIT BREAKER] Recovery detected (equity {current_equity:,.2f}), releasing LOW risk override")
+                configured_profile = str(exec_cfg.get('risk_profile', '') or RISK_PROFILE_DEFAULT).strip().lower()
+                self.active_risk_profile = configured_profile
+                self.requested_risk_profile = configured_profile
+                print(f"[CIRCUIT BREAKER] Recovery detected (equity {current_equity:,.2f}), releasing LOW risk override → {configured_profile}")
 
     # ------------------------------------------------------------------
     # Phase 5.3 – Factor attribution reporting
@@ -18439,7 +18627,7 @@ def debug_run_news_overlay_phase2(config_path: str = "paper_config.json", outdir
             filtered_rows, filter_stats = _filter_signal_rows(case.get("signals", []), cfg_row)
             clip_events = _calc_clip_events(filtered_rows, cfg_row)
             clip_count = sum(1 for x in clip_events if bool(x.get("clipped", False)))
-            engine._read_recent_industry_signals = (lambda rows=filtered_rows: list(rows))
+            engine._read_recent_industry_signals = (lambda rows=filtered_rows, tickers=None: list(rows))
 
             before = float(base_cash_target)
             after, info = engine.apply_news_overlay_to_cash_target(tickers, before)

@@ -1641,7 +1641,7 @@
     "reason_on_block": "Blocked by asset_data_policy (see ASSET_POLICY_DECISION for details)"
   },
   "execution": {
-    "risk_profile": "",
+    "risk_profile": "mid",
     "weight_threshold": 0.025,
     "min_trade_notional_usd": 400,
     "signal_refresh_minutes": 1440,
@@ -1994,7 +1994,11 @@
       "mode": "add_bearish_label",
       "min_macro_confidence": 0.55
     },
-    "enable_confidence_scaling": true
+    "enable_confidence_scaling": true,
+    "semantic_query_n_results": 20,
+    "industry_stale_warn_hours": 2.0,
+    "min_cycles_before_adaptive": 20,
+    "ic_ema_alpha": 0.1
   },
   "news_sources": {
     "market_rss_enabled": true,
