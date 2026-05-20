@@ -138,10 +138,11 @@ EFFECTIVE_RISK_MODEL_CONFIG_SCHEMA_VERSION = 1
 DEFAULT_RISK_PROFILES = {
     "low": {
         "execution": {
-            "target_vol_annual": 0.08,
+            "target_vol_annual": 0.22,
             "portfolio_exposure_cap": 0.90,
             "max_turnover_pct_per_rebalance": 0.12,
             "weight_threshold": 0.02,
+            "target_vol_min_scale": 0.45,
             "enable_target_cov_gate": False,
             "target_cov_gate_min_coverage": 0.60,
             "target_cov_gate_require_ok": True,
@@ -151,7 +152,7 @@ DEFAULT_RISK_PROFILES = {
             "max_weight_per_asset": 0.12,
         },
         "risk_model": {
-            "rc_limit": 0.18,
+            "rc_limit": 0.25,
             "use_cov_vol_for_gate": False,
         },
         "news_overlay": {
@@ -162,10 +163,11 @@ DEFAULT_RISK_PROFILES = {
     },
     "mid": {
         "execution": {
-            "target_vol_annual": 0.12,
+            "target_vol_annual": 0.30,
             "portfolio_exposure_cap": 0.95,
-            "max_turnover_pct_per_rebalance": 0.18,
+            "max_turnover_pct_per_rebalance": 0.40,
             "weight_threshold": 0.015,
+            "target_vol_min_scale": 0.60,
             "enable_target_cov_gate": False,
             "target_cov_gate_min_coverage": 0.60,
             "target_cov_gate_require_ok": True,
@@ -175,7 +177,7 @@ DEFAULT_RISK_PROFILES = {
             "max_weight_per_asset": 0.15,
         },
         "risk_model": {
-            "rc_limit": 0.30,
+            "rc_limit": 0.40,
             "portfolio_cov_rc_hysteresis_band": 0.03,
             "portfolio_cov_rc_abort_buffer_enabled": True,
             "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
@@ -191,10 +193,11 @@ DEFAULT_RISK_PROFILES = {
     },
     "high": {
         "execution": {
-            "target_vol_annual": 0.16,
+            "target_vol_annual": 0.40,
             "portfolio_exposure_cap": 1.00,
-            "max_turnover_pct_per_rebalance": 0.28,
+            "max_turnover_pct_per_rebalance": 0.55,
             "weight_threshold": 0.01,
+            "target_vol_min_scale": 0.72,
             "enable_target_cov_gate": True,
             "target_cov_gate_min_coverage": 0.60,
             "target_cov_gate_require_ok": True,
@@ -204,7 +207,7 @@ DEFAULT_RISK_PROFILES = {
             "max_weight_per_asset": 0.22,
         },
         "risk_model": {
-            "rc_limit": 0.30,
+            "rc_limit": 0.65,
             "use_cov_vol_for_gate": True,
         },
         "news_overlay": {
@@ -215,10 +218,11 @@ DEFAULT_RISK_PROFILES = {
     },
     "ultra": {
         "execution": {
-            "target_vol_annual": 0.22,
+            "target_vol_annual": 0.55,
             "portfolio_exposure_cap": 1.00,
-            "max_turnover_pct_per_rebalance": 0.40,
+            "max_turnover_pct_per_rebalance": 0.70,
             "weight_threshold": 0.0075,
+            "target_vol_min_scale": 0.85,
             "enable_target_cov_gate": True,
             "target_cov_gate_min_coverage": 0.60,
             "target_cov_gate_require_ok": True,
@@ -228,7 +232,7 @@ DEFAULT_RISK_PROFILES = {
             "max_weight_per_asset": 0.30,
         },
         "risk_model": {
-            "rc_limit": 0.40,
+            "rc_limit": 0.75,
             "use_cov_vol_for_gate": True,
         },
         "news_overlay": {
@@ -268,7 +272,7 @@ RISK_PROFILE_ALLOWED_KEYS = {
     },
 }
 RISK_PROFILE_CHOICES = tuple(sorted(DEFAULT_RISK_PROFILES.keys()))
-RISK_PROFILE_DEFAULT = "mid"
+RISK_PROFILE_DEFAULT = "high"
 
 
 def _normalize_cov_rc_gate_decision(decision_value) -> str | None:
@@ -1320,6 +1324,7 @@ class PaperTradingEngine:
         self._debug_now_override_warned = False
         self.current_turnover_info = {}
         self.current_exit_info = {}
+        self._exit_signal_bar_ts_seen: dict = {}  # {ticker: last bar timestamp evaluated}
         self.current_risk_check_info = {}
         self.current_vol_targeting_info = {'enabled': False, 'status': 'disabled'}
         self.current_vol_target_diag_info = {
@@ -1660,10 +1665,11 @@ class PaperTradingEngine:
         execution_config.setdefault('enable_short_term_momentum', True)
         execution_config.setdefault('short_momentum_lookback_days', 10)
         execution_config.setdefault('enable_exit_signals', True)
+        execution_config.setdefault('exit_signal_pre_buy_check', True)
         execution_config.setdefault('exit_signal_lookback_days', 20)
         execution_config.setdefault('exit_signal_action', 'reduce')
         execution_config.setdefault('exit_signal_reduce_factor', 0.5)
-        execution_config.setdefault('exit_signal_min_trigger_count', 1)
+        execution_config.setdefault('exit_signal_min_trigger_count', 2)
         execution_config.setdefault('exit_signal_gap_down_pct', 0.03)
         execution_config.setdefault('exit_signal_volume_spike_ratio', 2.0)
         execution_config.setdefault('exit_signal_consecutive_down_days', 3)
@@ -1674,7 +1680,7 @@ class PaperTradingEngine:
         execution_config.setdefault('exit_gap_volume_window', 30)
         execution_config.setdefault('enable_score_smoothing', True)
         execution_config.setdefault('score_smoothing_window', 3)
-        execution_config.setdefault('max_portfolio_volatility', 0.25)
+        execution_config.setdefault('max_portfolio_volatility', 0.50)
         execution_config.setdefault('enable_diversity_check', True)
         execution_config.setdefault('max_herfindahl_index', 0.35)
         execution_config.setdefault('portfolio_vol_min_coverage', 0.70)
@@ -14071,6 +14077,24 @@ class PaperTradingEngine:
         
         total_equity = self.cash + positions_value
 
+        # Pre-buy exit signal check: block buying into a technical breakdown.
+        # Entry and exit criteria should be consistent — if we would exit a position
+        # on a signal, we should not be opening or adding to it either.
+        # Does NOT update _exit_signal_bar_ts_seen (only the holding loop below does that).
+        if enable_exit_signals and total_equity > 0 and bool(execution_config.get('exit_signal_pre_buy_check', True)):
+            for ticker, target_w in list(target_weights.items()):
+                if ticker == 'CASH':
+                    continue
+                current_w = (current_values.get(ticker, 0.0) / total_equity) if total_equity > 0 else 0.0
+                if target_w <= current_w + 1e-4:
+                    continue  # not a buy / add candidate
+                hist_pb = self.get_market_data(ticker, period='3mo', interval='1d')
+                pb_flag, pb_reason, _ = self.detect_exit_signals(ticker, hist_pb)
+                if pb_flag:
+                    target_weights[ticker] = current_w  # cap at current, no new buying
+                    print(f"[PRE_BUY_EXIT_BLOCK] {ticker}: '{pb_reason}' — buy blocked "
+                          f"({target_w:.2%} → capped at {current_w:.2%})")
+
         # Evaluate exit signals for existing holdings and override target weights if triggered.
         if enable_exit_signals and total_equity > 0 and self.positions:
             adjusted_target_weights = dict(target_weights)
@@ -14081,7 +14105,27 @@ class PaperTradingEngine:
                 if ticker not in current_values:
                     continue
 
+                # Do not fire exit signal on positions entered within min_holding_cycles.
+                # Prevents momentum buys from being immediately reversed by exit signals
+                # on the same or next bar (the AMD buy→sell-at-loss pattern).
+                if min_holding_cycles > 0:
+                    _entry_cyc = self.position_entry_cycle.get(str(ticker).upper())
+                    if _entry_cyc is not None and (int(self.current_cycle) - int(_entry_cyc)) < min_holding_cycles:
+                        logger.debug(
+                            f"[EXIT_SIGNAL_SKIP] {ticker}: held "
+                            f"{int(self.current_cycle) - int(_entry_cyc)} < {min_holding_cycles} cycles"
+                        )
+                        continue
+
                 hist = self.get_market_data(ticker, period='3mo', interval='1d')
+                # Deduplicate: only evaluate exit signal once per daily bar per ticker.
+                # Each intraday cycle fetches the same daily OHLC window; without this guard
+                # a single gap-down day would re-trigger the signal every 20-minute cycle.
+                if hist is not None and not hist.empty:
+                    _last_bar_ts = hist.index[-1]
+                    if self._exit_signal_bar_ts_seen.get(ticker) == _last_bar_ts:
+                        continue
+                    self._exit_signal_bar_ts_seen[ticker] = _last_bar_ts
                 exit_flag, exit_reason, force_exit = self.detect_exit_signals(ticker, hist)
                 if not exit_flag:
                     continue

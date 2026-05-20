@@ -1578,7 +1578,7 @@
   "strategy": {
     "type": "momentum_vol_targeting",
     "lookback_days": 40,
-    "vol_target": 0.15,
+    "vol_target": 0.40,
     "momentum_weight": 0.65,
     "vol_weight": 0.35
   },
@@ -1600,7 +1600,7 @@
     "portfolio_cov_rc_abort_buffer_relax_delta": 0.02,
     "portfolio_cov_rc_abort_buffer_active_cycles": 3,
     "enable_vol_targeting": true,
-    "vol_target": 0.2,
+    "vol_target": 0.40,
     "cov_method": "ledoit_wolf",
     "enable_crisis_detection": true,
     "crisis_corr_ratio": 1.5,
@@ -1618,7 +1618,7 @@
     "vix_extreme": 40.0,
     "cooldown_hours": 24,
     "risk_on_profile": "high",
-    "neutral_profile": "mid",
+    "neutral_profile": "high",
     "risk_off_profile": "low"
   },
   "asset_data_policy": {
@@ -1641,7 +1641,7 @@
     "reason_on_block": "Blocked by asset_data_policy (see ASSET_POLICY_DECISION for details)"
   },
   "execution": {
-    "risk_profile": "mid",
+    "risk_profile": "high",
     "weight_threshold": 0.025,
     "min_trade_notional_usd": 400,
     "signal_refresh_minutes": 1440,
@@ -1669,10 +1669,11 @@
     "enable_short_term_momentum": true,
     "short_momentum_lookback_days": 10,
     "enable_exit_signals": true,
+    "exit_signal_pre_buy_check": true,
     "exit_signal_lookback_days": 20,
     "exit_signal_action": "reduce",
     "exit_signal_reduce_factor": 0.5,
-    "exit_signal_min_trigger_count": 1,
+    "exit_signal_min_trigger_count": 2,
     "exit_signal_gap_down_pct": 0.03,
     "exit_signal_volume_spike_ratio": 2.0,
     "exit_signal_consecutive_down_days": 3,
@@ -1683,7 +1684,7 @@
     "exit_gap_volume_window": 30,
     "enable_score_smoothing": true,
     "score_smoothing_window": 3,
-    "max_portfolio_volatility": 0.25,
+    "max_portfolio_volatility": 0.50,
     "enable_diversity_check": true,
     "max_herfindahl_index": 0.35,
     "portfolio_vol_min_coverage": 0.7,
@@ -1714,6 +1715,7 @@
     "circuit_breaker_rolling_window": 10,
     "circuit_breaker_rolling_drawdown_pct": 0.12,
     "circuit_breaker_rolling_recovery_pct": 0.03,
+    "target_vol_min_scale": 0.65,
     "price_stale_policy": {
       "allow_buy": [
         "LIVE",
@@ -1729,10 +1731,11 @@
   "risk_profiles": {
     "low": {
       "execution": {
-        "target_vol_annual": 0.08,
+        "target_vol_annual": 0.22,
         "portfolio_exposure_cap": 0.9,
         "max_turnover_pct_per_rebalance": 0.12,
         "weight_threshold": 0.02,
+        "target_vol_min_scale": 0.45,
         "enable_target_cov_gate": false,
         "target_cov_gate_min_coverage": 0.6,
         "target_cov_gate_require_ok": true
@@ -1742,7 +1745,7 @@
         "max_weight_per_asset": 0.12
       },
       "risk_model": {
-        "rc_limit": 0.18,
+        "rc_limit": 0.25,
         "use_cov_vol_for_gate": false
       },
       "news_overlay": {
@@ -1753,10 +1756,11 @@
     },
     "mid": {
       "execution": {
-        "target_vol_annual": 0.12,
+        "target_vol_annual": 0.30,
         "portfolio_exposure_cap": 0.95,
         "max_turnover_pct_per_rebalance": 0.4,
         "weight_threshold": 0.015,
+        "target_vol_min_scale": 0.60,
         "enable_target_cov_gate": false,
         "target_cov_gate_min_coverage": 0.6,
         "target_cov_gate_require_ok": true
@@ -1766,7 +1770,7 @@
         "max_weight_per_asset": 0.15
       },
       "risk_model": {
-        "rc_limit": 0.65,
+        "rc_limit": 0.40,
         "portfolio_cov_rc_hysteresis_band": 0.02,
         "portfolio_cov_rc_abort_buffer_enabled": true,
         "portfolio_cov_rc_abort_buffer_trigger_consecutive_aborts": 3,
@@ -1782,10 +1786,11 @@
     },
     "high": {
       "execution": {
-        "target_vol_annual": 0.16,
+        "target_vol_annual": 0.40,
         "portfolio_exposure_cap": 1.0,
         "max_turnover_pct_per_rebalance": 0.55,
         "weight_threshold": 0.01,
+        "target_vol_min_scale": 0.72,
         "enable_target_cov_gate": true,
         "target_cov_gate_min_coverage": 0.6,
         "target_cov_gate_require_ok": true
@@ -1795,7 +1800,7 @@
         "max_weight_per_asset": 0.22
       },
       "risk_model": {
-        "rc_limit": 0.4,
+        "rc_limit": 0.65,
         "use_cov_vol_for_gate": true
       },
       "news_overlay": {
@@ -1806,10 +1811,11 @@
     },
     "ultra": {
       "execution": {
-        "target_vol_annual": 0.22,
+        "target_vol_annual": 0.55,
         "portfolio_exposure_cap": 1.0,
         "max_turnover_pct_per_rebalance": 0.7,
         "weight_threshold": 0.0075,
+        "target_vol_min_scale": 0.85,
         "enable_target_cov_gate": true,
         "target_cov_gate_min_coverage": 0.6,
         "target_cov_gate_require_ok": true
@@ -1819,7 +1825,7 @@
         "max_weight_per_asset": 0.3
       },
       "risk_model": {
-        "rc_limit": 0.5,
+        "rc_limit": 0.75,
         "use_cov_vol_for_gate": true
       },
       "news_overlay": {

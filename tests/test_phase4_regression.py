@@ -47,7 +47,7 @@ def test_import_constants():
         RISK_PROFILE_CHOICES,
     )
     assert isinstance(LIVE_SCHEMA_VERSION, int)
-    assert RISK_PROFILE_DEFAULT == "mid"
+    assert RISK_PROFILE_DEFAULT == "high"
     assert set(DEFAULT_RISK_PROFILES.keys()) == {"low", "mid", "high", "ultra"}
     assert set(RISK_PROFILE_CHOICES) == {"low", "mid", "high", "ultra"}
 
@@ -543,9 +543,9 @@ def test_phase1_vol_targeting_enabled(engine):
 
 
 def test_phase1_vol_target_value(engine):
-    """Phase 1.5: vol_target must be 0.20 (raised from 0.12 to reduce over-cashing)."""
+    """Phase 1.5: vol_target raised to 0.40 to align with tech portfolio vol range."""
     risk_cfg = engine._get_risk_model_cfg()
-    assert float(risk_cfg.get("vol_target", 0)) == pytest.approx(0.20)
+    assert float(risk_cfg.get("vol_target", 0)) == pytest.approx(0.40)
 
 
 def test_phase1_macro_decay_lambda(engine):
