@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,7 +24,7 @@ def _fail(msg: str) -> int:
 
 def _write_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+    with path.open("w", encoding="utf-8", newline="\n") as _f: _f.write(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
 def _write_csv(path: Path, cols, rows) -> None:
@@ -65,7 +66,7 @@ def _run_a7(daily_base: Path) -> subprocess.CompletedProcess:
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="quant_replay_drift_daily_min_"))
     try:
-        date_str = "2026-02-18"
+        date_str = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
         daily_base = tmp / "outputs" / "Daily Report"
         report_path = daily_base / f"{date_str}.json"
         _write_json(report_path, {"date": date_str, "title": "Daily"})
@@ -99,7 +100,7 @@ def main() -> int:
             [
                 {
                     "cycle": 20,
-                    "time_utc": "2026-02-18T15:00:00+00:00",
+                    "time_utc": f"{date_str}T15:00:00+00:00",
                     "price_rows": 3,
                     "num_trades": 2,
                     "target_hash": "th",

@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V3.4.1)
+# GlobalWatch Paper Trading (V3.5.0)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -12,6 +12,64 @@ GlobalWatch Paper Trading 是一个本地优先的量化研究与纸面交易系
 - **AI 信号层**：本地 Ollama LLM（qwen2.5:32b / gemma3:12b）分析行业新闻，双向驱动买卖
 - **执行层**：FX 正确的 CAD/USD 记账、stale 报价策略、换手预算、风控退出
 - **系统层**：checkpoint 恢复、快照落盘、永久日度摘要日志、Streamlit 可视化监控
+
+## V3.5.0 更新摘要
+
+### 1. 默认风险档位改为 "high"
+运行时默认档位从 `"mid"` 改为 `"high"`：
+- `execution.risk_profile`: `"mid"` → `"high"`
+- `auto_risk_profile.neutral_profile`: `"mid"` → `"high"`
+- 代码中 `DEFAULT_RISK_PROFILES` 所有兜底值同步更新
+
+### 2. Vol 目标过度修正问题修复
+**根本原因：** `target_vol_annual` 设定为 12–16%，而实际科技股组合波动率约 45–51%，导致缩放系数 `scale ≈ 0.25`，引擎被迫持有约 50–75% 现金仓，严重压制收益。
+
+**修复：** 将 `target_vol_annual` 调整为符合真实科技股组合特征的值：
+
+| 档位 | `target_vol_annual`（修复前）| `target_vol_annual`（修复后）|
+|---|---|---|
+| low | 0.08 | 0.22 |
+| mid | 0.12 | 0.30 |
+| high | 0.16 | 0.40 |
+| ultra | 0.22 | 0.55 |
+
+**新增 `target_vol_min_scale` 参数** — 每个档位的 scale 下限，即使在极端波动行情中也不会跌破该阈值：
+
+| 档位 | `target_vol_min_scale` |
+|---|---|
+| low | 0.45 |
+| mid | 0.60 |
+| high | 0.72 |
+| ultra | 0.85 |
+
+### 3. rc_limit 修正为单调递增
+原有 `rc_limit` 非单调（mid=0.65 > high=0.40），mid 档比 high 档还宽松——逻辑倒置：
+
+| 档位 | `rc_limit`（修复前）| `rc_limit`（修复后）|
+|---|---|---|
+| low | 0.18 | 0.25 |
+| mid | 0.65 | 0.40 |
+| high | 0.40 | 0.65 |
+| ultra | 0.50 | 0.75 |
+
+### 4. 退出信号陈旧重复触发问题修复
+**根本原因：** `detect_exit_signals()` 读取 `window.iloc[-1]`（最后一根日线 K 线）。每个 20 分钟的盘中 cycle 都会重新读到同一根历史 K 线（例如 5/13 的单日跳空低开），导致 ON/MRVL/MU/ARM 每个 cycle 持续减仓。
+
+**修复：** 新增 `_exit_signal_bar_ts_seen` 字典 — 记录每个 ticker 上次触发退出信号时的 K 线时间戳。同一根 K 线在同一天内只触发一次，后续 cycle 跳过（按日线 K 线去重，而非按日历日）。
+
+### 5. 买入前退出信号预检查
+新增配置项 `exit_signal_pre_buy_check: true`。执行买入前，引擎先对该 ticker 运行 `detect_exit_signals()`。若买入后会立即触发退出信号，则目标权重上限设为当前权重——买入被阻断。
+
+**效果：** 修复 AMD 买入即卖出亏损模式（每次损失 $200–300）。此前动量信号触发买入，退出信号在同一轮调仓中立即触发卖出。
+
+### 6. exit_signal_min_trigger_count 提升至 2
+`exit_signal_min_trigger_count`: `1` → `2`。引擎现在需要同时触发 ≥2 个退出条件（例如跳空低开 + 连续 3 日下跌）才会减仓。单根 K 线不再能强制触发卖出。
+
+### 7. 退出信号 min_holding 保护
+持仓周期少于 `min_holding_cycles`（默认 4 周期 / 80 分钟）的仓位，直接跳过退出信号评估。防止刚买入的仓位在同一或下一个调仓周期被立即翻转。
+
+### 8. max_portfolio_volatility 上调
+`max_portfolio_volatility`: `0.25` → `0.50`。旧值 0.25 低于 high 档的 `target_vol_annual=0.40`，造成引擎总在达到自身 vol 目标之前就中止调仓的矛盾。
 
 ## V3.4.1 更新摘要
 
@@ -147,15 +205,14 @@ outputs/daily/YYYY-MM-DD.log
 - `app.log` 保持轮转临时文件（重启时删除）
 - 可快速回顾多天表现，无需加载大型日志
 
-## 交易限制体系（mid profile 关键参数）
+## 交易限制体系（high profile 关键参数）
 
 | 类型 | 参数 | 当前值 |
 |---|---|---|
 | 市场时间 | 09:30–16:00 ET | 非交易时段完全阻断 |
-| RC 集中度门控 | `rc_limit` | 0.65（pass=0.63, fail=0.67）|
-| 单仓上限 | `max_weight_per_asset` | 15% |
-| 最小现金 | `min_cash_pct` | 12% |
-| 单次换手上限 | `max_turnover_pct_per_rebalance` | 40% |
+| RC 集中度门控 | `rc_limit` | 0.65（high 档）|
+| 单仓上限 | `max_weight_per_asset` | 22% |
+| 单次换手上限 | `max_turnover_pct_per_rebalance` | 55% |
 | 最小交易额 | `min_trade_notional_usd` | $400 |
 | 止损 | `stop_loss_pct` | -8% |
 | 熔断器 | `circuit_breaker_rolling_drawdown_pct` | 12%（10 周期内）|
@@ -272,7 +329,15 @@ python scripts/quant/a20_attach_exec_blockers_to_daily.py --daily-base "outputs/
 
 ### `risk_profiles`
 每个 profile（`low`、`mid`、`high`、`ultra`）可覆盖：
-- `rc_limit`、`max_weight_per_asset`、`min_cash_pct`、`max_turnover_pct_per_rebalance`、`weight_threshold`
+- `rc_limit`、`max_weight_per_asset`、`min_cash_pct`、`max_turnover_pct_per_rebalance`、`weight_threshold`、`target_vol_annual`、`target_vol_min_scale`
+
+当前值：
+| 档位 | `target_vol_annual` | `rc_limit` | `target_vol_min_scale` |
+|---|---|---|---|
+| low | 0.22 | 0.25 | 0.45 |
+| mid | 0.30 | 0.40 | 0.60 |
+| high *（默认）* | 0.40 | 0.65 | 0.72 |
+| ultra | 0.55 | 0.75 | 0.85 |
 
 ### `universe`
 - 78 个可交易标的：美股、加拿大 `.TO` 股票、ETF、板块 ETF、CASH

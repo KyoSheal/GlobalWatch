@@ -22,7 +22,7 @@ def _fail(msg: str) -> int:
 
 def _write_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+    with path.open("w", encoding="utf-8", newline="\n") as _f: _f.write(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
 def main() -> int:

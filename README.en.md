@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V3.4.1)
+# GlobalWatch Paper Trading (V3.5.0)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -13,6 +13,64 @@ The stack combines:
 - AI-driven industry news signals (bidirectional buy + sell via local Ollama LLM)
 - execution safeguards (stale policy, turnover budget, planner, FX-correct accounting)
 - structured runtime outputs consumed by Streamlit monitoring pages
+
+## What's New in V3.5.0
+
+### 1. Default Risk Profile Changed to "high"
+The default runtime profile has changed from `"mid"` to `"high"`:
+- `execution.risk_profile`: `"mid"` → `"high"`
+- `auto_risk_profile.neutral_profile`: `"mid"` → `"high"`
+- All hardcoded fallback values in `DEFAULT_RISK_PROFILES` updated to match config
+
+### 2. Vol Targeting Overcorrection Fixed
+**Root cause:** `target_vol_annual` values of 12–16% against actual tech portfolio vol of ~45–51% produced a scaling factor of ~0.25, forcing the engine to hold ~50–75% cash at all times and severely suppressing returns.
+
+**Fix:** Raised `target_vol_annual` to values consistent with real tech-stock portfolio behavior:
+
+| Profile | `target_vol_annual` (before) | `target_vol_annual` (after) |
+|---|---|---|
+| low | 0.08 | 0.22 |
+| mid | 0.12 | 0.30 |
+| high | 0.16 | 0.40 |
+| ultra | 0.22 | 0.55 |
+
+**New `target_vol_min_scale` parameter** added per profile — a floor that prevents the vol-targeting scale from dropping below a threshold even during extreme volatility:
+
+| Profile | `target_vol_min_scale` |
+|---|---|
+| low | 0.45 |
+| mid | 0.60 |
+| high | 0.72 |
+| ultra | 0.85 |
+
+### 3. rc_limit Reordered — Now Monotonically Increasing
+Previous `rc_limit` values were non-monotonic (`mid=0.65 > high=0.40`), meaning the "mid" profile was more permissive than "high" — a logical inversion:
+
+| Profile | `rc_limit` (before) | `rc_limit` (after) |
+|---|---|---|
+| low | 0.18 | 0.25 |
+| mid | 0.65 | 0.40 |
+| high | 0.40 | 0.65 |
+| ultra | 0.50 | 0.75 |
+
+### 4. Stale Exit Signal Fixed
+**Root cause:** `detect_exit_signals()` reads `window.iloc[-1]` (the last daily bar). On every 20-minute intraday cycle, the same historical bar (e.g., a May 13 gap-down event) re-fired continuously, causing ON/MRVL/MU/ARM to be incrementally reduced each cycle.
+
+**Fix:** `_exit_signal_bar_ts_seen` dict — the engine records the bar timestamp per ticker when an exit signal fires. If the same bar is seen again within the same day, the signal is skipped (deduplication by daily bar, not by calendar day).
+
+### 5. Pre-Buy Exit Signal Check
+New config key `exit_signal_pre_buy_check: true`. Before increasing any position, the engine runs `detect_exit_signals()` on that ticker. If an exit signal would fire immediately after the buy, the target weight is capped at the current weight — the buy is blocked.
+
+**Effect:** Fixes the AMD buy→sell-at-loss pattern (~$200–300 per occurrence) where momentum triggered a buy and the exit signal triggered a sell within the same rebalance cycle.
+
+### 6. exit_signal_min_trigger_count Raised to 2
+`exit_signal_min_trigger_count`: `1` → `2`. The engine now requires ≥2 concurrent exit signal conditions (e.g., gap-down AND 3-day consecutive decline) before reducing a position. A single candle can no longer force an immediate sell.
+
+### 7. min_holding Guard for Exit Signals
+Positions held fewer than `min_holding_cycles` (default: 4 cycles / 80 min) now skip exit signal evaluation entirely. This prevents a buy from being immediately reversed by an exit signal in the same or next rebalance cycle.
+
+### 8. max_portfolio_volatility Raised
+`max_portfolio_volatility`: `0.25` → `0.50`. The previous value of 0.25 was below the `target_vol_annual=0.40` for the high profile, creating a contradiction where the engine would always abort before reaching its own vol target.
 
 ## What's New in V3.4.1
 
@@ -294,7 +352,15 @@ python paper_trading.py --debug-system-s1-5 --debug-outdir outputs/gw_dryrun pap
 
 ### `risk_profiles`
 Each profile (`low`, `mid`, `high`, `ultra`) can override:
-- `rc_limit`, `max_weight_per_asset`, `min_cash_pct`, `max_turnover_pct_per_rebalance`, `weight_threshold`
+- `rc_limit`, `max_weight_per_asset`, `min_cash_pct`, `max_turnover_pct_per_rebalance`, `weight_threshold`, `target_vol_annual`, `target_vol_min_scale`
+
+Current values:
+| Profile | `target_vol_annual` | `rc_limit` | `target_vol_min_scale` |
+|---|---|---|---|
+| low | 0.22 | 0.25 | 0.45 |
+| mid | 0.30 | 0.40 | 0.60 |
+| high *(default)* | 0.40 | 0.65 | 0.72 |
+| ultra | 0.55 | 0.75 | 0.85 |
 
 ### `universe`
 - 78 tradable assets: US stocks, Canadian `.TO` stocks, ETFs, sector ETFs, CASH

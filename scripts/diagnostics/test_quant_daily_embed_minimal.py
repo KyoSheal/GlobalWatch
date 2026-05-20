@@ -22,7 +22,7 @@ def _fail(msg: str) -> int:
 
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    with path.open("w", encoding="utf-8", newline="\n") as _f: _f.write(text)
 
 
 def _run_embed(*, daily_dir: Path, strict: bool = False) -> subprocess.CompletedProcess:

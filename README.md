@@ -1,4 +1,4 @@
-# GlobalWatch Paper Trading (V3.4.1)
+# GlobalWatch Paper Trading (V3.5.0)
 
 [![EN](https://img.shields.io/badge/Language-English-blue)](./README.en.md)
 [![CN](https://img.shields.io/badge/Language-%E4%B8%AD%E6%96%87-red)](./README.zh.md)
@@ -8,6 +8,48 @@ It combines cross-sectional alpha selection, macro/topic overlays, and execution
 
 From a quant angle, the stack supports momentum + volatility + correlation-aware allocation, regime-aware cash control, and AI-driven industry news overlays (bidirectional: buy and sell signals).
 From a systems angle, it provides checkpoint resume, structured snapshots, deterministic dry-runs, permanent daily summary logs, and a Streamlit dashboard for live monitoring and audit.
+
+## Release Highlights (V3.5.0)
+
+1. **Default risk profile changed to "high"** — previous default was "mid":
+   - `execution.risk_profile`: `"mid"` → `"high"`
+   - `auto_risk_profile.neutral_profile`: `"mid"` → `"high"`
+   - All hardcoded fallback values in `DEFAULT_RISK_PROFILES` updated to match
+
+2. **Vol targeting overcorrection fixed** — portfolio was holding ~50% cash at all times:
+   - Root cause: `target_vol_annual` of 12–16% vs actual tech portfolio vol of ~45–51% → `scale ≈ 0.25`
+   - Fix: raised `target_vol_annual` to realistic levels across all profiles
+   - New `target_vol_min_scale` floor added per profile to prevent scale from dropping below a threshold even in volatile markets
+
+3. **rc_limit reordered** — previous values were non-monotonic (mid=65% > high=40%):
+   - Before: `low=0.18, mid=0.65, high=0.40, ultra=0.50`
+   - After: `low=0.25, mid=0.40, high=0.65, ultra=0.75`
+
+4. **Risk profile parameter table (new values):**
+   | Profile | `target_vol_annual` | `rc_limit` | `target_vol_min_scale` |
+   |---|---|---|---|
+   | low | 0.22 | 0.25 | 0.45 |
+   | mid | 0.30 | 0.40 | 0.60 |
+   | high | 0.40 | 0.65 | 0.72 |
+   | ultra | 0.55 | 0.75 | 0.85 |
+
+5. **Stale exit signal fixed** — same historical gap-down bar was firing on every 20-min intraday cycle:
+   - Fix: `_exit_signal_bar_ts_seen` dict deduplicates by daily bar timestamp (fires once per bar per ticker)
+
+6. **Pre-buy exit signal check** (`exit_signal_pre_buy_check: true`):
+   - Before executing a buy, the engine checks if the ticker would immediately trigger an exit signal
+   - If so, the target weight is capped at current weight — buy is blocked
+   - Fixes the AMD buy→sell-at-loss pattern ($200–300 per occurrence)
+
+7. **`exit_signal_min_trigger_count` raised to 2**:
+   - Requires ≥2 concurrent exit signals (e.g., gap-down + 3-day decline) before a position is reduced
+   - Prevents a single candle from forcing an immediate sell
+
+8. **min_holding guard for exit signals**:
+   - Positions held fewer than `min_holding_cycles` now skip exit signal evaluation entirely
+   - Prevents momentum buys from being immediately reversed
+
+9. **`max_portfolio_volatility` raised**: `0.25` → `0.50` — resolved contradiction with `target_vol_annual=0.40` for high profile
 
 ## Release Highlights (V3.4.1)
 
