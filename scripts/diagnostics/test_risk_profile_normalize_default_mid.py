@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""T02: normalize risk profile to strict low/mid/high/ultra with default mid."""
+"""T02: normalize risk profile to strict low/mid/high/ultra with default high."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def main() -> int:
     failures: list[str] = []
     engine = _build_engine_stub()
 
-    # A) empty / None -> mid
+    # A) empty / None -> high (default profile)
     for raw in ("", None):
         cfg = {"execution": {"risk_profile": raw}}
         try:
@@ -43,10 +43,10 @@ def main() -> int:
             failures.append(f"A: raised on raw={raw!r}: {exc}")
             continue
         final = str(cfg.get("execution", {}).get("risk_profile", "")).strip().lower()
-        if normalized != "mid" or final != "mid":
-            failures.append(f"A: raw={raw!r} normalized={normalized!r} final={final!r} expected 'mid'")
+        if normalized != "high" or final != "high":
+            failures.append(f"A: raw={raw!r} normalized={normalized!r} final={final!r} expected 'high'")
 
-    # B) manual/abc -> mid without exception
+    # B) manual/abc -> high (default) without exception
     for raw in ("manual", "abc"):
         cfg = {"execution": {"risk_profile": raw}}
         try:
@@ -55,8 +55,8 @@ def main() -> int:
             failures.append(f"B: raised on raw={raw!r}: {exc}")
             continue
         final = str(cfg.get("execution", {}).get("risk_profile", "")).strip().lower()
-        if normalized != "mid" or final != "mid":
-            failures.append(f"B: raw={raw!r} normalized={normalized!r} final={final!r} expected 'mid'")
+        if normalized != "high" or final != "high":
+            failures.append(f"B: raw={raw!r} normalized={normalized!r} final={final!r} expected 'high'")
 
     # C) trim + lowercase: " High " -> "high"
     cfg_c = {"execution": {"risk_profile": " High "}}
@@ -84,8 +84,8 @@ def main() -> int:
         if _is_valid_runtime_requested(v):
             failures.append(f"D: invalid runtime request flagged valid: {v!r}")
 
-    if str(RISK_PROFILE_DEFAULT).strip().lower() != "mid":
-        failures.append(f"default profile is {RISK_PROFILE_DEFAULT!r}, expected 'mid'")
+    if str(RISK_PROFILE_DEFAULT).strip().lower() != "high":
+        failures.append(f"default profile is {RISK_PROFILE_DEFAULT!r}, expected 'high'")
 
     if failures:
         print("[FAIL] risk_profile_normalize_default_mid")
